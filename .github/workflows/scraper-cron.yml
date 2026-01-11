@@ -39,15 +39,17 @@ jobs:
       - name: Install Playwright (Chromium)
         run: npx playwright install --with-deps chromium
 
-      - name: Run scraper (headed via Xvfb)
+      - name: Run scraper
         env:
+          TZ: Africa/Cairo
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           RPC_NAME: refresh_match_stream_app
           CONCURRENCY: 2
-          HEADLESS: 0
+          HEADLESS: 1
           DEBUG: 0
-        run: xvfb-run -a node scraper.js
+        run: node scraper.js
+
 
 
       - name: Upload debug.png if failed
