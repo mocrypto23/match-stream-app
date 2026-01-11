@@ -27,7 +27,6 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Cache Playwright browsers to reduce install time
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
@@ -41,16 +40,23 @@ jobs:
 
       - name: Run scraper
         env:
-          TZ: Africa/Cairo
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           RPC_NAME: refresh_match_stream_app
           CONCURRENCY: 2
           HEADLESS: 1
           DEBUG: 0
+          DIAG: 1
         run: node scraper.js
 
-
+      # Upload diagnostics even on success (this is what tells us why GitHub differs)
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag
+          path: diag
+          if-no-files-found: ignore
 
       - name: Upload debug.png if failed
         if: failure()
