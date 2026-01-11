@@ -52,6 +52,21 @@ jobs:
           DIAG: 1
         run: xvfb-run -a node scraper.js
 
+      - name: Diagnose Supabase rows (today)
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TABLE_NAME: match-stream-app
+        run: node scripts/diag-supabase.js
+
+      - name: Probe site rendering (runner)
+        if: always()
+        env:
+          HEADLESS: 0
+        run: xvfb-run -a node scripts/diag-site.js
+
+
       - name: List diagnostics files
         if: always()
         run: |
