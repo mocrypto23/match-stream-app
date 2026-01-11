@@ -30,11 +30,17 @@ jobs:
       - name: Install Playwright (Chromium)
         run: npx playwright install --with-deps chromium
 
-      - name: Run scraper
+          - name: Run scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TABLE_NAME: match-stream-app
+          HEADLESS: "1"
+          CONCURRENCY: "1"
+          CI_SAFE: "1"
+          DEBUG: "0"
         run: node scraper.js
+
 
       - name: Upload debug.png if failed
         if: failure()
