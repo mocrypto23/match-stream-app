@@ -49,6 +49,23 @@ jobs:
           DIAG: 1
         run: node scraper.js
 
+      - name: List diagnostics files
+        if: always()
+        run: |
+          echo "=== diag tree ==="
+          ls -la
+          ls -la diag || true
+          find diag -maxdepth 2 -type f -print || true
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag
+          path: diag
+          if-no-files-found: warn
+
+
       # Upload diagnostics even on success (this is what tells us why GitHub differs)
       - name: Upload diagnostics
         if: always()
