@@ -3,9 +3,25 @@ import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabase";
 
 type DayKey = "yesterday" | "today" | "tomorrow";
+const TZ = "Africa/Cairo";
+
+type MatchRow = {
+  id: number;
+  home_team: string;
+  away_team: string;
+  home_logo: string;
+  away_logo: string;
+  stream_url: string;
+  match_day: string;
+  match_start: string | null;
+  match_time: string | null;
+  home_score: number | null;
+  away_score: number | null;
+  status_key?: string | null;
+  status_text?: string | null;
+};
 
 function cairoDayStringFromOffset(offsetDays: number) {
-  const TZ = "Africa/Cairo";
   const now = new Date();
   const shifted = new Date(now.getTime() + offsetDays * 24 * 60 * 60 * 1000);
 
@@ -23,14 +39,50 @@ function cairoDayStringFromOffset(offsetDays: number) {
   return `${y}-${m}-${d}`;
 }
 
-
 function dayToOffset(day: DayKey) {
   return day === "yesterday" ? -1 : day === "tomorrow" ? 1 : 0;
 }
 
+function safeDate(v: any): Date | null {
+  if (!v) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function hasScores(m: MatchRow) {
+  return m.home_score !== null && m.away_score !== null;
+}
+
+// fallback only (if status_key missing)
+function isLiveWindow(matchStart: any) {
+  const start = safeDate(matchStart);
+  if (!start) return false;
+
+  const now = new Date();
+  const earlyMs = 10 * 60 * 1000;
+  const lateMs = 2 * 60 * 60 * 1000 + 15 * 60 * 1000;
+
+  return now.getTime() >= start.getTime() - earlyMs && now.getTime() <= start.getTime() + lateMs;
+}
+
+function isFinishedByTime(matchStart: any) {
+  const start = safeDate(matchStart);
+  if (!start) return false;
+
+  const now = new Date();
+  const endMs = 2 * 60 * 60 * 1000 + 15 * 60 * 1000;
+  return now.getTime() > start.getTime() + endMs;
+}
+
+function normalizeStatusKey(sk: any): "live" | "finished" | "upcoming" | "unknown" {
+  const s = String(sk || "").toLowerCase().trim();
+  if (s === "live" || s === "finished" || s === "upcoming" || s === "unknown") return s as any;
+  return "unknown";
+}
+
 export default function Home() {
   const [day, setDay] = useState<DayKey>("today");
-  const [matches, setMatches] = useState<any[]>([]);
+  const [matches, setMatches] = useState<MatchRow[]>([]);
   const [loading, setLoading] = useState(true);
 
   const tabs = useMemo(
@@ -47,7 +99,6 @@ export default function Home() {
 
     const fetchMatches = async () => {
       setLoading(true);
-
       const matchDay = cairoDayStringFromOffset(dayToOffset(day));
 
       const { data, error } = await supabase
@@ -62,7 +113,7 @@ export default function Home() {
           console.error("Supabase error:", error.message);
           setMatches([]);
         } else {
-          setMatches(data || []);
+          setMatches((data || []) as MatchRow[]);
         }
         setLoading(false);
       }
@@ -74,17 +125,58 @@ export default function Home() {
     };
   }, [day]);
 
+  const sortedMatches = useMemo(() => {
+    const arr = [...matches];
+
+    const computedStatus = (m: MatchRow) => {
+      if (day === "yesterday") return "finished" as const;
+
+      const sk = normalizeStatusKey(m.status_key);
+
+      // prefer scraper status
+      if (day === "today") {
+        if (sk === "live" || sk === "finished") return sk;
+      }
+
+      if (day === "tomorrow") return "upcoming" as const;
+
+      // fallback if status missing/unknown
+      const scores = hasScores(m);
+      if (scores && isFinishedByTime(m.match_start)) return "finished" as const;
+      if (isLiveWindow(m.match_start)) return "live" as const;
+      return "upcoming" as const;
+    };
+
+    const rank = (s: string) => (s === "live" ? 0 : s === "upcoming" ? 1 : 2);
+
+    arr.sort((a, b) => {
+      const sa = computedStatus(a);
+      const sb = computedStatus(b);
+      const ra = rank(sa);
+      const rb = rank(sb);
+      if (ra !== rb) return ra - rb;
+
+      const da = safeDate(a.match_start)?.getTime() ?? Number.POSITIVE_INFINITY;
+      const db = safeDate(b.match_start)?.getTime() ?? Number.POSITIVE_INFINITY;
+      if (da !== db) return da - db;
+
+      return (a.id ?? 0) - (b.id ?? 0);
+    });
+
+    return arr;
+  }, [matches, day]);
+
   if (loading) {
     return (
       <div className="min-h-screen bg-black text-white flex items-center justify-center font-bold">
-        جاري تحميل {day === "yesterday" ? "مباريات الأمس" : day === "tomorrow" ? "مباريات الغد" : "مباريات اليوم"}...
+        جاري تحميل{" "}
+        {day === "yesterday" ? "مباريات الأمس" : day === "tomorrow" ? "مباريات الغد" : "مباريات اليوم"}...
       </div>
     );
   }
 
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-white p-4 sm:p-8 font-sans" dir="rtl">
-      {/* Header */}
       <header className="max-w-4xl mx-auto flex justify-between items-center mb-6 border-b border-gray-900 pb-6">
         <h1 className="text-3xl font-black text-blue-500 tracking-tighter">
           Two<span className="text-white">Footy</span>
@@ -95,7 +187,6 @@ export default function Home() {
         </div>
       </header>
 
-      {/* Tabs */}
       <div className="max-w-4xl mx-auto flex gap-2 mb-8">
         {tabs.map((t) => (
           <button
@@ -113,22 +204,30 @@ export default function Home() {
         ))}
       </div>
 
-      {/* Matches Grid */}
       <main className="max-w-4xl mx-auto grid gap-6">
-        {matches.length > 0 ? (
-          matches.map((match) => {
-            const hasScores =
-              match.home_score !== undefined &&
-              match.home_score !== null &&
-              match.away_score !== undefined &&
-              match.away_score !== null;
+        {sortedMatches.length > 0 ? (
+          sortedMatches.map((match) => {
+            const scores = hasScores(match);
+
+            const sk = normalizeStatusKey(match.status_key);
+            const fallbackLive = day === "today" && isLiveWindow(match.match_start);
+            const fallbackFinished = day === "today" && scores && isFinishedByTime(match.match_start);
+
+            const status =
+              day === "yesterday"
+                ? "finished"
+                : day === "tomorrow"
+                ? "upcoming"
+                : sk === "live" || sk === "finished"
+                ? sk
+                : fallbackFinished
+                ? "finished"
+                : fallbackLive
+                ? "live"
+                : "upcoming";
 
             const centerText =
-              day === "yesterday"
-                ? hasScores
-                  ? `${match.home_score} - ${match.away_score}`
-                  : match.match_time || "—"
-                : match.match_time || "—";
+              status !== "upcoming" && scores ? `${match.home_score} - ${match.away_score}` : match.match_time || "—";
 
             const canNavigate = day !== "yesterday" && Boolean(match?.id);
 
@@ -144,7 +243,6 @@ export default function Home() {
                   canNavigate ? "hover:border-blue-600 hover:scale-[1.01] transition-all cursor-pointer" : "opacity-90",
                 ].join(" ")}
               >
-                {/* Home */}
                 <div className="flex flex-col items-center gap-3 flex-1">
                   <div className="w-16 h-16 bg-gray-900 rounded-full flex items-center justify-center p-2 border border-gray-800 group-hover:border-blue-500 transition-colors">
                     <img src={match.home_logo} alt={match.home_team} className="w-full h-full object-contain" />
@@ -152,13 +250,16 @@ export default function Home() {
                   <span className="text-sm sm:text-lg font-black text-center">{match.home_team}</span>
                 </div>
 
-                {/* Center */}
                 <div className="flex flex-col items-center gap-2 px-4">
                   <span className="text-blue-500 font-black text-xl">{centerText}</span>
 
-                  {day === "yesterday" ? (
+                  {status === "finished" ? (
                     <div className="bg-gray-700/10 text-gray-300 text-[10px] px-4 py-1 rounded-full font-black border border-gray-700/30">
                       انتهت
+                    </div>
+                  ) : status === "live" ? (
+                    <div className="bg-red-600/10 text-red-400 text-[10px] px-4 py-1 rounded-full font-black border border-red-600/30">
+                      جارية الآن
                     </div>
                   ) : (
                     <div className="bg-blue-600/10 text-blue-500 text-[10px] px-4 py-1 rounded-full font-black border border-blue-600/20">
@@ -167,7 +268,6 @@ export default function Home() {
                   )}
                 </div>
 
-                {/* Away */}
                 <div className="flex flex-col items-center gap-3 flex-1">
                   <div className="w-16 h-16 bg-gray-900 rounded-full flex items-center justify-center p-2 border border-gray-800 group-hover:border-blue-500 transition-colors">
                     <img src={match.away_logo} alt={match.away_team} className="w-full h-full object-contain" />
