@@ -34,6 +34,9 @@ const { createClient } = require("@supabase/supabase-js");
 const fs = require("fs");
 const path = require("path");
 require("dotenv").config({ path: ".env.local" });
+const { PlaywrightBlocker } = require("@ghostery/adblocker-playwright");
+const fetch = require("cross-fetch");
+
 
 // ===================== ENV =====================
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -43,6 +46,28 @@ if (!supabaseUrl || !supabaseKey) {
   console.error("❌ Missing SUPABASE_URL or SUPABASE_KEY in environment.");
   process.exit(1);
 }
+
+let blockerPromise = null;
+
+async function getAdBlocker() {
+  if (!blockerPromise) {
+    blockerPromise = PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch).then((b) => {
+      // اختياري (بس مفيد): خلي البلوكر يمنع الصور والخطوط بدل ما تعملها أنت يدوي
+      b.blockImages();
+      b.blockFonts();
+
+      // اختياري كمان لو عايز تقلل حمل أكتر:
+      // b.blockStyles();
+      // b.blockMedias();
+      // b.blockFrames();
+
+      return b;
+    });
+  }
+  return blockerPromise;
+}
+
+
 
 const TABLE_NAME = process.env.TABLE_NAME || "match-stream-app";
 const RPC_NAME = process.env.RPC_NAME || "refresh_match_stream_app";
@@ -232,16 +257,35 @@ async function applyAntiAds(context, page) {
     } catch {}
   }, AD_HOSTS);
 
-  await page.route("**/*", (route) => {
+  // ✅ 1) Route خفيف جداً: يمنع فقط الدومينات اللي انت محددها + موارد تقيلة لو تحب
+await page.route("**/*", (route) => {
+  try {
     const req = route.request();
     const url = req.url();
     const type = req.resourceType();
 
+    // امنع الدومينات الإعلانية اللي محددها انت
     if (isAdHost(url)) return route.abort();
-    if (["image", "font"].includes(type)) return route.abort();
+
+    // (اختياري) امنع الحاجات التقيلة هنا أو سيبها للبلوكر
+    // أنا بفضّل تسيب الصور/الخطوط للبلوكر فقط لتجنب التكرار
+    // لو عايز تخليها هنا بدل البلوكر: فعل السطرين دول واحذف blockImages/blockFonts فوق
+    // if (["image", "font"].includes(type)) return route.abort();
 
     return route.continue();
-  });
+  } catch {
+    return route.continue();
+  }
+});
+
+// ✅ 2) Ghostery Adblocker (لازم بعد route)
+try {
+  const blocker = await getAdBlocker();
+  await blocker.enableBlockingInPage(page);
+} catch (e) {
+  dbg("⚠️ adblocker failed:", e?.message || e);
+}
+
 }
 
 // ===================== Time / Parse Helpers =====================
