@@ -1,3 +1,4 @@
+// app/watch/[id]/page.tsx
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
@@ -31,6 +32,14 @@ function formatStartTimeAr(iso?: string | null) {
     timeStyle: "short",
   }).format(d);
 }
+
+/**
+ * Safe sandbox:
+ * - blocks popups + top navigation (common ad-redirect patterns)
+ * - still allows scripts + same-origin (many players need this)
+ */
+const SAFE_IFRAME_SANDBOX =
+  "allow-scripts allow-same-origin allow-forms allow-presentation";
 
 export default function WatchPage() {
   const params = useParams();
@@ -103,7 +112,10 @@ export default function WatchPage() {
     return (
       <div className="min-h-screen bg-black text-white p-4">
         <div className="max-w-3xl mx-auto mt-10">
-          <button onClick={() => router.back()} className="mb-4 text-gray-400 hover:text-white">
+          <button
+            onClick={() => router.back()}
+            className="mb-4 text-gray-400 hover:text-white"
+          >
             ← العودة للرئيسية
           </button>
 
@@ -111,8 +123,8 @@ export default function WatchPage() {
             <div className="font-bold mb-2">تعذر فتح صفحة المشاهدة</div>
             <div className="text-gray-300 break-words">{errMsg}</div>
             <div className="text-gray-500 mt-3 text-sm">
-              لو المشكلة بسبب RLS: إمّا تسمح بالقراءة للـ anon على الجدول، أو تعرض الصفحة كـ Client زي هنا مع جلسة
-              المستخدم.
+              لو المشكلة بسبب RLS: إمّا تسمح بالقراءة للـ anon على الجدول، أو تعرض
+              الصفحة كـ Client زي هنا مع جلسة المستخدم.
             </div>
           </div>
         </div>
@@ -149,6 +161,22 @@ export default function WatchPage() {
           ← العودة للرئيسية
         </button>
 
+        {/* رسالة ضخمة */}
+        <div className="mb-4 rounded-2xl border border-gray-800 bg-gradient-to-r from-[#1b1b1b] via-[#111111] to-[#1b1b1b] p-5 shadow-2xl">
+          <div className="flex flex-col gap-2 items-center text-center">
+            <div className="text-2xl sm:text-3xl font-black tracking-wide">
+              😄 احنا موقع لذيذ
+            </div>
+            <div className="text-sm sm:text-base text-gray-300 leading-relaxed max-w-3xl">
+              لو دست على <span className="text-white font-semibold">أي إعلان</span> مش حيِقرفك ويفتح في صفحة جديدة…
+              <span className="text-white font-black"> الإعلان حيختفي والله ✅ وبمجرد ما تكبر البث مش حتشوف ولا اعلان يزعجك</span>
+            </div>
+            <div className="text-xs text-gray-500">
+              ملاحظة: المشغل شغّال بوضع حماية دائمًا لمنع التحويلات والنوافذ المنبثقة.
+            </div>
+          </div>
+        </div>
+
         {/* مشغل الفيديو */}
         <div className="aspect-video bg-gray-900 rounded-xl overflow-hidden shadow-2xl border border-gray-800">
           {shouldBlockStream ? (
@@ -169,7 +197,9 @@ export default function WatchPage() {
               allowFullScreen
               scrolling="no"
               allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
-              referrerPolicy="no-referrer-when-downgrade"
+              referrerPolicy="no-referrer"
+              sandbox={SAFE_IFRAME_SANDBOX}
+              title="Live Stream"
             />
           ) : (
             <div className="flex flex-col gap-2 items-center justify-center h-full text-gray-400 p-6 text-center">

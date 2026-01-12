@@ -37,7 +37,6 @@ require("dotenv").config({ path: ".env.local" });
 const { PlaywrightBlocker } = require("@ghostery/adblocker-playwright");
 const fetch = require("cross-fetch");
 
-
 // ===================== ENV =====================
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
@@ -66,8 +65,6 @@ async function getAdBlocker() {
   }
   return blockerPromise;
 }
-
-
 
 const TABLE_NAME = process.env.TABLE_NAME || "match-stream-app";
 const RPC_NAME = process.env.RPC_NAME || "refresh_match_stream_app";
@@ -104,6 +101,8 @@ const AD_HOSTS = [
   "pushwelcome.com",
   "pushpushgo.com",
   "hilltopads.net",
+  // from your popup example:
+  "identitylumber.com",
 ];
 
 const BOT_HINTS = [
@@ -218,7 +217,7 @@ async function applyStealth(page) {
 
 async function applyAntiAds(context, page) {
   if (page.__antiAdsApplied) return;
-  page.__antiAdsApplied = true;             
+  page.__antiAdsApplied = true;
 
   await applyStealth(page);
 
@@ -257,35 +256,32 @@ async function applyAntiAds(context, page) {
     } catch {}
   }, AD_HOSTS);
 
-  // ✅ 1) Route خفيف جداً: يمنع فقط الدومينات اللي انت محددها + موارد تقيلة لو تحب
-await page.route("**/*", (route) => {
+  // ✅ 1) Route خفيف جداً: يمنع فقط الدومينات اللي انت محددها
+  await page.route("**/*", (route) => {
+    try {
+      const req = route.request();
+      const url = req.url();
+
+      // امنع الدومينات الإعلانية اللي محددها انت
+      if (isAdHost(url)) return route.abort();
+
+      // ✅ مهم: سيب Ghostery يمسك باقي الطلبات
+      if (typeof route.fallback === "function") return route.fallback();
+      return route.continue();
+    } catch {
+      if (typeof route.fallback === "function") return route.fallback();
+      return route.continue();
+    }
+  });
+
+  // ✅ 2) Ghostery Adblocker (لازم بعد route)
   try {
-    const req = route.request();
-    const url = req.url();
-    const type = req.resourceType();
-
-    // امنع الدومينات الإعلانية اللي محددها انت
-    if (isAdHost(url)) return route.abort();
-
-    // (اختياري) امنع الحاجات التقيلة هنا أو سيبها للبلوكر
-    // أنا بفضّل تسيب الصور/الخطوط للبلوكر فقط لتجنب التكرار
-    // لو عايز تخليها هنا بدل البلوكر: فعل السطرين دول واحذف blockImages/blockFonts فوق
-    // if (["image", "font"].includes(type)) return route.abort();
-
-    return route.continue();
-  } catch {
-    return route.continue();
+    const blocker = await getAdBlocker();
+    await blocker.enableBlockingInPage(page);
+    dbg("✅ Ghostery adblocker enabled");
+  } catch (e) {
+    dbg("⚠️ adblocker failed:", e?.message || e);
   }
-});
-
-// ✅ 2) Ghostery Adblocker (لازم بعد route)
-try {
-  const blocker = await getAdBlocker();
-  await blocker.enableBlockingInPage(page);
-} catch (e) {
-  dbg("⚠️ adblocker failed:", e?.message || e);
-}
-
 }
 
 // ===================== Time / Parse Helpers =====================
@@ -293,10 +289,26 @@ function normalizeDigits(input) {
   if (input === null || input === undefined) return "";
   const s = String(input);
   const map = {
-    "٠": "0","١": "1","٢": "2","٣": "3","٤": "4",
-    "٥": "5","٦": "6","٧": "7","٨": "8","٩": "9",
-    "۰": "0","۱": "1","۲": "2","۳": "3","۴": "4",
-    "۵": "5","۶": "6","۷": "7","۸": "8","۹": "9",
+    "٠": "0",
+    "١": "1",
+    "٢": "2",
+    "٣": "3",
+    "٤": "4",
+    "٥": "5",
+    "٦": "6",
+    "٧": "7",
+    "٨": "8",
+    "٩": "9",
+    "۰": "0",
+    "۱": "1",
+    "۲": "2",
+    "۳": "3",
+    "۴": "4",
+    "۵": "5",
+    "۶": "6",
+    "۷": "7",
+    "۸": "8",
+    "۹": "9",
   };
   return s.replace(/[٠-٩۰-۹]/g, (ch) => map[ch] ?? ch);
 }
@@ -846,9 +858,15 @@ async function getDeepMatchDetails(page, matchUrl) {
     dbg(`   ⚠️ Deep error: ${e.message}`);
     return { deep_stream_url: null };
   } finally {
-    try { page.off("request", onReq); } catch {}
-    try { page.off("popup", onPopup); } catch {}
-    try { ctx.off("page", onCtxPage); } catch {}
+    try {
+      page.off("request", onReq);
+    } catch {}
+    try {
+      page.off("popup", onPopup);
+    } catch {}
+    try {
+      ctx.off("page", onCtxPage);
+    } catch {}
   }
 }
 
