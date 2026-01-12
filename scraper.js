@@ -13,6 +13,12 @@
  * 6) Upcoming matches display time_text (site time) as match_time.
  * 7) Merge: allow overwriting old synthetic now-30m rows if new schedule is far future.
  *
+ * ✅ HOTFIX (Today):
+ * A) If dayKey === "yesterday" and DOM status is unknown => treat as "finished"
+ *    (so yesterday matches show results, not time).
+ * B) When normalized status is unknown => fallback by _day_key:
+ *    yesterday => finished, tomorrow => upcoming, today => upcoming
+ *
  * ENV:
  *  - SUPABASE_URL, SUPABASE_KEY (required)
  *  - TABLE_NAME (default: "match-stream-app")
@@ -278,7 +284,6 @@ function toIsoFromDataStart(dataStart) {
   if (!dataStart) return null;
   const s = String(dataStart).trim();
   if (!s) return null;
-  // Keep timezone from source: "2026-01-12 19:30+03:00" => "2026-01-12T19:30+03:00"
   return s.includes("T") ? s : s.replace(" ", "T");
 }
 
@@ -305,11 +310,6 @@ function isValidGoalNumber(n) {
   return Number.isFinite(n) && n >= 0 && n <= 30;
 }
 
-/**
- * ✅ Strict goal parsing:
- * - ONLY digit-only 1..2 length
- * - ONLY 0..30
- */
 function parseScore(raw) {
   if (raw === null || raw === undefined) return null;
   const s = normalizeDigits(String(raw)).trim();
@@ -331,14 +331,11 @@ function statusKeyFromText(statusText) {
   if (!s0) return "unknown";
   const s = s0.toLowerCase();
 
-  // explicit upcoming
   if (/لم\s*تبدأ|not started|upcoming|scheduled/i.test(s0)) return "upcoming";
 
-  // arabic live/finished
   if (s0.includes("جارية") || s0.includes("مباشر") || s0.includes("الآن")) return "live";
   if (s0.includes("انتهت") || s0.includes("انتهى") || s0.includes("نهاية")) return "finished";
 
-  // english
   if (/\blive\b|in progress|\bnow\b/i.test(s)) return "live";
   if (/\bft\b|full ?time|\bfinished\b|\bended\b|\bfinal\b/i.test(s)) return "finished";
 
@@ -448,7 +445,8 @@ async function scrapeOneDay(page, dayKey, url) {
     }
   } catch {}
 
-  const rows = await page.evaluate(() => {
+  // ✅ IMPORTANT: pass dayKey into evaluate for correct fallback behavior
+  const rows = await page.evaluate((DAY_KEY) => {
     const BASE = "https://www.bein-live.com";
 
     const toAbs = (u) => {
@@ -509,26 +507,24 @@ async function scrapeOneDay(page, dayKey, url) {
     };
 
     const findScorePair = (match, statusKey) => {
-      // ✅ IMPORTANT: Upcoming -> DO NOT read score (even if DOM has hidden 0-0)
+      // ✅ Upcoming -> DO NOT read score (even if DOM has hidden 0-0)
       if (statusKey === "upcoming") return { home: null, away: null, hasAny: false };
 
       const visibility = getResultVisibility(match);
 
-      // For live/finished: allow goals even if hidden, but still strict
+      // allow goals for live/finished/unknown BUT guard against hidden 0-0 in unknown
       const goals = Array.from(match.querySelectorAll(".RS-goals")).map((g) => (g.textContent || "").trim());
       if (goals.length >= 2) {
         const a = strictParseGoal(goals[0]);
         const b = strictParseGoal(goals[1]);
         if (a !== null && b !== null) {
-          // Safety: if still hidden 0-0 and not explicit live/finished, ignore
-          if (visibility === "hidden" && a === 0 && b === 0 && statusKey === "unknown") {
+          if (statusKey === "unknown" && visibility === "hidden" && a === 0 && b === 0) {
             return { home: null, away: null, hasAny: false };
           }
           return { home: String(a), away: String(b), hasAny: true };
         }
       }
 
-      // fallback "x-y" in visible text (strict 0..30)
       const scoreText = pickText(match, [".RS-score", ".RS-Score", ".MT_Score", ".MatchScore", ".match-score", ".score"]);
       const m1 = scoreText.match(/(\d{1,2})\s*[-:]\s*(\d{1,2})/);
       if (m1) {
@@ -557,14 +553,22 @@ async function scrapeOneDay(page, dayKey, url) {
         // statusKey: classStatus first, then MT_Stat text
         let statusKey = classStatus || "unknown";
         if (statusKey === "unknown" && statText) {
-          const sk = (() => {
-            const t = statText.toLowerCase();
-            if (t.includes("لم") && (t.includes("تبدأ") || t.includes("تبدا") || t.includes("يبدأ") || t.includes("يبدا"))) return "upcoming";
-            if (t.includes("جارية") || t.includes("مباشر") || t.includes("الآن")) return "live";
-            if (t.includes("انتهت") || t.includes("انتهى") || t.includes("نهاية")) return "finished";
-            return "unknown";
-          })();
-          statusKey = sk;
+          const t = statText.toLowerCase();
+          if (t.includes("لم") && (t.includes("تبدأ") || t.includes("تبدا") || t.includes("يبدأ") || t.includes("يبدا")))
+            statusKey = "upcoming";
+          else if (t.includes("جارية") || t.includes("مباشر") || t.includes("الآن"))
+            statusKey = "live";
+          else if (t.includes("انتهت") || t.includes("انتهى") || t.includes("نهاية"))
+            statusKey = "finished";
+        }
+
+        // ✅ HOTFIX: yesterday unknown => finished
+        if (statusKey === "unknown" && DAY_KEY === "yesterday") {
+          statusKey = "finished";
+        }
+        // tomorrow unknown => upcoming
+        if (statusKey === "unknown" && DAY_KEY === "tomorrow") {
+          statusKey = "upcoming";
         }
 
         const matchUrl = toAbs(a?.getAttribute("href") || "");
@@ -576,7 +580,7 @@ async function scrapeOneDay(page, dayKey, url) {
           data_start: dataStart || null,
           time_text: timeText || null,
           status_text: statText || null,
-          status_key_dom: statusKey, // ✅ store computed statusKey
+          status_key_dom: statusKey,
           result_visibility: getResultVisibility(match),
           has_score_hint: !!scorePair.hasAny,
           home_logo: toAbs(pickLogo(imgs[0])),
@@ -587,7 +591,7 @@ async function scrapeOneDay(page, dayKey, url) {
         };
       })
       .filter((m) => m.home_team && m.away_team && m.match_url);
-  });
+  }, dayKey);
 
   console.log(`📦 ${dayKey}: ${rows.length} مباراة`);
 
@@ -614,7 +618,6 @@ async function extractMatchMetaFromDom(page) {
       const statText = pickText(root, [".MT_Stat", ".MT_Status", ".match-status", ".MatchStatus", ".RS-status", ".status"]);
       const title = (document.title || "").trim();
 
-      // status by class on main match container (if present)
       const m = document.querySelector(".AY_Match");
       const cls = (m?.className || "").toLowerCase();
       let classStatus = "";
@@ -622,7 +625,6 @@ async function extractMatchMetaFromDom(page) {
       else if (cls.includes("live")) classStatus = "live";
       else if (cls.includes("finished") || cls.includes("ended")) classStatus = "finished";
 
-      // Decide statusKey from DOM only
       let statusKey = classStatus || "unknown";
       if (statusKey === "unknown" && statText) {
         const t = statText.toLowerCase();
@@ -639,7 +641,6 @@ async function extractMatchMetaFromDom(page) {
         return n;
       };
 
-      // Upcoming: never take score
       let home = null;
       let away = null;
       let hasAny = false;
@@ -736,7 +737,6 @@ async function getDeepMatchDetails(page, matchUrl) {
 
     let meta = await extractMatchMetaFromDom(page);
 
-    // Try to trigger server/embed if needed
     try {
       const buttons = page.locator(".video-serv a, .server-tab, .video-serv button");
       if ((await buttons.count()) > 0) {
@@ -906,12 +906,10 @@ function mergeWithExisting({ newRows, existingRows }) {
     let out = { ...r };
 
     if (old) {
-      // keep stronger stream url
       if (isWeakStreamUrl(out.stream_url) && !isWeakStreamUrl(old.stream_url)) {
         out.stream_url = old.stream_url;
       }
 
-      // ✅ If old time is synthetic "now-ish" but new is clearly future => accept new
       const oldMs = parseMs(old.match_start);
       const newMs = parseMs(out.match_start);
       const oldLooksNowish = oldMs !== null && oldMs > nowMs - 6 * 60 * 60 * 1000 && oldMs < nowMs + 15 * 60 * 1000;
@@ -920,11 +918,24 @@ function mergeWithExisting({ newRows, existingRows }) {
       if (oldLooksNowish && newIsFarFuture) {
         // accept new schedule (do nothing)
       } else {
-        // fallback: keep old start only if new missing
         if ((!out.match_start || !parseMs(out.match_start)) && old.match_start) {
           out.match_start = old.match_start;
           out.match_time = old.match_time || out.match_time;
         }
+      }
+
+      // ✅ if new row lost scores but old had real scores, preserve old scores
+      const newHS = typeof out.home_score === "number" ? out.home_score : null;
+      const newAS = typeof out.away_score === "number" ? out.away_score : null;
+      const oldHS = typeof old.home_score === "number" ? old.home_score : null;
+      const oldAS = typeof old.away_score === "number" ? old.away_score : null;
+
+      const oldHasScore = oldHS !== null || oldAS !== null;
+      const newHasScore = newHS !== null || newAS !== null;
+
+      if (!newHasScore && oldHasScore) {
+        out.home_score = oldHS;
+        out.away_score = oldAS;
       }
     }
 
@@ -982,35 +993,25 @@ async function startScraping() {
       const isoFromAttr = toIsoFromDataStart(m.data_start);
       const match_day = cairoDayFromIso(isoFromAttr) || matchDayFromKey(m._day_key);
 
-      // match_start: authoritative from data-start; fallback none (rare)
       let match_start = isoFromAttr || null;
 
-      // statusKey from DOM only (deep preferred, else list)
       const statusKeyDom = (m.deep_status_key_dom || m.status_key_dom || "unknown").toLowerCase();
       const statusTextRaw = m.deep_status_text || m.status_text || "";
 
-      // If DOM says unknown, try text (still safe)
       let statusKey = statusKeyDom !== "unknown" ? statusKeyDom : statusKeyFromText(statusTextRaw);
 
-      // final safety: if still unknown => upcoming
-      if (statusKey === "unknown") statusKey = "upcoming";
+      // ✅ HOTFIX: fallback by day key
+      if (statusKey === "unknown") {
+        if (m._day_key === "yesterday") statusKey = "finished";
+        else if (m._day_key === "tomorrow") statusKey = "upcoming";
+        else statusKey = "upcoming"; // today safest
+      }
 
-      // scores: only for live/finished
       const homeScoreRaw = m.deep_home_score_raw ?? m.home_score_raw;
       const awayScoreRaw = m.deep_away_score_raw ?? m.away_score_raw;
       const home_score = statusKey === "upcoming" ? null : parseScore(homeScoreRaw);
       const away_score = statusKey === "upcoming" ? null : parseScore(awayScoreRaw);
 
-      // DO NOT patch times unless explicit live/finished AND time is broken
-      const nowMs = Date.now();
-      const startMs = match_start ? parseMs(match_start) : null;
-
-      if ((statusKey === "live" || statusKey === "finished") && (!startMs || startMs > nowMs + 5 * 60 * 1000)) {
-        // if site says live/finished but time is in future, keep time as-is (safer) OR adjust
-        // We'll keep as-is to avoid poisoning.
-      }
-
-      // match_time: for upcoming use site time_text (matches their UI), else format from ISO
       const match_time =
         statusKey === "upcoming"
           ? (m.time_text || prettyTimeFromIso(match_start) || "—")
@@ -1066,7 +1067,7 @@ async function startScraping() {
       return;
     }
 
-    console.log("✅ تم التحديث بنجاح (Hard-fixed).");
+    console.log("✅ تم التحديث بنجاح (Hard-fixed + Yesterday Results Restored).");
   } catch (err) {
     console.error("❌ فشل السكرابر:", err.message);
     if (DIAG) diagWrite("fatal_error.txt", String(err?.stack || err?.message || err));
