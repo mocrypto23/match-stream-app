@@ -218,7 +218,7 @@ async function applyStealth(page) {
 
 async function applyAntiAds(context, page) {
   if (page.__antiAdsApplied) return;
-  page.__antiAdsApplied = true;
+  page.__antiAdsApplied = true;             
 
   await applyStealth(page);
 
@@ -1048,7 +1048,7 @@ async function startScraping() {
       if (statusKey === "unknown") {
         if (m._day_key === "yesterday") statusKey = "finished";
         else if (m._day_key === "tomorrow") statusKey = "upcoming";
-        else statusKey = "upcoming"; // today safest
+        else statusKey = "unknown"; // today safest
       }
 
       const homeScoreRaw = m.deep_home_score_raw ?? m.home_score_raw;
