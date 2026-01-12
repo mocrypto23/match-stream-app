@@ -18,6 +18,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ✅ NEW: إثبات 100% أي Commit وأي scraper.js بيتنفذ
+      - name: Show commit + scraper fingerprint
+        run: |
+          echo "================ RUN INFO ================"
+          echo "GITHUB_SHA: $GITHUB_SHA"
+          echo "GITHUB_REF: $GITHUB_REF"
+          echo "GITHUB_REF_NAME: $GITHUB_REF_NAME"
+          echo "=========================================="
+          echo "git rev-parse HEAD:"
+          git rev-parse HEAD
+          echo "git show -s --oneline:"
+          git show -s --oneline
+          echo "=========================================="
+          echo "scraper.js sha256:"
+          sha256sum scraper.js || true
+          echo "=========================================="
+          echo "Markers inside scraper.js:"
+          grep -n "FINAL FIXES" scraper.js || true
+          grep -n "now-30m" scraper.js || true
+          grep -n "function parseScore" -n scraper.js || true
+          grep -n "\\^\\\\d\\{1,2\\}\\$" scraper.js || true
+          echo "=========================================="
+          echo "parseScore area (lines 1..220):"
+          nl -ba scraper.js | sed -n '1,220p'
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -66,7 +91,6 @@ jobs:
           HEADLESS: 0
         run: xvfb-run -a node scripts/diag-site.js
 
-
       - name: List diagnostics files
         if: always()
         run: |
@@ -81,6 +105,15 @@ jobs:
         with:
           name: diag
           path: diag
+          if-no-files-found: warn
+
+      # ✅ NEW: ارفع نسخة scraper.js اللي اتنفذت فعلاً (علشان نقفل أي جدال)
+      - name: Upload executed scraper.js
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: executed-scraper-js
+          path: scraper.js
           if-no-files-found: warn
 
       - name: Upload debug.png if failed
