@@ -9,6 +9,8 @@ type MatchRow = {
   home_team?: string | null;
   away_team?: string | null;
   stream_url?: string | null;
+  match_start?: string | null; // timestamptz from Supabase
+  status_key?: string | null; // upcoming | live | finished | unknown
 };
 
 function isValidHttpUrl(u: string) {
@@ -18,6 +20,16 @@ function isValidHttpUrl(u: string) {
   } catch {
     return false;
   }
+}
+
+function formatStartTimeAr(iso?: string | null) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return new Intl.DateTimeFormat("ar-EG", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(d);
 }
 
 export default function WatchPage() {
@@ -54,7 +66,7 @@ export default function WatchPage() {
 
       const { data, error } = await supabase
         .from("match-stream-app")
-        .select("id, home_team, away_team, stream_url")
+        .select("id, home_team, away_team, stream_url, match_start, status_key")
         .eq("id", idNum)
         .maybeSingle();
 
@@ -91,10 +103,7 @@ export default function WatchPage() {
     return (
       <div className="min-h-screen bg-black text-white p-4">
         <div className="max-w-3xl mx-auto mt-10">
-          <button
-            onClick={() => router.back()}
-            className="mb-4 text-gray-400 hover:text-white"
-          >
+          <button onClick={() => router.back()} className="mb-4 text-gray-400 hover:text-white">
             ← العودة للرئيسية
           </button>
 
@@ -102,7 +111,8 @@ export default function WatchPage() {
             <div className="font-bold mb-2">تعذر فتح صفحة المشاهدة</div>
             <div className="text-gray-300 break-words">{errMsg}</div>
             <div className="text-gray-500 mt-3 text-sm">
-              لو المشكلة بسبب RLS: إمّا تسمح بالقراءة للـ anon على الجدول، أو تعرض الصفحة كـ Client زي هنا مع جلسة المستخدم.
+              لو المشكلة بسبب RLS: إمّا تسمح بالقراءة للـ anon على الجدول، أو تعرض الصفحة كـ Client زي هنا مع جلسة
+              المستخدم.
             </div>
           </div>
         </div>
@@ -115,20 +125,44 @@ export default function WatchPage() {
   const streamUrl = match?.stream_url ?? "";
   const canEmbed = streamUrl && isValidHttpUrl(streamUrl);
 
+  // ✅ قرار: هل البث لازم يفتح ولا لسه؟
+  const status = (match?.status_key ?? "").toLowerCase();
+  const nowMs = Date.now();
+  const startMs = match?.match_start ? new Date(match.match_start).getTime() : null;
+  const startValid = startMs !== null && Number.isFinite(startMs);
+
+  // سماحية بسيطة (قبل البداية بدقيقتين) عشان اختلاف التوقيت
+  const hasStartedByTime = startValid ? nowMs >= (startMs as number) - 2 * 60 * 1000 : false;
+  const hasStartedByStatus = status === "live" || status === "finished";
+  const isUpcomingByStatus = status === "upcoming";
+
+  // لو status_key مش موجود/فاضي: نعتمد على الوقت لو متاح
+  const shouldBlockStream = isUpcomingByStatus || (!hasStartedByStatus && startValid && !hasStartedByTime);
+
+  const prettyStart = formatStartTimeAr(match?.match_start);
+
   return (
     <div className="min-h-screen bg-black text-white p-4">
       <div className="max-w-5xl mx-auto">
         {/* زر العودة */}
-        <button
-          onClick={() => router.back()}
-          className="mb-4 text-gray-400 hover:text-white"
-        >
+        <button onClick={() => router.back()} className="mb-4 text-gray-400 hover:text-white">
           ← العودة للرئيسية
         </button>
 
         {/* مشغل الفيديو */}
         <div className="aspect-video bg-gray-900 rounded-xl overflow-hidden shadow-2xl border border-gray-800">
-          {canEmbed ? (
+          {shouldBlockStream ? (
+            <div className="flex flex-col gap-2 items-center justify-center h-full text-gray-400 p-6 text-center">
+              <div className="text-white font-bold text-xl">لم يبدأ البث بعد</div>
+              {prettyStart ? (
+                <div className="text-sm text-gray-400">
+                  موعد المباراة: <span className="text-gray-200">{prettyStart}</span>
+                </div>
+              ) : (
+                <div className="text-sm text-gray-500">سيتم تفعيل البث عند بدء المباراة.</div>
+              )}
+            </div>
+          ) : canEmbed ? (
             <iframe
               src={streamUrl}
               className="w-full h-full"
