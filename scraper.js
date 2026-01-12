@@ -2,14 +2,16 @@
 /**
  * Unified Scraper (Yesterday / Today / Tomorrow) + Deep Stream Link Extractor
  *
- * Permanent GitHub-safe fixes:
- * 1) Run-safe diagnostics (DIAG=1 always creates ./diag with a touch file).
- * 2) Strong LIVE detection (Arabic/English + DOM hints + score inference).
- * 3) If match inferred LIVE but listed time is future => fix match_start to now-30m.
- * 4) Merge guardrails use canonical, order-insensitive key to preserve live rows.
- * 5) ✅ NEW: On GitHub, list page may miss live status/score. We now extract status/score
- *          from the match page while doing deep extraction and use it as an override.
- * 6) ✅ NEW: Wait briefly for live bits on list page (polling) before evaluating.
+ * ✅ FINAL (Hard) FIX:
+ * 1) Status comes ONLY from DOM truth:
+ *    - .AY_Match classes: not-started / live / finished
+ *    - .MT_Stat text (لم تبدأ بعد / جارية الآن / انتهت)
+ * 2) data-start is authoritative for match_start when present.
+ * 3) Strict score parsing: ONLY "0".."30" (1-2 digits). Anything else => null.
+ * 4) Upcoming matches NEVER read score from hidden/visible goals (avoid 0-0 hints).
+ * 5) Never flip to LIVE based on score hints. Only explicit LIVE signals.
+ * 6) Upcoming matches display time_text (site time) as match_time.
+ * 7) Merge: allow overwriting old synthetic now-30m rows if new schedule is far future.
  *
  * ENV:
  *  - SUPABASE_URL, SUPABASE_KEY (required)
@@ -17,7 +19,7 @@
  *  - RPC_NAME (default: "refresh_match_stream_app")
  *  - HEADLESS (default: 1)
  *  - DEBUG (default: 0)
- *  - DIAG (default: 0)   => when 1 writes ./diag/*
+ *  - DIAG (default: 0)
  *  - CONCURRENCY (default: 2)
  */
 
@@ -30,6 +32,11 @@ require("dotenv").config({ path: ".env.local" });
 // ===================== ENV =====================
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
+
+if (!supabaseUrl || !supabaseKey) {
+  console.error("❌ Missing SUPABASE_URL or SUPABASE_KEY in environment.");
+  process.exit(1);
+}
 
 const TABLE_NAME = process.env.TABLE_NAME || "match-stream-app";
 const RPC_NAME = process.env.RPC_NAME || "refresh_match_stream_app";
@@ -96,7 +103,6 @@ function diagRoot() {
   return path.join(process.cwd(), "diag");
 }
 
-// IMPORTANT: always create a file when DIAG=1 so artifact is never empty.
 function diagTouch() {
   if (!DIAG) return;
   try {
@@ -131,13 +137,7 @@ async function diagShot(page, rel) {
   } catch {}
 }
 
-// Create diag marker as early as possible
 diagTouch();
-
-if (!supabaseUrl || !supabaseKey) {
-  console.error("❌ Missing SUPABASE_URL or SUPABASE_KEY in environment.");
-  process.exit(1);
-}
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
@@ -162,7 +162,6 @@ function isAdHost(url) {
   }
 }
 
-// --- Stealth-ish init ---
 async function applyStealth(page) {
   await page.addInitScript(() => {
     try {
@@ -268,20 +267,6 @@ function ymdInTimeZone(date, timeZone) {
   return `${y}-${m}-${d}`;
 }
 
-function hmInTimeZone(date, timeZone) {
-  const parts = new Intl.DateTimeFormat("en", {
-    timeZone,
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).formatToParts(date);
-
-  const hh = parts.find((p) => p.type === "hour")?.value;
-  const mm = parts.find((p) => p.type === "minute")?.value;
-  if (!hh || !mm) return null;
-  return { hh, mm };
-}
-
 function matchDayFromKey(dayKey) {
   const now = new Date();
   const offset = dayKey === "yesterday" ? -1 : dayKey === "tomorrow" ? 1 : 0;
@@ -293,6 +278,7 @@ function toIsoFromDataStart(dataStart) {
   if (!dataStart) return null;
   const s = String(dataStart).trim();
   if (!s) return null;
+  // Keep timezone from source: "2026-01-12 19:30+03:00" => "2026-01-12T19:30+03:00"
   return s.includes("T") ? s : s.replace(" ", "T");
 }
 
@@ -315,75 +301,29 @@ function prettyTimeFromIso(iso) {
   }).format(d);
 }
 
+function isValidGoalNumber(n) {
+  return Number.isFinite(n) && n >= 0 && n <= 30;
+}
+
+/**
+ * ✅ Strict goal parsing:
+ * - ONLY digit-only 1..2 length
+ * - ONLY 0..30
+ */
 function parseScore(raw) {
   if (raw === null || raw === undefined) return null;
   const s = normalizeDigits(String(raw)).trim();
-  if (!s) return null;
-  const digits = s.replace(/[^\d]/g, "");
-  if (!digits) return null;
-  const n = parseInt(digits, 10);
-  return Number.isFinite(n) ? n : null;
+  if (!/^\d{1,2}$/.test(s)) return null;
+  const n = parseInt(s, 10);
+  if (!isValidGoalNumber(n)) return null;
+  return n;
 }
 
-function cairoOffsetForDay(matchDayYmd) {
-  try {
-    const noonUtc = new Date(`${matchDayYmd}T12:00:00Z`);
-    const parts = new Intl.DateTimeFormat("en-US", {
-      timeZone: TZ,
-      timeZoneName: "shortOffset",
-      hour: "2-digit",
-      minute: "2-digit",
-    }).formatToParts(noonUtc);
-
-    const tzPart = parts.find((p) => p.type === "timeZoneName")?.value || "";
-    const m = tzPart.match(/GMT([+-])(\d{1,2})(?::?(\d{2}))?/i);
-    if (!m) return "+02:00";
-
-    const sign = m[1];
-    const hh = String(m[2]).padStart(2, "0");
-    const mm = String(m[3] || "00").padStart(2, "0");
-    return `${sign}${hh}:${mm}`;
-  } catch {
-    return "+02:00";
-  }
-}
-
-function isoFromMatchDayAndTimeText(matchDayYmd, timeTextRaw) {
-  if (!matchDayYmd || !timeTextRaw) return null;
-
-  const t0 = normalizeDigits(String(timeTextRaw))
-    .replace(/\u200f|\u200e/g, "")
-    .trim();
-  if (!t0) return null;
-
-  const t = t0.toLowerCase();
-  const m = t.match(/(\d{1,2})\s*[:٫.]\s*(\d{2})/);
-  if (!m) return null;
-
-  let hh = parseInt(m[1], 10);
-  const mm = parseInt(m[2], 10);
-  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
-
-  const isPM = t.includes("pm") || t.includes("م") || t.includes("مس") || t.includes("مساء");
-  const isAM = t.includes("am") || t.includes("ص") || t.includes("صب") || t.includes("صباح");
-
-  if (isPM && hh < 12) hh += 12;
-  if (isAM && hh === 12) hh = 0;
-
-  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
-
-  const offset = cairoOffsetForDay(matchDayYmd);
-  const HH = String(hh).padStart(2, "0");
-  const MM = String(mm).padStart(2, "0");
-  return `${matchDayYmd}T${HH}:${MM}:00${offset}`;
-}
-
-function isoFromDateInCairo(date) {
-  const ymd = ymdInTimeZone(date, TZ);
-  const hm = hmInTimeZone(date, TZ);
-  if (!ymd || !hm) return null;
-  const offset = cairoOffsetForDay(ymd);
-  return `${ymd}T${hm.hh}:${hm.mm}:00${offset}`;
+function parseMs(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  const t = d.getTime();
+  return Number.isFinite(t) ? t : null;
 }
 
 function statusKeyFromText(statusText) {
@@ -391,13 +331,18 @@ function statusKeyFromText(statusText) {
   if (!s0) return "unknown";
   const s = s0.toLowerCase();
 
+  // explicit upcoming
+  if (/لم\s*تبدأ|not started|upcoming|scheduled/i.test(s0)) return "upcoming";
+
+  // arabic live/finished
   if (s0.includes("جارية") || s0.includes("مباشر") || s0.includes("الآن")) return "live";
   if (s0.includes("انتهت") || s0.includes("انتهى") || s0.includes("نهاية")) return "finished";
 
-  if (/\blive\b|\bnow\b|in progress|kick ?off/i.test(s)) return "live";
-  if (/\bft\b|full ?time|\bended\b|\bfinished\b|\bfinal\b/i.test(s)) return "finished";
+  // english
+  if (/\blive\b|in progress|\bnow\b/i.test(s)) return "live";
+  if (/\bft\b|full ?time|\bfinished\b|\bended\b|\bfinal\b/i.test(s)) return "finished";
 
-  return "upcoming";
+  return "unknown";
 }
 
 function normalizeUrl(raw, baseUrl) {
@@ -469,38 +414,6 @@ async function waitForStableMatchCount(page, maxWaitMs = 20000, settleMs = 1400)
   return last;
 }
 
-// ✅ NEW: wait for scores/status to appear (GitHub often slower / delayed)
-async function waitForLiveBits(page, maxWaitMs = 9000) {
-  const start = Date.now();
-  while (Date.now() - start < maxWaitMs) {
-    const ok = await page
-      .evaluate(() => {
-        const root = document.body;
-        if (!root) return false;
-        const matches = Array.from(document.querySelectorAll(".AY_Match")).slice(0, 30);
-        if (!matches.length) return false;
-
-        const kw = ["جارية", "مباشر", "الآن", "انتهت", "انتهى", "LIVE", "FT", "Finished", "Ended"];
-        const hasGoals = !!document.querySelector(".AY_Match .RS-goals");
-        if (hasGoals) return true;
-
-        for (const m of matches) {
-          const t = (m.textContent || "").trim();
-          if (!t) continue;
-          for (const k of kw) {
-            if (t.toLowerCase().includes(String(k).toLowerCase())) return true;
-          }
-        }
-        return false;
-      })
-      .catch(() => false);
-
-    if (ok) return true;
-    await page.waitForTimeout(450);
-  }
-  return false;
-}
-
 // ===================== Scrape List =====================
 async function scrapeOneDay(page, dayKey, url) {
   console.log(`\n🔎 سحب: ${dayKey} => ${url}`);
@@ -511,16 +424,12 @@ async function scrapeOneDay(page, dayKey, url) {
   await page.waitForSelector(".AY_Match, .no-data__msg, body", { timeout: 30000 });
 
   await page.waitForTimeout(900);
-  const stableCount = await waitForStableMatchCount(page, 20000, 1400);
-  dbg(`   📌 Stable match count: ${stableCount}`);
+  await waitForStableMatchCount(page, 20000, 1400);
 
   try {
     await page.mouse.wheel(0, 1400);
     await page.waitForTimeout(700);
   } catch {}
-
-  // ✅ NEW: extra wait for delayed live bits
-  await waitForLiveBits(page, 9000);
 
   await diagShot(page, `list/${dayKey}.png`);
   if (DIAG) {
@@ -571,70 +480,62 @@ async function scrapeOneDay(page, dayKey, url) {
       return "";
     };
 
-    const findStatusText = (match) => {
-      const direct = pickText(match, [
-        ".MT_Status",
-        ".match-status",
-        ".MatchStatus",
-        ".RS-status",
-        ".status",
-        ".State",
-        ".state",
-        ".live",
-        ".finished",
-        ".ended",
-      ]);
-      if (direct) return direct;
-
-      const keywords = ["جارية", "الآن", "مباشر", "انتهت", "انتهى", "نهاية", "LIVE", "FT", "Finished", "Ended"];
-      const nodes = Array.from(match.querySelectorAll("span,div,button,strong,em"));
-      for (const n of nodes) {
-        const t = (n.textContent || "").trim();
-        if (!t) continue;
-        if (t.length > 40) continue;
-        const tl = t.toLowerCase();
-        if (keywords.some((k) => tl.includes(String(k).toLowerCase()))) return t;
-      }
+    const statusFromClass = (match) => {
+      const cls = (match.className || "").toLowerCase();
+      if (cls.includes("not-started")) return "upcoming";
+      if (cls.includes("live")) return "live";
+      if (cls.includes("finished") || cls.includes("ended")) return "finished";
       return "";
     };
 
-    const findStatusHint = (match) => {
-      const hasLive =
-        !!match.querySelector(".live, .is-live, .Live, [class*='live'], [class*='Live']") ||
-        !!match.querySelector("[data-status*='live'], [aria-label*='live'], [title*='live']");
-
-      const hasFinished =
-        !!match.querySelector(".finished, .ended, .Finished, [class*='finish'], [class*='end']") ||
-        !!match.querySelector("[data-status*='finish'], [data-status*='end']");
-
-      if (hasLive) return "live";
-      if (hasFinished) return "finished";
-      return "";
+    const getResultVisibility = (match) => {
+      const res = match.querySelector(".MT_Result");
+      if (!res) return "missing";
+      const st = (res.getAttribute("style") || "").toLowerCase();
+      if (st.includes("display") && st.includes("none")) return "hidden";
+      try {
+        const cs = window.getComputedStyle(res);
+        if (cs && cs.display === "none") return "hidden";
+      } catch {}
+      return "visible";
     };
 
-    const findScorePair = (match) => {
+    const strictParseGoal = (t) => {
+      const s = String(t || "").trim();
+      if (!/^\d{1,2}$/.test(s)) return null;
+      const n = parseInt(s, 10);
+      if (!Number.isFinite(n) || n < 0 || n > 30) return null;
+      return n;
+    };
+
+    const findScorePair = (match, statusKey) => {
+      // ✅ IMPORTANT: Upcoming -> DO NOT read score (even if DOM has hidden 0-0)
+      if (statusKey === "upcoming") return { home: null, away: null, hasAny: false };
+
+      const visibility = getResultVisibility(match);
+
+      // For live/finished: allow goals even if hidden, but still strict
       const goals = Array.from(match.querySelectorAll(".RS-goals")).map((g) => (g.textContent || "").trim());
-      if (goals.length >= 2 && (goals[0] || goals[1])) {
-        return { home: goals[0] || null, away: goals[1] || null, hasAny: true };
+      if (goals.length >= 2) {
+        const a = strictParseGoal(goals[0]);
+        const b = strictParseGoal(goals[1]);
+        if (a !== null && b !== null) {
+          // Safety: if still hidden 0-0 and not explicit live/finished, ignore
+          if (visibility === "hidden" && a === 0 && b === 0 && statusKey === "unknown") {
+            return { home: null, away: null, hasAny: false };
+          }
+          return { home: String(a), away: String(b), hasAny: true };
+        }
       }
 
-      const scoreText = pickText(match, [
-        ".RS-score",
-        ".RS-Score",
-        ".MT_Score",
-        ".MatchScore",
-        ".match-score",
-        ".score",
-        "[class*='score']",
-        "[class*='Score']",
-      ]);
-
-      const m1 = scoreText.match(/(\d+)\s*[-:]\s*(\d+)/);
-      if (m1) return { home: m1[1], away: m1[2], hasAny: true };
-
-      const allText = (match.textContent || "").replace(/\s+/g, " ").trim();
-      const m2 = allText.match(/(\d+)\s*[-:]\s*(\d+)/);
-      if (m2) return { home: m2[1], away: m2[2], hasAny: true };
+      // fallback "x-y" in visible text (strict 0..30)
+      const scoreText = pickText(match, [".RS-score", ".RS-Score", ".MT_Score", ".MatchScore", ".match-score", ".score"]);
+      const m1 = scoreText.match(/(\d{1,2})\s*[-:]\s*(\d{1,2})/);
+      if (m1) {
+        const a = strictParseGoal(m1[1]);
+        const b = strictParseGoal(m1[2]);
+        if (a !== null && b !== null) return { home: String(a), away: String(b), hasAny: true };
+      }
 
       return { home: null, away: null, hasAny: false };
     };
@@ -644,26 +545,39 @@ async function scrapeOneDay(page, dayKey, url) {
     return matches
       .map((match) => {
         const teams = Array.from(match.querySelectorAll(".TM_Name")).map((e) => (e.textContent || "").trim());
-
         const imgs = Array.from(match.querySelectorAll(".TM_Logo img"));
         const a = match.querySelector("a[href]");
 
         const dataStart = (match.getAttribute("data-start") || "").trim();
         const timeText = pickText(match, [".MT_Time", ".TM_Time", ".match-time", ".MatchTime", ".AY_Time"]);
 
-        const statusText = findStatusText(match);
-        const statusHint = findStatusHint(match);
-        const scorePair = findScorePair(match);
+        const statText = pickText(match, [".MT_Stat"]);
+        const classStatus = statusFromClass(match);
+
+        // statusKey: classStatus first, then MT_Stat text
+        let statusKey = classStatus || "unknown";
+        if (statusKey === "unknown" && statText) {
+          const sk = (() => {
+            const t = statText.toLowerCase();
+            if (t.includes("لم") && (t.includes("تبدأ") || t.includes("تبدا") || t.includes("يبدأ") || t.includes("يبدا"))) return "upcoming";
+            if (t.includes("جارية") || t.includes("مباشر") || t.includes("الآن")) return "live";
+            if (t.includes("انتهت") || t.includes("انتهى") || t.includes("نهاية")) return "finished";
+            return "unknown";
+          })();
+          statusKey = sk;
+        }
 
         const matchUrl = toAbs(a?.getAttribute("href") || "");
+        const scorePair = findScorePair(match, statusKey);
 
         return {
           home_team: teams[0] || "",
           away_team: teams[1] || "",
           data_start: dataStart || null,
           time_text: timeText || null,
-          status_text: statusText || null,
-          status_hint: statusHint || null,
+          status_text: statText || null,
+          status_key_dom: statusKey, // ✅ store computed statusKey
+          result_visibility: getResultVisibility(match),
           has_score_hint: !!scorePair.hasAny,
           home_logo: toAbs(pickLogo(imgs[0])),
           away_logo: toAbs(pickLogo(imgs[1])),
@@ -695,103 +609,84 @@ async function extractMatchMetaFromDom(page) {
         return "";
       };
 
-      const findStatusText = (root) => {
-        const direct = pickText(root, [
-          ".MT_Status",
-          ".match-status",
-          ".MatchStatus",
-          ".RS-status",
-          ".status",
-          ".State",
-          ".state",
-          ".live",
-          ".finished",
-          ".ended",
-        ]);
-        if (direct) return direct;
-
-        const keywords = ["جارية", "الآن", "مباشر", "انتهت", "انتهى", "نهاية", "LIVE", "FT", "Finished", "Ended"];
-        const nodes = Array.from(root.querySelectorAll("span,div,button,strong,em,i,b"));
-        for (const n of nodes) {
-          const t = (n.textContent || "").trim();
-          if (!t) continue;
-          if (t.length > 50) continue;
-          const tl = t.toLowerCase();
-          if (keywords.some((k) => tl.includes(String(k).toLowerCase()))) return t;
-        }
-
-        const ttl = (document.title || "").trim();
-        if (keywords.some((k) => ttl.toLowerCase().includes(String(k).toLowerCase()))) return ttl;
-
-        return "";
-      };
-
-      const findStatusHint = (root) => {
-        const hasLive =
-          !!root.querySelector(".live, .is-live, .Live, [class*='live'], [class*='Live']") ||
-          !!root.querySelector("[data-status*='live'], [aria-label*='live'], [title*='live']");
-
-        const hasFinished =
-          !!root.querySelector(".finished, .ended, .Finished, [class*='finish'], [class*='end']") ||
-          !!root.querySelector("[data-status*='finish'], [data-status*='end']");
-
-        if (hasLive) return "live";
-        if (hasFinished) return "finished";
-        return "";
-      };
-
-      const findScorePair = (root) => {
-        const goals = Array.from(root.querySelectorAll(".RS-goals")).map((g) => (g.textContent || "").trim());
-        if (goals.length >= 2 && (goals[0] || goals[1])) {
-          return { home: goals[0] || null, away: goals[1] || null, hasAny: true };
-        }
-
-        const scoreText = pickText(root, [
-          ".RS-score",
-          ".RS-Score",
-          ".MT_Score",
-          ".MatchScore",
-          ".match-score",
-          ".score",
-          "[class*='score']",
-          "[class*='Score']",
-          "[class*='goals']",
-          "[class*='Goals']",
-        ]);
-
-        const m1 = scoreText.match(/(\d+)\s*[-:]\s*(\d+)/);
-        if (m1) return { home: m1[1], away: m1[2], hasAny: true };
-
-        const ttl = (document.title || "").replace(/\s+/g, " ").trim();
-        const m2 = ttl.match(/(\d+)\s*[-:]\s*(\d+)/);
-        if (m2) return { home: m2[1], away: m2[2], hasAny: true };
-
-        const bodyText = (root.textContent || "").replace(/\s+/g, " ").trim();
-        const m3 = bodyText.match(/(\d+)\s*[-:]\s*(\d+)/);
-        if (m3) return { home: m3[1], away: m3[2], hasAny: true };
-
-        return { home: null, away: null, hasAny: false };
-      };
-
       const root = document.body || document.documentElement;
-      const statusText = findStatusText(root);
-      const statusHint = findStatusHint(root);
-      const scorePair = findScorePair(root);
+
+      const statText = pickText(root, [".MT_Stat", ".MT_Status", ".match-status", ".MatchStatus", ".RS-status", ".status"]);
+      const title = (document.title || "").trim();
+
+      // status by class on main match container (if present)
+      const m = document.querySelector(".AY_Match");
+      const cls = (m?.className || "").toLowerCase();
+      let classStatus = "";
+      if (cls.includes("not-started")) classStatus = "upcoming";
+      else if (cls.includes("live")) classStatus = "live";
+      else if (cls.includes("finished") || cls.includes("ended")) classStatus = "finished";
+
+      // Decide statusKey from DOM only
+      let statusKey = classStatus || "unknown";
+      if (statusKey === "unknown" && statText) {
+        const t = statText.toLowerCase();
+        if (t.includes("لم") && (t.includes("تبدأ") || t.includes("تبدا") || t.includes("يبدأ") || t.includes("يبدا"))) statusKey = "upcoming";
+        else if (t.includes("جارية") || t.includes("مباشر") || t.includes("الآن")) statusKey = "live";
+        else if (t.includes("انتهت") || t.includes("انتهى") || t.includes("نهاية")) statusKey = "finished";
+      }
+
+      const strictParseGoal = (x) => {
+        const s = String(x || "").trim();
+        if (!/^\d{1,2}$/.test(s)) return null;
+        const n = parseInt(s, 10);
+        if (!Number.isFinite(n) || n < 0 || n > 30) return null;
+        return n;
+      };
+
+      // Upcoming: never take score
+      let home = null;
+      let away = null;
+      let hasAny = false;
+
+      if (statusKey !== "upcoming") {
+        const goals = Array.from(document.querySelectorAll(".RS-goals")).map((g) => (g.textContent || "").trim());
+        if (goals.length >= 2) {
+          const a = strictParseGoal(goals[0]);
+          const b = strictParseGoal(goals[1]);
+          if (a !== null && b !== null) {
+            home = String(a);
+            away = String(b);
+            hasAny = true;
+          }
+        }
+
+        if (!hasAny) {
+          const scoreText = pickText(root, [".RS-score", ".RS-Score", ".MT_Score", ".MatchScore", ".match-score", ".score"]);
+          const m1 = scoreText.match(/(\d{1,2})\s*[-:]\s*(\d{1,2})/);
+          if (m1) {
+            const a = strictParseGoal(m1[1]);
+            const b = strictParseGoal(m1[2]);
+            if (a !== null && b !== null) {
+              home = String(a);
+              away = String(b);
+              hasAny = true;
+            }
+          }
+        }
+      }
+
+      const statusText = statText || title || "";
 
       return {
-        status_text: statusText || null,
-        status_hint: statusHint || null,
-        home_score_raw: scorePair.home,
-        away_score_raw: scorePair.away,
-        has_score_hint: !!scorePair.hasAny,
+        deep_status_text: statusText || null,
+        deep_status_key_dom: statusKey || "unknown",
+        deep_home_score_raw: home,
+        deep_away_score_raw: away,
+        deep_has_score_hint: !!hasAny,
       };
     })
     .catch(() => ({
-      status_text: null,
-      status_hint: null,
-      home_score_raw: null,
-      away_score_raw: null,
-      has_score_hint: false,
+      deep_status_text: null,
+      deep_status_key_dom: "unknown",
+      deep_home_score_raw: null,
+      deep_away_score_raw: null,
+      deep_has_score_hint: false,
     }));
 }
 
@@ -837,12 +732,11 @@ async function getDeepMatchDetails(page, matchUrl) {
 
   try {
     await page.goto(matchUrl, { waitUntil: "domcontentloaded", timeout: DEEP_TIMEOUT_MS });
-    await page.waitForTimeout(1700);
+    await page.waitForTimeout(1400);
 
-    // First meta pass
     let meta = await extractMatchMetaFromDom(page);
 
-    // Try to trigger server/embed (often needed to reveal iframes/urls)
+    // Try to trigger server/embed if needed
     try {
       const buttons = page.locator(".video-serv a, .server-tab, .video-serv button");
       if ((await buttons.count()) > 0) {
@@ -856,24 +750,20 @@ async function getDeepMatchDetails(page, matchUrl) {
       }
     } catch {}
 
-    // Collect URLs from DOM
     const domUrls = await page
       .evaluate(() => {
         const urls = [];
         document.querySelectorAll(".video-serv a[href]").forEach((a) => urls.push(a.href));
-
         document.querySelectorAll("iframe").forEach((f) => {
           const s = f.getAttribute("src");
           const ds = f.getAttribute("data-src");
           if (s) urls.push(s);
           if (ds) urls.push(ds);
         });
-
         document.querySelectorAll("video, source").forEach((v) => {
           const s = v.getAttribute("src");
           if (s) urls.push(s);
         });
-
         return urls;
       })
       .catch(() => []);
@@ -887,15 +777,14 @@ async function getDeepMatchDetails(page, matchUrl) {
       });
     } catch {}
 
-    // Second meta pass (after potential JS updates)
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(800);
     const meta2 = await extractMatchMetaFromDom(page);
     meta = {
-      status_text: meta2.status_text || meta.status_text,
-      status_hint: meta2.status_hint || meta.status_hint,
-      home_score_raw: meta2.home_score_raw ?? meta.home_score_raw,
-      away_score_raw: meta2.away_score_raw ?? meta.away_score_raw,
-      has_score_hint: meta2.has_score_hint || meta.has_score_hint,
+      deep_status_text: meta2.deep_status_text || meta.deep_status_text,
+      deep_status_key_dom: meta2.deep_status_key_dom || meta.deep_status_key_dom,
+      deep_home_score_raw: meta2.deep_home_score_raw ?? meta.deep_home_score_raw,
+      deep_away_score_raw: meta2.deep_away_score_raw ?? meta.deep_away_score_raw,
+      deep_has_score_hint: meta2.deep_has_score_hint || meta.deep_has_score_hint,
     };
 
     const cleanUrls = Array.from(candidates)
@@ -907,25 +796,15 @@ async function getDeepMatchDetails(page, matchUrl) {
 
     return {
       deep_stream_url: best || null,
-      deep_status_text: meta.status_text || null,
-      deep_status_hint: meta.status_hint || null,
-      deep_home_score_raw: meta.home_score_raw ?? null,
-      deep_away_score_raw: meta.away_score_raw ?? null,
-      deep_has_score_hint: !!meta.has_score_hint,
+      ...meta,
     };
   } catch (e) {
     dbg(`   ⚠️ Deep error: ${e.message}`);
     return { deep_stream_url: null };
   } finally {
-    try {
-      page.off("request", onReq);
-    } catch {}
-    try {
-      page.off("popup", onPopup);
-    } catch {}
-    try {
-      ctx.off("page", onCtxPage);
-    } catch {}
+    try { page.off("request", onReq); } catch {}
+    try { page.off("popup", onPopup); } catch {}
+    try { ctx.off("page", onCtxPage); } catch {}
   }
 }
 
@@ -942,9 +821,7 @@ async function enrichWithDeepLinks(browser, rows) {
       locale: "ar-EG",
       timezoneId: TZ,
       serviceWorkers: "block",
-      extraHTTPHeaders: {
-        "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7",
-      },
+      extraHTTPHeaders: { "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7" },
       userAgent:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
       viewport: { width: 1280, height: 720 },
@@ -993,22 +870,6 @@ function keyOfRow(r) {
   return `${day}||${pair}`;
 }
 
-function parseMs(iso) {
-  if (!iso) return null;
-  const d = new Date(iso);
-  const t = d.getTime();
-  return Number.isFinite(t) ? t : null;
-}
-
-// likely live = started within last 6 hours (or starting within next 15 minutes)
-function isLikelyLiveRow(r, nowMs) {
-  const t = parseMs(r.match_start);
-  if (!t) return false;
-  const fifteenMin = 15 * 60 * 1000;
-  const sixH = 6 * 60 * 60 * 1000;
-  return t <= nowMs + fifteenMin && t >= nowMs - sixH;
-}
-
 function isWeakStreamUrl(u) {
   if (!u) return true;
   const s = String(u).toLowerCase();
@@ -1038,9 +899,6 @@ function mergeWithExisting({ newRows, existingRows }) {
 
   const mergedMap = new Map();
 
-  let preservedMissingLive = 0;
-  let preservedLiveOverride = 0;
-
   for (const r of newRows) {
     const k = keyOfRow(r);
     const old = existingMap.get(k);
@@ -1048,39 +906,32 @@ function mergeWithExisting({ newRows, existingRows }) {
     let out = { ...r };
 
     if (old) {
+      // keep stronger stream url
       if (isWeakStreamUrl(out.stream_url) && !isWeakStreamUrl(old.stream_url)) {
         out.stream_url = old.stream_url;
       }
 
-      const oldLikelyLive = isLikelyLiveRow(old, nowMs);
-      const newT = parseMs(out.match_start);
+      // ✅ If old time is synthetic "now-ish" but new is clearly future => accept new
+      const oldMs = parseMs(old.match_start);
+      const newMs = parseMs(out.match_start);
+      const oldLooksNowish = oldMs !== null && oldMs > nowMs - 6 * 60 * 60 * 1000 && oldMs < nowMs + 15 * 60 * 1000;
+      const newIsFarFuture = newMs !== null && newMs > nowMs + 2 * 60 * 60 * 1000;
 
-      if (oldLikelyLive && newT && newT > nowMs + 30 * 60 * 1000) {
-        out.match_start = old.match_start;
-        out.match_time = old.match_time || out.match_time;
-        preservedLiveOverride++;
-      }
-
-      if ((!out.match_start || !parseMs(out.match_start)) && old.match_start) {
-        out.match_start = old.match_start;
-        out.match_time = old.match_time || out.match_time;
+      if (oldLooksNowish && newIsFarFuture) {
+        // accept new schedule (do nothing)
+      } else {
+        // fallback: keep old start only if new missing
+        if ((!out.match_start || !parseMs(out.match_start)) && old.match_start) {
+          out.match_start = old.match_start;
+          out.match_time = old.match_time || out.match_time;
+        }
       }
     }
 
     mergedMap.set(k, out);
   }
 
-  for (const old of existingRows) {
-    const k = keyOfRow(old);
-    if (mergedMap.has(k)) continue;
-
-    if (isLikelyLiveRow(old, nowMs)) {
-      mergedMap.set(k, old);
-      preservedMissingLive++;
-    }
-  }
-
-  return { mergedRows: Array.from(mergedMap.values()), preservedMissingLive, preservedLiveOverride };
+  return { mergedRows: Array.from(mergedMap.values()) };
 }
 
 // ===================== Main =====================
@@ -1088,22 +939,6 @@ async function startScraping() {
   console.log("🚀 بدء السكرابر (أمس/اليوم/غد) + استخراج رابط البث ...");
 
   diagTouch();
-  if (DIAG) {
-    diagWrite(
-      "meta.json",
-      JSON.stringify(
-        {
-          ts: new Date().toISOString(),
-          headless: HEADLESS,
-          node: process.version,
-          concurrency: CONCURRENCY,
-          tz: TZ,
-        },
-        null,
-        2
-      )
-    );
-  }
 
   const browser = await chromium.launch({
     headless: HEADLESS,
@@ -1114,9 +949,7 @@ async function startScraping() {
     locale: "ar-EG",
     timezoneId: TZ,
     serviceWorkers: "block",
-    extraHTTPHeaders: {
-      "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7",
-    },
+    extraHTTPHeaders: { "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7" },
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     viewport: { width: 1280, height: 720 },
@@ -1149,57 +982,40 @@ async function startScraping() {
       const isoFromAttr = toIsoFromDataStart(m.data_start);
       const match_day = cairoDayFromIso(isoFromAttr) || matchDayFromKey(m._day_key);
 
-      const isoFromVisibleTime = isoFromMatchDayAndTimeText(match_day, m.time_text);
+      // match_start: authoritative from data-start; fallback none (rare)
+      let match_start = isoFromAttr || null;
 
-      let match_start =
-        m._day_key === "today" && isoFromVisibleTime
-          ? isoFromVisibleTime
-          : isoFromAttr || isoFromVisibleTime || null;
+      // statusKey from DOM only (deep preferred, else list)
+      const statusKeyDom = (m.deep_status_key_dom || m.status_key_dom || "unknown").toLowerCase();
+      const statusTextRaw = m.deep_status_text || m.status_text || "";
 
-      // ✅ Override status/score from deep (match page) when available
-      const statusTextRaw = m.deep_status_text || m.status_text;
-      const statusHintRaw = m.deep_status_hint || m.status_hint;
+      // If DOM says unknown, try text (still safe)
+      let statusKey = statusKeyDom !== "unknown" ? statusKeyDom : statusKeyFromText(statusTextRaw);
 
+      // final safety: if still unknown => upcoming
+      if (statusKey === "unknown") statusKey = "upcoming";
+
+      // scores: only for live/finished
       const homeScoreRaw = m.deep_home_score_raw ?? m.home_score_raw;
       const awayScoreRaw = m.deep_away_score_raw ?? m.away_score_raw;
-      const hasScoreHintRaw = !!(m.deep_has_score_hint || m.has_score_hint);
+      const home_score = statusKey === "upcoming" ? null : parseScore(homeScoreRaw);
+      const away_score = statusKey === "upcoming" ? null : parseScore(awayScoreRaw);
 
-      const home_score = parseScore(homeScoreRaw);
-      const away_score = parseScore(awayScoreRaw);
+      // DO NOT patch times unless explicit live/finished AND time is broken
+      const nowMs = Date.now();
+      const startMs = match_start ? parseMs(match_start) : null;
 
-      const hasAnyScore = (home_score !== null || away_score !== null) || hasScoreHintRaw;
-
-      const textKey = statusKeyFromText(statusTextRaw);
-      const hintKey = statusKeyFromText(statusHintRaw);
-      let statusKey = textKey !== "unknown" ? textKey : hintKey;
-
-      const now = new Date();
-      const nowMs = now.getTime();
-      const startDate = match_start ? new Date(match_start) : null;
-      const startMs = startDate && !Number.isNaN(startDate.getTime()) ? startDate.getTime() : null;
-
-      // If we have any score hints TODAY and time is far in the future => treat as LIVE
-      if (m._day_key === "today" && hasAnyScore && startMs && startMs > nowMs + 10 * 60 * 1000) {
-        statusKey = "live";
+      if ((statusKey === "live" || statusKey === "finished") && (!startMs || startMs > nowMs + 5 * 60 * 1000)) {
+        // if site says live/finished but time is in future, keep time as-is (safer) OR adjust
+        // We'll keep as-is to avoid poisoning.
       }
 
-      if (statusKey === "live") {
-        const bad = !startMs || startMs > nowMs + 5 * 60 * 1000;
-        if (bad) {
-          const fix = new Date(nowMs - 30 * 60 * 1000);
-          match_start = isoFromDateInCairo(fix) || match_start;
-        }
-      }
+      // match_time: for upcoming use site time_text (matches their UI), else format from ISO
+      const match_time =
+        statusKey === "upcoming"
+          ? (m.time_text || prettyTimeFromIso(match_start) || "—")
+          : (prettyTimeFromIso(match_start) || m.time_text || "—");
 
-      if (statusKey === "finished") {
-        const bad = !startMs || startMs > nowMs;
-        if (bad) {
-          const fix = new Date(nowMs - 3 * 60 * 60 * 1000);
-          match_start = isoFromDateInCairo(fix) || match_start;
-        }
-      }
-
-      const match_time = match_start ? prettyTimeFromIso(match_start) : m.time_text || "—";
       const finalStreamUrl = m.deep_stream_url || m.match_url;
 
       return {
@@ -1224,67 +1040,16 @@ async function startScraping() {
       return;
     }
 
-    const daysToRefresh = [
-      matchDayFromKey("yesterday"),
-      matchDayFromKey("today"),
-      matchDayFromKey("tomorrow"),
-    ].filter(Boolean);
+    const daysToRefresh = [matchDayFromKey("yesterday"), matchDayFromKey("today"), matchDayFromKey("tomorrow")].filter(Boolean);
 
     const existing = await fetchExistingForDays(daysToRefresh);
-    const { mergedRows, preservedMissingLive, preservedLiveOverride } = mergeWithExisting({
-      newRows: finalRows,
-      existingRows: existing,
-    });
-
-    const weakCount = mergedRows.filter((r) => isWeakStreamUrl(r.stream_url)).length;
-
-    const nowMs = Date.now();
-    const oldLive = existing.filter((r) => isLikelyLiveRow(r, nowMs)).length;
-    const newLive = mergedRows.filter((r) => isLikelyLiveRow(r, nowMs)).length;
-
-    if (oldLive > 0 && newLive === 0) {
-      console.error(`❌ Guardrail triggered: live rows dropped to 0 (oldLive=${oldLive}). Skip update.`);
-      if (DIAG) diagWrite("guardrail_live_drop.json", JSON.stringify({ oldLive, newLive }, null, 2));
-      return;
-    }
-
-    const todayKey = matchDayFromKey("today");
-    const oldToday = existing.filter((r) => r.match_day === todayKey).length;
-    const newToday = mergedRows.filter((r) => r.match_day === todayKey).length;
-
-    if (oldToday >= 6 && newToday < Math.floor(oldToday * 0.5)) {
-      console.error(`❌ Guardrail triggered: today rows dropped too much (old=${oldToday}, new=${newToday}). Skip update.`);
-      if (DIAG) diagWrite("guardrail_today_drop.json", JSON.stringify({ oldToday, newToday }, null, 2));
-      return;
-    }
+    const { mergedRows } = mergeWithExisting({ newRows: finalRows, existingRows: existing });
 
     if (DIAG) {
       diagWrite("final_rows.json", JSON.stringify(mergedRows, null, 2));
-      diagWrite(
-        "summary.json",
-        JSON.stringify(
-          {
-            ts: new Date().toISOString(),
-            daysToRefresh,
-            counts: {
-              oldToday,
-              newToday,
-              oldLive,
-              newLive,
-              weakCount,
-              preservedMissingLive,
-              preservedLiveOverride,
-            },
-          },
-          null,
-          2
-        )
-      );
+      diagWrite("summary.json", JSON.stringify({ ts: new Date().toISOString(), daysToRefresh, count: mergedRows.length }, null, 2));
     }
 
-    console.log(
-      `\n🧠 Merge Guardrails: preserved_missing_live=${preservedMissingLive}, preserved_live_time_override=${preservedLiveOverride}, weak_stream_urls_after_merge=${weakCount}`
-    );
     console.log(`\n🔁 تحديث ذري عبر RPC: ${RPC_NAME}`);
     console.log(`📌 أيام التحديث: ${daysToRefresh.join(" , ")}`);
     console.log(`⬆️ صفوف نهائية بعد الدمج: ${mergedRows.length}`);
@@ -1301,7 +1066,7 @@ async function startScraping() {
       return;
     }
 
-    console.log("✅ تم التحديث بنجاح (GitHub-safe).");
+    console.log("✅ تم التحديث بنجاح (Hard-fixed).");
   } catch (err) {
     console.error("❌ فشل السكرابر:", err.message);
     if (DIAG) diagWrite("fatal_error.txt", String(err?.stack || err?.message || err));
