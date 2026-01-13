@@ -1,4 +1,3 @@
-// app/watch/[id]/page.tsx
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
@@ -10,8 +9,12 @@ type MatchRow = {
   home_team?: string | null;
   away_team?: string | null;
   stream_url?: string | null;
-  match_start?: string | null; // timestamptz from Supabase
-  status_key?: string | null; // upcoming | live | finished | unknown
+  stream_url_2?: string | null;
+  stream_url_3?: string | null;
+  stream_url_4?: string | null;
+  stream_url_5?: string | null;
+  match_start?: string | null;
+  status_key?: string | null;
 };
 
 function isValidHttpUrl(u: string) {
@@ -33,11 +36,6 @@ function formatStartTimeAr(iso?: string | null) {
   }).format(d);
 }
 
-/**
- * Safe sandbox:
- * - blocks popups + top navigation (common ad-redirect patterns)
- * - still allows scripts + same-origin (many players need this)
- */
 const SAFE_IFRAME_SANDBOX =
   "allow-scripts allow-same-origin allow-forms allow-presentation";
 
@@ -59,6 +57,8 @@ export default function WatchPage() {
   const [loading, setLoading] = useState(true);
   const [errMsg, setErrMsg] = useState<string | null>(null);
 
+  const [selectedServer, setSelectedServer] = useState<number>(1);
+
   useEffect(() => {
     let cancelled = false;
 
@@ -75,7 +75,9 @@ export default function WatchPage() {
 
       const { data, error } = await supabase
         .from("match-stream-app")
-        .select("id, home_team, away_team, stream_url, match_start, status_key")
+        .select(
+          "id, home_team, away_team, stream_url, stream_url_2, stream_url_3, stream_url_4, stream_url_5, match_start, status_key"
+        )
         .eq("id", idNum)
         .maybeSingle();
 
@@ -104,6 +106,23 @@ export default function WatchPage() {
     };
   }, [idNum]);
 
+  const servers = useMemo(() => {
+    const s = [
+      { n: 1, url: match?.stream_url ?? null },
+      { n: 2, url: match?.stream_url_2 ?? null },
+      { n: 3, url: match?.stream_url_3 ?? null },
+      { n: 4, url: match?.stream_url_4 ?? null },
+      { n: 5, url: match?.stream_url_5 ?? null },
+    ]
+      .filter((x) => x.url && isValidHttpUrl(x.url))
+      .map((x) => ({ n: x.n, url: x.url as string }));
+
+    const exists = s.some((x) => x.n === selectedServer);
+    if (!exists && s.length) setSelectedServer(s[0].n);
+
+    return s;
+  }, [match, selectedServer]);
+
   if (loading) {
     return <div className="text-white text-center mt-20">جاري تحميل البث...</div>;
   }
@@ -112,10 +131,7 @@ export default function WatchPage() {
     return (
       <div className="min-h-screen bg-black text-white p-4">
         <div className="max-w-3xl mx-auto mt-10">
-          <button
-            onClick={() => router.back()}
-            className="mb-4 text-gray-400 hover:text-white"
-          >
+          <button onClick={() => router.back()} className="mb-4 text-gray-400 hover:text-white">
             ← العودة للرئيسية
           </button>
 
@@ -123,8 +139,8 @@ export default function WatchPage() {
             <div className="font-bold mb-2">تعذر فتح صفحة المشاهدة</div>
             <div className="text-gray-300 break-words">{errMsg}</div>
             <div className="text-gray-500 mt-3 text-sm">
-              لو المشكلة بسبب RLS: إمّا تسمح بالقراءة للـ anon على الجدول، أو تعرض
-              الصفحة كـ Client زي هنا مع جلسة المستخدم.
+              لو المشكلة بسبب RLS: إمّا تسمح بالقراءة للـ anon على الجدول، أو تعرض الصفحة كـ Client زي هنا مع جلسة
+              المستخدم.
             </div>
           </div>
         </div>
@@ -134,21 +150,29 @@ export default function WatchPage() {
 
   const home = match?.home_team ?? "الفريق الأول";
   const away = match?.away_team ?? "الفريق الثاني";
-  const streamUrl = match?.stream_url ?? "";
-  const canEmbed = streamUrl && isValidHttpUrl(streamUrl);
 
-  // ✅ قرار: هل البث لازم يفتح ولا لسه؟
+  const selectedUrl =
+    selectedServer === 2
+      ? match?.stream_url_2 ?? ""
+      : selectedServer === 3
+      ? match?.stream_url_3 ?? ""
+      : selectedServer === 4
+      ? match?.stream_url_4 ?? ""
+      : selectedServer === 5
+      ? match?.stream_url_5 ?? ""
+      : match?.stream_url ?? "";
+
+  const canEmbed = selectedUrl && isValidHttpUrl(selectedUrl);
+
   const status = (match?.status_key ?? "").toLowerCase();
   const nowMs = Date.now();
   const startMs = match?.match_start ? new Date(match.match_start).getTime() : null;
   const startValid = startMs !== null && Number.isFinite(startMs);
 
-  // سماحية بسيطة (قبل البداية بدقيقتين) عشان اختلاف التوقيت
   const hasStartedByTime = startValid ? nowMs >= (startMs as number) - 2 * 60 * 1000 : false;
   const hasStartedByStatus = status === "live" || status === "finished";
   const isUpcomingByStatus = status === "upcoming";
 
-  // لو status_key مش موجود/فاضي: نعتمد على الوقت لو متاح
   const shouldBlockStream = isUpcomingByStatus || (!hasStartedByStatus && startValid && !hasStartedByTime);
 
   const prettyStart = formatStartTimeAr(match?.match_start);
@@ -156,20 +180,19 @@ export default function WatchPage() {
   return (
     <div className="min-h-screen bg-black text-white p-4">
       <div className="max-w-5xl mx-auto">
-        {/* زر العودة */}
         <button onClick={() => router.back()} className="mb-4 text-gray-400 hover:text-white">
           ← العودة للرئيسية
         </button>
 
-        {/* رسالة ضخمة */}
         <div className="mb-4 rounded-2xl border border-gray-800 bg-gradient-to-r from-[#1b1b1b] via-[#111111] to-[#1b1b1b] p-5 shadow-2xl">
           <div className="flex flex-col gap-2 items-center text-center">
-            <div className="text-2xl sm:text-3xl font-black tracking-wide">
-              😄 احنا موقع لذيذ
-            </div>
+            <div className="text-2xl sm:text-3xl font-black tracking-wide">😄 احنا موقع لذيذ</div>
             <div className="text-sm sm:text-base text-gray-300 leading-relaxed max-w-3xl">
               لو دست على <span className="text-white font-semibold">أي إعلان</span> مش حيِقرفك ويفتح في صفحة جديدة…
-              <span className="text-white font-black"> الإعلان حيختفي والله ✅ وبمجرد ما تكبر البث مش حتشوف ولا اعلان يزعجك</span>
+              <span className="text-white font-black">
+                {" "}
+                الإعلان حيختفي والله ✅ وبمجرد ما تكبر البث مش حتشوف ولا اعلان يزعجك
+              </span>
             </div>
             <div className="text-xs text-gray-500">
               ملاحظة: المشغل شغّال بوضع حماية دائمًا لمنع التحويلات والنوافذ المنبثقة.
@@ -177,7 +200,25 @@ export default function WatchPage() {
           </div>
         </div>
 
-        {/* مشغل الفيديو */}
+        {servers.length > 1 ? (
+          <div className="mb-3 flex flex-wrap gap-2">
+            {servers.map((s) => (
+              <button
+                key={s.n}
+                onClick={() => setSelectedServer(s.n)}
+                className={[
+                  "px-4 py-2 rounded-full font-black text-sm border transition-all",
+                  selectedServer === s.n
+                    ? "bg-blue-600/20 text-blue-400 border-blue-600/40"
+                    : "bg-[#121212] text-gray-300 border-gray-800 hover:border-blue-600/40",
+                ].join(" ")}
+              >
+                سيرفر {s.n}
+              </button>
+            ))}
+          </div>
+        ) : null}
+
         <div className="aspect-video bg-gray-900 rounded-xl overflow-hidden shadow-2xl border border-gray-800">
           {shouldBlockStream ? (
             <div className="flex flex-col gap-2 items-center justify-center h-full text-gray-400 p-6 text-center">
@@ -192,28 +233,28 @@ export default function WatchPage() {
             </div>
           ) : canEmbed ? (
             <iframe
-              src={streamUrl}
+              key={`${selectedServer}-${selectedUrl}`}
+              src={selectedUrl}
               className="w-full h-full"
               allowFullScreen
               scrolling="no"
               allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
               referrerPolicy="no-referrer"
               sandbox={SAFE_IFRAME_SANDBOX}
-              title="Live Stream"
+              title={`Live Stream Server ${selectedServer}`}
             />
           ) : (
             <div className="flex flex-col gap-2 items-center justify-center h-full text-gray-400 p-6 text-center">
               <div className="text-gray-300 font-semibold">رابط البث غير متوفر أو غير صالح للعرض داخل iframe</div>
-              {streamUrl ? (
+              {selectedUrl ? (
                 <div className="text-xs text-gray-500 break-words">
-                  الحالي: <span className="text-gray-400">{streamUrl}</span>
+                  الحالي: <span className="text-gray-400">{selectedUrl}</span>
                 </div>
               ) : null}
             </div>
           )}
         </div>
 
-        {/* تفاصيل المباراة */}
         <div className="mt-6 bg-[#161616] p-6 rounded-2xl border border-gray-800 flex justify-between items-center">
           <div className="text-center flex-1 font-bold text-xl">{home}</div>
           <div className="text-red-500 font-black px-4">VS</div>

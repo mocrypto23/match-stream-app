@@ -1,23 +1,10 @@
 // scraper.js
 /**
- * Unified Scraper (Yesterday / Today / Tomorrow) + Deep Stream Link Extractor
+  * Unified Scraper (Yesterday / Today / Tomorrow) + Deep Stream Link Extractor
+ * + SIIIR.TV (Server 2) extractor
  *
- * ✅ FINAL (Hard) FIX:
- * 1) Status comes ONLY from DOM truth:
- *    - .AY_Match classes: not-started / live / finished
- *    - .MT_Stat text (لم تبدأ بعد / جارية الآن / انتهت)
- * 2) data-start is authoritative for match_start when present.
- * 3) Strict score parsing: ONLY "0".."30" (1-2 digits). Anything else => null.
- * 4) Upcoming matches NEVER read score from hidden/visible goals (avoid 0-0 hints).
- * 5) Never flip to LIVE based on score hints. Only explicit LIVE signals.
- * 6) Upcoming matches display time_text (site time) as match_time.
- * 7) Merge: allow overwriting old synthetic now-30m rows if new schedule is far future.
- *
- * ✅ HOTFIX (Today):
- * A) If dayKey === "yesterday" and DOM status is unknown => treat as "finished"
- *    (so yesterday matches show results, not time).
- * B) When normalized status is unknown => fallback by _day_key:
- *    yesterday => finished, tomorrow => upcoming, today => upcoming
+ * Adds:
+ * - stream_url_2..5 support (currently fills stream_url_2 from siiir.tv)
  *
  * ENV:
  *  - SUPABASE_URL, SUPABASE_KEY (required)
@@ -51,15 +38,8 @@ let blockerPromise = null;
 async function getAdBlocker() {
   if (!blockerPromise) {
     blockerPromise = PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch).then((b) => {
-      // اختياري (بس مفيد): خلي البلوكر يمنع الصور والخطوط بدل ما تعملها أنت يدوي
       b.blockImages();
       b.blockFonts();
-
-      // اختياري كمان لو عايز تقلل حمل أكتر:
-      // b.blockStyles();
-      // b.blockMedias();
-      // b.blockFrames();
-
       return b;
     });
   }
@@ -84,6 +64,16 @@ const DAYS = [
   { key: "tomorrow", url: "https://www.bein-live.com/matches-tomorrow/" },
 ];
 
+// SIIIR source (Server 2)
+const SIIIR = {
+  dayUrl: {
+    yesterday: "https://w4.siiir.tv/yesterday-matches/",
+    today: "https://w4.siiir.tv/today-matches/",
+    tomorrow: "https://w4.siiir.tv/tomorrow-matches/",
+  },
+};
+
+
 // ===================== Anti-Ads Config =====================
 const AD_HOSTS = [
   "doubleclick.net",
@@ -101,7 +91,6 @@ const AD_HOSTS = [
   "pushwelcome.com",
   "pushpushgo.com",
   "hilltopads.net",
-  // from your popup example:
   "identitylumber.com",
 ];
 
@@ -256,16 +245,11 @@ async function applyAntiAds(context, page) {
     } catch {}
   }, AD_HOSTS);
 
-  // ✅ 1) Route خفيف جداً: يمنع فقط الدومينات اللي انت محددها
   await page.route("**/*", (route) => {
     try {
       const req = route.request();
       const url = req.url();
-
-      // امنع الدومينات الإعلانية اللي محددها انت
       if (isAdHost(url)) return route.abort();
-
-      // ✅ مهم: سيب Ghostery يمسك باقي الطلبات
       if (typeof route.fallback === "function") return route.fallback();
       return route.continue();
     } catch {
@@ -274,7 +258,6 @@ async function applyAntiAds(context, page) {
     }
   });
 
-  // ✅ 2) Ghostery Adblocker (لازم بعد route)
   try {
     const blocker = await getAdBlocker();
     await blocker.enableBlockingInPage(page);
@@ -388,7 +371,6 @@ function statusKeyFromText(statusText) {
   const s = s0.toLowerCase();
 
   if (/لم\s*تبدأ|not started|upcoming|scheduled/i.test(s0)) return "upcoming";
-
   if (s0.includes("جارية") || s0.includes("مباشر") || s0.includes("الآن")) return "live";
   if (s0.includes("انتهت") || s0.includes("انتهى") || s0.includes("نهاية")) return "finished";
 
@@ -467,7 +449,7 @@ async function waitForStableMatchCount(page, maxWaitMs = 20000, settleMs = 1400)
   return last;
 }
 
-// ===================== Scrape List =====================
+// ===================== Scrape List (bein-live) =====================
 async function scrapeOneDay(page, dayKey, url) {
   console.log(`\n🔎 سحب: ${dayKey} => ${url}`);
 
@@ -501,7 +483,6 @@ async function scrapeOneDay(page, dayKey, url) {
     }
   } catch {}
 
-  // ✅ IMPORTANT: pass dayKey into evaluate for correct fallback behavior
   const rows = await page.evaluate((DAY_KEY) => {
     const BASE = "https://www.bein-live.com";
 
@@ -563,12 +544,10 @@ async function scrapeOneDay(page, dayKey, url) {
     };
 
     const findScorePair = (match, statusKey) => {
-      // ✅ Upcoming -> DO NOT read score (even if DOM has hidden 0-0)
       if (statusKey === "upcoming") return { home: null, away: null, hasAny: false };
 
       const visibility = getResultVisibility(match);
 
-      // allow goals for live/finished/unknown BUT guard against hidden 0-0 in unknown
       const goals = Array.from(match.querySelectorAll(".RS-goals")).map((g) => (g.textContent || "").trim());
       if (goals.length >= 2) {
         const a = strictParseGoal(goals[0]);
@@ -606,7 +585,6 @@ async function scrapeOneDay(page, dayKey, url) {
         const statText = pickText(match, [".MT_Stat"]);
         const classStatus = statusFromClass(match);
 
-        // statusKey: classStatus first, then MT_Stat text
         let statusKey = classStatus || "unknown";
         if (statusKey === "unknown" && statText) {
           const t = statText.toLowerCase();
@@ -618,14 +596,8 @@ async function scrapeOneDay(page, dayKey, url) {
             statusKey = "finished";
         }
 
-        // ✅ HOTFIX: yesterday unknown => finished
-        if (statusKey === "unknown" && DAY_KEY === "yesterday") {
-          statusKey = "finished";
-        }
-        // tomorrow unknown => upcoming
-        if (statusKey === "unknown" && DAY_KEY === "tomorrow") {
-          statusKey = "upcoming";
-        }
+        if (statusKey === "unknown" && DAY_KEY === "yesterday") statusKey = "finished";
+        if (statusKey === "unknown" && DAY_KEY === "tomorrow") statusKey = "upcoming";
 
         const matchUrl = toAbs(a?.getAttribute("href") || "");
         const scorePair = findScorePair(match, statusKey);
@@ -656,7 +628,7 @@ async function scrapeOneDay(page, dayKey, url) {
   return rows;
 }
 
-// ===================== Deep Match Details =====================
+// ===================== Deep Match Details (bein-live) =====================
 async function extractMatchMetaFromDom(page) {
   return page
     .evaluate(() => {
@@ -670,7 +642,6 @@ async function extractMatchMetaFromDom(page) {
       };
 
       const root = document.body || document.documentElement;
-
       const statText = pickText(root, [".MT_Stat", ".MT_Status", ".match-status", ".MatchStatus", ".RS-status", ".status"]);
       const title = (document.title || "").trim();
 
@@ -870,7 +841,229 @@ async function getDeepMatchDetails(page, matchUrl) {
   }
 }
 
-// ===================== Worker pool =====================
+// ===================== SIIIR (Server 2) =====================
+function safeTextListFromContainerText(raw) {
+  const stop = new Set([
+    "انتهت",
+    "جارية",
+    "مباشر",
+    "الآن",
+    "اليوم",
+    "الأمس",
+    "الغد",
+    "مباريات",
+    "الدوري",
+    "كأس",
+    "server",
+    "hd",
+    "بث",
+    "البيت",
+    "الرسمي",
+  ]);
+
+  return String(raw || "")
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .filter((x) => x.length >= 2 && x.length <= 40)
+    .filter((x) => !/^\d+(\s*[-:]\s*\d+)?$/.test(x))
+    .filter((x) => !stop.has(x.toLowerCase()));
+}
+
+async function scrapeSiiirDay(page, dayKey) {
+  const url = SIIIR.dayUrl[dayKey];
+  console.log(`\n🟣 SIIIR list: ${dayKey} => ${url}`);
+
+  if (!url) return [];
+
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: LIST_TIMEOUT_MS });
+  await page.waitForSelector(".AY_Match, .no-data__msg, body", { timeout: 30000 });
+
+  await page.waitForTimeout(900);
+  try {
+    await waitForStableMatchCount(page, 20000, 1400);
+  } catch {}
+
+  await diagShot(page, `siiir/list_${dayKey}.png`);
+  if (DIAG) {
+    try {
+      diagWrite(`siiir/list_${dayKey}.html`, (await page.content()).slice(0, 350000));
+    } catch {}
+  }
+
+  // نقرأ الكروت من صفحة اليوم زي HTML اللي انت بعته
+  const rows = await page.evaluate(() => {
+    const out = [];
+    const matches = Array.from(document.querySelectorAll(".AY_Match"));
+
+    for (const match of matches) {
+      const teams = Array.from(match.querySelectorAll(".TM_Name"))
+        .map((e) => (e.textContent || "").trim())
+        .filter(Boolean);
+
+      if (teams.length < 2) continue;
+
+      const timeEl = match.querySelector(".MT_Time");
+      const dataStart = (timeEl?.getAttribute("data-start") || "").trim();
+
+      // اللينك اللي تحت الكارت بيروح لصفحة /matches/...
+      const a = match.querySelector("a[href]");
+const hrefRaw = a?.getAttribute("href") || "";
+
+
+      let href = "";
+      try {
+        href = new URL(hrefRaw, location.href).toString();
+      } catch {
+        href = "";
+      }
+
+      if (!href) continue;
+
+      out.push({
+        match_page_url: href,
+        home_team: teams[0],
+        away_team: teams[1],
+        data_start: dataStart || null,
+      });
+    }
+
+    return out;
+  });
+
+  // نحول data_start إلى match_day بالقاهرة (عشان الماتشات تتطابق مع bein-live)
+  const final = rows
+    .map((r) => {
+      const iso = toIsoFromDataStart(r.data_start);
+      const match_day = cairoDayFromIso(iso) || matchDayFromKey(dayKey);
+      return { ...r, match_day };
+    })
+    .filter((r) => r.home_team && r.away_team && r.match_page_url && r.match_day);
+
+  console.log(`🟣 SIIIR ${dayKey}: ${final.length} items`);
+  if (DIAG) diagWrite(`siiir/raw_${dayKey}.json`, JSON.stringify(final, null, 2));
+  return final;
+}
+
+
+async function resolveSiiirPlayerIframeSrc(page, matchPageUrl) {
+  try {
+    await page.goto(matchPageUrl, { waitUntil: "domcontentloaded", timeout: DEEP_TIMEOUT_MS });
+    await page.waitForTimeout(1200);
+
+    // ساعات لازم click بسيط عشان iframe يتحطله src
+    for (const sel of [
+      ".video-serv a",
+      ".video-serv button",
+      ".server-tab",
+      ".server-body a",
+      "a:has-text('Server')",
+      "a:has-text('سيرفر')",
+    ]) {
+      try {
+        const el = page.locator(sel).first();
+        if (await el.count()) {
+          await el.click({ timeout: 2000, noWaitAfter: true }).catch(() => {});
+          await page.waitForTimeout(600);
+          break;
+        }
+      } catch {}
+    }
+
+    await page.waitForTimeout(800);
+
+    const domUrls = await page.evaluate(() => {
+      const urls = [];
+      const push = (u) => { if (u && typeof u === "string") urls.push(u); };
+
+      // iframe الأساسي
+      const f = document.querySelector("iframe#player");
+      push(f?.getAttribute("src"));
+      push(f?.src);
+
+      // أي iframe تاني
+      document.querySelectorAll("#yalla-ajax-server iframe, .server-body iframe, iframe").forEach((ifr) => {
+        push(ifr.getAttribute("src"));
+        push(ifr.getAttribute("data-src"));
+        push(ifr.src);
+      });
+
+      // لينكات السيرفرات
+      document.querySelectorAll(".video-serv a[href], .server-body a[href], a[href*='player'], a[href*='embed']").forEach((a) => {
+        push(a.getAttribute("href"));
+        push(a.href);
+      });
+
+      // فيديو/سورس لو موجود
+      document.querySelectorAll("video source[src], video[src]").forEach((v) => {
+        push(v.getAttribute("src"));
+        push(v.src);
+      });
+
+      return urls;
+    }).catch(() => []);
+
+    // كمان ناخد frame urls
+    try {
+      page.frames().forEach((fr) => {
+        const u = fr.url();
+        if (u) domUrls.push(u);
+      });
+    } catch {}
+
+    const clean = Array.from(new Set(domUrls))
+      .map((u) => normalizeUrl(u, matchPageUrl))
+      .filter((u) => u && !isAdHost(u) && !isJunkCandidateUrl(u) && u !== matchPageUrl);
+
+    const best = pickBestUrl(clean);
+    return best || null;
+  } catch (e) {
+    dbg("⚠️ SIIIR resolve error:", e?.message || e);
+    return null;
+  }
+}
+
+
+async function enrichSiiirWithPlayerUrls(browser, siiirRows) {
+  if (!siiirRows.length) return [];
+
+  const limit = Math.min(CONCURRENCY, siiirRows.length);
+  const queue = siiirRows.map((r, idx) => ({ r, idx }));
+  const out = new Array(siiirRows.length);
+
+  const worker = async (workerId) => {
+    const context = await browser.newContext({
+      locale: "ar-EG",
+      timezoneId: TZ,
+      serviceWorkers: "block",
+      extraHTTPHeaders: { "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7" },
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+      viewport: { width: 1280, height: 720 },
+    });
+
+    const page = await context.newPage();
+    await applyAntiAds(context, page);
+
+    while (queue.length) {
+      const item = queue.shift();
+      if (!item) break;
+
+      const { r, idx } = item;
+      console.log(`🟣 SIIIR [W${workerId}] (${idx + 1}/${siiirRows.length}): ${r.home_team} vs ${r.away_team}`);
+
+      const src = await resolveSiiirPlayerIframeSrc(page, r.match_page_url);
+      out[idx] = { ...r, siiir_stream_url: src };
+    }
+
+    await context.close();
+  };
+
+  await Promise.all(Array.from({ length: limit }, (_, i) => worker(i + 1)));
+  return out.map((x) => x || null).filter(Boolean);
+}
+
+// ===================== Worker pool (bein-live deep) =====================
 async function enrichWithDeepLinks(browser, rows) {
   if (!rows.length) return rows;
 
@@ -924,26 +1117,40 @@ function canonTeamName(v) {
   return s.toLowerCase();
 }
 
-function keyOfRow(r) {
-  const day = String(r.match_day || "").toLowerCase();
-  const a = canonTeamName(r.home_team);
-  const b = canonTeamName(r.away_team);
+function keyOfTeams(matchDay, home, away) {
+  const day = String(matchDay || "").toLowerCase();
+  const a = canonTeamName(home);
+  const b = canonTeamName(away);
   const pair = [a, b].sort().join("__");
   return `${day}||${pair}`;
+}
+
+function keyOfRow(r) {
+  return keyOfTeams(r.match_day, r.home_team, r.away_team);
 }
 
 function isWeakStreamUrl(u) {
   if (!u) return true;
   const s = String(u).toLowerCase();
   if (s.includes("bein-live.com") && s.includes("match")) return true;
-  const goodHints = ["m3u8", "embed", "player", "iframe", "albaplayer", "kora-live"];
+  const goodHints = ["m3u8", "embed", "player", "iframe", "albaplayer", "kora-live", "playerv2.php", "aleynoxitram.sbs"];
   return !goodHints.some((h) => s.includes(h));
+}
+
+function preferExistingUrl(newUrl, oldUrl) {
+  if (!newUrl && oldUrl) return oldUrl;
+  if (newUrl && !oldUrl) return newUrl;
+  if (!newUrl && !oldUrl) return null;
+  if (isWeakStreamUrl(newUrl) && !isWeakStreamUrl(oldUrl)) return oldUrl;
+  return newUrl;
 }
 
 async function fetchExistingForDays(days) {
   const { data, error } = await supabase
     .from(TABLE_NAME)
-    .select("home_team,away_team,home_logo,away_logo,stream_url,match_day,match_start,match_time,home_score,away_score")
+    .select(
+      "home_team,away_team,home_logo,away_logo,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,match_day,match_start,match_time,home_score,away_score"
+    )
     .in("match_day", days);
 
   if (error) {
@@ -968,25 +1175,27 @@ function mergeWithExisting({ newRows, existingRows }) {
     let out = { ...r };
 
     if (old) {
-      if (isWeakStreamUrl(out.stream_url) && !isWeakStreamUrl(old.stream_url)) {
-        out.stream_url = old.stream_url;
-      }
+      // Server 1
+      out.stream_url = preferExistingUrl(out.stream_url, old.stream_url);
+
+      // Servers 2..5 (preserve if new scrape missing)
+      out.stream_url_2 = preferExistingUrl(out.stream_url_2, old.stream_url_2);
+      out.stream_url_3 = preferExistingUrl(out.stream_url_3, old.stream_url_3);
+      out.stream_url_4 = preferExistingUrl(out.stream_url_4, old.stream_url_4);
+      out.stream_url_5 = preferExistingUrl(out.stream_url_5, old.stream_url_5);
 
       const oldMs = parseMs(old.match_start);
       const newMs = parseMs(out.match_start);
       const oldLooksNowish = oldMs !== null && oldMs > nowMs - 6 * 60 * 60 * 1000 && oldMs < nowMs + 15 * 60 * 1000;
       const newIsFarFuture = newMs !== null && newMs > nowMs + 2 * 60 * 60 * 1000;
 
-      if (oldLooksNowish && newIsFarFuture) {
-        // accept new schedule (do nothing)
-      } else {
+      if (!(oldLooksNowish && newIsFarFuture)) {
         if ((!out.match_start || !parseMs(out.match_start)) && old.match_start) {
           out.match_start = old.match_start;
           out.match_time = old.match_time || out.match_time;
         }
       }
 
-      // ✅ if new row lost scores but old had real scores, preserve old scores
       const newHS = typeof out.home_score === "number" ? out.home_score : null;
       const newAS = typeof out.away_score === "number" ? out.away_score : null;
       const oldHS = typeof old.home_score === "number" ? old.home_score : null;
@@ -1009,7 +1218,7 @@ function mergeWithExisting({ newRows, existingRows }) {
 
 // ===================== Main =====================
 async function startScraping() {
-  console.log("🚀 بدء السكرابر (أمس/اليوم/غد) + استخراج رابط البث ...");
+  console.log("🚀 بدء السكرابر (bein-live) + Server2 (SIIIR) ...");
 
   diagTouch();
 
@@ -1032,6 +1241,7 @@ async function startScraping() {
   await applyAntiAds(listContext, page);
 
   try {
+    // 1) bein-live schedule
     const all = [];
     for (const d of DAYS) {
       try {
@@ -1051,6 +1261,43 @@ async function startScraping() {
 
     const enriched = await enrichWithDeepLinks(browser, all);
 
+    // 2) SIIIR lists + resolve iframe src
+    const siiirListContext = await browser.newContext({
+      locale: "ar-EG",
+      timezoneId: TZ,
+      serviceWorkers: "block",
+      extraHTTPHeaders: { "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7" },
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+      viewport: { width: 1280, height: 720 },
+    });
+    const siiirListPage = await siiirListContext.newPage();
+    await applyAntiAds(siiirListContext, siiirListPage);
+
+    const siiirAll = [];
+    for (const d of DAYS) {
+      try {
+        const rows = await scrapeSiiirDay(siiirListPage, d.key);
+        siiirAll.push(...rows);
+      } catch (e) {
+        console.error(`⚠️ SIIIR list fail ${d.key}:`, e.message);
+        if (DIAG) diagWrite(`siiir/errors_${d.key}.txt`, String(e?.stack || e?.message || e));
+      }
+    }
+    await siiirListPage.close().catch(() => {});
+    await siiirListContext.close().catch(() => {});
+
+    const siiirEnriched = await enrichSiiirWithPlayerUrls(browser, siiirAll);
+
+    // map SIIIR by match key
+    const siiirMap = new Map();
+    for (const r of siiirEnriched) {
+      if (!r.siiir_stream_url) continue;
+      const k = keyOfTeams(r.match_day, r.home_team, r.away_team);
+      if (!siiirMap.has(k)) siiirMap.set(k, r.siiir_stream_url);
+    }
+
+    // 3) Normalize bein-live rows
     const normalized = enriched.map((m) => {
       const isoFromAttr = toIsoFromDataStart(m.data_start);
       const match_day = cairoDayFromIso(isoFromAttr) || matchDayFromKey(m._day_key);
@@ -1059,14 +1306,12 @@ async function startScraping() {
 
       const statusKeyDom = (m.deep_status_key_dom || m.status_key_dom || "unknown").toLowerCase();
       const statusTextRaw = m.deep_status_text || m.status_text || "";
-
       let statusKey = statusKeyDom !== "unknown" ? statusKeyDom : statusKeyFromText(statusTextRaw);
 
-      // ✅ HOTFIX: fallback by day key
       if (statusKey === "unknown") {
         if (m._day_key === "yesterday") statusKey = "finished";
         else if (m._day_key === "tomorrow") statusKey = "upcoming";
-        else statusKey = "unknown"; // today safest
+        else statusKey = "unknown";
       }
 
       const homeScoreRaw = m.deep_home_score_raw ?? m.home_score_raw;
@@ -1081,12 +1326,20 @@ async function startScraping() {
 
       const finalStreamUrl = m.deep_stream_url || m.match_url;
 
+      // Server 2 attach (SIIIR)
+      const k = keyOfTeams(match_day, m.home_team, m.away_team);
+      const server2 = siiirMap.get(k) || null;
+
       return {
         home_team: m.home_team,
         away_team: m.away_team,
         home_logo: m.home_logo,
         away_logo: m.away_logo,
         stream_url: finalStreamUrl,
+        stream_url_2: server2,
+        stream_url_3: null,
+        stream_url_4: null,
+        stream_url_5: null,
         match_day,
         match_start: match_start || null,
         match_time,
@@ -1110,7 +1363,14 @@ async function startScraping() {
 
     if (DIAG) {
       diagWrite("final_rows.json", JSON.stringify(mergedRows, null, 2));
-      diagWrite("summary.json", JSON.stringify({ ts: new Date().toISOString(), daysToRefresh, count: mergedRows.length }, null, 2));
+      diagWrite(
+        "summary.json",
+        JSON.stringify(
+          { ts: new Date().toISOString(), daysToRefresh, count: mergedRows.length, siiir_count: siiirEnriched.length },
+          null,
+          2
+        )
+      );
     }
 
     console.log(`\n🔁 تحديث ذري عبر RPC: ${RPC_NAME}`);
@@ -1129,7 +1389,7 @@ async function startScraping() {
       return;
     }
 
-    console.log("✅ تم التحديث بنجاح (Hard-fixed + Yesterday Results Restored).");
+    console.log("✅ تم التحديث بنجاح (Server2=SIIIR).");
   } catch (err) {
     console.error("❌ فشل السكرابر:", err.message);
     if (DIAG) diagWrite("fatal_error.txt", String(err?.stack || err?.message || err));
