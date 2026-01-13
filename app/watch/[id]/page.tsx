@@ -36,8 +36,17 @@ function formatStartTimeAr(iso?: string | null) {
   }).format(d);
 }
 
+// ✅ سيرفر 1 وباقي السيرفرات (زي ما كان)
 const SAFE_IFRAME_SANDBOX =
-  "allow-scripts allow-same-origin allow-forms allow-presentation";
+  "allow-scripts";
+
+// ✅ (اختياري) تفعيل sandbox لسيرفر 2 قد يمنع popups
+// ⚠️ لو السيرفر 2 اتعطل/رفض يشتغل: خليها false
+const USE_SERVER2_SANDBOX = true;
+
+// sandbox لسيرفر 2 بدون allow-popups (يعني يمنع النوافذ المنبثقة لو السيرفر يقبل)
+const SERVER2_SANDBOX =
+  "allow-scripts allow-same-origin";
 
 export default function WatchPage() {
   const params = useParams();
@@ -107,7 +116,7 @@ export default function WatchPage() {
   }, [idNum]);
 
   const servers = useMemo(() => {
-    const s = [
+    return [
       { n: 1, url: match?.stream_url ?? null },
       { n: 2, url: match?.stream_url_2 ?? null },
       { n: 3, url: match?.stream_url_3 ?? null },
@@ -116,12 +125,14 @@ export default function WatchPage() {
     ]
       .filter((x) => x.url && isValidHttpUrl(x.url))
       .map((x) => ({ n: x.n, url: x.url as string }));
+  }, [match]);
 
-    const exists = s.some((x) => x.n === selectedServer);
-    if (!exists && s.length) setSelectedServer(s[0].n);
-
-    return s;
-  }, [match, selectedServer]);
+  // ✅ تثبيت سيرفر مختار لو الحالي مش موجود
+  useEffect(() => {
+    const exists = servers.some((x) => x.n === selectedServer);
+    if (!exists && servers.length) setSelectedServer(servers[0].n);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [servers.length, servers.map((s) => s.n).join(","), selectedServer]);
 
   if (loading) {
     return <div className="text-white text-center mt-20">جاري تحميل البث...</div>;
@@ -131,7 +142,10 @@ export default function WatchPage() {
     return (
       <div className="min-h-screen bg-black text-white p-4">
         <div className="max-w-3xl mx-auto mt-10">
-          <button onClick={() => router.back()} className="mb-4 text-gray-400 hover:text-white">
+          <button
+            onClick={() => router.back()}
+            className="mb-4 text-gray-400 hover:text-white"
+          >
             ← العودة للرئيسية
           </button>
 
@@ -139,8 +153,8 @@ export default function WatchPage() {
             <div className="font-bold mb-2">تعذر فتح صفحة المشاهدة</div>
             <div className="text-gray-300 break-words">{errMsg}</div>
             <div className="text-gray-500 mt-3 text-sm">
-              لو المشكلة بسبب RLS: إمّا تسمح بالقراءة للـ anon على الجدول، أو تعرض الصفحة كـ Client زي هنا مع جلسة
-              المستخدم.
+              لو المشكلة بسبب RLS: إمّا تسمح بالقراءة للـ anon على الجدول، أو تعرض
+              الصفحة كـ Client زي هنا مع جلسة المستخدم.
             </div>
           </div>
         </div>
@@ -169,33 +183,45 @@ export default function WatchPage() {
   const startMs = match?.match_start ? new Date(match.match_start).getTime() : null;
   const startValid = startMs !== null && Number.isFinite(startMs);
 
-  const hasStartedByTime = startValid ? nowMs >= (startMs as number) - 2 * 60 * 1000 : false;
+  const hasStartedByTime = startValid
+    ? nowMs >= (startMs as number) - 2 * 60 * 1000
+    : false;
   const hasStartedByStatus = status === "live" || status === "finished";
   const isUpcomingByStatus = status === "upcoming";
 
-  const shouldBlockStream = isUpcomingByStatus || (!hasStartedByStatus && startValid && !hasStartedByTime);
+  const shouldBlockStream =
+    isUpcomingByStatus || (!hasStartedByStatus && startValid && !hasStartedByTime);
 
   const prettyStart = formatStartTimeAr(match?.match_start);
+
+  const isServer2 = selectedServer === 2;
 
   return (
     <div className="min-h-screen bg-black text-white p-4">
       <div className="max-w-5xl mx-auto">
-        <button onClick={() => router.back()} className="mb-4 text-gray-400 hover:text-white">
+        <button
+          onClick={() => router.back()}
+          className="mb-4 text-gray-400 hover:text-white"
+        >
           ← العودة للرئيسية
         </button>
 
         <div className="mb-4 rounded-2xl border border-gray-800 bg-gradient-to-r from-[#1b1b1b] via-[#111111] to-[#1b1b1b] p-5 shadow-2xl">
           <div className="flex flex-col gap-2 items-center text-center">
-            <div className="text-2xl sm:text-3xl font-black tracking-wide">😄 احنا موقع لذيذ</div>
+            <div className="text-2xl sm:text-3xl font-black tracking-wide">
+              😄 احنا موقع لذيذ
+            </div>
             <div className="text-sm sm:text-base text-gray-300 leading-relaxed max-w-3xl">
-              لو دست على <span className="text-white font-semibold">أي إعلان</span> مش حيِقرفك ويفتح في صفحة جديدة…
+              لو دست على <span className="text-white font-semibold">أي إعلان</span>{" "}
+              مش حيِقرفك ويفتح في صفحة جديدة…
               <span className="text-white font-black">
                 {" "}
-                الإعلان حيختفي والله ✅ وبمجرد ما تكبر البث مش حتشوف ولا اعلان يزعجك
+                الإعلان حيختفي والله ✅ وبمجرد ما تكبر البث مش حتشوف ولا اعلان
+                يزعجك
               </span>
             </div>
-            <div className="text-xs text-gray-500">
-              ملاحظة: المشغل شغّال بوضع حماية دائمًا لمنع التحويلات والنوافذ المنبثقة.
+            <div className="text-2xl sm:text-3xl font-black tracking-wide">
+              دبل كليك على الفيديو وحيكبر بسهولة
             </div>
           </div>
         </div>
@@ -219,37 +245,73 @@ export default function WatchPage() {
           </div>
         ) : null}
 
-        <div className="aspect-video bg-gray-900 rounded-xl overflow-hidden shadow-2xl border border-gray-800">
+        <div className="bg-gray-900 rounded-xl overflow-hidden shadow-2xl border border-gray-800">
           {shouldBlockStream ? (
-            <div className="flex flex-col gap-2 items-center justify-center h-full text-gray-400 p-6 text-center">
+            <div className="flex flex-col gap-2 items-center justify-center h-[55vh] min-h-[320px] text-gray-400 p-6 text-center">
               <div className="text-white font-bold text-xl">لم يبدأ البث بعد</div>
               {prettyStart ? (
                 <div className="text-sm text-gray-400">
-                  موعد المباراة: <span className="text-gray-200">{prettyStart}</span>
+                  موعد المباراة:{" "}
+                  <span className="text-gray-200">{prettyStart}</span>
                 </div>
               ) : (
-                <div className="text-sm text-gray-500">سيتم تفعيل البث عند بدء المباراة.</div>
+                <div className="text-sm text-gray-500">
+                  سيتم تفعيل البث عند بدء المباراة.
+                </div>
               )}
             </div>
           ) : canEmbed ? (
-            <iframe
-              key={`${selectedServer}-${selectedUrl}`}
-              src={selectedUrl}
-              className="w-full h-full"
-              allowFullScreen
-              scrolling="no"
-              allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
-              referrerPolicy="no-referrer"
-              sandbox={SAFE_IFRAME_SANDBOX}
-              title={`Live Stream Server ${selectedServer}`}
-            />
+            isServer2 ? (
+              <div className="relative">
+                <iframe
+                  key={`${selectedServer}-${selectedUrl}`}
+                  src={selectedUrl}
+                  className="w-full block"
+                  style={{ height: 550 }}
+                  frameBorder={0}
+                  allowFullScreen
+                  allow="autoplay; fullscreen"
+                  // ✅ اختياري: sandbox لسيرفر 2 لمنع popups لو السيرفر يقبل
+                  sandbox={USE_SERVER2_SANDBOX ? SERVER2_SANDBOX : undefined}
+                  title={`Live Stream Server ${selectedServer}`}
+                />
+              </div>
+            ) : (
+              <div className="aspect-video">
+                <iframe
+                  key={`${selectedServer}-${selectedUrl}`}
+                  src={selectedUrl}
+                  className="w-full h-full"
+                  allowFullScreen
+                  scrolling="no"
+                  allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
+                  referrerPolicy="no-referrer"
+                  sandbox={SAFE_IFRAME_SANDBOX}
+                  title={`Live Stream Server ${selectedServer}`}
+                />
+              </div>
+            )
           ) : (
-            <div className="flex flex-col gap-2 items-center justify-center h-full text-gray-400 p-6 text-center">
-              <div className="text-gray-300 font-semibold">رابط البث غير متوفر أو غير صالح للعرض داخل iframe</div>
+            <div className="flex flex-col gap-2 items-center justify-center h-[55vh] min-h-[320px] text-gray-400 p-6 text-center">
+              <div className="text-gray-300 font-semibold">
+                رابط البث غير متوفر أو غير صالح للعرض داخل iframe
+              </div>
+
               {selectedUrl ? (
                 <div className="text-xs text-gray-500 break-words">
                   الحالي: <span className="text-gray-400">{selectedUrl}</span>
                 </div>
+              ) : null}
+
+              {selectedUrl ? (
+                <a
+                  href={selectedUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-3 text-sm font-bold text-blue-400 hover:text-blue-300"
+                >
+                  فتح الرابط في صفحة جديدة
+                </a>
               ) : null}
             </div>
           )}

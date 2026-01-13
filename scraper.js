@@ -73,7 +73,6 @@ const SIIIR = {
   },
 };
 
-
 // ===================== Anti-Ads Config =====================
 const AD_HOSTS = [
   "doubleclick.net",
@@ -165,7 +164,11 @@ function isJunkCandidateUrl(url) {
   if (!url) return true;
   const u = String(url).toLowerCase();
   return (
-    /\.(css|js|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|ico|json)(\?.*)?$/.test(u) ||
+/\.(css|js|png|jpg|jpeg|gif|svg|webp|avif|woff|woff2|ttf|eot|ico|json|map)(\?.*)?$/.test(u) ||
+    u.includes("cloudflareinsights.com") ||
+    u.includes("beacon.min.js") ||
+    u.includes("cf-beacon") ||
+    u.includes("wp-content/uploads/") ||
     u.includes("/assets/css/") ||
     u.includes("/wp-content/themes/") ||
     u.includes("/wp-includes/")
@@ -412,12 +415,17 @@ function scoreCandidate(u) {
   if (s.includes("albaplayer")) score += 250;
   if (s.includes("kora-live")) score += 200;
   if (s.includes("m3u8")) score += 300;
+  if (s.includes("playerv2.php")) score += 260; // ✅ مهم لـ SIIIR
   if (s.includes("embed")) score += 80;
   if (s.includes("player")) score += 60;
   if (s.includes("iframe")) score += 40;
   if (s.includes("live")) score += 20;
 
   if (s.includes("bein-live.com") && s.includes("match")) score -= 120;
+
+    if (s.includes("aleynoxitram.sbs") && s.includes("/hard/") && s.includes("match=")) score += 500;
+  if (s.includes("sir-tv.tv/wp-content/uploads/")) score -= 500;
+  if (s.includes("cloudflareinsights.com") || s.includes("beacon.min.js")) score -= 500;
 
   return score;
 }
@@ -891,7 +899,7 @@ async function scrapeSiiirDay(page, dayKey) {
     } catch {}
   }
 
-  // نقرأ الكروت من صفحة اليوم زي HTML اللي انت بعته
+  // نقرأ الكروت من صفحة اليوم
   const rows = await page.evaluate(() => {
     const out = [];
     const matches = Array.from(document.querySelectorAll(".AY_Match"));
@@ -906,10 +914,8 @@ async function scrapeSiiirDay(page, dayKey) {
       const timeEl = match.querySelector(".MT_Time");
       const dataStart = (timeEl?.getAttribute("data-start") || "").trim();
 
-      // اللينك اللي تحت الكارت بيروح لصفحة /matches/...
       const a = match.querySelector("a[href]");
-const hrefRaw = a?.getAttribute("href") || "";
-
+      const hrefRaw = a?.getAttribute("href") || "";
 
       let href = "";
       try {
@@ -931,7 +937,6 @@ const hrefRaw = a?.getAttribute("href") || "";
     return out;
   });
 
-  // نحول data_start إلى match_day بالقاهرة (عشان الماتشات تتطابق مع bein-live)
   const final = rows
     .map((r) => {
       const iso = toIsoFromDataStart(r.data_start);
@@ -945,13 +950,157 @@ const hrefRaw = a?.getAttribute("href") || "";
   return final;
 }
 
+/**
+ * ✅ أهم تعديل:
+ * صفحات hard/*.html?match=7 بتولد playerv2.php بالـ JS (وممكن الدومين مختلف)
+ * فنستخرج match + host + key من scripts ونبني الرابط يدويًا.
+ */
+async function deriveSiiirPlayerV2Url(page) {
+  let pageUrl = "";
+  try {
+    pageUrl = page.url();
+  } catch {
+    pageUrl = "";
+  }
+  if (!pageUrl) return null;
+
+  try {
+    const u = new URL(pageUrl);
+
+    // لو احنا بالفعل على playerv2.php خلاص
+    if (u.pathname.toLowerCase().includes("playerv2.php")) return pageUrl;
+
+    // لازم match param
+    let matchId = u.searchParams.get("match");
+    matchId = normalizeDigits(matchId || "").trim();
+    matchId = matchId.replace(/^match/i, ""); // لو جت match7
+    if (!/^\d{1,5}$/.test(matchId)) return null;
+
+    const scriptsText = await page
+      .evaluate(() => Array.from(document.scripts).map((s) => s.textContent || "").join("\n"))
+      .catch(() => "");
+
+    if (!scriptsText) return null;
+
+    // استخرج host الخاص بـ playerv2.php
+    const hostMatch =
+      scriptsText.match(/https:\/\/([^\/\s"'`]+)\/playerv2\.php/i) ||
+      scriptsText.match(/playerUrl\s*=\s*`https:\/\/([^\/\s"'`]+)\/playerv2\.php/i);
+
+    const host = (hostMatch?.[1] || "").trim();
+    if (!host) return null;
+
+    // استخرج key
+    const keyMatch =
+      scriptsText.match(/key=([A-Za-z0-9]+)\b/i) ||
+      scriptsText.match(/&key=([^&"'`\s]+)\b/i);
+
+    const key = (keyMatch?.[1] || "").trim();
+    if (!key) return null;
+
+    return `https://${host}/playerv2.php?match=match${encodeURIComponent(matchId)}&key=${encodeURIComponent(key)}`;
+  } catch {
+    return null;
+  }
+}
 
 async function resolveSiiirPlayerIframeSrc(page, matchPageUrl) {
+    // ✅ لو SIIIR أعطانا hard wrapper مباشرة، ده هو اللينك اللي لازم نخزنه (يتحل مشكلة refused to connect)
+  if (matchPageUrl && /aleynoxitram\.sbs\/hard\/.+\.html\?match=\d+/i.test(matchPageUrl)) {
+    if (DIAG) diagWrite(`siiir/resolve_direct_${Date.now()}.txt`, matchPageUrl + "\n");
+    return matchPageUrl;
+  }
+
+  const candidates = new Set();
+  const ctx = page.context();
+
+  const onReq = (req) => {
+    try {
+      const u = req.url();
+      if (u) candidates.add(u);
+    } catch {}
+  };
+
+  const onPopup = async (p) => {
+    try {
+      await p.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => {});
+      const u = p.url();
+      if (u) candidates.add(u);
+    } catch {}
+    try {
+      await p.close();
+    } catch {}
+  };
+
+  const onCtxPage = async (p) => {
+    if (p === page) return;
+    try {
+      await p.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => {});
+      const u = p.url();
+      if (u) candidates.add(u);
+    } catch {}
+    try {
+      await p.close();
+    } catch {}
+  };
+
+  page.on("request", onReq);
+  page.on("popup", onPopup);
+  ctx.on("page", onCtxPage);
+
   try {
     await page.goto(matchPageUrl, { waitUntil: "domcontentloaded", timeout: DEEP_TIMEOUT_MS });
-    await page.waitForTimeout(1200);
 
-    // ساعات لازم click بسيط عشان iframe يتحطله src
+    // وقت إضافي عشان سكربت hard يبني iframe.src
+    await page.waitForTimeout(1600);
+        // ✅ استخرج أي لينك hard wrapper من الصفحة (أولوية)
+    const hardFromDom = await page.evaluate(() => {
+      const urls = [];
+
+      const push = (u) => {
+        if (!u || typeof u !== "string") return;
+        urls.push(u);
+      };
+
+      document.querySelectorAll("a[href]").forEach((a) => push(a.getAttribute("href")));
+      document.querySelectorAll("iframe[src], iframe[data-src]").forEach((f) => {
+        push(f.getAttribute("src"));
+        push(f.getAttribute("data-src"));
+      });
+
+      // كمان: ممكن يكون match id/لينك داخل scripts
+      document.querySelectorAll("script").forEach((s) => {
+        const t = s.textContent || "";
+        if (!t) return;
+        const m = t.match(/https?:\/\/[^"' ]+aleynoxitram\.sbs\/hard\/[^"' ]+\.html\?match=\d+/i);
+        if (m) push(m[0]);
+      });
+
+      // حول لروابط مطلقة
+      const abs = [];
+      for (const u of urls) {
+        try {
+          abs.push(new URL(u, location.href).toString());
+        } catch {}
+      }
+
+      return abs;
+    }).catch(() => []);
+
+    const hardCandidate = hardFromDom.find((u) => /aleynoxitram\.sbs\/hard\/.+\.html\?match=\d+/i.test(u)) || null;
+
+    if (DIAG) {
+      diagWrite(
+        `siiir/resolve_dom_${Date.now()}.json`,
+        JSON.stringify({ matchPageUrl, finalUrl: page.url(), hardCandidate, hardFromDom: hardFromDom.slice(0, 50) }, null, 2)
+      );
+    }
+
+    if (hardCandidate) return hardCandidate;
+
+    await page.waitForLoadState("networkidle", { timeout: 2500 }).catch(() => {});
+
+    // ساعات لازم click بسيط
     for (const sel of [
       ".video-serv a",
       ".video-serv button",
@@ -964,65 +1113,104 @@ async function resolveSiiirPlayerIframeSrc(page, matchPageUrl) {
         const el = page.locator(sel).first();
         if (await el.count()) {
           await el.click({ timeout: 2000, noWaitAfter: true }).catch(() => {});
-          await page.waitForTimeout(600);
+          await page.waitForTimeout(700);
           break;
         }
       } catch {}
     }
 
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(900);
 
-    const domUrls = await page.evaluate(() => {
-      const urls = [];
-      const push = (u) => { if (u && typeof u === "string") urls.push(u); };
+    // always collect current url (redirects)
+    try {
+      const cur = page.url();
+      if (cur) candidates.add(cur);
+    } catch {}
 
-      // iframe الأساسي
-      const f = document.querySelector("iframe#player");
-      push(f?.getAttribute("src"));
-      push(f?.src);
+    const domUrls = await page
+      .evaluate(() => {
+        const urls = [];
+        const push = (u) => {
+          if (u && typeof u === "string") urls.push(u);
+        };
 
-      // أي iframe تاني
-      document.querySelectorAll("#yalla-ajax-server iframe, .server-body iframe, iframe").forEach((ifr) => {
-        push(ifr.getAttribute("src"));
-        push(ifr.getAttribute("data-src"));
-        push(ifr.src);
-      });
+        const f = document.querySelector("iframe#player");
+        push(f?.getAttribute("src"));
+        push(f?.src);
 
-      // لينكات السيرفرات
-      document.querySelectorAll(".video-serv a[href], .server-body a[href], a[href*='player'], a[href*='embed']").forEach((a) => {
-        push(a.getAttribute("href"));
-        push(a.href);
-      });
+        document.querySelectorAll("#yalla-ajax-server iframe, .server-body iframe, iframe").forEach((ifr) => {
+          push(ifr.getAttribute("src"));
+          push(ifr.getAttribute("data-src"));
+          push(ifr.src);
+        });
 
-      // فيديو/سورس لو موجود
-      document.querySelectorAll("video source[src], video[src]").forEach((v) => {
-        push(v.getAttribute("src"));
-        push(v.src);
-      });
+        document.querySelectorAll(".video-serv a[href], .server-body a[href], a[href*='player'], a[href*='embed']").forEach((a) => {
+          push(a.getAttribute("href"));
+          push(a.href);
+        });
 
-      return urls;
-    }).catch(() => []);
+        document.querySelectorAll("video source[src], video[src]").forEach((v) => {
+          push(v.getAttribute("src"));
+          push(v.src);
+        });
 
-    // كمان ناخد frame urls
+        // التقط playerv2.php من داخل السكربت لو مكتوب كنص
+        const scriptsText = Array.from(document.scripts).map((s) => s.textContent || "").join("\n");
+        const m = scriptsText.match(/https:\/\/[^"'`\s]+\/playerv2\.php\?[^"'`\s]+/i);
+        if (m && m[0]) push(m[0]);
+
+        return urls;
+      })
+      .catch(() => []);
+
+    domUrls.forEach((u) => candidates.add(u));
+
     try {
       page.frames().forEach((fr) => {
         const u = fr.url();
-        if (u) domUrls.push(u);
+        if (u) candidates.add(u);
       });
     } catch {}
 
-    const clean = Array.from(new Set(domUrls))
+    // ✅ بناء playerv2.php يدويًا (الأهم)
+    const derived = await deriveSiiirPlayerV2Url(page);
+    if (derived) candidates.add(derived);
+
+    const clean = Array.from(candidates)
       .map((u) => normalizeUrl(u, matchPageUrl))
       .filter((u) => u && !isAdHost(u) && !isJunkCandidateUrl(u) && u !== matchPageUrl);
 
     const best = pickBestUrl(clean);
+    dbg("🟣 SIIIR best:", best || "None");
+
+    if (DIAG) {
+      diagWrite(
+        `siiir/resolve_debug_${Date.now()}.json`,
+        JSON.stringify(
+          { matchPageUrl, finalUrl: page.url(), derived, best, clean: clean.slice(0, 200) },
+          null,
+          2
+        )
+      );
+      await diagShot(page, `siiir/resolve_${Date.now()}.png`);
+    }
+
     return best || null;
   } catch (e) {
     dbg("⚠️ SIIIR resolve error:", e?.message || e);
     return null;
+  } finally {
+    try {
+      page.off("request", onReq);
+    } catch {}
+    try {
+      page.off("popup", onPopup);
+    } catch {}
+    try {
+      ctx.off("page", onCtxPage);
+    } catch {}
   }
 }
-
 
 async function enrichSiiirWithPlayerUrls(browser, siiirRows) {
   if (!siiirRows.length) return [];
