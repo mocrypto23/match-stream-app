@@ -209,17 +209,9 @@ export default function WatchPage() {
         <div className="mb-4 rounded-2xl border border-gray-800 bg-gradient-to-r from-[#1b1b1b] via-[#111111] to-[#1b1b1b] p-5 shadow-2xl">
           <div className="flex flex-col gap-2 items-center text-center">
             <div className="text-2xl sm:text-3xl font-black tracking-wide">
-              😄 احنا موقع لذيذ
+              مفيش اعلانات
             </div>
-            <div className="text-sm sm:text-base text-gray-300 leading-relaxed max-w-3xl">
-              لو دست على <span className="text-white font-semibold">أي إعلان</span>{" "}
-              مش حيِقرفك ويفتح في صفحة جديدة…
-              <span className="text-white font-black">
-                {" "}
-                الإعلان حيختفي والله ✅ وبمجرد ما تكبر البث مش حتشوف ولا اعلان
-                يزعجك
-              </span>
-            </div>
+
             <div className="text-2xl sm:text-3xl font-black tracking-wide">
               دبل كليك على الفيديو وحيكبر بسهولة
             </div>

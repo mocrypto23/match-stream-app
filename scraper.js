@@ -914,8 +914,14 @@ async function scrapeSiiirDay(page, dayKey) {
       const timeEl = match.querySelector(".MT_Time");
       const dataStart = (timeEl?.getAttribute("data-start") || "").trim();
 
-      const a = match.querySelector("a[href]");
-      const hrefRaw = a?.getAttribute("href") || "";
+      const a =
+  match.querySelector('a[href*="aleynoxitram.sbs/hard/"]') ||
+  match.querySelector('a[href*="/hard/"]') ||
+  match.querySelector('a[href*="playerv2.php"]') ||
+  match.querySelector("a[href]");
+
+const hrefRaw = a?.getAttribute("href") || "";
+
 
       let href = "";
       try {
@@ -1005,11 +1011,26 @@ async function deriveSiiirPlayerV2Url(page) {
 }
 
 async function resolveSiiirPlayerIframeSrc(page, matchPageUrl) {
-    // ✅ لو SIIIR أعطانا hard wrapper مباشرة، ده هو اللينك اللي لازم نخزنه (يتحل مشكلة refused to connect)
-  if (matchPageUrl && /aleynoxitram\.sbs\/hard\/.+\.html\?match=\d+/i.test(matchPageUrl)) {
-    if (DIAG) diagWrite(`siiir/resolve_direct_${Date.now()}.txt`, matchPageUrl + "\n");
-    return matchPageUrl;
+ // ✅ لو الرابط hard: افتحه واستخرج playerv2 (أفضل للعرض داخل iframe)
+// ولو فشل الاستخراج لأي سبب: ارجع للـ hard كـ fallback
+if (matchPageUrl && /aleynoxitram\.sbs\/hard\/.+\.html\?match=\d+/i.test(matchPageUrl)) {
+  try {
+    await page.goto(matchPageUrl, { waitUntil: "domcontentloaded", timeout: DEEP_TIMEOUT_MS });
+    await page.waitForTimeout(1200);
+
+    const derived = await deriveSiiirPlayerV2Url(page);
+    if (derived) {
+      if (DIAG) diagWrite(`siiir/resolve_direct_${Date.now()}.txt`, derived + "\n");
+      return derived;
+    }
+  } catch (e) {
+    // ignore and fallback below
   }
+
+  if (DIAG) diagWrite(`siiir/resolve_direct_${Date.now()}.txt`, matchPageUrl + "\n");
+  return matchPageUrl;
+}
+
 
   const candidates = new Set();
   const ctx = page.context();
@@ -1314,8 +1335,11 @@ function keyOfTeams(matchDay, home, away) {
 }
 
 function keyOfRow(r) {
+  // لو match_key موجود استخدمه (أفضل وأثبت)
+  if (r && r.match_key) return String(r.match_key);
   return keyOfTeams(r.match_day, r.home_team, r.away_team);
 }
+
 
 function isWeakStreamUrl(u) {
   if (!u) return true;
@@ -1337,8 +1361,9 @@ async function fetchExistingForDays(days) {
   const { data, error } = await supabase
     .from(TABLE_NAME)
     .select(
-      "home_team,away_team,home_logo,away_logo,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,match_day,match_start,match_time,home_score,away_score"
-    )
+  "match_key,home_team,away_team,home_logo,away_logo,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,match_day,match_start,match_time,home_score,away_score"
+)
+
     .in("match_day", days);
 
   if (error) {
@@ -1487,56 +1512,62 @@ async function startScraping() {
 
     // 3) Normalize bein-live rows
     const normalized = enriched.map((m) => {
-      const isoFromAttr = toIsoFromDataStart(m.data_start);
-      const match_day = cairoDayFromIso(isoFromAttr) || matchDayFromKey(m._day_key);
+  const isoFromAttr = toIsoFromDataStart(m.data_start);
+  const match_day = cairoDayFromIso(isoFromAttr) || matchDayFromKey(m._day_key);
 
-      let match_start = isoFromAttr || null;
+  let match_start = isoFromAttr || null;
 
-      const statusKeyDom = (m.deep_status_key_dom || m.status_key_dom || "unknown").toLowerCase();
-      const statusTextRaw = m.deep_status_text || m.status_text || "";
-      let statusKey = statusKeyDom !== "unknown" ? statusKeyDom : statusKeyFromText(statusTextRaw);
+  const statusKeyDom = (m.deep_status_key_dom || m.status_key_dom || "unknown").toLowerCase();
+  const statusTextRaw = m.deep_status_text || m.status_text || "";
+  let statusKey = statusKeyDom !== "unknown" ? statusKeyDom : statusKeyFromText(statusTextRaw);
 
-      if (statusKey === "unknown") {
-        if (m._day_key === "yesterday") statusKey = "finished";
-        else if (m._day_key === "tomorrow") statusKey = "upcoming";
-        else statusKey = "unknown";
-      }
+  if (statusKey === "unknown") {
+    if (m._day_key === "yesterday") statusKey = "finished";
+    else if (m._day_key === "tomorrow") statusKey = "upcoming";
+    else statusKey = "unknown";
+  }
 
-      const homeScoreRaw = m.deep_home_score_raw ?? m.home_score_raw;
-      const awayScoreRaw = m.deep_away_score_raw ?? m.away_score_raw;
-      const home_score = statusKey === "upcoming" ? null : parseScore(homeScoreRaw);
-      const away_score = statusKey === "upcoming" ? null : parseScore(awayScoreRaw);
+  const homeScoreRaw = m.deep_home_score_raw ?? m.home_score_raw;
+  const awayScoreRaw = m.deep_away_score_raw ?? m.away_score_raw;
+  const home_score = statusKey === "upcoming" ? null : parseScore(homeScoreRaw);
+  const away_score = statusKey === "upcoming" ? null : parseScore(awayScoreRaw);
 
-      const match_time =
-        statusKey === "upcoming"
-          ? (m.time_text || prettyTimeFromIso(match_start) || "—")
-          : (prettyTimeFromIso(match_start) || m.time_text || "—");
+  const match_time =
+    statusKey === "upcoming"
+      ? (m.time_text || prettyTimeFromIso(match_start) || "—")
+      : (prettyTimeFromIso(match_start) || m.time_text || "—");
 
-      const finalStreamUrl = m.deep_stream_url || m.match_url;
+  const finalStreamUrl = m.deep_stream_url || m.match_url;
 
-      // Server 2 attach (SIIIR)
-      const k = keyOfTeams(match_day, m.home_team, m.away_team);
-      const server2 = siiirMap.get(k) || null;
+  // ✅ مفتاح ثابت للماتش (اليوم + الفريقين) — ده اللي هيمنع تغيّر الـ id لاحقًا
+  const match_key = keyOfTeams(match_day, m.home_team, m.away_team);
 
-      return {
-        home_team: m.home_team,
-        away_team: m.away_team,
-        home_logo: m.home_logo,
-        away_logo: m.away_logo,
-        stream_url: finalStreamUrl,
-        stream_url_2: server2,
-        stream_url_3: null,
-        stream_url_4: null,
-        stream_url_5: null,
-        match_day,
-        match_start: match_start || null,
-        match_time,
-        home_score,
-        away_score,
-      };
-    });
+  // Server 2 attach (SIIIR)
+  const server2 = siiirMap.get(match_key) || null;
 
-    const finalRows = normalized.filter((r) => r.match_day && r.home_team && r.away_team && r.stream_url);
+  return {
+    // ✅ لازم يتبعت مع الصف للـ RPC
+    match_key,
+
+    home_team: m.home_team,
+    away_team: m.away_team,
+    home_logo: m.home_logo,
+    away_logo: m.away_logo,
+    stream_url: finalStreamUrl,
+    stream_url_2: server2,
+    stream_url_3: null,
+    stream_url_4: null,
+    stream_url_5: null,
+    match_day,
+    match_start: match_start || null,
+    match_time,
+    home_score,
+    away_score,
+  };
+});
+
+
+const finalRows = normalized.filter((r) => r.match_key && r.match_day && r.home_team && r.away_team && r.stream_url);
 
     if (!finalRows.length) {
       console.log("⚠️ لا توجد بيانات صالحة للإدخال.");
