@@ -414,7 +414,9 @@ function scoreCandidate(u) {
   let score = 0;
   if (s.includes("albaplayer")) score += 250;
   if (s.includes("kora-live")) score += 200;
-  if (s.includes("m3u8")) score += 300;
+// ❌ ممنوع m3u8 (بيعمل مشاكل عندك في التخزين)
+// خليه يخسر فورًا بدل ما يكسب
+if (s.includes("m3u8")) return -99999;
 if (s.includes("playerv2.php")) score += 1200;
   if (s.includes("embed")) score += 80;
   if (s.includes("player")) score += 60;
@@ -822,11 +824,14 @@ async function getDeepMatchDetails(page, matchUrl) {
       deep_has_score_hint: meta2.deep_has_score_hint || meta.deep_has_score_hint,
     };
 
-    const cleanUrls = Array.from(candidates)
-      .map((u) => normalizeUrl(u, matchUrl))
-      .filter((u) => u && !isJunkCandidateUrl(u) && !isAdHost(u) && u !== matchUrl);
+   const cleanUrls = Array.from(candidates)
+  .map((u) => normalizeUrl(u, matchUrl))
+  .filter((u) => u && !isJunkCandidateUrl(u) && !isAdHost(u) && u !== matchUrl)
+  // ✅ امنع m3u8 نهائيًا من Server 1
+  .filter((u) => !/\.m3u8(\?|$)/i.test(u));
 
-    const best = pickBestUrl(cleanUrls);
+const best = pickBestUrl(cleanUrls);
+
     dbg(`   🎯 Best Link for ${matchUrl}: ${best || "None"}`);
 
     return {
@@ -1303,8 +1308,12 @@ function isWeakStreamUrl(u) {
   if (s.includes("playerv2.php")) return false;
 
   // باقي المؤشرات المقبولة (سيرفرات أخرى)
-  const goodHints = ["m3u8", "embed", "player", "iframe", "albaplayer", "kora-live"];
-  return !goodHints.some((h) => s.includes(h));
+// ✅ امنع m3u8 من أنه يُعتبر "قوي" أو يتّحافظ عليه
+if (s.includes("m3u8")) return true;
+
+const goodHints = ["embed", "player", "iframe", "albaplayer", "kora-live"];
+return !goodHints.some((h) => s.includes(h));
+
 }
 
 
