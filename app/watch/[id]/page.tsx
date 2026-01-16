@@ -38,7 +38,7 @@ function formatStartTimeAr(iso?: string | null) {
 
 // ✅ سيرفر 1 وباقي السيرفرات (زي ما كان)
 const SAFE_IFRAME_SANDBOX =
-  "allow-scripts allow-same-origin";
+  "allow-scripts";
 
 // ✅ (اختياري) تفعيل sandbox لسيرفر 2 قد يمنع popups
 // ⚠️ لو السيرفر 2 اتعطل/رفض يشتغل: خليها false
