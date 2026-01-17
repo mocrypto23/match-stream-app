@@ -2,7 +2,6 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { supabase } from "@/lib/supabase";
 
 type MatchRow = {
   id: number;
@@ -36,17 +35,9 @@ function formatStartTimeAr(iso?: string | null) {
   }).format(d);
 }
 
-// ✅ سيرفر 1 وباقي السيرفرات (زي ما كان)
-const SAFE_IFRAME_SANDBOX =
-  "allow-scripts";
-
-// ✅ (اختياري) تفعيل sandbox لسيرفر 2 قد يمنع popups
-// ⚠️ لو السيرفر 2 اتعطل/رفض يشتغل: خليها false
+const SAFE_IFRAME_SANDBOX = "allow-scripts allow-same-origin";
 const USE_SERVER2_SANDBOX = true;
-
-// sandbox لسيرفر 2 بدون allow-popups (يعني يمنع النوافذ المنبثقة لو السيرفر يقبل)
-const SERVER2_SANDBOX =
-  "allow-scripts allow-same-origin";
+const SERVER2_SANDBOX = "allow-scripts allow-same-origin";
 
 export default function WatchPage() {
   const params = useParams();
@@ -58,14 +49,15 @@ export default function WatchPage() {
   }, [params]);
 
   const idNum = useMemo(() => {
-    const n = Number(rawId);
-    return Number.isFinite(n) ? n : null;
+    const s = String(rawId ?? "").trim();
+    if (!s) return null;
+    const n = Number.parseInt(s, 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
   }, [rawId]);
 
   const [match, setMatch] = useState<MatchRow | null>(null);
   const [loading, setLoading] = useState(true);
   const [errMsg, setErrMsg] = useState<string | null>(null);
-
   const [selectedServer, setSelectedServer] = useState<number>(1);
 
   useEffect(() => {
@@ -82,30 +74,27 @@ export default function WatchPage() {
         return;
       }
 
-      const { data, error } = await supabase
-        .from("match-stream-app")
-        .select(
-          "id, home_team, away_team, stream_url, stream_url_2, stream_url_3, stream_url_4, stream_url_5, match_start, status_key"
-        )
-        .eq("id", idNum)
-        .maybeSingle();
+      try {
+    const res = await fetch(`/api/match/${encodeURIComponent(String(idNum))}`);
 
-      if (cancelled) return;
 
-      if (error) {
-        setErrMsg(`خطأ أثناء جلب بيانات المباراة: ${error.message}`);
+        const json = await res.json().catch(() => null);
+
+        if (cancelled) return;
+
+        if (!res.ok) {
+          setErrMsg(json?.error || `فشل تحميل المباراة (${res.status})`);
+          setLoading(false);
+          return;
+        }
+
+        setMatch(json as MatchRow);
         setLoading(false);
-        return;
-      }
-
-      if (!data) {
-        setErrMsg("المباراة غير موجودة (لا يوجد سجل بهذا الرقم).");
+      } catch (e: any) {
+        if (cancelled) return;
+        setErrMsg(e?.message || "Network error");
         setLoading(false);
-        return;
       }
-
-      setMatch(data as MatchRow);
-      setLoading(false);
     };
 
     fetchMatch();
@@ -127,7 +116,6 @@ export default function WatchPage() {
       .map((x) => ({ n: x.n, url: x.url as string }));
   }, [match]);
 
-  // ✅ تثبيت سيرفر مختار لو الحالي مش موجود
   useEffect(() => {
     const exists = servers.some((x) => x.n === selectedServer);
     if (!exists && servers.length) setSelectedServer(servers[0].n);
@@ -142,10 +130,7 @@ export default function WatchPage() {
     return (
       <div className="min-h-screen bg-black text-white p-4">
         <div className="max-w-3xl mx-auto mt-10">
-          <button
-            onClick={() => router.back()}
-            className="mb-4 text-gray-400 hover:text-white"
-          >
+          <button onClick={() => router.back()} className="mb-4 text-gray-400 hover:text-white">
             ← العودة للرئيسية
           </button>
 
@@ -153,8 +138,7 @@ export default function WatchPage() {
             <div className="font-bold mb-2">تعذر فتح صفحة المشاهدة</div>
             <div className="text-gray-300 break-words">{errMsg}</div>
             <div className="text-gray-500 mt-3 text-sm">
-              لو المشكلة بسبب RLS: إمّا تسمح بالقراءة للـ anon على الجدول، أو تعرض
-              الصفحة كـ Client زي هنا مع جلسة المستخدم.
+              لو بتستخدم API routes: اتأكد إن _supabase.ts بيقرأ Service Role Key على السيرفر فقط.
             </div>
           </div>
         </div>
@@ -183,38 +167,26 @@ export default function WatchPage() {
   const startMs = match?.match_start ? new Date(match.match_start).getTime() : null;
   const startValid = startMs !== null && Number.isFinite(startMs);
 
-  const hasStartedByTime = startValid
-    ? nowMs >= (startMs as number) - 2 * 60 * 1000
-    : false;
+  const hasStartedByTime = startValid ? nowMs >= (startMs as number) - 2 * 60 * 1000 : false;
   const hasStartedByStatus = status === "live" || status === "finished";
   const isUpcomingByStatus = status === "upcoming";
 
-  const shouldBlockStream =
-    isUpcomingByStatus || (!hasStartedByStatus && startValid && !hasStartedByTime);
+  const shouldBlockStream = isUpcomingByStatus || (!hasStartedByStatus && startValid && !hasStartedByTime);
 
   const prettyStart = formatStartTimeAr(match?.match_start);
-
   const isServer2 = selectedServer === 2;
 
   return (
     <div className="min-h-screen bg-black text-white p-4">
       <div className="max-w-5xl mx-auto">
-        <button
-          onClick={() => router.back()}
-          className="mb-4 text-gray-400 hover:text-white"
-        >
+        <button onClick={() => router.back()} className="mb-4 text-gray-400 hover:text-white">
           ← العودة للرئيسية
         </button>
 
         <div className="mb-4 rounded-2xl border border-gray-800 bg-gradient-to-r from-[#1b1b1b] via-[#111111] to-[#1b1b1b] p-5 shadow-2xl">
           <div className="flex flex-col gap-2 items-center text-center">
-            <div className="text-2xl sm:text-3xl font-black tracking-wide">
-              مفيش اعلانات
-            </div>
-
-            <div className="text-2xl sm:text-3xl font-black tracking-wide">
-              دبل كليك على الفيديو وحيكبر بسهولة
-            </div>
+            <div className="text-2xl sm:text-3xl font-black tracking-wide">مفيش اعلانات</div>
+            <div className="text-2xl sm:text-3xl font-black tracking-wide">دبل كليك على الفيديو وحيكبر بسهولة</div>
           </div>
         </div>
 
@@ -243,13 +215,10 @@ export default function WatchPage() {
               <div className="text-white font-bold text-xl">لم يبدأ البث بعد</div>
               {prettyStart ? (
                 <div className="text-sm text-gray-400">
-                  موعد المباراة:{" "}
-                  <span className="text-gray-200">{prettyStart}</span>
+                  موعد المباراة: <span className="text-gray-200">{prettyStart}</span>
                 </div>
               ) : (
-                <div className="text-sm text-gray-500">
-                  سيتم تفعيل البث عند بدء المباراة.
-                </div>
+                <div className="text-sm text-gray-500">سيتم تفعيل البث عند بدء المباراة.</div>
               )}
             </div>
           ) : canEmbed ? (
@@ -263,7 +232,6 @@ export default function WatchPage() {
                   frameBorder={0}
                   allowFullScreen
                   allow="autoplay; fullscreen"
-                  // ✅ اختياري: sandbox لسيرفر 2 لمنع popups لو السيرفر يقبل
                   sandbox={USE_SERVER2_SANDBOX ? SERVER2_SANDBOX : undefined}
                   title={`Live Stream Server ${selectedServer}`}
                 />
@@ -285,9 +253,7 @@ export default function WatchPage() {
             )
           ) : (
             <div className="flex flex-col gap-2 items-center justify-center h-[55vh] min-h-[320px] text-gray-400 p-6 text-center">
-              <div className="text-gray-300 font-semibold">
-                رابط البث غير متوفر أو غير صالح للعرض داخل iframe
-              </div>
+              <div className="text-gray-300 font-semibold">رابط البث غير متوفر أو غير صالح للعرض داخل iframe</div>
 
               {selectedUrl ? (
                 <div className="text-xs text-gray-500 break-words">

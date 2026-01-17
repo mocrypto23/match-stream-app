@@ -1,6 +1,7 @@
+// app/page.tsx
 "use client";
+
 import { useEffect, useMemo, useState } from "react";
-import { supabase } from "@/lib/supabase";
 
 type DayKey = "yesterday" | "today" | "tomorrow";
 const TZ = "Africa/Cairo";
@@ -53,7 +54,6 @@ function hasScores(m: MatchRow) {
   return m.home_score !== null && m.away_score !== null;
 }
 
-// fallback only (if status_key missing)
 function isLiveWindow(matchStart: any) {
   const start = safeDate(matchStart);
   if (!start) return false;
@@ -95,34 +95,41 @@ export default function Home() {
   );
 
   useEffect(() => {
-    let cancelled = false;
+    const ac = new AbortController();
 
     const fetchMatches = async () => {
       setLoading(true);
       const matchDay = cairoDayStringFromOffset(dayToOffset(day));
 
-      const { data, error } = await supabase
-        .from("match-stream-app")
-        .select("*")
-        .eq("match_day", matchDay)
-        .order("match_start", { ascending: true, nullsFirst: false })
-        .order("id", { ascending: true });
+      try {
+        // ✅ بدل supabase client: هنجيب من API
+        const res = await fetch(`/api/matches?day=${encodeURIComponent(matchDay)}`, {
+          method: "GET",
+          signal: ac.signal,
+          headers: { Accept: "application/json" },
+        });
 
-      if (!cancelled) {
-        if (error) {
-          console.error("Supabase error:", error.message);
+        const json = (await res.json().catch(() => null)) as any;
+
+        if (!res.ok) {
+          console.error("API error:", json?.error || `HTTP ${res.status}`);
           setMatches([]);
-        } else {
-          setMatches((data || []) as MatchRow[]);
+          setLoading(false);
+          return;
         }
+
+        setMatches((Array.isArray(json) ? json : json?.data || []) as MatchRow[]);
+        setLoading(false);
+      } catch (e: any) {
+        if (e?.name === "AbortError") return;
+        console.error("Fetch error:", e?.message || e);
+        setMatches([]);
         setLoading(false);
       }
     };
 
     fetchMatches();
-    return () => {
-      cancelled = true;
-    };
+    return () => ac.abort();
   }, [day]);
 
   const sortedMatches = useMemo(() => {
@@ -133,14 +140,12 @@ export default function Home() {
 
       const sk = normalizeStatusKey(m.status_key);
 
-      // prefer scraper status
       if (day === "today") {
         if (sk === "live" || sk === "finished") return sk;
       }
 
       if (day === "tomorrow") return "upcoming" as const;
 
-      // fallback if status missing/unknown
       const scores = hasScores(m);
       if (scores && isFinishedByTime(m.match_start)) return "finished" as const;
       if (isLiveWindow(m.match_start)) return "live" as const;
@@ -286,4 +291,3 @@ export default function Home() {
     </div>
   );
 }
-  
