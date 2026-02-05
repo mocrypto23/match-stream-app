@@ -1,22 +1,14 @@
-// app/api/match/[id]/route.ts
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { supabaseAdmin } from "../../_supabase";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function extractId(req: Request, ctx: { params?: { id?: string } }) {
-  const fromParams = ctx?.params?.id;
-  if (fromParams) return fromParams;
-
-  // fallback: /api/match/123
-  const pathname = new URL(req.url).pathname;
-  const parts = pathname.split("/").filter(Boolean);
-  return parts[parts.length - 1] || null;
-}
-
-export async function GET(req: Request, ctx: { params?: { id?: string } }) {
-  const raw = extractId(req, ctx);
+export async function GET(
+  req: NextRequest,
+  context: { params: Promise<{ id: string }> }
+) {
+  const { id: raw } = await context.params;
   const id = raw ? Number.parseInt(raw, 10) : NaN;
 
   if (!raw || !Number.isFinite(id) || id <= 0) {
