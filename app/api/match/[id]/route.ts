@@ -4,11 +4,29 @@ import { supabaseAdmin } from "../../_supabase";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+<<<<<<< HEAD
 export async function GET(
   req: NextRequest,
   context: { params: Promise<{ id: string }> }
 ) {
   const { id: raw } = await context.params;
+=======
+// Next.js 16: params قد تكون Promise
+type Ctx = { params: Promise<{ id?: string }> };
+
+function extractIdFromPath(req: Request) {
+  // fallback: /api/match/123
+  const pathname = new URL(req.url).pathname;
+  const parts = pathname.split("/").filter(Boolean);
+  return parts[parts.length - 1] || null;
+}
+
+export async function GET(req: Request, ctx: Ctx) {
+  // ✅ unwrap params safely
+  const { id: fromParams } = await ctx.params;
+
+  const raw = fromParams ?? extractIdFromPath(req);
+>>>>>>> c99b50c (Update UI)
   const id = raw ? Number.parseInt(raw, 10) : NaN;
 
   if (!raw || !Number.isFinite(id) || id <= 0) {

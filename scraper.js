@@ -71,8 +71,12 @@ const SIIIR = {
     today: "https://w4.siiir.tv/today-matches/",
     tomorrow: "https://w4.siiir.tv/tomorrow-matches/",
   },
+  
 };
-
+// ===================== YALLALIVE (Server 3) Config =====================
+const YALLA = {
+  url: "https://yallalive.sx/",
+};
 // ===================== Anti-Ads Config =====================
 const AD_HOSTS = [
   "doubleclick.net",
@@ -160,11 +164,111 @@ diagTouch();
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 // ===================== URL Helpers =====================
+function isImageUrl(u) {
+  if (!u) return false;
+  const s = String(u).toLowerCase();
+  return /\.(png|jpe?g|gif|webp|svg|avif)(\?|#|$)/i.test(s);
+}
+
+function isMediaAssetUrl(u) {
+  if (!u) return false;
+  const s = String(u).toLowerCase();
+
+  // ملفات ستريم مباشرة/مقاطع HLS/DASH
+  if (/\.(m3u8|ts|m4s|mp4|webm|mpd|mkv|avi|mov|flv)(\?|#|$)/i.test(s)) return true;
+
+  // مسارات شائعة للستريم/المقاطع
+  if (s.includes("/hls/") || s.includes("/dash/") || s.includes("/live/")) return true;
+
+  // أسماء مقاطع شائعة
+  if (s.includes("seg_") || s.includes("segment") || s.includes("chunk") || s.includes("frag")) return true;
+
+  return false;
+}
+
+async function resolveFinalUrlViaBrowser(context, startUrl, { timeoutMs = 20000 } = {}) {
+  const intermediateHosts = new Set(
+    String(process.env.INTERMEDIATE_HOSTS || "linkb.my")
+      .split(",")
+      .map((x) => x.trim().toLowerCase())
+      .filter(Boolean)
+  );
+
+  const isIntermediate = (url) => {
+    try {
+      const host = new URL(url).hostname.toLowerCase();
+      return (
+        intermediateHosts.has(host) ||
+        Array.from(intermediateHosts).some((h) => host === h || host.endsWith("." + h))
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const isGoodFinal = (url) => {
+    if (!url) return false;
+    if (!/^https?:\/\//i.test(url)) return false;
+    if (isImageUrl(url)) return false;
+    if (isIntermediate(url)) return false;
+    return true;
+  };
+
+  const page = await context.newPage();
+  let finalUrl = null;
+
+  const remember = (u) => {
+    if (!u) return;
+    if (!finalUrl && isGoodFinal(u)) finalUrl = u;
+  };
+
+  const onPopup = async (p) => {
+    try {
+      await p.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => {});
+      remember(p.url());
+    } catch {}
+    try { await p.close(); } catch {}
+  };
+
+  const onCtxPage = async (p) => {
+    if (p === page) return;
+    try {
+      await p.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => {});
+      remember(p.url());
+    } catch {}
+    try { await p.close(); } catch {}
+  };
+
+  page.on("popup", onPopup);
+  context.on("page", onCtxPage);
+
+  try {
+    await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    remember(page.url());
+
+    const start = Date.now();
+    while (!finalUrl && Date.now() - start < timeoutMs) {
+      remember(page.url());
+
+      const href = await page.evaluate(() => location.href).catch(() => null);
+      if (href) remember(href);
+
+      await page.waitForTimeout(500);
+    }
+
+    return finalUrl;
+  } finally {
+    try { page.off("popup", onPopup); } catch {}
+    try { context.off("page", onCtxPage); } catch {}
+    try { await page.close(); } catch {}
+  }
+}
+
 function isJunkCandidateUrl(url) {
   if (!url) return true;
   const u = String(url).toLowerCase();
   return (
-/\.(css|js|png|jpg|jpeg|gif|svg|webp|avif|woff|woff2|ttf|eot|ico|json|map)(\?.*)?$/.test(u) ||
+/\.(css|js|png|jpg|jpeg|gif|svg|webp|avif|woff|woff2|ttf|eot|ico|json|map|m3u8|ts|m4s|mp4|mpd|webm)(\?.*)?$/.test(u) ||
     u.includes("cloudflareinsights.com") ||
     u.includes("beacon.min.js") ||
     u.includes("cf-beacon") ||
@@ -416,7 +520,7 @@ function scoreCandidate(u) {
   if (s.includes("kora-live")) score += 200;
 // ❌ ممنوع m3u8 (بيعمل مشاكل عندك في التخزين)
 // خليه يخسر فورًا بدل ما يكسب
-if (s.includes("m3u8")) return -99999;
+if (isMediaAssetUrl(s)) return -99999;
 if (s.includes("playerv2.php")) score += 1200;
   if (s.includes("embed")) score += 80;
   if (s.includes("player")) score += 60;
@@ -827,8 +931,9 @@ async function getDeepMatchDetails(page, matchUrl) {
    const cleanUrls = Array.from(candidates)
   .map((u) => normalizeUrl(u, matchUrl))
   .filter((u) => u && !isJunkCandidateUrl(u) && !isAdHost(u) && u !== matchUrl)
-  // ✅ امنع m3u8 نهائيًا من Server 1
-  .filter((u) => !/\.m3u8(\?|$)/i.test(u));
+  // ✅ امنع أي ملفات ستريم/segments نهائيًا (مش صفحة)
+  .filter((u) => !isMediaAssetUrl(u));
+
 
 const best = pickBestUrl(cleanUrls);
 
@@ -1298,23 +1403,25 @@ function isWeakStreamUrl(u) {
   if (!u) return true;
   const s = String(u).toLowerCase();
 
+  // ✅ ممنوع الصور تتحفظ كـ stream_url (ده سبب png في supabase غالبًا)
+  if (isImageUrl(s)) return true;
+
   // أي لينك بين-لايف ماتش ضعيف
   if (s.includes("bein-live.com") && s.includes("match")) return true;
 
-  // ✅ hard wrapper غير موثوق داخل iframe => اعتبره ضعيف
+  // hard wrapper غير موثوق داخل iframe => ضعيف
   if (s.includes("/hard/") && s.includes("aleynoxitram.sbs")) return true;
 
-  // ✅ أقوى شيء لServer2 هو playerv2
+  // أقوى شيء لServer2 هو playerv2
   if (s.includes("playerv2.php")) return false;
 
-  // باقي المؤشرات المقبولة (سيرفرات أخرى)
-// ✅ امنع m3u8 من أنه يُعتبر "قوي" أو يتّحافظ عليه
-if (s.includes("m3u8")) return true;
+  // ممنوع m3u8 عندك
+  if (s.includes("m3u8")) return true;
 
-const goodHints = ["embed", "player", "iframe", "albaplayer", "kora-live"];
-return !goodHints.some((h) => s.includes(h));
-
+  const goodHints = ["embed", "player", "iframe", "albaplayer", "kora-live"];
+  return !goodHints.some((h) => s.includes(h));
 }
+
 
 
 function preferExistingUrl(newUrl, oldUrl) {
@@ -1395,6 +1502,382 @@ function mergeWithExisting({ newRows, existingRows }) {
   }
 
   return { mergedRows: Array.from(mergedMap.values()) };
+}
+// ===================== YALLALIVE (Server 3) Functions =====================
+
+// 1. جلب قائمة مباريات اليوم (محدث بناء على HTML الموقع)
+async function scrapeYallaToday(page) {
+  console.log(`\n🔵 YALLA list: searching matches in #aspwp-today...`);
+  try {
+    await page.goto(YALLA.url, { waitUntil: "domcontentloaded", timeout: 60000 });
+    
+    // ننتظر ظهور جدول مباريات اليوم
+    try {
+      await page.waitForSelector("#aspwp-today .AF_Match", { timeout: 5000 });
+    } catch {
+      console.log("⚠️ Yalla selector timeout, trying generic parsing...");
+    }
+
+    const rows = await page.evaluate(() => {
+      const out = [];
+      // نبحث فقط داخل تبويب "اليوم"
+      const container = document.querySelector("#aspwp-today");
+      if (!container) return [];
+
+      // كل مباراة لها كلاس AF_Match
+      const matches = container.querySelectorAll(".AF_Match");
+
+      matches.forEach((m) => {
+        // استخراج الفريق الأول
+        const homeEl = m.querySelector(".AF_FTeam .AF_TeamName");
+        const home = homeEl ? homeEl.innerText.trim() : "";
+
+        // استخراج الفريق الثاني
+        const awayEl = m.querySelector(".AF_STeam .AF_TeamName");
+        const away = awayEl ? awayEl.innerText.trim() : "";
+
+        // استخراج الرابط (موجود داخل a.AF_EventMask)
+        const linkEl = m.querySelector("a.AF_EventMask");
+        const href = linkEl ? linkEl.href : "";
+
+        // استخراج حالة المباراة (للتأكد فقط)
+        const timeEl = m.querySelector(".AF_EvTime"); // مثلا 05:00 PM
+        
+        if (home && away && href) {
+          out.push({ 
+            home_team: home, 
+            away_team: away, 
+            match_url: href,
+            match_time_txt: timeEl ? timeEl.innerText : ""
+          });
+        }
+      });
+
+      return out;
+    });
+
+    // إضافة تاريخ اليوم
+    const todayDate = matchDayFromKey("today");
+    const final = rows.map(r => ({ ...r, match_day: todayDate }));
+
+    console.log(`🔵 YALLA Found: ${final.length} matches.`);
+    return final;
+
+  } catch (e) {
+    console.error("⚠️ YALLA List Error:", e.message);
+    return [];
+  }
+}
+
+// ✅ نسخة محدثة من resolveYallaStream - تتبع التحويلات المتعددة
+async function resolveYallaStream(page, matchUrl) {
+  if (!matchUrl) return null;
+
+  const isBad = (u) =>
+    !u ||
+    !/^https?:\/\//i.test(u) ||
+    isImageUrl(u) ||
+    /anewssport\.fun\/matches\//i.test(u) || // ❌ صفحة وسيطة مش نهائية
+    /yallalive\.sx\//i.test(u); // ❌ الصفحة الأولى مش نهائية
+
+  const isGoodIframe = (u) => {
+    if (!u) return false;
+    const s = String(u).toLowerCase();
+    // ✅ لازم يكون لينك embed/player حقيقي
+    return (
+      s.includes('yalla.php?id=') ||
+      s.includes('embed') ||
+      s.includes('player') ||
+      (s.includes('codepcplay') && s.includes('php'))
+    );
+  };
+
+  try {
+    console.log(`🔵 YALLA Step 1: Opening initial page: ${matchUrl}`);
+
+    // ✅ Step 1: افتح الصفحة الأولية (yallalive.sx) مع referer صحيح
+    await page.goto(matchUrl, { 
+      waitUntil: "domcontentloaded", 
+      timeout: 25000,
+      referer: "https://yallalive.sx/"
+    });
+    await page.waitForTimeout(1500);
+
+    // ✅ Step 2: شوف لو في تحويل تلقائي لصفحة وسيطة
+    let currentUrl = page.url();
+    console.log(`🔵 YALLA Step 2: Current URL after load: ${currentUrl}`);
+
+    // لو وصلنا لصفحة anewssport.fun، استنى شوية عشان الـ iframe يحمّل
+    if (currentUrl.includes('anewssport.fun')) {
+      console.log(`🔵 YALLA Step 3: Detected intermediate page, waiting for iframe...`);
+      await page.waitForTimeout(3000); // ✅ زودنا الوقت
+
+      // ✅ نحاول نضغط على زرار "مشاهدة" لو موجود
+      try {
+        const watchBtn = page.locator('button:has-text("مشاهدة"), a:has-text("مشاهدة"), .watch-btn, .play-btn');
+        if (await watchBtn.count() > 0) {
+          await watchBtn.first().click({ timeout: 3000 });
+          await page.waitForTimeout(2000);
+        }
+      } catch {}
+
+      // جرّب تلاقي الـ iframe في الصفحة الوسيطة
+      const iframeSrc = await page.evaluate(() => {
+        // بحث شامل عن كل الـ iframes
+        const iframes = Array.from(document.querySelectorAll('iframe'));
+        
+        for (const iframe of iframes) {
+          const src = iframe.getAttribute('src') || 
+                      iframe.getAttribute('data-src') || 
+                      iframe.src || 
+                      '';
+          
+          // لو لقينا iframe فيه yalla.php أو codepcplay
+          if (src && (src.includes('yalla.php') || src.includes('codepcplay'))) {
+            return src;
+          }
+        }
+
+        // لو مفيش، جرّب أي iframe غير فاضي
+        for (const iframe of iframes) {
+          const src = iframe.getAttribute('src') || iframe.src || '';
+          if (src && src.startsWith('http')) {
+            return src;
+          } 
+        }
+
+        return '';
+      });
+
+      if (iframeSrc && isGoodIframe(iframeSrc)) {
+        console.log(`✅ YALLA Found iframe in intermediate page: ${iframeSrc}`);
+        
+        // ✅ نتأكد إن الرابط بيشتغل بنفتحه في صفحة جديدة مع referer صحيح
+        const testPage = await page.context().newPage();
+        try {
+          await testPage.goto(iframeSrc, { 
+            waitUntil: "domcontentloaded", 
+            timeout: 10000,
+            referer: "https://anewssport.fun/"
+          });
+          await testPage.waitForTimeout(1000);
+          
+          // نشوف لو في رسالة خطأ
+          const bodyText = await testPage.evaluate(() => document.body?.innerText || '').catch(() => '');
+          if (bodyText.toLowerCase().includes('not allow') || bodyText.toLowerCase().includes('domain')) {
+            console.log(`⚠️ YALLA URL blocked: ${iframeSrc}`);
+            await testPage.close();
+            return null;
+          }
+          
+          await testPage.close();
+          return iframeSrc;
+        } catch (e) {
+          console.log(`⚠️ YALLA test failed: ${e.message}`);
+          try { await testPage.close(); } catch {}
+        }
+      }
+    }
+
+    // ✅ Step 4: جرّب استخراج من الـ SNS API (الطريقة الأصلية)
+    const sns = await page.evaluate(async () => {
+      try {
+        const idMeta = document.querySelector('meta[name="sns-post-id"]');
+        if (!idMeta?.content) return null;
+        
+        const pid = idMeta.content.trim();
+        const endpoint = `${location.origin}/wp-json/sns/v1/links?id=${encodeURIComponent(pid)}`;
+        
+        const r = await fetch(endpoint, { 
+          cache: "no-store",
+          headers: {
+            "Referer": location.origin,
+            "Origin": location.origin
+          }
+        }).catch(() => null);
+        
+        if (!r || !r.ok) return null;
+        const j = await r.json().catch(() => null);
+        return j && Array.isArray(j.urls) ? j.urls : null;
+      } catch {
+        return null;
+      }
+    }).catch(() => null);
+
+    if (sns && sns.length) {
+      console.log(`🔵 YALLA SNS API returned ${sns.length} URLs`);
+      const best = sns.find((u) => isGoodIframe(u));
+      if (best) {
+        console.log(`✅ YALLA Found good URL from SNS: ${best}`);
+        return best;
+      }
+    }
+
+    // ✅ Step 5: محاولة أخيرة - بحث في كل الـ iframes والروابط
+    const fallbackUrl = await page.evaluate(() => {
+      // جرّب كل iframe
+      const iframes = Array.from(document.querySelectorAll('iframe'));
+      for (const iframe of iframes) {
+        const src = iframe.getAttribute('src') || iframe.getAttribute('data-src') || iframe.src || '';
+        if (src && (src.includes('yalla.php') || src.includes('player') || src.includes('embed'))) {
+          return src;
+        }
+      }
+
+      // جرّب السيرفرات لو موجودة
+      const serverLinks = Array.from(document.querySelectorAll('.MW-Servers a, a[href*="yalla.php"]'));
+      for (const a of serverLinks) {
+        const href = a.getAttribute('href') || a.href || '';
+        if (href && href.includes('yalla.php')) {
+          return href;
+        }
+      }
+
+      return '';
+    });
+
+    if (fallbackUrl && isGoodIframe(fallbackUrl)) {
+      console.log(`✅ YALLA Found fallback URL: ${fallbackUrl}`);
+      return fallbackUrl;
+    }
+
+    console.log(`⚠️ YALLA No valid stream found for: ${matchUrl}`);
+    return null;
+
+  } catch (e) {
+    console.error("⚠️ YALLA resolve error:", e.message);
+    return null;
+  }
+}
+
+
+// ================= دالة enrichYallaWithStreams المُحدثة =================
+async function enrichYallaWithStreams(browser, rows) {
+  if (!rows.length) return [];
+  const limit = Math.min(CONCURRENCY, rows.length);
+  const queue = rows.map((r, idx) => ({ r, idx }));
+  const out = new Array(rows.length);
+
+  const worker = async (id) => {
+    const context = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      locale: "ar-EG",
+      timezoneId: TZ,
+      viewport: { width: 1280, height: 720 },
+      // ✅ تغيير الـ Referer الأساسي
+      extraHTTPHeaders: {
+        "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://anewssport.fun/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "https://anewssport.fun"
+      }
+    });
+
+    const page = await context.newPage();
+
+    // ✅ CRITICAL FIX: نضيف route handler لتزييف الـ Referer لكل طلب
+    await page.route("**/*", async (route) => {
+      const req = route.request();
+      const url = req.url();
+      
+      // لو الطلب رايح لـ codepcplay أو أي سيرفر بث
+      if (url.includes('codepcplay') || url.includes('yalla.php')) {
+        const headers = {
+          ...req.headers(),
+          'Referer': 'https://anewssport.fun/',
+          'Origin': 'https://anewssport.fun'
+        };
+        
+        await route.continue({ headers });
+      } else {
+        await route.continue();
+      }
+    });
+
+    while (queue.length) {
+      const item = queue.shift();
+      if (!item) break;
+
+      const { r, idx } = item;
+      console.log(`🔵 YALLA [W${id}] Processing: ${r.home_team} vs ${r.away_team}`);
+      const finalUrl = await resolveYallaStream(page, r.match_url);
+
+      out[idx] = { ...r, yalla_stream: finalUrl };
+    }
+
+    await context.close();
+  };
+
+  await Promise.all(Array.from({ length: limit }, (_, i) => worker(i + 1)));
+
+  return out.filter((x) => x && x.yalla_stream);
+}
+
+// 3. الموزع (Worker)
+async function enrichYallaWithStreams(browser, rows) {
+  if (!rows.length) return [];
+  const limit = Math.min(CONCURRENCY, rows.length);
+  const queue = rows.map((r, idx) => ({ r, idx }));
+  const out = new Array(rows.length);
+
+  const worker = async (id) => {
+    const context = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      locale: "ar-EG",
+      timezoneId: TZ,
+      viewport: { width: 1280, height: 720 },
+      // ✅ أضفنا الـ extraHTTPHeaders
+      extraHTTPHeaders: {
+        "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://anewssport.fun/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "https://anewssport.fun"
+      }
+    });
+
+    const page = await context.newPage();
+
+    // ✅ CRITICAL FIX: نضيف route handler لتزييف الـ Referer لكل طلب
+    await page.route("**/*", async (route) => {
+      const req = route.request();
+      const url = req.url();
+      
+      // لو الطلب رايح لـ codepcplay أو أي سيرفر بث
+      if (url.includes('codepcplay') || url.includes('yalla.php')) {
+        const headers = {
+          ...req.headers(),
+          'Referer': 'https://anewssport.fun/',
+          'Origin': 'https://anewssport.fun'
+        };
+        
+        await route.continue({ headers });
+      } else {
+        await route.continue();
+      }
+    });
+
+    // ✅ الجزء الناقص - اللوب اللي بيعالج الصفوف
+    while (queue.length) {
+      const item = queue.shift();
+      if (!item) break;
+
+      const { r, idx } = item;
+      console.log(`🔵 YALLA [W${id}] Processing: ${r.home_team} vs ${r.away_team}`);
+      const finalUrl = await resolveYallaStream(page, r.match_url);
+
+      out[idx] = { ...r, yalla_stream: finalUrl };
+    }
+
+    await context.close();
+  };
+
+  await Promise.all(Array.from({ length: limit }, (_, i) => worker(i + 1)));
+
+  return out.filter((x) => x && x.yalla_stream);
 }
 
 // ===================== Main =====================
@@ -1478,6 +1961,28 @@ async function startScraping() {
       if (!siiirMap.has(k)) siiirMap.set(k, r.siiir_stream_url);
     }
 
+// ================= START YALLA SECTION =================
+    const yallaContext = await browser.newContext({ 
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121.0.0.0 Safari/537.36" 
+    });
+    const yallaPage = await yallaContext.newPage();
+    
+    // نجلب القائمة
+    const yallaRows = await scrapeYallaToday(yallaPage);
+    await yallaPage.close();
+    await yallaContext.close();
+
+    // نستخرج الروابط
+    const yallaEnriched = await enrichYallaWithStreams(browser, yallaRows);
+
+    // نجهز الـ Map للبحث
+    const yallaMap = new Map();
+    for (const r of yallaEnriched) {
+      const k = keyOfTeams(r.match_day, r.home_team, r.away_team);
+      yallaMap.set(k, r.yalla_stream);
+    }
+    // ================= END YALLA SECTION =================
+
     // 3) Normalize bein-live rows
     const normalized = enriched.map((m) => {
   const isoFromAttr = toIsoFromDataStart(m.data_start);
@@ -1510,7 +2015,7 @@ async function startScraping() {
   // ✅ مفتاح ثابت للماتش (اليوم + الفريقين) — ده اللي هيمنع تغيّر الـ id لاحقًا
   const match_key = keyOfTeams(match_day, m.home_team, m.away_team);
 
-  // Server 2 attach (SIIIR)
+// Server 2 attach (SIIIR)
 let server2 = siiirMap.get(match_key) || null;
 
 // ✅ Server2 لازم يكون playerv2 فقط
@@ -1518,7 +2023,15 @@ if (server2 && !/\/playerv2\.php(\?|$)/i.test(String(server2))) {
   server2 = null;
 }
 
-  return {
+// Server 3 attach (YALLA)
+let server3 = yallaMap.get(match_key) || null;
+
+// ✅ امنع صفحة matches (لازم يكون لينك سيرفر/iframe)
+if (server3 && /anewssport\.fun\/matches\//i.test(String(server3))) {
+  server3 = null;
+}
+
+return {
     // ✅ لازم يتبعت مع الصف للـ RPC
     match_key,
 
@@ -1528,8 +2041,8 @@ if (server2 && !/\/playerv2\.php(\?|$)/i.test(String(server2))) {
     away_logo: m.away_logo,
     stream_url: finalStreamUrl,
     stream_url_2: server2,
-    stream_url_3: null,
-    stream_url_4: null,
+stream_url_3: server3,        // ✅ Server 3 Added Here
+stream_url_4: null,
     stream_url_5: null,
     match_day,
     match_start: match_start || null,
@@ -1569,6 +2082,16 @@ const finalRows = normalized.filter((r) => r.match_key && r.match_day && r.home_
     console.log(`📌 أيام التحديث: ${daysToRefresh.join(" , ")}`);
     console.log(`⬆️ صفوف نهائية بعد الدمج: ${mergedRows.length}`);
     console.log(`🗂️ جدول: ${TABLE_NAME}`);
+
+console.log("🧪 payload row sample:", {
+  match_key: mergedRows?.[0]?.match_key,
+  stream_url: mergedRows?.[0]?.stream_url,
+  stream_url_2: mergedRows?.[0]?.stream_url_2,
+  stream_url_3: mergedRows?.[0]?.stream_url_3,
+  home_logo: mergedRows?.[0]?.home_logo,
+  away_logo: mergedRows?.[0]?.away_logo,
+});
+
 
     const rpcRes = await supabase.rpc(RPC_NAME, {
       days: daysToRefresh,

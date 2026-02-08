@@ -38,6 +38,10 @@ function formatStartTimeAr(iso?: string | null) {
 const SAFE_IFRAME_SANDBOX = "allow-scripts allow-same-origin";
 const USE_SERVER2_SANDBOX = true;
 const SERVER2_SANDBOX = "allow-scripts allow-same-origin";
+const USE_SERVER3_SANDBOX = true;
+const SERVER3_SANDBOX = "allow-scripts allow-same-origin";
+
+const SERVER3_REFERRER_POLICY: React.HTMLAttributeReferrerPolicy = "no-referrer";
 
 export default function WatchPage() {
   const params = useParams();
@@ -75,8 +79,7 @@ export default function WatchPage() {
       }
 
       try {
-    const res = await fetch(`/api/match/${encodeURIComponent(String(idNum))}`);
-
+        const res = await fetch(`/api/match/${encodeURIComponent(String(idNum))}`);
 
         const json = await res.json().catch(() => null);
 
@@ -149,18 +152,21 @@ export default function WatchPage() {
   const home = match?.home_team ?? "الفريق الأول";
   const away = match?.away_team ?? "الفريق الثاني";
 
+  // ✅ التعديل الأساسي: استخدام الـ Proxy لـ Server 3
   const selectedUrl =
     selectedServer === 2
       ? match?.stream_url_2 ?? ""
       : selectedServer === 3
-      ? match?.stream_url_3 ?? ""
+      ? match?.stream_url_3
+        ? `/api/stream-proxy?url=${encodeURIComponent(match.stream_url_3)}`
+        : ""
       : selectedServer === 4
       ? match?.stream_url_4 ?? ""
       : selectedServer === 5
       ? match?.stream_url_5 ?? ""
       : match?.stream_url ?? "";
 
-  const canEmbed = selectedUrl && isValidHttpUrl(selectedUrl);
+  const canEmbed = selectedUrl && selectedUrl.length > 0;
 
   const status = (match?.status_key ?? "").toLowerCase();
   const nowMs = Date.now();
@@ -175,6 +181,7 @@ export default function WatchPage() {
 
   const prettyStart = formatStartTimeAr(match?.match_start);
   const isServer2 = selectedServer === 2;
+  const isServer3 = selectedServer === 3;
 
   return (
     <div className="min-h-screen bg-black text-white p-4">
@@ -235,6 +242,21 @@ export default function WatchPage() {
                   sandbox={USE_SERVER2_SANDBOX ? SERVER2_SANDBOX : undefined}
                   title={`Live Stream Server ${selectedServer}`}
                 />
+              </div>
+            ) : isServer3 ? (
+              <div className="aspect-video">
+                <iframe
+  key={`${selectedServer}-${selectedUrl}`}
+  src={selectedUrl}
+  className="w-full h-full"
+  allowFullScreen
+  scrolling="no"
+  allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
+  // referrerPolicy={SERVER3_REFERRER_POLICY}  // ❌ شيلها
+  sandbox={USE_SERVER3_SANDBOX ? SERVER3_SANDBOX : undefined}
+  title={`Live Stream Server ${selectedServer}`}
+/>
+
               </div>
             ) : (
               <div className="aspect-video">
