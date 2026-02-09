@@ -56,6 +56,30 @@ jobs:
           TZ: Africa/Cairo
         run: node scraper.js
 
+      - name: Trigger on-demand revalidation
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+        run: |
+          if [ -z "${SITE_URL}" ] || [ -z "${REVALIDATE_SECRET}" ]; then
+            echo "SITE_URL or REVALIDATE_SECRET is missing"
+            exit 1
+          fi
+
+          BODY='{"paths":["/","/watch/[id]"]}'
+          HTTP_CODE=$(curl -sS -o /tmp/revalidate.json -w "%{http_code}" \
+            -X POST "${SITE_URL%/}/api/revalidate" \
+            -H "Content-Type: application/json" \
+            -H "x-revalidate-secret: ${REVALIDATE_SECRET}" \
+            --data "${BODY}")
+
+          cat /tmp/revalidate.json || true
+
+          if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
+            echo "revalidation failed with HTTP ${HTTP_CODE}"
+            exit 1
+          fi
+
       - name: Diagnose Supabase rows (today)
         if: always()
         env:
