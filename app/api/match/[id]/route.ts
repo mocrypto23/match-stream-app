@@ -5,6 +5,10 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 type Ctx = { params: Promise<{ id?: string }> };
+const SELECT_WITH_SERVER_7 =
+  "id,home_team,away_team,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,stream_url_6,stream_url_7,match_start,status_key";
+const SELECT_LEGACY =
+  "id,home_team,away_team,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,match_start,status_key";
 
 function extractIdFromPath(req: Request) {
   const pathname = new URL(req.url).pathname;
@@ -21,13 +25,22 @@ export async function GET(req: Request, ctx: Ctx) {
     return NextResponse.json({ error: "Invalid id", raw }, { status: 400 });
   }
 
-  const { data, error } = await supabaseAdmin
+  let { data, error } = await supabaseAdmin
     .from("match-stream-app")
-    .select(
-      "id,home_team,away_team,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,match_start,status_key"
-    )
+    .select(SELECT_WITH_SERVER_7)
     .eq("id", id)
     .maybeSingle();
+
+  if (error && /stream_url_6|stream_url_7/i.test(error.message || "")) {
+    const legacyRes = await supabaseAdmin
+      .from("match-stream-app")
+      .select(SELECT_LEGACY)
+      .eq("id", id)
+      .maybeSingle();
+
+    error = legacyRes.error;
+    data = legacyRes.data ? { ...legacyRes.data, stream_url_6: null, stream_url_7: null } : legacyRes.data;
+  }
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   if (!data) return NextResponse.json({ error: "Not found" }, { status: 404 });
