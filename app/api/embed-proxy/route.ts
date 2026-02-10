@@ -137,6 +137,25 @@ const STREAM_HOST_DIRECT_SUFFIXES = Array.from(
   new Set([...DEFAULT_DIRECT_HOST_SUFFIXES, ...STREAM_HOST_DIRECT_FROM_ENV])
 );
 
+const M3U8_CACHE_TTL_MS = Math.max(
+  0,
+  Number.parseInt(process.env.EMBED_PROXY_M3U8_CACHE_TTL_MS || "2500", 10) || 2500
+);
+const M3U8_CACHE_MAX_ENTRIES = Math.max(
+  32,
+  Number.parseInt(process.env.EMBED_PROXY_M3U8_CACHE_MAX_ENTRIES || "300", 10) || 300
+);
+
+type ManifestCacheEntry = {
+  body: string;
+  expiresAt: number;
+  headers: Array<[string, string]>;
+  status: number;
+  statusText: string;
+};
+
+const manifestCache = new Map<string, ManifestCacheEntry>();
+
 function normalizeHost(host: string) {
   return String(host || "").trim().toLowerCase().replace(/\.$/, "");
 }
@@ -373,6 +392,27 @@ function rewriteM3u8Manifest(
       return toProxyUri(trimmed);
     })
     .join("\n");
+}
+
+function shouldUseManifestCacheForTarget(target: URL) {
+  const value = `${target.pathname}${target.search}`.toLowerCase();
+  return value.includes(".m3u8");
+}
+
+function buildManifestCacheKey(target: URL, depth: number, safeReferrer?: string | null) {
+  return `${target.toString()}|d=${depth}|r=${safeReferrer || ""}`;
+}
+
+function trimManifestCache(now = Date.now()) {
+  for (const [key, value] of manifestCache) {
+    if (value.expiresAt <= now) manifestCache.delete(key);
+  }
+
+  while (manifestCache.size > M3U8_CACHE_MAX_ENTRIES) {
+    const firstKey = manifestCache.keys().next().value as string | undefined;
+    if (!firstKey) break;
+    manifestCache.delete(firstKey);
+  }
 }
 
 function buildInjection(depth: number, currentTargetUrl: string, stableMode: boolean) {
@@ -1018,11 +1058,8 @@ function buildManualHlsFallbackSnippet({
 
   const toProxyWrap = (u) => {
     try {
-      if (typeof window.__embedProxyWrap === "function") return window.__embedProxyWrap(u);
-    } catch {}
-    try {
       const abs = new URL(String(u || ""), fallbackRef);
-      return "/api/embed-proxy?url=" + encodeURIComponent(abs.toString()) + "&depth=${nextDepth}&ref=" + encodeURIComponent(fallbackRef);
+      return "/api/embed-proxy?url=" + encodeURIComponent(abs.toString()) + "&depth=0&ref=" + encodeURIComponent(fallbackRef);
     } catch {
       return null;
     }
@@ -1124,9 +1161,12 @@ function buildManualHlsFallbackSnippet({
 
     destroyHls();
     hls = new window.Hls({
-      enableWorker: false,
-      lowLatencyMode: false,
-      backBufferLength: 60,
+      enableWorker: true,
+      lowLatencyMode: true,
+      maxBufferLength: 18,
+      maxMaxBufferLength: 24,
+      backBufferLength: 12,
+      liveSyncDurationCount: 3,
     });
     window.__embedProxyManualHls = hls;
     hls.attachMedia(v);
@@ -1276,11 +1316,8 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number) {
 
   const toProxyWrap = (u) => {
     try {
-      if (typeof window.__embedProxyWrap === "function") return window.__embedProxyWrap(u);
-    } catch {}
-    try {
       const abs = new URL(String(u || ""), location.href);
-      return "/api/embed-proxy?url=" + encodeURIComponent(abs.toString()) + "&depth=${nextDepth}&ref=" + encodeURIComponent(location.href);
+      return "/api/embed-proxy?url=" + encodeURIComponent(abs.toString()) + "&depth=0&ref=" + encodeURIComponent(location.href);
     } catch {
       return null;
     }
@@ -1487,7 +1524,14 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number) {
     }
 
     destroyHls();
-    hls = new window.Hls({ enableWorker: false, lowLatencyMode: false, backBufferLength: 60 });
+    hls = new window.Hls({
+      enableWorker: true,
+      lowLatencyMode: true,
+      maxBufferLength: 18,
+      maxMaxBufferLength: 24,
+      backBufferLength: 12,
+      liveSyncDurationCount: 3,
+    });
     window.__embedProxyYallaHls = hls;
     hls.attachMedia(video);
     hls.on(window.Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(source));
@@ -1961,6 +2005,25 @@ async function handleProxyRequest(req: Request) {
     const method = String(req.method || "GET").toUpperCase();
     const hasBody = method !== "GET" && method !== "HEAD";
     const body = hasBody ? await req.arrayBuffer() : undefined;
+    const manifestCacheKey =
+      method === "GET" && M3U8_CACHE_TTL_MS > 0 && shouldUseManifestCacheForTarget(target)
+        ? buildManifestCacheKey(target, depth, safeReferrer)
+        : null;
+
+    if (manifestCacheKey) {
+      const now = Date.now();
+      const cached = manifestCache.get(manifestCacheKey);
+      if (cached && cached.expiresAt > now) {
+        const headers = withProxyMetaHeaders(new Headers(cached.headers));
+        headers.set("x-embed-proxy-cache", "hit");
+        return new Response(cached.body, {
+          status: cached.status,
+          statusText: cached.statusText,
+          headers,
+        });
+      }
+      trimManifestCache(now);
+    }
 
     const upstream = await fetch(target.toString(), {
       method,
@@ -1974,6 +2037,16 @@ async function handleProxyRequest(req: Request) {
     const isHtml = contentType.includes("text/html") || contentType.includes("application/xhtml+xml");
     const isCss = contentType.includes("text/css");
 
+    if (method === "HEAD") {
+      const headers = withProxyMetaHeaders(filterResponseHeaders(upstream.headers, { html: false }));
+      headers.set("x-embed-proxy-cache", "bypass");
+      return new Response(null, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers,
+      });
+    }
+
     if (!isHtml) {
       if (isLikelyM3u8(target, contentType)) {
         const rawManifest = await upstream.text();
@@ -1985,6 +2058,19 @@ async function handleProxyRequest(req: Request) {
         );
         const headers = withProxyMetaHeaders(filterResponseHeaders(upstream.headers, { html: false }));
         headers.set("content-type", "application/vnd.apple.mpegurl; charset=utf-8");
+        headers.set("x-embed-proxy-cache", manifestCacheKey ? "miss" : "bypass");
+
+        if (manifestCacheKey && upstream.ok) {
+          manifestCache.set(manifestCacheKey, {
+            body: rewrittenManifest,
+            expiresAt: Date.now() + M3U8_CACHE_TTL_MS,
+            headers: Array.from(headers.entries()),
+            status: upstream.status,
+            statusText: upstream.statusText,
+          });
+          trimManifestCache();
+        }
+
         return new Response(rewrittenManifest, {
           status: upstream.status,
           statusText: upstream.statusText,
@@ -2038,5 +2124,9 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
+  return handleProxyRequest(req);
+}
+
+export async function HEAD(req: Request) {
   return handleProxyRequest(req);
 }

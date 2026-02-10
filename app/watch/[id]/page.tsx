@@ -272,6 +272,25 @@ export default function WatchPage() {
 
   const shouldBlockStream = !hasStartedByStatus && (startValid ? !hasStartedByTime : isUpcomingByStatus);
 
+  useEffect(() => {
+    if (!shouldUseEmbedProxy || !iframeSrc || shouldBlockStream) return;
+
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 1800);
+    fetch(iframeSrc, {
+      method: "HEAD",
+      cache: "no-store",
+      credentials: "same-origin",
+      signal: controller.signal,
+      headers: { "x-embed-proxy-warmup": "1" },
+    }).catch(() => {});
+
+    return () => {
+      window.clearTimeout(timeoutId);
+      controller.abort();
+    };
+  }, [iframeSrc, shouldBlockStream, shouldUseEmbedProxy, selectedServer]);
+
   const prettyStart = formatStartTimeAr(match?.match_start);
   const isServer2 = selectedServer === 2;
   const isServer3 = selectedServer === 3;
