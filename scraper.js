@@ -1657,6 +1657,32 @@ function findLivehdFallbackUrl(rows, { matchDay, homeTeam, awayTeam }) {
   return null;
 }
 
+function findYalaFallbackUrl(rows, { matchDay, homeTeam, awayTeam }) {
+  if (!Array.isArray(rows) || !rows.length || !matchDay || !homeTeam || !awayTeam) return null;
+
+  let best = null;
+  let bestScore = 0;
+
+  for (const r of rows) {
+    if (!r || !r.yala_stream_url) continue;
+    if (String(r.match_day || "") !== String(matchDay || "")) continue;
+
+    const direct =
+      teamSoftMatchScore(homeTeam, r.home_team) + teamSoftMatchScore(awayTeam, r.away_team);
+    const swapped =
+      teamSoftMatchScore(homeTeam, r.away_team) + teamSoftMatchScore(awayTeam, r.home_team);
+    const score = Math.max(direct, swapped);
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = r;
+    }
+  }
+
+  if (best && bestScore >= 4) return best.yala_stream_url;
+  return null;
+}
+
 function keyOfRow(r) {
   // لو match_key موجود استخدمه (أفضل وأثبت)
   if (r && r.match_key) return String(r.match_key);
@@ -1797,6 +1823,12 @@ function mergeWithExisting({ newRows, existingRows }) {
     out.stream_url_5 = deduped[3];
     out.stream_url_6 = deduped[4];
     out.stream_url_7 = deduped[5];
+
+    // Drop weak leftovers for newer optional servers.
+    if (isWeakStreamUrl(out.stream_url_4)) out.stream_url_4 = null;
+    if (isWeakStreamUrl(out.stream_url_5)) out.stream_url_5 = null;
+    if (isWeakStreamUrl(out.stream_url_6)) out.stream_url_6 = null;
+    if (isWeakStreamUrl(out.stream_url_7)) out.stream_url_7 = null;
 
     mergedMap.set(k, out);
   }
@@ -2141,6 +2173,12 @@ function scoreWithHostPreference(url, preferredHostHints = []) {
   return score;
 }
 
+function looksLikePlayerUrl(url) {
+  const s = String(url || "").toLowerCase();
+  if (!/^https?:\/\//i.test(s)) return false;
+  return /\/albaplayer\/|\/alba\.php|\/playerv2\.php(\?|$)|\/embed|\/player|\/tv\//i.test(s);
+}
+
 async function scrapeAyMatchDay(page, { sourceName, dayKey, url, diagPrefix }) {
   console.log(`\n🟡 ${sourceName} list: ${dayKey} => ${url}`);
   if (!url) return [];
@@ -2295,15 +2333,39 @@ async function resolveStreamFromPage(page, pageUrl, { preferredHostHints = [] } 
       .filter(Boolean)
       .filter((u) => u !== pageUrl && !isClearlyNonStreamUrl(u));
 
-    if (!candidates.length) return null;
+    const filtered = candidates.filter((u) => {
+      try {
+        const cu = new URL(u);
+        const pu = new URL(pageUrl);
+        const path = cu.pathname.toLowerCase().replace(/\/+$/, "") || "/";
+        const leaf = path.replace(/^\/+/, "");
 
-    const sorted = candidates.sort(
+        if (path === "/" && !cu.search) return false;
+        if (cu.hostname === pu.hostname && /^(matches(?:-(today|yesterday|tomorrow))?|category|tag|author)?$/i.test(leaf)) {
+          return false;
+        }
+        return true;
+      } catch {
+        return true;
+      }
+    });
+
+    if (!filtered.length) return null;
+
+    // Prefer direct player endpoints over wrapper/article pages.
+    const strongPlayerCandidates = filtered.filter((u) =>
+      /\/albaplayer\/|\/alba\.php|\/playerv2\.php(\?|$)/i.test(String(u))
+    );
+
+    const pool = strongPlayerCandidates.length ? strongPlayerCandidates : filtered;
+    const sorted = pool.sort(
       (a, b) => scoreWithHostPreference(b, preferredHostHints) - scoreWithHostPreference(a, preferredHostHints)
     );
 
     const best = sorted[0];
     if (!best) return null;
     if (scoreWithHostPreference(best, preferredHostHints) < -400) return null;
+    if (!looksLikePlayerUrl(best)) return null;
     return best;
   } catch {
     return null;
@@ -2317,6 +2379,27 @@ async function scrapeYalaDay(page, dayKey) {
     url: YALA.dayUrl[dayKey],
     diagPrefix: "yala",
   });
+}
+
+function deriveYalaFallbackPlayerUrl(rawUrl) {
+  const normalized = normalizeUrl(rawUrl, rawUrl);
+  if (!normalized) return null;
+
+  try {
+    const u = new URL(normalized);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase().replace(/^\/+|\/+$/g, "");
+
+    if ((host === "a.sia-bth.net" || host.endsWith(".sia-bth.net")) && path && !path.includes("albaplayer")) {
+      return `https://e.kooraxx.com/albaplayer/${path}/`;
+    }
+
+    if ((host === "e.kooraxx.com" || host.endsWith(".kooraxx.com")) && looksLikePlayerUrl(normalized)) {
+      return normalized;
+    }
+  } catch {}
+
+  return null;
 }
 
 async function enrichYalaWithStreams(browser, rows) {
@@ -2350,12 +2433,21 @@ async function enrichYalaWithStreams(browser, rows) {
       const raw = normalizeUrl(r.match_url, r.match_url);
       let finalUrl = null;
 
-      if (raw && !hostMatches(raw, YALA.siteHost)) {
-        finalUrl = raw;
-      } else if (raw) {
+      if (raw) {
         finalUrl = await resolveStreamFromPage(page, raw, {
-          preferredHostHints: ["a.sia-bth.net", "koora", "kora", "albaplayer", "pyxq.online"],
+          preferredHostHints: ["kooraxx.com", "a.sia-bth.net", "koora", "kora", "albaplayer", "pyxq.online"],
         });
+
+        if (!finalUrl) {
+          finalUrl = deriveYalaFallbackPlayerUrl(raw);
+        }
+
+        if (!finalUrl) {
+          const looksDirectPlayer = looksLikePlayerUrl(raw);
+          if (looksDirectPlayer && !isClearlyNonStreamUrl(raw)) finalUrl = raw;
+        }
+
+        if (finalUrl && !looksLikePlayerUrl(finalUrl)) finalUrl = null;
       }
 
       out[idx] = { ...r, yala_stream_url: finalUrl };
@@ -2377,10 +2469,78 @@ async function scrapeTskoraDay(page, dayKey) {
   });
 }
 
+async function enrichTskoraWithStreams(browser, rows) {
+  if (!rows.length) return [];
+
+  const limit = Math.min(CONCURRENCY, rows.length);
+  const queue = rows.map((r, idx) => ({ r, idx }));
+  const out = new Array(rows.length);
+
+  const worker = async (workerId) => {
+    const context = await browser.newContext({
+      locale: "ar-EG",
+      timezoneId: TZ,
+      serviceWorkers: "block",
+      extraHTTPHeaders: { "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7" },
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+      viewport: { width: 1280, height: 720 },
+    });
+
+    const page = await context.newPage();
+    await applyAntiAds(context, page);
+
+    while (queue.length) {
+      const item = queue.shift();
+      if (!item) break;
+
+      const { r, idx } = item;
+      console.log(`🟠 TSKORA [W${workerId}] (${idx + 1}/${rows.length}): ${r.home_team} vs ${r.away_team}`);
+
+      const raw = normalizeUrl(r.match_url, r.match_url);
+      let finalUrl = null;
+
+      if (raw) {
+        finalUrl = await resolveStreamFromPage(page, raw, {
+          preferredHostHints: ["pyxq.online", "albaplayer", "koora", "kora"],
+        });
+
+        if (!finalUrl) {
+          const fallback = pickTskoraStreamUrl(raw);
+          finalUrl = looksLikePlayerUrl(fallback) ? fallback : null;
+        }
+      }
+
+      out[idx] = { ...r, tskora_stream_url: finalUrl };
+    }
+
+    await context.close();
+  };
+
+  await Promise.all(Array.from({ length: limit }, (_, i) => worker(i + 1)));
+  return out.filter((x) => x && x.tskora_stream_url);
+}
+
 function pickTskoraStreamUrl(rawUrl) {
   const normalized = normalizeUrl(rawUrl, rawUrl);
   if (!normalized) return null;
   if (isClearlyNonStreamUrl(normalized)) return null;
+
+  try {
+    const u = new URL(normalized);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase();
+    const isPyxq = host === "p.pyxq.online" || host.endsWith(".pyxq.online");
+    const isAlreadyPlayer = path.includes("/albaplayer/") || path.includes("/alba.php");
+
+    if (isPyxq && !isAlreadyPlayer) {
+      const slug = path.replace(/^\/+|\/+$/g, "");
+      if (slug && /^[a-z0-9-]+$/i.test(slug)) {
+        return `${u.protocol}//${u.host}/albaplayer/${slug}/`;
+      }
+    }
+  } catch {}
+
   return normalized;
 }
 
@@ -2756,12 +2916,12 @@ async function startScraping() {
     await tskoraPage.close().catch(() => {});
     await tskoraContext.close().catch(() => {});
 
+    const tskoraEnriched = await enrichTskoraWithStreams(browser, tskoraAll);
     const tskoraMap = new Map();
-    for (const r of tskoraAll) {
-      const direct = pickTskoraStreamUrl(r.match_url);
-      if (!direct) continue;
+    for (const r of tskoraEnriched) {
+      if (!r.tskora_stream_url) continue;
       const k = keyOfTeams(r.match_day, r.home_team, r.away_team);
-      if (!tskoraMap.has(k)) tskoraMap.set(k, direct);
+      if (!tskoraMap.has(k)) tskoraMap.set(k, r.tskora_stream_url);
     }
 
     // 6) 1KORA articles + resolve stream url (Server 6)
@@ -2844,7 +3004,16 @@ async function startScraping() {
       }
 
       // Server 4 (YALA), Server 5 (TSKORA), Server 6 (1KORA), Server 7 (reserved)
-      const server4 = yalaMap.get(match_key) || null;
+      let server4 = yalaMap.get(match_key) || null;
+      if (!server4) {
+        server4 = findYalaFallbackUrl(yalaEnriched, {
+          matchDay: match_day,
+          homeTeam: m.home_team,
+          awayTeam: m.away_team,
+        });
+      }
+      if (server4 && !looksLikePlayerUrl(server4)) server4 = null;
+
       const server5 = tskoraMap.get(match_key) || null;
       const server6 = oneKoraMap.get(match_key) || null;
       const server7 = null;
@@ -2900,7 +3069,7 @@ async function startScraping() {
             siiir_count: siiirEnriched.length,
             livehd_count: livehdEnriched.length,
             yala_count: yalaEnriched.length,
-            tskora_count: tskoraAll.length,
+            tskora_count: tskoraEnriched.length,
             onekora_count: oneKoraEnriched.length,
           },
           null,
