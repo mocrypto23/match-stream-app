@@ -12,6 +12,8 @@ type MatchRow = {
   stream_url_3?: string | null;
   stream_url_4?: string | null;
   stream_url_5?: string | null;
+  stream_url_6?: string | null;
+  stream_url_7?: string | null;
   match_start?: string | null;
   status_key?: string | null;
 };
@@ -140,6 +142,8 @@ export default function WatchPage() {
       { n: 3, url: match?.stream_url_3 ?? null },
       { n: 4, url: match?.stream_url_4 ?? null },
       { n: 5, url: match?.stream_url_5 ?? null },
+      { n: 6, url: match?.stream_url_6 ?? null },
+      { n: 7, url: match?.stream_url_7 ?? null },
     ]
       .filter((x) => x.url && isValidHttpUrl(x.url))
       .map((x) => ({ n: x.n, url: x.url as string }));
@@ -188,6 +192,10 @@ export default function WatchPage() {
       ? match?.stream_url_4 ?? ""
       : selectedServer === 5
       ? match?.stream_url_5 ?? ""
+      : selectedServer === 6
+      ? match?.stream_url_6 ?? ""
+      : selectedServer === 7
+      ? match?.stream_url_7 ?? ""
       : match?.stream_url ?? "";
 
   const normalizedSelectedUrl = selectedServer === 3 ? normalizeServer3AlbaplayerUrl(selectedUrl) : selectedUrl;
