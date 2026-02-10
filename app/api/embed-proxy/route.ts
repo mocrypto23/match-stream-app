@@ -59,6 +59,15 @@ const STREAM_HOST_ALLOW_SUFFIXES = [
   "koora-stream.top",
   "alkoora.live",
   "livehd77.pro",
+  "bein-live.com",
+  "lifekora.com",
+  "taktikora.live",
+  "popcdn.day",
+  "lovetier.bz",
+  "sportzonline.click",
+  "dynamicsafari.net",
+  "lovecdn.ru",
+  "pandalive.live",
 ];
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -78,6 +87,11 @@ const ALLOWED_HOST_SUFFIXES = String(process.env.EMBED_PROXY_ALLOWED_HOSTS || ""
   .filter(Boolean);
 
 const STREAM_HOST_ALLOWLIST_FROM_ENV = String(process.env.EMBED_PROXY_STREAM_ALLOW_HOSTS || "")
+  .split(",")
+  .map((x) => x.trim().toLowerCase())
+  .filter(Boolean);
+
+const STREAM_HOST_DIRECT_FROM_ENV = String(process.env.EMBED_PROXY_DIRECT_HOSTS || "")
   .split(",")
   .map((x) => x.trim().toLowerCase())
   .filter(Boolean);
@@ -131,6 +145,10 @@ function isAllowedStreamHost(host: string) {
   return hostMatchesAny(host, [...STREAM_HOST_ALLOW_SUFFIXES, ...STREAM_HOST_ALLOWLIST_FROM_ENV]);
 }
 
+function shouldKeepDirectHost(host: string) {
+  return hostMatchesAny(host, STREAM_HOST_DIRECT_FROM_ENV);
+}
+
 function isBlockedAbsoluteUrl(absUrl: string) {
   try {
     const u = new URL(absUrl);
@@ -157,8 +175,9 @@ function toAbsoluteUrl(raw: string, baseUrl: string) {
   }
 }
 
-function buildProxyUrl(absUrl: string, nextDepth: number) {
-  return `/api/embed-proxy?url=${encodeURIComponent(absUrl)}&depth=${nextDepth}`;
+function buildProxyUrl(absUrl: string, nextDepth: number, refUrl?: string | null) {
+  const refPart = refUrl ? `&ref=${encodeURIComponent(refUrl)}` : "";
+  return `/api/embed-proxy?url=${encodeURIComponent(absUrl)}&depth=${nextDepth}${refPart}`;
 }
 
 function rewriteAttributeUrls(html: string, baseUrl: string, depth: number) {
@@ -182,9 +201,9 @@ function rewriteAttributeUrls(html: string, baseUrl: string, depth: number) {
       try {
         const maybeProxy = new URL(absolute);
         const host = normalizeHost(maybeProxy.hostname);
-        const keepDirect = isAllowedStreamHost(host);
+        const keepDirect = isAllowedStreamHost(host) || shouldKeepDirectHost(host);
         if (!keepDirect && maybeProxy.pathname !== "/api/embed-proxy" && depth < MAX_PROXY_DEPTH) {
-          rewritten = buildProxyUrl(absolute, nextDepth);
+          rewritten = buildProxyUrl(absolute, nextDepth, baseUrl);
         }
       } catch {}
 
@@ -211,9 +230,9 @@ function rewriteSrcsetUrls(html: string, baseUrl: string, depth: number) {
         if (!absolute || isBlockedAbsoluteUrl(absolute)) return null;
         let finalUrl = absolute;
         try {
-          const host = new URL(absolute).hostname;
-          if (!isAllowedStreamHost(host) && depth < MAX_PROXY_DEPTH) {
-            finalUrl = buildProxyUrl(absolute, nextDepth);
+          const host = normalizeHost(new URL(absolute).hostname);
+          if (!(isAllowedStreamHost(host) || shouldKeepDirectHost(host)) && depth < MAX_PROXY_DEPTH) {
+            finalUrl = buildProxyUrl(absolute, nextDepth, baseUrl);
           }
         } catch {}
         return descriptor ? `${finalUrl} ${descriptor}` : finalUrl;
@@ -225,18 +244,34 @@ function rewriteSrcsetUrls(html: string, baseUrl: string, depth: number) {
   });
 }
 
-function buildInjection(depth: number) {
+function buildInjection(depth: number, currentTargetUrl: string, stableMode: boolean) {
   const nextDepth = Math.min(MAX_PROXY_DEPTH, depth + 1);
   const blockedHosts = JSON.stringify(BLOCKED_HOST_SUFFIXES);
   const blockedWords = JSON.stringify(BLOCKED_KEYWORDS);
   const allowedHosts = JSON.stringify([...STREAM_HOST_ALLOW_SUFFIXES, ...STREAM_HOST_ALLOWLIST_FROM_ENV]);
+  const directHosts = JSON.stringify(STREAM_HOST_DIRECT_FROM_ENV);
+  const currentTarget = JSON.stringify(currentTargetUrl);
+  const stableModeJson = stableMode ? "true" : "false";
 
   return `
-<meta name="referrer" content="no-referrer">
 <style>
-  html, body { background: #000 !important; }
+  html, body {
+    background: #000 !important;
+    max-width: 100% !important;
+    overflow-x: hidden !important;
+  }
+  .aplr-player-wrapper, .aplr-player-content, .video-con, .embed-responsive, .server_container {
+    width: 100% !important;
+    max-width: 100% !important;
+  }
+  .aplr-menu, .servers_list {
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+  }
+  .aplr-menu { overflow-x: auto !important; }
+  iframe, video { max-width: 100% !important; }
   .popup, .popunder, .adsbox, .ad-container, .adsbygoogle,
-  [class*="popup"], [id*="popup"], [class*="overlay"], [id*="overlay"],
+  [class*="popup"], [id*="popup"],
   iframe[src*="adsco.re"], iframe[src*="intellipopup.com"], iframe[src*="blockadsnot.com"] {
     display: none !important;
     visibility: hidden !important;
@@ -248,6 +283,9 @@ function buildInjection(depth: number) {
   const blockedHosts = ${blockedHosts};
   const blockedWords = ${blockedWords};
   const allowedHosts = ${allowedHosts};
+  const directHosts = ${directHosts};
+  const currentTargetUrl = ${currentTarget};
+  const stableMode = ${stableModeJson};
   const proxyPath = "/api/embed-proxy";
   const nextDepth = ${nextDepth};
   const maxDepth = ${MAX_PROXY_DEPTH};
@@ -255,6 +293,14 @@ function buildInjection(depth: number) {
   const hostAllowed = (host) => {
     const h = String(host || "").toLowerCase();
     return allowedHosts.some((suffix) => h === suffix || h.endsWith("." + suffix));
+  };
+  
+  const hostDirect = (host) => {
+    const h = String(host || "").toLowerCase();
+    return (
+      hostAllowed(h) ||
+      directHosts.some((suffix) => h === suffix || h.endsWith("." + suffix))
+    );
   };
 
   const hostBlocked = (host) => {
@@ -269,7 +315,7 @@ function buildInjection(depth: number) {
 
   const isBlocked = (urlLike) => {
     try {
-      const u = new URL(String(urlLike), location.href);
+      const u = new URL(String(urlLike), currentTargetUrl);
       if (hostAllowed(u.hostname)) return hasBadWord(u.pathname + u.search);
       const hay = (u.hostname + u.pathname + u.search).toLowerCase();
       return hostBlocked(u.hostname) || hasBadWord(hay);
@@ -280,13 +326,24 @@ function buildInjection(depth: number) {
 
   const toProxy = (urlLike) => {
     try {
-      const abs = new URL(String(urlLike), location.href);
+      const raw = String(urlLike || "").trim();
+      if (!raw) return null;
+      if (raw.startsWith(proxyPath) || raw.startsWith(location.origin + proxyPath)) return raw;
+      const abs = new URL(raw, currentTargetUrl);
       if (!/^https?:$/i.test(abs.protocol)) return null;
-      if (abs.pathname === proxyPath) return abs.toString();
-      if (hostAllowed(abs.hostname)) return abs.toString();
+      if (abs.pathname === proxyPath && abs.origin === location.origin) return abs.toString();
+      if (hostDirect(abs.hostname)) return abs.toString();
       if (isBlocked(abs.toString())) return null;
       if (nextDepth > maxDepth) return abs.toString();
-      return proxyPath + "?url=" + encodeURIComponent(abs.toString()) + "&depth=" + nextDepth;
+      return (
+        proxyPath +
+        "?url=" +
+        encodeURIComponent(abs.toString()) +
+        "&depth=" +
+        nextDepth +
+        "&ref=" +
+        encodeURIComponent(currentTargetUrl)
+      );
     } catch {
       return null;
     }
@@ -306,25 +363,9 @@ function buildInjection(depth: number) {
     } catch {}
   };
 
-  const looksLikeAdOverlay = (el) => {
-    try {
-      const style = window.getComputedStyle(el);
-      const fixed = style.position === "fixed" || style.position === "sticky";
-      const z = Number.parseInt(style.zIndex || "0", 10);
-      if (!fixed || !Number.isFinite(z) || z < 1000) return false;
-      const rect = el.getBoundingClientRect();
-      const area = rect.width * rect.height;
-      const viewport = Math.max(1, window.innerWidth * window.innerHeight);
-      const hasVideo = !!el.querySelector("video, canvas");
-      return area > viewport * 0.15 && !hasVideo;
-    } catch {
-      return false;
-    }
-  };
-
   const stripBadNodes = () => {
     const obvious = document.querySelectorAll(
-      ".popup, .popunder, .adsbox, .ad-container, .adsbygoogle, [class*='popup'], [id*='popup'], [class*='overlay'], [id*='overlay']"
+      ".popup, .popunder, .adsbox, .ad-container, .adsbygoogle, [class*='popup'], [id*='popup']"
     );
     for (const el of obvious) {
       try { el.remove(); } catch {}
@@ -346,11 +387,6 @@ function buildInjection(depth: number) {
       } catch {}
     }
 
-    const overlays = document.querySelectorAll("div, section, aside, iframe");
-    for (const el of overlays) {
-      if (!looksLikeAdOverlay(el)) continue;
-      try { el.remove(); } catch {}
-    }
   };
 
   const rewriteToProxy = () => {
@@ -376,6 +412,115 @@ function buildInjection(depth: number) {
     }
   };
 
+  const interceptNetworkApis = () => {
+    try {
+      const nativeFetch = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        try {
+          const method =
+            String(
+              init?.method ||
+                (input instanceof Request ? input.method : "GET")
+            ).toUpperCase();
+          if (method === "GET") {
+            if (typeof input === "string" || input instanceof URL) {
+              const raw = String(input);
+              const rewritten = toProxy(raw);
+              if (rewritten && rewritten !== raw) return nativeFetch(rewritten, init);
+            } else if (input instanceof Request) {
+              const rewritten = toProxy(input.url);
+              if (rewritten && rewritten !== input.url) {
+                return nativeFetch(new Request(rewritten, input), init);
+              }
+            }
+          }
+        } catch {}
+        return nativeFetch(input, init);
+      };
+    } catch {}
+
+    try {
+      const nativeOpen = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function (...args) {
+        try {
+          if (args.length >= 2 && typeof args[1] === "string") {
+            const rewritten = toProxy(args[1]);
+            if (rewritten && rewritten !== args[1]) args[1] = rewritten;
+          }
+        } catch {}
+        return nativeOpen.apply(this, args);
+      };
+    } catch {}
+  };
+
+  const enforceStableServerMode = () => {
+    if (!stableMode) return;
+
+    let path = "";
+    try {
+      path = new URL(currentTargetUrl).pathname.toLowerCase();
+      if (!path.includes("/albaplayer/") && !path.includes("/alba.php")) return;
+    } catch {
+      return;
+    }
+
+    const fallbackServ = path.includes("/ad-sport-2/") ? "5" : "2";
+    const allowedServ = path.includes("/ad-sport-2/")
+      ? new Set(["4", "5"])
+      : new Set(["2", "5"]);
+    const menuLinks = document.querySelectorAll(".aplr-menu .aplr-link");
+
+    for (const link of menuLinks) {
+      const href = link.getAttribute("href") || "";
+      let keep = false;
+      try {
+        const u = new URL(href, currentTargetUrl);
+        const serv = (u.searchParams.get("serv") || "").trim();
+        keep = allowedServ.has(serv);
+      } catch {}
+      const parent = link.closest("li");
+      if (parent) {
+        parent.style.display = keep ? "" : "none";
+      }
+    }
+
+    const currentServ = (() => {
+      try {
+        return new URL(currentTargetUrl).searchParams.get("serv");
+      } catch {
+        return null;
+      }
+    })();
+
+    if (currentServ && !allowedServ.has(String(currentServ))) {
+      try {
+        const u = new URL(currentTargetUrl);
+        u.searchParams.set("serv", fallbackServ);
+        location.replace(u.toString());
+      } catch {}
+    }
+
+    document.addEventListener(
+      "click",
+      (ev) => {
+        const target = ev.target;
+        if (!target || typeof target.closest !== "function") return;
+        const a = target.closest(".aplr-menu .aplr-link");
+        if (!a) return;
+        const href = a.getAttribute("href") || "";
+        try {
+          const u = new URL(href, currentTargetUrl);
+          const serv = (u.searchParams.get("serv") || "").trim();
+          if (allowedServ.has(serv)) return;
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (typeof ev.stopImmediatePropagation === "function") ev.stopImmediatePropagation();
+        } catch {}
+      },
+      true
+    );
+  };
+
   const onClickCapture = (ev) => {
     const t = ev.target;
     if (!t || typeof t.closest !== "function") return;
@@ -390,6 +535,8 @@ function buildInjection(depth: number) {
 
   const start = () => {
     lockPopupApis();
+    interceptNetworkApis();
+    enforceStableServerMode();
     rewriteToProxy();
     stripBadNodes();
 
@@ -434,17 +581,36 @@ function parseDepth(value: string | null) {
   return Math.min(MAX_PROXY_DEPTH, Math.max(0, parsed));
 }
 
-function buildUpstreamRequestHeaders(req: Request, target: URL) {
+function parseSafeReferrer(value: string | null) {
+  if (!value) return null;
+  try {
+    const u = new URL(value);
+    if (!/^https?:$/i.test(u.protocol)) return null;
+    if (isPrivateHost(u.hostname)) return null;
+    u.hash = "";
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+function buildUpstreamRequestHeaders(req: Request, target: URL, referrerUrl?: string | null) {
   const out = new Headers();
   const incoming = new Headers(req.headers);
+  const fallbackReferrer = `${target.protocol}//${target.host}/`;
+  const referer = referrerUrl || fallbackReferrer;
+  let origin = `${target.protocol}//${target.host}`;
+  try {
+    origin = new URL(referer).origin;
+  } catch {}
 
   out.set("user-agent", incoming.get("user-agent") || DEFAULT_USER_AGENT);
   out.set("accept", incoming.get("accept") || "*/*");
   out.set("accept-language", incoming.get("accept-language") || "ar,en-US;q=0.9,en;q=0.8");
   // Ask upstream for plain payloads to avoid encoding/header mismatches when re-streaming.
   out.set("accept-encoding", "identity");
-  out.set("referer", `${target.protocol}//${target.host}/`);
-  out.set("origin", `${target.protocol}//${target.host}`);
+  out.set("referer", referer);
+  out.set("origin", origin);
   out.set("cache-control", "no-cache");
   out.set("pragma", "no-cache");
 
@@ -488,6 +654,8 @@ export async function GET(req: Request) {
     const requestUrl = new URL(req.url);
     const rawUrl = requestUrl.searchParams.get("url");
     const depth = parseDepth(requestUrl.searchParams.get("depth"));
+    const safeReferrer = parseSafeReferrer(requestUrl.searchParams.get("ref"));
+    const stableMode = requestUrl.searchParams.get("stable") === "1";
 
     if (!rawUrl) {
       return NextResponse.json({ error: "Missing query parameter: url" }, { status: 400 });
@@ -524,7 +692,7 @@ export async function GET(req: Request) {
 
     const upstream = await fetch(target.toString(), {
       method: "GET",
-      headers: buildUpstreamRequestHeaders(req, target),
+      headers: buildUpstreamRequestHeaders(req, target, safeReferrer),
       redirect: "follow",
       cache: "no-store",
     });
@@ -544,7 +712,7 @@ export async function GET(req: Request) {
     let html = await upstream.text();
     html = rewriteAttributeUrls(html, target.toString(), depth);
     html = rewriteSrcsetUrls(html, target.toString(), depth);
-    html = injectProtection(html, buildInjection(depth));
+    html = injectProtection(html, buildInjection(depth, target.toString(), stableMode));
 
     const headers = filterResponseHeaders(upstream.headers, { html: true });
     headers.set("content-type", "text/html; charset=utf-8");
