@@ -40,6 +40,31 @@ const USE_SERVER2_SANDBOX = true;
 const SERVER2_SANDBOX = "allow-scripts allow-same-origin";
 const USE_SERVER3_SANDBOX = true;
 const SERVER3_SANDBOX = "allow-scripts allow-same-origin";
+const USE_EMBED_PROXY = true;
+const EMBED_PROXY_SANDBOX = "allow-scripts allow-same-origin allow-forms allow-presentation allow-pointer-lock";
+
+function toEmbedProxyUrl(rawUrl?: string | null) {
+  const value = String(rawUrl || "").trim();
+  if (!value || !isValidHttpUrl(value)) return "";
+  return `/api/embed-proxy?url=${encodeURIComponent(value)}&depth=0`;
+}
+
+function normalizeServer3AlbaplayerUrl(rawUrl?: string | null) {
+  const value = String(rawUrl || "").trim();
+  if (!value || !isValidHttpUrl(value)) return value;
+  try {
+    const u = new URL(value);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase();
+    const isAlbaplayer = path.includes("/albaplayer/") || path.includes("/alba.php");
+    const isLivehdChain = host.includes("alkoora.live") || host.includes("livehd77.pro");
+    if (!isLivehdChain || !isAlbaplayer) return value;
+    u.searchParams.set("serv", "2");
+    return u.toString();
+  } catch {
+    return value;
+  }
+}
 
 export default function WatchPage() {
   const params = useParams();
@@ -150,7 +175,7 @@ export default function WatchPage() {
   const home = match?.home_team ?? "الفريق الأول";
   const away = match?.away_team ?? "الفريق الثاني";
 
-  // Server 3 uses the scraped embeddable URL directly.
+  // Selected server URL from DB.
   const selectedUrl =
     selectedServer === 2
       ? match?.stream_url_2 ?? ""
@@ -162,7 +187,10 @@ export default function WatchPage() {
       ? match?.stream_url_5 ?? ""
       : match?.stream_url ?? "";
 
-  const canEmbed = selectedUrl && selectedUrl.length > 0;
+  const normalizedSelectedUrl = selectedServer === 3 ? normalizeServer3AlbaplayerUrl(selectedUrl) : selectedUrl;
+  const shouldUseEmbedProxy = USE_EMBED_PROXY && selectedServer === 3;
+  const iframeSrc = shouldUseEmbedProxy ? toEmbedProxyUrl(normalizedSelectedUrl) : normalizedSelectedUrl;
+  const canEmbed = iframeSrc.length > 0;
 
   const status = (match?.status_key ?? "").toLowerCase();
   const nowMs = Date.now();
@@ -228,28 +256,40 @@ export default function WatchPage() {
             isServer2 ? (
               <div className="relative">
                 <iframe
-                  key={`${selectedServer}-${selectedUrl}`}
-                  src={selectedUrl}
+                  key={`${selectedServer}-${iframeSrc}`}
+                  src={iframeSrc}
                   className="w-full block"
                   style={{ height: 550 }}
                   frameBorder={0}
                   allowFullScreen
                   allow="autoplay; fullscreen"
-                  sandbox={USE_SERVER2_SANDBOX ? SERVER2_SANDBOX : undefined}
+                  sandbox={
+                    shouldUseEmbedProxy
+                      ? EMBED_PROXY_SANDBOX
+                      : USE_SERVER2_SANDBOX
+                      ? SERVER2_SANDBOX
+                      : undefined
+                  }
                   title={`Live Stream Server ${selectedServer}`}
                 />
               </div>
             ) : isServer3 ? (
               <div className="aspect-video">
                 <iframe
-  key={`${selectedServer}-${selectedUrl}`}
-  src={selectedUrl}
+  key={`${selectedServer}-${iframeSrc}`}
+  src={iframeSrc}
   className="w-full h-full"
   allowFullScreen
   scrolling="no"
   allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
   // referrerPolicy={SERVER3_REFERRER_POLICY}  // ❌ شيلها
-  sandbox={USE_SERVER3_SANDBOX ? SERVER3_SANDBOX : undefined}
+  sandbox={
+    shouldUseEmbedProxy
+      ? EMBED_PROXY_SANDBOX
+      : USE_SERVER3_SANDBOX
+      ? SERVER3_SANDBOX
+      : undefined
+  }
   title={`Live Stream Server ${selectedServer}`}
 />
 
@@ -257,14 +297,14 @@ export default function WatchPage() {
             ) : (
               <div className="aspect-video">
                 <iframe
-                  key={`${selectedServer}-${selectedUrl}`}
-                  src={selectedUrl}
+                  key={`${selectedServer}-${iframeSrc}`}
+                  src={iframeSrc}
                   className="w-full h-full"
                   allowFullScreen
                   scrolling="no"
                   allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
                   referrerPolicy="no-referrer"
-                  sandbox={SAFE_IFRAME_SANDBOX}
+                  sandbox={shouldUseEmbedProxy ? EMBED_PROXY_SANDBOX : SAFE_IFRAME_SANDBOX}
                   title={`Live Stream Server ${selectedServer}`}
                 />
               </div>
@@ -273,15 +313,15 @@ export default function WatchPage() {
             <div className="flex flex-col gap-2 items-center justify-center h-[55vh] min-h-[320px] text-gray-400 p-6 text-center">
               <div className="text-gray-300 font-semibold">رابط البث غير متوفر أو غير صالح للعرض داخل iframe</div>
 
-              {selectedUrl ? (
+              {normalizedSelectedUrl ? (
                 <div className="text-xs text-gray-500 break-words">
-                  الحالي: <span className="text-gray-400">{selectedUrl}</span>
+                  الحالي: <span className="text-gray-400">{normalizedSelectedUrl}</span>
                 </div>
               ) : null}
 
-              {selectedUrl ? (
+              {normalizedSelectedUrl ? (
                 <a
-                  href={selectedUrl}
+                  href={normalizedSelectedUrl}
                   target="_blank"
                   rel="noreferrer"
                   className="mt-3 text-sm font-bold text-blue-400 hover:text-blue-300"

@@ -97,6 +97,35 @@ const AD_HOSTS = [
   "pushpushgo.com",
   "hilltopads.net",
   "identitylumber.com",
+  "adsco.re",
+  "dishtrainer.net",
+  "intellipopup.com",
+  "blockadsnot.com",
+  "adexchangeclear.com",
+  "usrpubtrk.com",
+  "histats.com",
+  "histats.net",
+  "trafficstars.com",
+  "ero-advertising.com",
+  "juicyads.com",
+  "exoclick.com",
+  "adnxs.com",
+  "criteo.com",
+  "adform.net",
+  "rtbhouse.com",
+  "bidvertiser.com",
+];
+
+const ADULT_HINTS = [
+  "porn",
+  "xxx",
+  "xnxx",
+  "xvideos",
+  "redtube",
+  "hentai",
+  "camgirl",
+  "cam4",
+  "adult",
 ];
 
 const BOT_HINTS = [
@@ -290,6 +319,12 @@ function isAdHost(url) {
   }
 }
 
+function isAdultUrl(url) {
+  if (!url) return false;
+  const s = String(url).toLowerCase();
+  return ADULT_HINTS.some((hint) => s.includes(hint));
+}
+
 async function applyStealth(page) {
   await page.addInitScript(() => {
     try {
@@ -325,18 +360,29 @@ async function applyAntiAds(context, page) {
     } catch {}
   });
 
-  await page.addInitScript((adHosts) => {
+  await page.addInitScript((adHosts, adultHints) => {
     try {
       const isBad = (host) => adHosts.some((h) => host === h || host.endsWith("." + h));
+      const hasAdultHint = (value) => {
+        const s = String(value || "").toLowerCase();
+        return adultHints.some((hint) => s.includes(hint));
+      };
+
+      const isBlockedUrl = (raw) => {
+        try {
+          const abs = new URL(String(raw), location.href);
+          const host = abs.hostname.toLowerCase();
+          const hay = `${host}${abs.pathname}${abs.search}`.toLowerCase();
+          return isBad(host) || hasAdultHint(hay);
+        } catch {
+          return hasAdultHint(raw);
+        }
+      };
 
       const origOpen = window.open.bind(window);
       window.open = function (url, name, features) {
         try {
-          if (url) {
-            const abs = new URL(String(url), location.href);
-            const host = abs.hostname.toLowerCase();
-            if (isBad(host)) return null;
-          }
+          if (url && isBlockedUrl(url)) return null;
         } catch {}
         return origOpen(url, name, features);
       };
@@ -351,14 +397,30 @@ async function applyAntiAds(context, page) {
         },
         set() {},
       });
+
+      document.addEventListener(
+        "click",
+        (ev) => {
+          try {
+            const a = ev?.target?.closest?.("a[href]");
+            const href = a?.getAttribute?.("href") || "";
+            if (href && isBlockedUrl(href)) {
+              ev.preventDefault();
+              ev.stopPropagation();
+              if (typeof ev.stopImmediatePropagation === "function") ev.stopImmediatePropagation();
+            }
+          } catch {}
+        },
+        true
+      );
     } catch {}
-  }, AD_HOSTS);
+  }, AD_HOSTS, ADULT_HINTS);
 
   await page.route("**/*", (route) => {
     try {
       const req = route.request();
       const url = req.url();
-      if (isAdHost(url)) return route.abort();
+      if (isAdHost(url) || isAdultUrl(url)) return route.abort();
       if (typeof route.fallback === "function") return route.fallback();
       return route.continue();
     } catch {
@@ -513,6 +575,7 @@ function scoreCandidate(u) {
   const s = u.toLowerCase();
 
   if (isJunkCandidateUrl(s)) return -99999;
+  if (isAdultUrl(s)) return -99999;
   if (s === "about:blank") return -9999;
   if (isAdHost(s) || s.includes("googleads") || s.includes("doubleclick")) return -5000;
   if (BOT_HINTS.some((h) => s.includes(h))) return -4000;
@@ -932,7 +995,7 @@ async function getDeepMatchDetails(page, matchUrl) {
 
    const cleanUrls = Array.from(candidates)
   .map((u) => normalizeUrl(u, matchUrl))
-  .filter((u) => u && !isJunkCandidateUrl(u) && !isAdHost(u) && u !== matchUrl)
+.filter((u) => u && !isJunkCandidateUrl(u) && !isAdHost(u) && !isAdultUrl(u) && u !== matchUrl)
   // ✅ امنع أي ملفات ستريم/segments نهائيًا (مش صفحة)
   .filter((u) => !isMediaAssetUrl(u));
 
@@ -1249,7 +1312,7 @@ async function resolveSiiirPlayerIframeSrc(page, matchPageUrl) {
     // ====== Phase 2: تنظيف + فرض playerv2 فقط ======
     const clean = Array.from(candidates)
       .map((u) => normalizeUrl(u, matchPageUrl))
-      .filter((u) => u && !isAdHost(u) && !isJunkCandidateUrl(u) && u !== matchPageUrl);
+      .filter((u) => u && !isAdHost(u) && !isAdultUrl(u) && !isJunkCandidateUrl(u) && u !== matchPageUrl);
 
     // ✅ ممنوع نرجع hard نهائيًا
     const onlyPlayer = clean.filter((u) => isPlayerV2(u));
@@ -1439,6 +1502,50 @@ function keyOfTeams(matchDay, home, away) {
   return `${day}||${pair}`;
 }
 
+function teamSoftMatchScore(teamA, teamB) {
+  const a = canonTeamName(teamA);
+  const b = canonTeamName(teamB);
+  if (!a || !b) return 0;
+  if (a === b) return 3;
+
+  const minLen = Math.min(a.length, b.length);
+  if (minLen >= 4 && (a.includes(b) || b.includes(a))) return 2;
+
+  let commonPrefix = 0;
+  const maxPrefix = Math.min(a.length, b.length);
+  while (commonPrefix < maxPrefix && a[commonPrefix] === b[commonPrefix]) commonPrefix += 1;
+  if (minLen >= 5 && commonPrefix >= Math.max(4, Math.floor(minLen * 0.6))) return 1.5;
+
+  return 0;
+}
+
+function findLivehdFallbackUrl(rows, { matchDay, homeTeam, awayTeam }) {
+  if (!Array.isArray(rows) || !rows.length || !matchDay || !homeTeam || !awayTeam) return null;
+
+  let best = null;
+  let bestScore = 0;
+
+  for (const r of rows) {
+    if (!r || !r.livehd_stream_url) continue;
+    if (String(r.match_day || "") !== String(matchDay || "")) continue;
+
+    const direct =
+      teamSoftMatchScore(homeTeam, r.home_team) + teamSoftMatchScore(awayTeam, r.away_team);
+    const swapped =
+      teamSoftMatchScore(homeTeam, r.away_team) + teamSoftMatchScore(awayTeam, r.home_team);
+    const score = Math.max(direct, swapped);
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = r;
+    }
+  }
+
+  // 4 = two strong partial matches or better.
+  if (best && bestScore >= 4) return best.livehd_stream_url;
+  return null;
+}
+
 function keyOfRow(r) {
   // لو match_key موجود استخدمه (أفضل وأثبت)
   if (r && r.match_key) return String(r.match_key);
@@ -1556,7 +1663,7 @@ function scoreLivehdCandidate(u) {
   const s = String(u).toLowerCase();
 
   if (!/^https?:\/\//i.test(s)) return -99999;
-  if (isImageUrl(s) || isMediaAssetUrl(s) || isAdHost(s)) return -99999;
+  if (isImageUrl(s) || isMediaAssetUrl(s) || isAdHost(s) || isAdultUrl(s)) return -99999;
   if (isJunkCandidateUrl(s)) return -99999;
 
   let score = scoreCandidate(s);
@@ -1574,6 +1681,24 @@ function scoreLivehdCandidate(u) {
   if (s.includes("/wp-content/") || s.includes("/wp-includes/")) score -= 2600;
 
   return score;
+}
+
+function normalizeLivehdServer3Url(rawUrl) {
+  const base = normalizeUrl(rawUrl, rawUrl);
+  if (!base) return null;
+  try {
+    const u = new URL(base);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase();
+    const isAlbaplayer = path.includes("/albaplayer/") || path.includes("/alba.php");
+    const isLivehdChain = host.includes("alkoora.live") || host.includes("livehd77.pro");
+    if (isAlbaplayer && isLivehdChain) {
+      u.searchParams.set("serv", "2");
+    }
+    return u.toString();
+  } catch {
+    return base;
+  }
 }
 
 function pickBestLivehdUrl(urls, { baseUrl = null } = {}) {
@@ -1756,7 +1881,7 @@ async function resolveLivehdFromTvPage(page, tvUrl) {
 
     const candidates = await collectLivehdCandidateUrlsFromPage(page, tvUrl);
     const best = pickBestLivehdUrl(candidates, { baseUrl: tvUrl });
-    return best || null;
+    return normalizeLivehdServer3Url(best || null);
   } catch {
     return null;
   }
@@ -1777,10 +1902,12 @@ async function resolveLivehdStream(page, matchUrl) {
     const bestLower = String(best).toLowerCase();
     if (bestLower.includes("livehd77.pro/tv/")) {
       const deep = await resolveLivehdFromTvPage(page, best);
-      if (deep && scoreLivehdCandidate(deep) >= scoreLivehdCandidate(best)) return deep;
+      if (deep && scoreLivehdCandidate(deep) >= scoreLivehdCandidate(best)) {
+        return normalizeLivehdServer3Url(deep);
+      }
     }
 
-    return best;
+    return normalizeLivehdServer3Url(best);
   } catch (e) {
     console.error(`⚠️ LIVEHD resolve error (${matchUrl}):`, e.message);
     return null;
@@ -1977,6 +2104,14 @@ if (server2 && !/\/playerv2\.php(\?|$)/i.test(String(server2))) {
 
 // Server 3 attach (LIVEHD77)
 let server3 = livehdMap.get(match_key) || null;
+if (!server3) {
+  server3 = findLivehdFallbackUrl(livehdEnriched, {
+    matchDay: match_day,
+    homeTeam: m.home_team,
+    awayTeam: m.away_team,
+  });
+}
+server3 = normalizeLivehdServer3Url(server3);
 
 // Keep only embeddable/live-like URLs
 if (
@@ -1986,6 +2121,7 @@ if (
     isImageUrl(String(server3)) ||
     isMediaAssetUrl(String(server3)) ||
     isAdHost(String(server3)) ||
+    isAdultUrl(String(server3)) ||
     /livehd77\.pro\/(liive|matches-today|category|author|tag)\//i.test(String(server3))
   )
 ) {
