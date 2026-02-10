@@ -42,6 +42,7 @@ const USE_SERVER3_SANDBOX = true;
 const SERVER3_SANDBOX = "allow-scripts allow-same-origin";
 const USE_EMBED_PROXY = true;
 const EMBED_PROXY_SANDBOX = "allow-scripts allow-same-origin allow-forms allow-presentation allow-pointer-lock";
+const PREMATCH_OPEN_WINDOW_MINUTES = 15;
 
 function toEmbedProxyUrl(rawUrl?: string | null) {
   const value = String(rawUrl || "").trim();
@@ -156,7 +157,7 @@ export default function WatchPage() {
     return (
       <div className="min-h-screen bg-black text-white p-4">
         <div className="max-w-3xl mx-auto mt-10">
-          <button onClick={() => router.back()} className="mb-4 text-gray-400 hover:text-white">
+          <button onClick={() => router.replace("/")} className="mb-4 text-gray-400 hover:text-white">
             ← العودة للرئيسية
           </button>
 
@@ -196,12 +197,13 @@ export default function WatchPage() {
   const nowMs = Date.now();
   const startMs = match?.match_start ? new Date(match.match_start).getTime() : null;
   const startValid = startMs !== null && Number.isFinite(startMs);
+  const prematchWindowMs = PREMATCH_OPEN_WINDOW_MINUTES * 60 * 1000;
 
-  const hasStartedByTime = startValid ? nowMs >= (startMs as number) - 2 * 60 * 1000 : false;
+  const hasStartedByTime = startValid ? nowMs >= (startMs as number) - prematchWindowMs : false;
   const hasStartedByStatus = status === "live" || status === "finished";
   const isUpcomingByStatus = status === "upcoming";
 
-  const shouldBlockStream = isUpcomingByStatus || (!hasStartedByStatus && startValid && !hasStartedByTime);
+  const shouldBlockStream = !hasStartedByStatus && (startValid ? !hasStartedByTime : isUpcomingByStatus);
 
   const prettyStart = formatStartTimeAr(match?.match_start);
   const isServer2 = selectedServer === 2;
@@ -210,7 +212,7 @@ export default function WatchPage() {
   return (
     <div className="min-h-screen bg-black text-white p-4">
       <div className="max-w-5xl mx-auto">
-        <button onClick={() => router.back()} className="mb-4 text-gray-400 hover:text-white">
+        <button onClick={() => router.replace("/")} className="mb-4 text-gray-400 hover:text-white">
           ← العودة للرئيسية
         </button>
 
