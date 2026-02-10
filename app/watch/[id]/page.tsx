@@ -41,8 +41,6 @@ const SERVER2_SANDBOX = "allow-scripts allow-same-origin";
 const USE_SERVER3_SANDBOX = true;
 const SERVER3_SANDBOX = "allow-scripts allow-same-origin";
 
-const SERVER3_REFERRER_POLICY: React.HTMLAttributeReferrerPolicy = "no-referrer";
-
 export default function WatchPage() {
   const params = useParams();
   const router = useRouter();
@@ -152,14 +150,12 @@ export default function WatchPage() {
   const home = match?.home_team ?? "الفريق الأول";
   const away = match?.away_team ?? "الفريق الثاني";
 
-  // ✅ التعديل الأساسي: استخدام الـ Proxy لـ Server 3
+  // Server 3 uses the scraped embeddable URL directly.
   const selectedUrl =
     selectedServer === 2
       ? match?.stream_url_2 ?? ""
       : selectedServer === 3
-      ? match?.stream_url_3
-        ? `/api/stream-proxy?url=${encodeURIComponent(match.stream_url_3)}`
-        : ""
+      ? match?.stream_url_3 ?? ""
       : selectedServer === 4
       ? match?.stream_url_4 ?? ""
       : selectedServer === 5
