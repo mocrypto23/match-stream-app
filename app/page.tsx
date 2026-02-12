@@ -10,8 +10,8 @@ type MatchRow = {
   id: number;
   home_team: string;
   away_team: string;
-  home_logo: string;
-  away_logo: string;
+  home_logo?: string | null;
+  away_logo?: string | null;
   stream_url: string;
   match_day: string;
   match_start: string | null;
@@ -21,6 +21,47 @@ type MatchRow = {
   status_key?: string | null;
   status_text?: string | null;
 };
+
+function isValidHttpUrl(raw: unknown): raw is string {
+  if (typeof raw !== "string") return false;
+  try {
+    const u = new URL(raw);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function teamInitials(name: string) {
+  const clean = String(name || "").trim();
+  if (!clean) return "FC";
+  const parts = clean.split(/\s+/).filter(Boolean);
+  if (parts.length <= 1) return parts[0]?.slice(0, 2) || "FC";
+  return `${parts[0]?.[0] || ""}${parts[1]?.[0] || ""}` || "FC";
+}
+
+function TeamLogo({ logo, team }: { logo?: string | null; team: string }) {
+  const [failed, setFailed] = useState(false);
+  const validLogo = isValidHttpUrl(logo) ? logo : null;
+  const showImage = Boolean(validLogo) && !failed;
+
+  return (
+    <div className="w-full h-full rounded-full overflow-hidden flex items-center justify-center bg-gray-950 text-gray-300">
+      {showImage ? (
+        <img
+          src={validLogo!}
+          alt={team}
+          className="w-full h-full object-contain"
+          loading="lazy"
+          decoding="async"
+          onError={() => setFailed(true)}
+        />
+      ) : (
+        <span className="text-[11px] sm:text-xs font-black">{teamInitials(team)}</span>
+      )}
+    </div>
+  );
+}
 
 function cairoDayStringFromOffset(offsetDays: number) {
   const now = new Date();
@@ -250,7 +291,7 @@ export default function Home() {
               >
                 <div className="flex flex-col items-center gap-3 flex-1">
                   <div className="w-16 h-16 bg-gray-900 rounded-full flex items-center justify-center p-2 border border-gray-800 group-hover:border-blue-500 transition-colors">
-                    <img src={match.home_logo} alt={match.home_team} className="w-full h-full object-contain" />
+                    <TeamLogo logo={match.home_logo} team={match.home_team} />
                   </div>
                   <span className="text-sm sm:text-lg font-black text-center">{match.home_team}</span>
                 </div>
@@ -275,7 +316,7 @@ export default function Home() {
 
                 <div className="flex flex-col items-center gap-3 flex-1">
                   <div className="w-16 h-16 bg-gray-900 rounded-full flex items-center justify-center p-2 border border-gray-800 group-hover:border-blue-500 transition-colors">
-                    <img src={match.away_logo} alt={match.away_team} className="w-full h-full object-contain" />
+                    <TeamLogo logo={match.away_logo} team={match.away_team} />
                   </div>
                   <span className="text-sm sm:text-lg font-black text-center">{match.away_team}</span>
                 </div>

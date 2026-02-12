@@ -59,6 +59,13 @@ const CONCURRENCY = Math.max(1, parseInt(process.env.CONCURRENCY || "2", 10) || 
 
 const LIST_TIMEOUT_MS = 60000;
 const DEEP_TIMEOUT_MS = 45000;
+const HTTP_TIMEOUT_MS = 20000;
+const DEFAULT_HTTP_HEADERS = {
+  "user-agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+  "accept-language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7",
+  accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+};
 
 const TZ = "Africa/Cairo";
 
@@ -106,6 +113,8 @@ const ONEKORA = {
   siteHost: "1kora.com",
   maxArticles: 24,
 };
+// User requested disabling old Server-4 source (YALA).
+const ENABLE_SERVER4_YALA = false;
 // ===================== Anti-Ads Config =====================
 const AD_HOSTS = [
   "doubleclick.net",
@@ -370,8 +379,28 @@ function isAdultUrl(url) {
 
 function hasAnyHostHint(url, hints) {
   if (!url) return false;
-  const s = String(url).toLowerCase();
-  return hints.some((h) => s.includes(h));
+  const s = String(url).toLowerCase().trim();
+  const normHints = (hints || [])
+    .map((h) => String(h || "").toLowerCase().trim())
+    .filter(Boolean);
+  if (!normHints.length) return false;
+
+  // Prefer hostname-aware matching so short hints like "x.com"
+  // do not accidentally match unrelated hosts such as "kooraxx.com".
+  let parsedAsUrl = false;
+  try {
+    parsedAsUrl = true;
+    const host = new URL(s).hostname.toLowerCase();
+    return normHints.some((h) => {
+      const domainHint = h.replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/+$/, "");
+      if (!domainHint) return false;
+      return host === domainHint || host.endsWith("." + domainHint);
+    });
+  } catch {}
+
+  // Fallback for non-URL strings only.
+  if (parsedAsUrl) return false;
+  return normHints.some((h) => s.includes(h));
 }
 
 function isClearlyNonStreamUrl(url) {
@@ -739,6 +768,120 @@ async function waitForStableMatchCount(page, maxWaitMs = 20000, settleMs = 1400)
   return last;
 }
 
+function decodeHtmlEntities(value) {
+  const s = String(value || "");
+  if (!s) return "";
+  return s
+    .replace(/&#(\d+);/g, (_m, n) => {
+      const code = Number.parseInt(String(n), 10);
+      return Number.isFinite(code) ? String.fromCharCode(code) : "";
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_m, hex) => {
+      const code = Number.parseInt(String(hex), 16);
+      return Number.isFinite(code) ? String.fromCharCode(code) : "";
+    })
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
+}
+
+function stripHtmlToText(input) {
+  const s = String(input || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ");
+  return normalizeSpaces(decodeHtmlEntities(s));
+}
+
+function extractAyMatchRowsFromHtml(html, pageUrl) {
+  const text = String(html || "");
+  if (!text) return [];
+
+  const chunks = text
+    .split(/<div\s+class=["'][^"']*(?:AY_Match|ay_1a31ddb3)[^"']*["']/i)
+    .slice(1);
+  const out = [];
+
+  for (const c of chunks) {
+    const endAnchor = c.search(/<\/a>\s*<\/div>/i);
+    const chunk = endAnchor >= 0 ? c.slice(0, endAnchor + 9) : c.slice(0, 5000);
+
+    const teamMatches = Array.from(
+      chunk.matchAll(/<div\s+class=["'][^"']*(?:TM_Name|ay_dea3dc0e)[^"']*["'][^>]*>([\s\S]*?)<\/div>/gi)
+    );
+    const teams = teamMatches.map((m) => stripHtmlToText(m[1])).filter(Boolean);
+
+    const hrefRaw = (chunk.match(/<a[^>]+href=["']([^"']+)["']/i) || [])[1] || "";
+    const dataStartRaw =
+      (chunk.match(/\bdata-start=["']([^"']+)["']/i) || [])[1] ||
+      (chunk.match(/\bdata-time=["']([^"']+)["']/i) || [])[1] ||
+      "";
+    const timeTextRaw =
+      (chunk.match(/<span[^>]*class=["'][^"']*(?:MT_Time|ay_0ce77098)[^"']*["'][^>]*>([\s\S]*?)<\/span>/i) || [])[1] ||
+      "";
+    const channelTextRaw =
+      (chunk.match(/<li[^>]*>([\s\S]*?)<\/li>/i) || [])[1] ||
+      (chunk.match(/<span[^>]*class=["'][^"']*(?:channel|ch)[^"']*["'][^>]*>([\s\S]*?)<\/span>/i) || [])[1] ||
+      "";
+    const imgCandidates = Array.from(
+      chunk.matchAll(/<img[^>]+(?:data-src|data-lazy-src|data-original|src)=["']([^"']+)["'][^>]*>/gi)
+    )
+      .map((m) => normalizeUrl(m[1] || "", pageUrl))
+      .filter(Boolean);
+
+    const href = normalizeUrl(hrefRaw, pageUrl);
+    if (!href || teams.length < 2) continue;
+
+    out.push({
+      home_team: teams[0],
+      away_team: teams[1],
+      match_url: href,
+      data_start: normalizeSpaces(dataStartRaw) || null,
+      status_text: null,
+      status_key_dom: "unknown",
+      time_text: stripHtmlToText(timeTextRaw) || null,
+      channel_text: stripHtmlToText(channelTextRaw) || null,
+      home_logo: imgCandidates[0] || null,
+      away_logo: imgCandidates[1] || null,
+    });
+  }
+
+  return out;
+}
+
+async function fetchAyMatchRowsFallback(url, dayKey) {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+    const resp = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: DEFAULT_HTTP_HEADERS,
+    });
+    clearTimeout(timeoutId);
+    if (!resp.ok) return [];
+
+    const html = await resp.text();
+    const rows = extractAyMatchRowsFromHtml(html, resp.url || url);
+    const final = rows
+      .map((r) => {
+        const iso = toIsoFromDataStart(r.data_start);
+        const match_day = cairoDayFromIso(iso) || matchDayFromKey(dayKey);
+        return { ...r, match_day };
+      })
+      .filter((r) => r.home_team && r.away_team && r.match_url && r.match_day);
+
+    if (DIAG) diagWrite(`fallback/ay_${dayKey}_${Date.now()}.json`, JSON.stringify(final, null, 2));
+    return final;
+  } catch {
+    return [];
+  }
+}
+
 // ===================== Scrape List (bein-live) =====================
 async function scrapeOneDay(page, dayKey, url) {
   console.log(`\n🔎 سحب: ${dayKey} => ${url}`);
@@ -911,11 +1054,32 @@ async function scrapeOneDay(page, dayKey, url) {
       .filter((m) => m.home_team && m.away_team && m.match_url);
   }, dayKey);
 
-  console.log(`📦 ${dayKey}: ${rows.length} مباراة`);
+  if (rows.length) {
+    console.log(`📦 ${dayKey}: ${rows.length} مباراة`);
+    if (DIAG) diagWrite(`rows/raw_${dayKey}.json`, JSON.stringify(rows, null, 2));
+    return rows;
+  }
 
-  if (DIAG) diagWrite(`rows/raw_${dayKey}.json`, JSON.stringify(rows, null, 2));
+  const fallbackRows = await fetchAyMatchRowsFallback(url, dayKey);
+  const converted = fallbackRows.map((r) => ({
+    home_team: r.home_team,
+    away_team: r.away_team,
+    data_start: r.data_start || null,
+    time_text: r.time_text || null,
+    status_text: r.status_text || null,
+    status_key_dom: r.status_key_dom || "unknown",
+    result_visibility: "unknown",
+    has_score_hint: false,
+    home_logo: r.home_logo || null,
+    away_logo: r.away_logo || null,
+    match_url: r.match_url,
+    home_score_raw: null,
+    away_score_raw: null,
+  }));
 
-  return rows;
+  console.log(`📦 ${dayKey}: 0 (browser) -> ${converted.length} (http fallback)`);
+  if (DIAG) diagWrite(`rows/raw_${dayKey}.json`, JSON.stringify(converted, null, 2));
+  return converted;
 }
 
 // ===================== Deep Match Details (bein-live) =====================
@@ -1237,16 +1401,114 @@ const hrefRaw = a?.getAttribute("href") || "";
     })
     .filter((r) => r.home_team && r.away_team && r.match_page_url && r.match_day);
 
-  console.log(`🟣 SIIIR ${dayKey}: ${final.length} items`);
-  if (DIAG) diagWrite(`siiir/raw_${dayKey}.json`, JSON.stringify(final, null, 2));
-  return final;
+  if (final.length) {
+    console.log(`🟣 SIIIR ${dayKey}: ${final.length} items`);
+    if (DIAG) diagWrite(`siiir/raw_${dayKey}.json`, JSON.stringify(final, null, 2));
+    return final;
+  }
+
+  const fallbackRows = await fetchAyMatchRowsFallback(SIIIR.dayUrl[dayKey], dayKey);
+  const converted = fallbackRows
+    .map((r) => ({
+      match_page_url: r.match_url,
+      home_team: r.home_team,
+      away_team: r.away_team,
+      data_start: r.data_start || null,
+      match_day: r.match_day,
+    }))
+    .filter((r) => r.home_team && r.away_team && r.match_page_url && r.match_day);
+  console.log(`🟣 SIIIR ${dayKey}: 0 (browser) -> ${converted.length} (http fallback)`);
+  if (DIAG) diagWrite(`siiir/raw_${dayKey}.json`, JSON.stringify(converted, null, 2));
+  return converted;
 }
 
-/**
- * ✅ أهم تعديل:
- * صفحات hard/*.html?match=7 بتولد playerv2.php بالـ JS (وممكن الدومين مختلف)
- * فنستخرج match + host + key من scripts ونبني الرابط يدويًا.
- */
+function deriveSiiirPlayerV2UrlFromScripts(pageUrl, scriptsText) {
+  const normalizedPageUrl = normalizeUrl(pageUrl, pageUrl);
+  if (!normalizedPageUrl || !scriptsText) return null;
+
+  try {
+    const u = new URL(normalizedPageUrl);
+    if (/\/playerv2\.php(\?|$)/i.test(u.pathname)) return normalizedPageUrl;
+
+    let matchId = normalizeDigits(u.searchParams.get("match") || "").trim();
+    matchId = matchId.replace(/^match/i, "");
+    if (!/^\d{1,5}$/.test(matchId)) return null;
+
+    const hostMatch =
+      scriptsText.match(/https:\/\/([^\/\s"'`]+)\/playerv2\.php/i) ||
+      scriptsText.match(/playerurl\s*[:=]\s*["'`]?https:\/\/([^\/\s"'`]+)\/playerv2\.php/i) ||
+      scriptsText.match(/src\s*[:=]\s*["'`]?https:\/\/([^\/\s"'`]+)\/playerv2\.php/i);
+    const host = normalizeSpaces(hostMatch?.[1] || "");
+    if (!host) return null;
+
+    const keyMatch =
+      scriptsText.match(/\bkey\s*=\s*["'`]?([A-Za-z0-9]+)\b/i) ||
+      scriptsText.match(/\bkey\s*:\s*["'`]?([A-Za-z0-9]+)\b/i) ||
+      scriptsText.match(/&key=([^&"'`\s]+)\b/i);
+    const key = normalizeSpaces(keyMatch?.[1] || "");
+    if (!key) return null;
+
+    return `https://${host}/playerv2.php?match=match${encodeURIComponent(matchId)}&key=${encodeURIComponent(key)}`;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveSiiirPlayerV2UrlViaHttp(matchPageUrl) {
+  const normalized = normalizeUrl(matchPageUrl, matchPageUrl);
+  if (!normalized) return null;
+  if (/\/playerv2\.php(\?|$)/i.test(normalized)) return normalized;
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+    const resp = await fetch(normalized, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: DEFAULT_HTTP_HEADERS,
+    });
+    clearTimeout(timeoutId);
+    if (!resp.ok) return null;
+
+    const html = await resp.text();
+    const finalPageUrl = normalizeUrl(resp.url || normalized, normalized) || normalized;
+    let matchId = "";
+    try {
+      const finalUrlObj = new URL(finalPageUrl);
+      matchId = normalizeDigits(finalUrlObj.searchParams.get("match") || "").trim().replace(/^match/i, "");
+      if (!/^\d{1,5}$/.test(matchId)) matchId = "";
+    } catch {}
+
+    const applyMatchTemplate = (value) => {
+      if (!matchId) return String(value || "");
+      return String(value || "")
+        .replace(/\$\{\s*encodeURIComponent\(\s*matchId\s*\)\s*\}/gi, encodeURIComponent(matchId))
+        .replace(/\$\{\s*matchId\s*\}/gi, matchId)
+        .replace(/\$\{[^}]*matchId[^}]*\}/gi, matchId);
+    };
+
+    const direct =
+      html.match(/https:\/\/[^"'`\s]+\/playerv2\.php\?[^"'`\s]+/i)?.[0] ||
+      html.match(/playerUrl\s*=\s*`([^`]*playerv2\.php[^`]*)`/i)?.[1] ||
+      html.match(/playerUrl\s*=\s*["']([^"'`]*playerv2\.php[^"'`]*)["']/i)?.[1] ||
+      null;
+
+    if (direct) {
+      const directAbs = normalizeUrl(applyMatchTemplate(direct), finalPageUrl);
+      if (directAbs && /\/playerv2\.php(\?|$)/i.test(directAbs)) return directAbs;
+    }
+
+    const scriptsText = Array.from(html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi))
+      .map((m) => m[1] || "")
+      .join("\n");
+
+    return deriveSiiirPlayerV2UrlFromScripts(finalPageUrl, scriptsText);
+  } catch {
+    return null;
+  }
+}
+
 async function deriveSiiirPlayerV2Url(page) {
   let pageUrl = "";
   try {
@@ -1256,46 +1518,10 @@ async function deriveSiiirPlayerV2Url(page) {
   }
   if (!pageUrl) return null;
 
-  try {
-    const u = new URL(pageUrl);
-
-    // لو بالفعل playerv2
-    if (u.pathname.toLowerCase().includes("playerv2.php")) return pageUrl;
-
-    // match param من URL (hard?match=5 أو match=match5)
-    let matchId = u.searchParams.get("match");
-    matchId = normalizeDigits(matchId || "").trim();
-    matchId = matchId.replace(/^match/i, ""); // match7 => 7
-    if (!/^\d{1,5}$/.test(matchId)) return null;
-
-    const scriptsText = await page
-      .evaluate(() => Array.from(document.scripts).map((s) => s.textContent || "").join("\n"))
-      .catch(() => "");
-
-    if (!scriptsText) return null;
-
-    // host: أي دومين بيستضيف playerv2.php
-    const hostMatch =
-      scriptsText.match(/https:\/\/([^\/\s"'`]+)\/playerv2\.php/i) ||
-      scriptsText.match(/playerurl\s*[:=]\s*["'`]?https:\/\/([^\/\s"'`]+)\/playerv2\.php/i) ||
-      scriptsText.match(/src\s*[:=]\s*["'`]?https:\/\/([^\/\s"'`]+)\/playerv2\.php/i);
-
-    const host = (hostMatch?.[1] || "").trim();
-    if (!host) return null;
-
-    // key: عدة أشكال
-    const keyMatch =
-      scriptsText.match(/\bkey\s*=\s*["'`]?([A-Za-z0-9]+)\b/i) ||
-      scriptsText.match(/\bkey\s*:\s*["'`]?([A-Za-z0-9]+)\b/i) ||
-      scriptsText.match(/&key=([^&"'`\s]+)\b/i);
-
-    const key = (keyMatch?.[1] || "").trim();
-    if (!key) return null;
-
-    return `https://${host}/playerv2.php?match=match${encodeURIComponent(matchId)}&key=${encodeURIComponent(key)}`;
-  } catch {
-    return null;
-  }
+  const scriptsText = await page
+    .evaluate(() => Array.from(document.scripts).map((s) => s.textContent || "").join("\n"))
+    .catch(() => "");
+  return deriveSiiirPlayerV2UrlFromScripts(pageUrl, scriptsText);
 }
 
 
@@ -1344,6 +1570,12 @@ async function resolveSiiirPlayerIframeSrc(page, matchPageUrl) {
   ctx.on("page", onCtxPage);
 
   try {
+    const fastHttp = await resolveSiiirPlayerV2UrlViaHttp(matchPageUrl);
+    if (isPlayerV2(fastHttp)) {
+      dbg("🟣 SIIIR fast-http playerv2:", fastHttp);
+      return fastHttp;
+    }
+
     await page.goto(matchPageUrl, { waitUntil: "domcontentloaded", timeout: DEEP_TIMEOUT_MS });
 
     // ====== Phase 1: محاولات سريعة لاستخراج playerv2 ======
@@ -1768,6 +2000,9 @@ function mergeWithExisting({ newRows, existingRows }) {
     let out = { ...r };
 
     if (old) {
+      if (!out.home_logo && old.home_logo) out.home_logo = old.home_logo;
+      if (!out.away_logo && old.away_logo) out.away_logo = old.away_logo;
+
       // Server 1
       out.stream_url = preferExistingUrl(out.stream_url, old.stream_url);
 
@@ -2271,12 +2506,24 @@ async function scrapeAyMatchDay(page, { sourceName, dayKey, url, diagPrefix }) {
       })
       .filter((r) => r.home_team && r.away_team && r.match_url && r.match_day);
 
-    console.log(`🟡 ${sourceName} ${dayKey}: ${final.length} items`);
-    if (DIAG) diagWrite(`${diagPrefix}/raw_${dayKey}.json`, JSON.stringify(final, null, 2));
-    return final;
+    if (final.length) {
+      console.log(`🟡 ${sourceName} ${dayKey}: ${final.length} items`);
+      if (DIAG) diagWrite(`${diagPrefix}/raw_${dayKey}.json`, JSON.stringify(final, null, 2));
+      return final;
+    }
+
+    const httpFallback = await fetchAyMatchRowsFallback(url, dayKey);
+    console.log(`🟡 ${sourceName} ${dayKey}: 0 (browser) -> ${httpFallback.length} (http fallback)`);
+    if (DIAG) diagWrite(`${diagPrefix}/raw_${dayKey}.json`, JSON.stringify(httpFallback, null, 2));
+    return httpFallback;
   } catch (e) {
     console.error(`⚠️ ${sourceName} list fail ${dayKey}:`, e.message);
     if (DIAG) diagWrite(`${diagPrefix}/errors_${dayKey}.txt`, String(e?.stack || e?.message || e));
+    const httpFallback = await fetchAyMatchRowsFallback(url, dayKey);
+    if (httpFallback.length) {
+      console.log(`🟡 ${sourceName} ${dayKey}: recovered with http fallback (${httpFallback.length})`);
+      return httpFallback;
+    }
     return [];
   }
 }
@@ -2434,17 +2681,17 @@ async function enrichYalaWithStreams(browser, rows) {
       let finalUrl = null;
 
       if (raw) {
-        finalUrl = await resolveStreamFromPage(page, raw, {
-          preferredHostHints: ["kooraxx.com", "a.sia-bth.net", "koora", "kora", "albaplayer", "pyxq.online"],
-        });
-
-        if (!finalUrl) {
-          finalUrl = deriveYalaFallbackPlayerUrl(raw);
-        }
+        finalUrl = deriveYalaFallbackPlayerUrl(raw);
 
         if (!finalUrl) {
           const looksDirectPlayer = looksLikePlayerUrl(raw);
           if (looksDirectPlayer && !isClearlyNonStreamUrl(raw)) finalUrl = raw;
+        }
+
+        if (!finalUrl) {
+          finalUrl = await resolveStreamFromPage(page, raw, {
+            preferredHostHints: ["kooraxx.com", "a.sia-bth.net", "koora", "kora", "albaplayer", "pyxq.online"],
+          });
         }
 
         if (finalUrl && !looksLikePlayerUrl(finalUrl)) finalUrl = null;
@@ -2857,37 +3104,79 @@ async function startScraping() {
     }
 
     // 4) YALA-LIVE lists + resolve stream url (Server 4)
-    const yalaListContext = await browser.newContext({
-      locale: "ar-EG",
-      timezoneId: TZ,
-      serviceWorkers: "block",
-      extraHTTPHeaders: { "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7" },
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-      viewport: { width: 1280, height: 720 },
-    });
-    const yalaListPage = await yalaListContext.newPage();
-    await applyAntiAds(yalaListContext, yalaListPage);
-
-    const yalaAll = [];
-    for (const d of DAYS) {
-      try {
-        const rows = await scrapeYalaDay(yalaListPage, d.key);
-        yalaAll.push(...rows);
-      } catch (e) {
-        console.error(`⚠️ YALA list fail ${d.key}:`, e.message);
-        if (DIAG) diagWrite(`yala/errors_${d.key}.txt`, String(e?.stack || e?.message || e));
-      }
-    }
-    await yalaListPage.close().catch(() => {});
-    await yalaListContext.close().catch(() => {});
-
-    const yalaEnriched = await enrichYalaWithStreams(browser, yalaAll);
+    // Disabled by user request: old Server-4 source removed from active pipeline.
+    let yalaEnriched = [];
+    const yalaDirectRows = [];
+    const yalaDirectMap = new Map();
     const yalaMap = new Map();
-    for (const r of yalaEnriched) {
-      if (!r.yala_stream_url) continue;
-      const k = keyOfTeams(r.match_day, r.home_team, r.away_team);
-      if (!yalaMap.has(k)) yalaMap.set(k, r.yala_stream_url);
+    if (ENABLE_SERVER4_YALA) {
+      const yalaListContext = await browser.newContext({
+        locale: "ar-EG",
+        timezoneId: TZ,
+        serviceWorkers: "block",
+        extraHTTPHeaders: { "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7" },
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        viewport: { width: 1280, height: 720 },
+      });
+      const yalaListPage = await yalaListContext.newPage();
+      await applyAntiAds(yalaListContext, yalaListPage);
+
+      const yalaAll = [];
+      for (const d of DAYS) {
+        try {
+          const rows = await scrapeYalaDay(yalaListPage, d.key);
+          yalaAll.push(...rows);
+        } catch (e) {
+          console.error(`⚠️ YALA list fail ${d.key}:`, e.message);
+          if (DIAG) diagWrite(`yala/errors_${d.key}.txt`, String(e?.stack || e?.message || e));
+        }
+      }
+      await yalaListPage.close().catch(() => {});
+      await yalaListContext.close().catch(() => {});
+
+      const directRows = yalaAll
+        .map((r) => {
+          const raw = normalizeUrl(r.match_url, r.match_url);
+          let direct = deriveYalaFallbackPlayerUrl(raw);
+          if (!direct && raw && looksLikePlayerUrl(raw) && !isClearlyNonStreamUrl(raw)) direct = raw;
+          if (!direct || !looksLikePlayerUrl(direct)) return null;
+          return { ...r, yala_stream_url: direct };
+        })
+        .filter(Boolean);
+      yalaDirectRows.push(...directRows);
+
+      for (const r of yalaDirectRows) {
+        const k = keyOfTeams(r.match_day, r.home_team, r.away_team);
+        if (!yalaDirectMap.has(k)) yalaDirectMap.set(k, r.yala_stream_url);
+      }
+
+      yalaEnriched = await enrichYalaWithStreams(browser, yalaAll);
+      for (const r of yalaEnriched) {
+        if (!r.yala_stream_url) continue;
+        const k = keyOfTeams(r.match_day, r.home_team, r.away_team);
+        if (!yalaMap.has(k)) yalaMap.set(k, r.yala_stream_url);
+      }
+
+      if (DIAG) {
+        diagWrite(`yala/enriched_${Date.now()}.json`, JSON.stringify(yalaEnriched, null, 2));
+        diagWrite(
+          `yala/maps_${Date.now()}.json`,
+          JSON.stringify(
+            {
+              yalaAll: yalaAll.length,
+              yalaDirectRows: yalaDirectRows.length,
+              yalaDirectMapSize: yalaDirectMap.size,
+              yalaEnriched: yalaEnriched.length,
+              yalaMapSize: yalaMap.size,
+            },
+            null,
+            2
+          )
+        );
+      }
+    } else {
+      console.log("⏭️ YALA source disabled (Server 4 old source removed).");
     }
 
     // 5) TSKORA lists (Server 5)
@@ -3004,9 +3293,16 @@ async function startScraping() {
       }
 
       // Server 4 (YALA), Server 5 (TSKORA), Server 6 (1KORA), Server 7 (reserved)
-      let server4 = yalaMap.get(match_key) || null;
+      let server4 = yalaMap.get(match_key) || yalaDirectMap.get(match_key) || null;
       if (!server4) {
         server4 = findYalaFallbackUrl(yalaEnriched, {
+          matchDay: match_day,
+          homeTeam: m.home_team,
+          awayTeam: m.away_team,
+        });
+      }
+      if (!server4) {
+        server4 = findYalaFallbackUrl(yalaDirectRows, {
           matchDay: match_day,
           homeTeam: m.home_team,
           awayTeam: m.away_team,

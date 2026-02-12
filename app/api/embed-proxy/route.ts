@@ -145,6 +145,34 @@ const M3U8_CACHE_MAX_ENTRIES = Math.max(
   32,
   Number.parseInt(process.env.EMBED_PROXY_M3U8_CACHE_MAX_ENTRIES || "300", 10) || 300
 );
+const UPSTREAM_FETCH_TIMEOUT_HTML_MS = Math.max(
+  3000,
+  Number.parseInt(process.env.EMBED_PROXY_FETCH_TIMEOUT_MS || "12000", 10) || 12000
+);
+const UPSTREAM_FETCH_RETRIES_HTML = Math.max(
+  0,
+  Number.parseInt(process.env.EMBED_PROXY_FETCH_RETRIES || "2", 10) || 2
+);
+const UPSTREAM_FETCH_RETRY_DELAY_HTML_MS = Math.max(
+  100,
+  Number.parseInt(process.env.EMBED_PROXY_FETCH_RETRY_DELAY_MS || "350", 10) || 350
+);
+const UPSTREAM_FETCH_TIMEOUT_MANIFEST_MS = Math.max(
+  2000,
+  Number.parseInt(process.env.EMBED_PROXY_FETCH_TIMEOUT_MANIFEST_MS || "5000", 10) || 5000
+);
+const UPSTREAM_FETCH_TIMEOUT_SEGMENT_MS = Math.max(
+  1500,
+  Number.parseInt(process.env.EMBED_PROXY_FETCH_TIMEOUT_SEGMENT_MS || "4000", 10) || 4000
+);
+const UPSTREAM_FETCH_RETRIES_STREAM = Math.max(
+  0,
+  Number.parseInt(process.env.EMBED_PROXY_FETCH_RETRIES_STREAM || "1", 10) || 1
+);
+const UPSTREAM_FETCH_RETRY_DELAY_STREAM_MS = Math.max(
+  100,
+  Number.parseInt(process.env.EMBED_PROXY_FETCH_RETRY_DELAY_STREAM_MS || "250", 10) || 250
+);
 
 type ManifestCacheEntry = {
   body: string;
@@ -356,6 +384,61 @@ function isLikelyM3u8(target: URL, contentType: string) {
     ct.includes("audio/mpegurl") ||
     ct.includes("audio/x-mpegurl")
   );
+}
+
+type UpstreamFetchPolicyName = "html_page" | "hls_manifest" | "hls_segment_or_chunk";
+type UpstreamFetchPolicy = {
+  name: UpstreamFetchPolicyName;
+  timeoutMs: number;
+  retries: number;
+  retryDelayMs: number;
+};
+
+const SEGMENT_PATH_RE = /\.(?:ts|m4s|m4f|cmf|mp4|aac|ac3|ec3|mp3|vtt|webm|key)(?:[?#]|$)/i;
+const MANIFEST_HINT_RE = /\.(?:m3u8)(?:[?#]|$)|\/(?:hls|live|chunks?|playlist|manifest)\b/i;
+const HTML_PAGE_RE = /\.(?:html?|php|asp|aspx|jsp)(?:[?#]|$)/i;
+
+function classifyProxyTarget(target: URL): UpstreamFetchPolicyName {
+  const value = `${target.pathname}${target.search}`.toLowerCase();
+  if (SEGMENT_PATH_RE.test(value)) return "hls_segment_or_chunk";
+  if (!HTML_PAGE_RE.test(value) && MANIFEST_HINT_RE.test(value)) return "hls_manifest";
+  return "html_page";
+}
+
+function getUpstreamFetchPolicy(target: URL, method: string): UpstreamFetchPolicy {
+  const methodUpper = String(method || "GET").toUpperCase();
+  if (methodUpper !== "GET" && methodUpper !== "HEAD") {
+    return {
+      name: "html_page",
+      timeoutMs: UPSTREAM_FETCH_TIMEOUT_HTML_MS,
+      retries: 0,
+      retryDelayMs: UPSTREAM_FETCH_RETRY_DELAY_HTML_MS,
+    };
+  }
+
+  const kind = classifyProxyTarget(target);
+  if (kind === "hls_manifest") {
+    return {
+      name: kind,
+      timeoutMs: UPSTREAM_FETCH_TIMEOUT_MANIFEST_MS,
+      retries: UPSTREAM_FETCH_RETRIES_STREAM,
+      retryDelayMs: UPSTREAM_FETCH_RETRY_DELAY_STREAM_MS,
+    };
+  }
+  if (kind === "hls_segment_or_chunk") {
+    return {
+      name: kind,
+      timeoutMs: UPSTREAM_FETCH_TIMEOUT_SEGMENT_MS,
+      retries: UPSTREAM_FETCH_RETRIES_STREAM,
+      retryDelayMs: UPSTREAM_FETCH_RETRY_DELAY_STREAM_MS,
+    };
+  }
+  return {
+    name: "html_page",
+    timeoutMs: UPSTREAM_FETCH_TIMEOUT_HTML_MS,
+    retries: UPSTREAM_FETCH_RETRIES_HTML,
+    retryDelayMs: UPSTREAM_FETCH_RETRY_DELAY_HTML_MS,
+  };
 }
 
 function rewriteM3u8Manifest(
@@ -679,7 +762,7 @@ function buildInjection(depth: number, currentTargetUrl: string, stableMode: boo
       patchClappr(window.Clappr);
       patchHls();
       patchMediaSrcSetter();
-    }, 700);
+    }, 2500);
   };
 
   const lockPopupApis = () => {
@@ -835,7 +918,7 @@ function buildInjection(depth: number, currentTargetUrl: string, stableMode: boo
     };
 
     applyAll();
-    setInterval(applyAll, 500);
+    setInterval(applyAll, 2500);
   };
 
   const enforceStableServerMode = () => {
@@ -932,7 +1015,7 @@ function buildInjection(depth: number, currentTargetUrl: string, stableMode: boo
     setInterval(() => {
       rewriteToProxy();
       stripBadNodes();
-    }, 1200);
+    }, 3500);
 
     const observer = new MutationObserver(() => {
       rewriteToProxy();
@@ -943,7 +1026,7 @@ function buildInjection(depth: number, currentTargetUrl: string, stableMode: boo
       subtree: true,
       childList: true,
       attributes: true,
-      attributeFilter: ["src", "href", "data-src", "class", "style", "id"]
+      attributeFilter: ["src", "href", "data-src"]
     });
   };
 
@@ -1054,7 +1137,12 @@ function buildManualHlsFallbackSnippet({
   let video = null;
   let hls = null;
   let currentIndex = 0;
-  let switchedAfterFatal = false;
+  let currentSource = "";
+  let networkRetryCount = 0;
+  let stallRecoverCount = 0;
+  let lastPlaybackTime = 0;
+  let lastProgressAt = Date.now();
+  let lastRecoverAt = 0;
 
   const toProxyWrap = (u) => {
     try {
@@ -1112,6 +1200,29 @@ function buildManualHlsFallbackSnippet({
     hls = null;
   };
 
+  const recoverPlayback = (reason) => {
+    const now = Date.now();
+    if (now - lastRecoverAt < 2500) return;
+    lastRecoverAt = now;
+    try {
+      emitDiag("manual_hls_recover", { reason, idx: currentIndex });
+    } catch {}
+    if (hls && typeof hls.startLoad === "function") {
+      try { hls.startLoad(); } catch {}
+    }
+    if (video) video.play().catch(() => {});
+  };
+
+  const switchToNextSource = (reason) => {
+    if (candidates.length <= 1) return false;
+    currentIndex = (currentIndex + 1) % candidates.length;
+    networkRetryCount = 0;
+    stallRecoverCount = 0;
+    emitDiag("manual_hls_switch_source", { reason, idx: currentIndex });
+    startCurrent().catch(() => {});
+    return true;
+  };
+
   const ensureVideo = () => {
     if (video && video.isConnected) return video;
     const root = mountRoot();
@@ -1124,7 +1235,9 @@ function buildManualHlsFallbackSnippet({
       video.controls = true;
       video.autoplay = true;
       video.muted = true;
+      video.preload = "auto";
       video.playsInline = true;
+      video.setAttribute("playsinline", "true");
       video.style.width = "100%";
       video.style.height = "100%";
       video.style.background = "#000";
@@ -1143,6 +1256,11 @@ function buildManualHlsFallbackSnippet({
   const playSource = async (source) => {
     const v = ensureVideo();
     if (!v || !source) return false;
+    currentSource = source;
+    networkRetryCount = 0;
+    stallRecoverCount = 0;
+    lastPlaybackTime = 0;
+    lastProgressAt = Date.now();
 
     if (v.canPlayType("application/vnd.apple.mpegurl")) {
       destroyHls();
@@ -1185,19 +1303,21 @@ function buildManualHlsFallbackSnippet({
       }
       if (!data?.fatal) return;
       if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
-        try { hls.startLoad(); } catch {}
+        networkRetryCount += 1;
+        if (networkRetryCount <= 2) {
+          try { hls.startLoad(); } catch {}
+          return;
+        }
+        networkRetryCount = 0;
+        if (switchToNextSource("network_fatal")) return;
         return;
       }
       if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
         try { hls.recoverMediaError(); } catch {}
+        if (switchToNextSource("media_fatal")) return;
         return;
       }
-      if (!switchedAfterFatal && candidates.length > 1) {
-        switchedAfterFatal = true;
-        currentIndex = (currentIndex + 1) % candidates.length;
-        emitDiag("manual_hls_fallback_once", { idx: currentIndex });
-        startCurrent().catch(() => {});
-      }
+      switchToNextSource("fatal");
     });
     return true;
   };
@@ -1231,15 +1351,37 @@ function buildManualHlsFallbackSnippet({
     await startCurrent();
   };
 
+  const watchdog = () => {
+    if (!video || document.hidden) return;
+    if (video.paused || video.ended) return;
+    const now = Date.now();
+    const t = Number(video.currentTime || 0);
+    if (Number.isFinite(t) && t > lastPlaybackTime + 0.15) {
+      lastPlaybackTime = t;
+      lastProgressAt = now;
+      stallRecoverCount = 0;
+      return;
+    }
+    if (now - lastProgressAt < 12000) return;
+    stallRecoverCount += 1;
+    recoverPlayback("watchdog");
+    if (stallRecoverCount >= 2) {
+      stallRecoverCount = 0;
+      if (!switchToNextSource("watchdog_switch")) {
+        recoverPlayback("watchdog_retry");
+      }
+    }
+    lastProgressAt = now;
+  };
+
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) return;
-    if (video && video.currentSrc) video.play().catch(() => {});
-    if (hls && typeof hls.startLoad === "function") {
-      try { hls.startLoad(); } catch {}
-    }
+    recoverPlayback("visibility");
   });
+  window.addEventListener("pageshow", () => recoverPlayback("pageshow"));
 
   setTimeout(() => { boot().catch(() => {}); }, 80);
+  setInterval(watchdog, 3500);
 })();
 </script>`;
 }
@@ -1282,12 +1424,21 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number) {
 (() => {
   const tokenEndpoint = ${JSON.stringify(proxiedTokenEndpoint)};
   const hlsLibUrl = ${JSON.stringify(hlsLibUrl)};
+  const playerRef = ${JSON.stringify(target.toString())};
   let video = null;
   let hls = null;
   let tabsWrap = null;
   let currentPath = "";
   let currentTabIndex = 0;
   let lastStartAt = 0;
+  let currentSources = [];
+  let currentSourceIndex = 0;
+  let networkRetryCount = 0;
+  let stallRecoverCount = 0;
+  let lastPlaybackTime = 0;
+  let lastProgressAt = Date.now();
+  let lastRecoverAt = 0;
+  let refreshingToken = false;
 
   const emitDiag = (event, data) => {
     try {
@@ -1316,8 +1467,14 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number) {
 
   const toProxyWrap = (u) => {
     try {
-      const abs = new URL(String(u || ""), location.href);
-      return "/api/embed-proxy?url=" + encodeURIComponent(abs.toString()) + "&depth=0&ref=" + encodeURIComponent(location.href);
+      const abs = new URL(String(u || ""), playerRef);
+      return (
+        "/api/embed-proxy?url=" +
+        encodeURIComponent(abs.toString()) +
+        "&depth=${nextDepth}" +
+        "&ref=" +
+        encodeURIComponent(playerRef)
+      );
     } catch {
       return null;
     }
@@ -1420,7 +1577,9 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number) {
       video.controls = true;
       video.autoplay = true;
       video.muted = true;
+      video.preload = "auto";
       video.playsInline = true;
+      video.setAttribute("playsinline", "true");
       video.style.width = "100%";
       video.style.height = "100%";
       video.style.background = "#000";
@@ -1504,9 +1663,108 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number) {
     });
   };
 
-  const playStream = async (source) => {
+  const parseManifestItems = (text) => {
+    return String(text || "")
+      .split(/\r?\n/)
+      .map((x) => x.trim())
+      .filter((x) => x && !x.startsWith("#"));
+  };
+
+  const probeSource = async (source) => {
+    try {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 2600);
+      const res = await fetch(source, { method: "GET", cache: "no-store", signal: ctl.signal });
+      clearTimeout(t);
+      if (!res.ok) return -1;
+      const txt = await res.text().catch(() => "");
+      if (!txt || txt.indexOf("#EXTM3U") === -1) return -1;
+
+      const l1 = parseManifestItems(txt);
+      if (!l1.length) return 1;
+      const first = l1[0];
+      if (!/\.m3u8(?:[?#]|$)/i.test(first)) {
+        return Math.min(20, l1.length + 2);
+      }
+
+      const ctl2 = new AbortController();
+      const t2 = setTimeout(() => ctl2.abort(), 2600);
+      const res2 = await fetch(first, { method: "GET", cache: "no-store", signal: ctl2.signal });
+      clearTimeout(t2);
+      if (!res2.ok) return 2;
+      const txt2 = await res2.text().catch(() => "");
+      const l2 = parseManifestItems(txt2);
+      if (!l2.length) return 3;
+
+      const probeSeg = l2[0];
+      const ctl3 = new AbortController();
+      const t3 = setTimeout(() => ctl3.abort(), 2200);
+      const res3 = await fetch(probeSeg, { method: "GET", cache: "no-store", signal: ctl3.signal });
+      clearTimeout(t3);
+      if (!res3.ok) return 4;
+      return Math.min(50, l2.length + 8);
+    } catch {
+      return -1;
+    }
+  };
+
+  const pickBestSourceIndex = async (sources) => {
+    let bestIdx = 0;
+    let bestScore = -1;
+    for (let i = 0; i < sources.length; i++) {
+      const source = sources[i];
+      if (!source) continue;
+      const score = await probeSource(source);
+      emitDiag("yalla_probe_source", { idx: i, score });
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  };
+
+  const recoverPlayback = (reason) => {
+    const now = Date.now();
+    if (now - lastRecoverAt < 2500) return;
+    lastRecoverAt = now;
+    emitDiag("yalla_recover", { reason, idx: currentTabIndex, sourceIdx: currentSourceIndex });
+    if (hls && typeof hls.startLoad === "function") {
+      try { hls.startLoad(); } catch {}
+    }
+    if (video) video.play().catch(() => {});
+  };
+
+  const refreshTabStream = (reason) => {
+    if (refreshingToken || !currentPath) return false;
+    refreshingToken = true;
+    emitDiag("yalla_refresh_tab", { reason, path: currentPath, idx: currentTabIndex });
+    playTab({ path: currentPath, label: "auto" }, currentTabIndex, true)
+      .catch(() => {})
+      .finally(() => {
+        refreshingToken = false;
+      });
+    return true;
+  };
+
+  const rotateSource = (reason) => {
+    if (!currentSources.length || currentSources.length <= 1) return false;
+    currentSourceIndex = (currentSourceIndex + 1) % currentSources.length;
+    networkRetryCount = 0;
+    stallRecoverCount = 0;
+    emitDiag("yalla_switch_source", { reason, idx: currentTabIndex, sourceIdx: currentSourceIndex });
+    playCurrentSource().catch(() => {});
+    return true;
+  };
+
+  const playStream = async (source, sourceIndex = 0) => {
     if (!video || !source) return false;
-    emitDiag("yalla_play_source", { source });
+    currentSourceIndex = sourceIndex;
+    networkRetryCount = 0;
+    stallRecoverCount = 0;
+    lastPlaybackTime = 0;
+    lastProgressAt = Date.now();
+    emitDiag("yalla_play_source", { source, sourceIdx: sourceIndex });
 
     if (video.canPlayType("application/vnd.apple.mpegurl")) {
       destroyHls();
@@ -1541,19 +1799,38 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number) {
         type: data?.type || "",
         details: data?.details || "",
         fatal: !!data?.fatal,
+        sourceIdx: currentSourceIndex,
       });
       if (!data?.fatal) return;
       if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
-        try { hls.startLoad(); } catch {}
+        networkRetryCount += 1;
+        if (networkRetryCount <= 2) {
+          try { hls.startLoad(); } catch {}
+          return;
+        }
+        networkRetryCount = 0;
+        if (refreshTabStream("network_fatal")) return;
+        if (rotateSource("network_fatal")) return;
         return;
       }
       if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
         try { hls.recoverMediaError(); } catch {}
+        if (refreshTabStream("media_fatal")) return;
+        if (rotateSource("media_fatal")) return;
         return;
       }
-      emitDiag("yalla_fatal_stop", { path: currentPath, idx: currentTabIndex });
+      if (refreshTabStream("fatal")) return;
+      if (rotateSource("fatal")) return;
+      emitDiag("yalla_fatal_stop", { path: currentPath, idx: currentTabIndex, sourceIdx: currentSourceIndex });
     });
     return true;
+  };
+
+  const playCurrentSource = async () => {
+    if (!currentSources.length) return false;
+    const source = currentSources[currentSourceIndex];
+    if (!source) return false;
+    return playStream(source, currentSourceIndex);
   };
 
   const playTab = async (tab, idx, force = false) => {
@@ -1582,17 +1859,9 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number) {
       emitDiag("yalla_no_candidate", { path: tab.path, reason: "no_sources" });
       return false;
     }
-
-    const firstOk = await playStream(sources[0]);
-    if (firstOk) return true;
-
-    for (let i = 1; i < sources.length; i++) {
-      const ok = await playStream(sources[i]);
-      if (ok) return true;
-    }
-
-    emitDiag("yalla_no_candidate", { path: tab.path });
-    return false;
+    currentSources = sources;
+    currentSourceIndex = await pickBestSourceIndex(sources);
+    return playCurrentSource();
   };
 
   const buildTabsUi = (tabs) => {
@@ -1626,20 +1895,186 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number) {
     await playTab(first, first.idx, true);
   };
 
+  const watchdog = () => {
+    if (!video || document.hidden) return;
+    if (video.paused || video.ended) return;
+    const now = Date.now();
+    const t = Number(video.currentTime || 0);
+    if (Number.isFinite(t) && t > lastPlaybackTime + 0.15) {
+      lastPlaybackTime = t;
+      lastProgressAt = now;
+      stallRecoverCount = 0;
+      return;
+    }
+    if (now - lastProgressAt < 7000) return;
+    stallRecoverCount += 1;
+    recoverPlayback("watchdog");
+    if (stallRecoverCount >= 2) {
+      stallRecoverCount = 0;
+      if (!rotateSource("watchdog_switch")) {
+        if (!refreshTabStream("watchdog_refresh")) {
+          recoverPlayback("watchdog_retry");
+        }
+      }
+    }
+    lastProgressAt = now;
+  };
+
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) return;
-    if (video && video.currentSrc) video.play().catch(() => {});
-    if (hls && typeof hls.startLoad === "function") {
-      try { hls.startLoad(); } catch {}
-    }
+    recoverPlayback("visibility");
   });
+  window.addEventListener("pageshow", () => recoverPlayback("pageshow"));
 
   setTimeout(() => { boot().catch(() => {}); }, 80);
+  setInterval(watchdog, 3500);
 })();
 </script>`;
 
     if (/<\/body>/i.test(out)) out = out.replace(/<\/body>/i, `${fallbackScript}</body>`);
     else out += fallbackScript;
+  }
+
+  if (host.endsWith("kooraxx.com") || host.endsWith("sia-bth.net")) {
+    // Neutralize common frame-buster snippets that try to escape the embed proxy iframe.
+    out = out
+      .replace(/if\s*\(\s*top\s*!==\s*self\s*\)\s*\{[\s\S]{0,220}?top\.location[\s\S]{0,220}?\}/gi, "")
+      .replace(/if\s*\(\s*window\.top\s*!==\s*window\.self\s*\)\s*\{[\s\S]{0,220}?top\.location[\s\S]{0,220}?\}/gi, "")
+      .replace(/\btop\.location(?:\.href)?\s*=\s*[^;]+;/gi, "")
+      .replace(/\bparent\.location(?:\.href)?\s*=\s*[^;]+;/gi, "");
+
+    const keepEmbeddedScript = `
+<script>
+(() => {
+  const wrap = (urlLike) => {
+    try {
+      if (typeof window.__embedProxyWrap === "function") {
+        return window.__embedProxyWrap(urlLike) || urlLike;
+      }
+    } catch {}
+    return urlLike;
+  };
+
+  const patchLocation = () => {
+    try {
+      const proto = window.Location && window.Location.prototype;
+      if (!proto || proto.__embedProxyNavPatched) return;
+      const patch = (name) => {
+        const native = proto[name];
+        if (typeof native !== "function") return;
+        proto[name] = function (value) {
+          try {
+            const wrapped = wrap(value);
+            return native.call(this, wrapped || value);
+          } catch {
+            return native.call(this, value);
+          }
+        };
+      };
+      patch("assign");
+      patch("replace");
+      proto.__embedProxyNavPatched = true;
+    } catch {}
+  };
+
+  const guardAnchors = () => {
+    document.addEventListener(
+      "click",
+      (ev) => {
+        try {
+          const a = ev?.target?.closest?.("a[href]");
+          if (!a) return;
+          const href = String(a.getAttribute("href") || "").trim();
+          if (!href || href.startsWith("#") || /^javascript:/i.test(href)) return;
+          const wrapped = wrap(href);
+          if (wrapped && wrapped !== href) {
+            a.setAttribute("href", wrapped);
+            a.setAttribute("target", "_self");
+          }
+        } catch {}
+      },
+      true
+    );
+  };
+
+  patchLocation();
+  guardAnchors();
+})();
+</script>`;
+
+    out = appendBeforeBody(out, keepEmbeddedScript);
+  }
+
+  if (host.endsWith("bein-live.com") && /\/matches\//i.test(target.pathname)) {
+    const keepMainFrameScript = `
+<script>
+(() => {
+  const isBad = (value) => {
+    const s = String(value || "").toLowerCase();
+    if (!s) return true;
+    return (
+      s.includes("about:blank") ||
+      s.includes("javascript:") ||
+      s.includes("doubleclick.net") ||
+      s.includes("googletagmanager.com") ||
+      s.includes("adsco.re") ||
+      s.includes("intellipopup.com") ||
+      s.includes("blockadsnot.com")
+    );
+  };
+
+  const score = (value) => {
+    const s = String(value || "").toLowerCase();
+    if (!s || isBad(s)) return -9999;
+    let out = 0;
+    if (s.includes("/albaplayer/")) out += 1200;
+    if (s.includes("/alba.php")) out += 1100;
+    if (s.includes("/playerv2.php")) out += 1000;
+    if (s.includes("/embed")) out += 450;
+    if (s.includes("/player")) out += 350;
+    if (s.includes("yallashoot") || s.includes("yallashot")) out += 280;
+    if (s.includes("koora") || s.includes("kora")) out += 180;
+    if (s.includes("bein-live.com/matches/")) out -= 1000;
+    if (s.includes("/wp-content/uploads/")) out -= 2000;
+    return out;
+  };
+
+  const pickMain = () => {
+    const frames = Array.from(document.querySelectorAll("iframe[src], iframe[data-src]"));
+    let best = "";
+    let bestScore = -9999;
+    for (const frame of frames) {
+      const raw = frame.getAttribute("src") || frame.getAttribute("data-src") || "";
+      const sc = score(raw);
+      if (sc > bestScore) {
+        bestScore = sc;
+        best = raw;
+      }
+    }
+    if (!best || bestScore < 200) return null;
+    try {
+      return new URL(best, location.href).toString();
+    } catch {
+      return null;
+    }
+  };
+
+  const tryRedirect = () => {
+    try {
+      const picked = pickMain();
+      if (!picked) return;
+      if (picked === location.href) return;
+      if (picked.includes("bein-live.com/matches/")) return;
+      location.replace(picked);
+    } catch {}
+  };
+
+  setTimeout(tryRedirect, 40);
+  setTimeout(tryRedirect, 220);
+  setTimeout(tryRedirect, 900);
+})();
+</script>`;
+    out = appendBeforeBody(out, keepMainFrameScript);
   }
 
   if (host.endsWith("dishtrainer.net")) {
@@ -1945,6 +2380,95 @@ function filterResponseHeaders(source: Headers, { html }: { html: boolean }) {
   return out;
 }
 
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableStatus(status: number) {
+  return (
+    status === 408 ||
+    status === 425 ||
+    status === 429 ||
+    status === 500 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    status === 520 ||
+    status === 521 ||
+    status === 522 ||
+    status === 523 ||
+    status === 524
+  );
+}
+
+function isRetryableFetchError(error: unknown) {
+  if (!(error instanceof Error)) return false;
+  const name = String(error.name || "");
+  const msg = String(error.message || "").toLowerCase();
+  return (
+    name === "AbortError" ||
+    msg.includes("timeout") ||
+    msg.includes("network") ||
+    msg.includes("fetch failed") ||
+    msg.includes("socket") ||
+    msg.includes("econnreset")
+  );
+}
+
+type UpstreamResult = {
+  upstream: Response;
+  attempts: number;
+};
+
+async function fetchUpstreamWithRetry(params: {
+  target: URL;
+  method: string;
+  headers: Headers;
+  body?: ArrayBuffer;
+  policy: UpstreamFetchPolicy;
+}) {
+  const methodUpper = String(params.method || "GET").toUpperCase();
+  const canRetry = methodUpper === "GET" || methodUpper === "HEAD";
+  const retries = canRetry ? params.policy.retries : 0;
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), params.policy.timeoutMs);
+    try {
+      const upstream = await fetch(params.target.toString(), {
+        method: methodUpper,
+        headers: params.headers,
+        redirect: "follow",
+        cache: "no-store",
+        body: params.body,
+        signal: controller.signal,
+      });
+
+      if (attempt < retries && isRetryableStatus(upstream.status)) {
+        try {
+          await upstream.body?.cancel();
+        } catch {}
+        await sleep(params.policy.retryDelayMs * (attempt + 1));
+        continue;
+      }
+
+      return { upstream, attempts: attempt + 1 } satisfies UpstreamResult;
+    } catch (error: unknown) {
+      lastError = error;
+      if (attempt >= retries || !isRetryableFetchError(error)) {
+        throw error;
+      }
+      await sleep(params.policy.retryDelayMs * (attempt + 1));
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  if (lastError instanceof Error) throw lastError;
+  throw new Error("Upstream fetch failed");
+}
+
 async function handleProxyRequest(req: Request) {
   try {
     const startedAt = Date.now();
@@ -1995,14 +2519,20 @@ async function handleProxyRequest(req: Request) {
       return new NextResponse(null, { status: 204 });
     }
 
+    const method = String(req.method || "GET").toUpperCase();
+    const fetchPolicy = getUpstreamFetchPolicy(target, method);
+    let upstreamAttempts = 0;
     const withProxyMetaHeaders = (headers: Headers) => {
       headers.set("x-embed-proxy-target", target.toString());
       headers.set("x-embed-proxy-depth", String(depth));
       headers.set("x-embed-proxy-elapsed-ms", String(Date.now() - startedAt));
+      headers.set("x-embed-proxy-upstream-attempts", String(upstreamAttempts));
+      headers.set("x-embed-proxy-policy", fetchPolicy.name);
+      headers.set("x-embed-proxy-timeout-ms", String(fetchPolicy.timeoutMs));
+      headers.set("x-embed-proxy-retries", String(fetchPolicy.retries));
       return headers;
     };
 
-    const method = String(req.method || "GET").toUpperCase();
     const hasBody = method !== "GET" && method !== "HEAD";
     const body = hasBody ? await req.arrayBuffer() : undefined;
     const manifestCacheKey =
@@ -2025,13 +2555,15 @@ async function handleProxyRequest(req: Request) {
       trimManifestCache(now);
     }
 
-    const upstream = await fetch(target.toString(), {
+    const fetched = await fetchUpstreamWithRetry({
+      target,
       method,
       headers: buildUpstreamRequestHeaders(req, target, safeReferrer),
-      redirect: "follow",
-      cache: "no-store",
       body,
+      policy: fetchPolicy,
     });
+    const upstream = fetched.upstream;
+    upstreamAttempts = fetched.attempts;
 
     const contentType = (upstream.headers.get("content-type") || "").toLowerCase();
     const isHtml = contentType.includes("text/html") || contentType.includes("application/xhtml+xml");
