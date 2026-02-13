@@ -16,20 +16,26 @@ type MatchRow = {
   stream_url_3?: string | null;
   stream_url_4?: string | null;
   stream_url_5?: string | null;
+  stream_url_6?: string | null;
   match_start?: string | null;
   status_key?: string | null;
 };
 
 type ServerOption = { n: number; label: string; url: string | null };
-type ServerHealthState = "checking" | "ok" | "down";
+type ServerHealthState = "ok" | "down";
 
 const PREMATCH_OPEN_WINDOW_MINUTES = 30;
 const STALL_FREEZE_MS = 12000;
 const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const RESOLVE_COOLDOWN_MS = 1500;
-const CANDIDATE_PROBE_TIMEOUT_MS = 7000;
+const CANDIDATE_PROBE_TIMEOUT_MS = 5000;
+const RESOLVE_CHILD_CONCURRENCY = 3;
+const EXPAND_VARIANTS_CONCURRENCY = 4;
+const PROBE_CONCURRENCY = 4;
 const HLS_CT = ["application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl"];
 const MEDIA_RE = /\.(?:m3u8|mp4|m4v|mov|webm|mpd|ts)(?:[?#]|$)/i;
+const SEGMENT_FILE_RE = /\.(?:ts|m4s|m4f|cmf|mp4|aac|ac3|ec3|mp3|vtt|webm|key)(?:[?#]|$)/i;
+const PLAYLIST_HINT_RE = /\.(?:m3u8)(?:[?#]|$)|\/(?:master|index|playlist|manifest)\b/i;
 const NON_STREAM_EXT_RE =
   /\.(?:png|jpe?g|gif|svg|webp|avif|ico|bmp|css|js|woff2?|ttf|eot|otf|map|json|xml|txt|pdf)(?:[?#]|$)/i;
 const NON_STREAM_HOST_HINTS = [
@@ -84,13 +90,15 @@ const PLAYERV2_FALLBACK_DOMAINS = [
 ];
 
 type Playerv2TokenPayload = { token: string; session_id: string };
+type AlbaRollingConfig = { ch: string; dm: string[]; iv: number };
 type ProbeHlsOptions = {
   signal?: AbortSignal;
   timeoutMs?: number;
   maxChildChecks?: number;
   pushDiag?: (line: string) => void;
 };
-type FilterPlayableOptions = ProbeHlsOptions & { maxChecks?: number };
+type FilterPlayableOptions = ProbeHlsOptions & { maxChecks?: number; concurrency?: number };
+type ResolveBatchPhase = "fast" | "deep" | "token";
 
 function isValidHttpUrl(value: string) {
   try {
@@ -270,6 +278,170 @@ async function fetchWithTimeout(
   }
 }
 
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>
+) {
+  if (!items.length) return [] as R[];
+  const results = new Array<R>(items.length);
+  const limit = Math.max(1, Math.min(items.length, Math.floor(concurrency) || 1));
+  let cursor = 0;
+
+  const runOne = async () => {
+    while (true) {
+      const idx = cursor;
+      cursor += 1;
+      if (idx >= items.length) return;
+      results[idx] = await worker(items[idx], idx);
+    }
+  };
+
+  await Promise.all(Array.from({ length: limit }, () => runOne()));
+  return results;
+}
+
+function getUrlOrigin(value: string) {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
+
+function getServFromUrl(value: string) {
+  try {
+    const raw = new URL(value).searchParams.get("serv");
+    if (!raw) return null;
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizePathKey(value: string) {
+  try {
+    const u = new URL(value);
+    return u.pathname.toLowerCase().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function materializeTemplateUrl(raw: string, sourceUrl: string) {
+  let value = String(raw || "").trim();
+  if (!value.includes("${")) return value;
+
+  let matchId = "";
+  try {
+    matchId = String(new URL(sourceUrl).searchParams.get("match") || "").trim();
+  } catch {}
+  if (!matchId) return "";
+
+  const encoded = encodeURIComponent(matchId);
+  value = value
+    .replace(/\\?\$\{\s*encodeURIComponent\(\s*matchId\s*\)\s*\}/gi, encoded)
+    .replace(/\\?\$\{\s*matchId\s*\}/gi, matchId)
+    .replace(/\\?\$\{\s*encodeURIComponent\(\s*match\s*\)\s*\}/gi, encoded)
+    .replace(/\\?\$\{\s*match\s*\}/gi, matchId);
+
+  return value;
+}
+
+function extractServerVariantUrlsFromProxyHtml(html: string, sourceUrl: string) {
+  const text = normalizeHtmlForScan(html);
+  const sourceOrigin = getUrlOrigin(sourceUrl);
+  const sourcePathKey = normalizePathKey(sourceUrl);
+  const all = new Set<string>();
+
+  const addRaw = (raw: string) => {
+    let candidate = String(raw || "").trim();
+    if (!candidate) return;
+    if (candidate.startsWith("/api/embed-proxy?")) {
+      const target = getProxyTargetUrl(candidate);
+      if (!target) return;
+      candidate = target;
+    }
+    candidate = materializeTemplateUrl(candidate, sourceUrl) || candidate;
+    if (!isValidHttpUrl(candidate) || !PLAYER_PAGE_HINT_RE.test(candidate)) return;
+    const serv = getServFromUrl(candidate);
+    if (sourceOrigin && getUrlOrigin(candidate) !== sourceOrigin && serv === null) return;
+    const pathKey = normalizePathKey(candidate);
+    if (serv === null && pathKey !== sourcePathKey) return;
+
+    const key = canonicalizeUrl(candidate);
+    if (!key) return;
+    all.add(candidate);
+  };
+
+  addRaw(sourceUrl);
+  for (const m of text.match(/\/api\/embed-proxy\?[^"'`\s<>()]+/gi) || []) addRaw(m);
+  for (const m of text.match(/https?:\/\/[^"'`\s<>()]+/gi) || []) addRaw(m);
+
+  const sorted = Array.from(all).sort((a, b) => {
+    if (a === sourceUrl) return -1;
+    if (b === sourceUrl) return 1;
+    const sa = getServFromUrl(a);
+    const sb = getServFromUrl(b);
+    if (sa !== null && sb !== null) return sa - sb;
+    if (sa !== null) return -1;
+    if (sb !== null) return 1;
+    return a.localeCompare(b);
+  });
+  return sorted;
+}
+
+function extractRollingConfigFromHtml(html: string): AlbaRollingConfig | null {
+  const text = normalizeHtmlForScan(html);
+  const cfgMatch = text.match(
+    /const\s+C\s*=\s*\{[\s\S]*?ch\s*:\s*['"]([^'"]+)['"][\s\S]*?dm\s*:\s*\[([^\]]+)\][\s\S]*?iv\s*:\s*(\d+)/i
+  );
+  if (!cfgMatch?.[1] || !cfgMatch?.[2]) return null;
+
+  const ch = String(cfgMatch[1]).trim();
+  if (!ch) return null;
+  const dm: string[] = [];
+  for (const m of cfgMatch[2].matchAll(/["']([^"']+)["']/g)) {
+    const v = String(m[1] || "").trim();
+    if (v) dm.push(v);
+  }
+  const ivRaw = Number.parseInt(String(cfgMatch[3] || ""), 10);
+  const iv = Number.isFinite(ivRaw) && ivRaw > 0 ? ivRaw : 1800000;
+  if (!dm.length) return null;
+  return { ch, dm: Array.from(new Set(dm)), iv };
+}
+
+function buildRollingPrefix(ts: number, interval: number, len = 5) {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz";
+  let value = Math.floor(ts / interval);
+  let out = "";
+  while (out.length < len) {
+    out = alphabet[value % 26] + out;
+    value = Math.floor(value / 26);
+  }
+  return out;
+}
+
+function extractRollingHlsCandidatesFromHtml(html: string, sourceUrl: string) {
+  const cfg = extractRollingConfigFromHtml(html);
+  if (!cfg) return [];
+  if (isValidHttpUrl(cfg.ch)) return dedupeUrls([toEmbedProxyUrl(cfg.ch, sourceUrl)].filter(Boolean));
+
+  const now = Date.now();
+  const slots = [now - cfg.iv, now, now + cfg.iv];
+  const out: string[] = [];
+  for (const slot of slots) {
+    const prefix = buildRollingPrefix(slot, cfg.iv, 5);
+    for (const domain of cfg.dm) {
+      const abs = `https://${prefix}.${domain}/hls/${cfg.ch}/master.m3u8`;
+      const proxied = toEmbedProxyUrl(abs, sourceUrl);
+      if (proxied) out.push(proxied);
+    }
+  }
+  return dedupeUrls(out);
+}
+
 function extractPlayableCandidatesFromProxyHtml(html: string, sourceUrl: string) {
   const text = String(html || "")
     .replace(/&amp;/gi, "&")
@@ -279,7 +451,11 @@ function extractPlayableCandidatesFromProxyHtml(html: string, sourceUrl: string)
   const out: string[] = [];
   const seen = new Set<string>();
   const add = (raw: string) => {
-    const v = String(raw || "").trim();
+    let v = String(raw || "").trim().replace(/[),;]+$/g, "");
+    if (v.includes("${")) {
+      const materialized = materializeTemplateUrl(v, sourceUrl);
+      if (materialized) v = materialized;
+    }
     if (!v) return;
     if (v.startsWith("/api/embed-proxy?")) {
       const target = getProxyTargetUrl(v);
@@ -313,7 +489,11 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
   const out: string[] = [];
   const seen = new Set<string>();
   const add = (raw: string) => {
-    const v = String(raw || "").trim();
+    let v = String(raw || "").trim().replace(/[),;]+$/g, "");
+    if (v.includes("${")) {
+      const materialized = materializeTemplateUrl(v, sourceUrl);
+      if (materialized) v = materialized;
+    }
     if (!v) return;
 
     if (v.startsWith("/api/embed-proxy?")) {
@@ -341,6 +521,10 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
 
   for (const m of text.match(/\/api\/embed-proxy\?[^"'`\s<>()]+/gi) || []) add(m);
   for (const m of text.match(/https?:\/\/[^"'`\s<>()]+/gi) || []) add(m);
+  for (const m of text.match(/https?:\/\/[^\s"'`<>()]+\/playerv2\.php\?[^"'`\s<>]*\$\{encodeURIComponent\(\s*matchId\s*\)\}[^"'`\s<>]*/gi) || [])
+    add(m);
+  for (const m of text.match(/https?:\/\/[^\s"'`<>()]+\/playerv2\.php\?[^"'`\s<>]*\$\{matchId\}[^"'`\s<>]*/gi) || [])
+    add(m);
   return out;
 }
 
@@ -573,11 +757,25 @@ async function resolveCandidatesForServer(
     maxDeepCandidates?: number;
     maxPlayerv2Pool?: number;
     playerv2Diag?: (line: string) => void;
+    onBatchCandidates?: (batch: string[], phase: ResolveBatchPhase) => void;
+    parallelChildConcurrency?: number;
   }
 ) {
   const maxPlayerPages = opts?.maxPlayerPages ?? 6;
   const maxDeepCandidates = opts?.maxDeepCandidates ?? 8;
   const maxPlayerv2Pool = opts?.maxPlayerv2Pool ?? 6;
+  const parallelChildConcurrency = opts?.parallelChildConcurrency ?? RESOLVE_CHILD_CONCURRENCY;
+  const sourceServ = getServFromUrl(sourceUrl);
+  const sourcePathKey = normalizePathKey(sourceUrl);
+  const normalizePlayableBatch = (input: string[]) =>
+    dedupeUrls(input).filter((url) => {
+      const target = url.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(url) || "" : url;
+      return isStrongPlayableStreamUrl(target);
+    });
+  const emitBatch = (batch: string[], phase: ResolveBatchPhase) => {
+    const normalized = normalizePlayableBatch(batch);
+    if (normalized.length) opts?.onBatchCandidates?.(normalized, phase);
+  };
 
   const fetchHtml = async (url: string) => {
     const res = await fetch(url, {
@@ -593,6 +791,7 @@ async function resolveCandidatesForServer(
 
   if (isStrongPlayableStreamUrl(sourceUrl)) {
     const one = toEmbedProxyUrl(sourceUrl, sourceUrl);
+    if (one) emitBatch([one], "fast");
     return one ? [one] : [];
   }
 
@@ -610,57 +809,111 @@ async function resolveCandidatesForServer(
 
   const html = await first.res.text();
   const primaryList = extractPlayableCandidatesFromProxyHtml(html, sourceUrl);
-  const playerPages = extractPlayerPageCandidatesFromProxyHtml(html, sourceUrl);
+  const rollingPrimary = extractRollingHlsCandidatesFromHtml(html, sourceUrl);
+  emitBatch([...rollingPrimary, ...primaryList], "fast");
+  const isSameServerVariantPage = (value: string) => {
+    const target = value.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(value) || "" : value;
+    if (!target || !isValidHttpUrl(target)) return false;
+
+    const targetServ = getServFromUrl(target);
+    if (sourceServ !== null) {
+      if (targetServ !== null && targetServ !== sourceServ) return false;
+      return true;
+    }
+
+    if (targetServ !== null && normalizePathKey(target) === sourcePathKey) {
+      return false;
+    }
+    return true;
+  };
+  const playerPages = extractPlayerPageCandidatesFromProxyHtml(html, sourceUrl).filter((p) =>
+    isSameServerVariantPage(p)
+  );
   const deepList: string[] = [];
+  const rollingDeepList: string[] = [];
   const playerv2HtmlPool: Array<{ pageUrl: string; html: string }> = [];
   playerv2HtmlPool.push({ pageUrl: sourceUrl, html });
+  type ChildResolveResult = {
+    deep: string[];
+    rolling: string[];
+    playerv2: { pageUrl: string; html: string } | null;
+    playable: string[];
+  };
+  const emptyChildResult: ChildResolveResult = { deep: [], rolling: [], playerv2: null, playable: [] };
+  const childResults = await mapWithConcurrency(
+    playerPages.slice(0, maxPlayerPages),
+    parallelChildConcurrency,
+    async (pageUrl): Promise<ChildResolveResult> => {
+      if (signal.aborted) throw new DOMException("aborted", "AbortError");
+      try {
+        const childProbe = pageUrl.startsWith("/api/embed-proxy?") ? pageUrl : toEmbedProxyUrl(pageUrl, sourceUrl);
+        if (!childProbe) return emptyChildResult;
 
-  for (const pageUrl of playerPages.slice(0, maxPlayerPages)) {
+        const child = await fetchHtml(childProbe);
+        if (HLS_CT.some((x) => child.ct.includes(x))) {
+          return { deep: [childProbe], rolling: [], playerv2: null, playable: [childProbe] };
+        }
+
+        if (!child.ct.includes("text/html") && !child.ct.includes("application/xhtml+xml")) {
+          return emptyChildResult;
+        }
+
+        const childHtml = await child.res.text();
+        const childList = extractPlayableCandidatesFromProxyHtml(childHtml, pageUrl);
+        const childRolling = extractRollingHlsCandidatesFromHtml(childHtml, pageUrl);
+        return {
+          deep: childList,
+          rolling: childRolling,
+          playerv2: { pageUrl, html: childHtml },
+          playable: [...childRolling, ...childList],
+        };
+      } catch (e: unknown) {
+        if (e instanceof Error && e.name === "AbortError") throw e;
+        return emptyChildResult;
+      }
+    }
+  );
+
+  for (const childResult of childResults) {
     if (signal.aborted) break;
-    try {
-      const childProbe = pageUrl.startsWith("/api/embed-proxy?") ? pageUrl : toEmbedProxyUrl(pageUrl, sourceUrl);
-      if (!childProbe) continue;
-
-      const child = await fetchHtml(childProbe);
-      if (HLS_CT.some((x) => child.ct.includes(x))) {
-        deepList.push(childProbe);
-        if (deepList.length >= maxDeepCandidates) break;
-        continue;
-      }
-
-      if (!child.ct.includes("text/html") && !child.ct.includes("application/xhtml+xml")) {
-        continue;
-      }
-
-      const childHtml = await child.res.text();
-      playerv2HtmlPool.push({ pageUrl, html: childHtml });
-      const childList = extractPlayableCandidatesFromProxyHtml(childHtml, pageUrl);
-      if (childList.length) deepList.push(...childList);
-      if (deepList.length >= maxDeepCandidates) break;
-    } catch {}
+    if (childResult.playerv2) playerv2HtmlPool.push(childResult.playerv2);
+    if (childResult.rolling.length) rollingDeepList.push(...childResult.rolling);
+    if (childResult.deep.length && deepList.length < maxDeepCandidates) {
+      const remaining = maxDeepCandidates - deepList.length;
+      deepList.push(...childResult.deep.slice(0, remaining));
+    }
+    emitBatch(childResult.playable, "deep");
   }
 
   const playerv2List: string[] = [];
-  for (const item of playerv2HtmlPool.slice(0, maxPlayerv2Pool)) {
-    if (signal.aborted) break;
-    const pageUrl = item.pageUrl.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(item.pageUrl) || "" : item.pageUrl;
-    if (!pageUrl || !isValidHttpUrl(pageUrl)) continue;
-    if (!/\/playerv2\.php/i.test(pageUrl) && !PLAYERV2_CONFIG_RE.test(item.html)) continue;
-    try {
-      const built = await extractPlayerv2TokenizedCandidatesFromHtml(
-        item.html,
-        pageUrl,
-        signal,
-        opts?.playerv2Diag
-      );
-      if (built.length) playerv2List.push(...built);
-    } catch {}
+  const playerv2Results = await mapWithConcurrency(
+    playerv2HtmlPool.slice(0, maxPlayerv2Pool),
+    Math.min(parallelChildConcurrency, 3),
+    async (item): Promise<string[]> => {
+      if (signal.aborted) throw new DOMException("aborted", "AbortError");
+      const pageUrl = item.pageUrl.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(item.pageUrl) || "" : item.pageUrl;
+      if (!pageUrl || !isValidHttpUrl(pageUrl)) return [];
+      if (!/\/playerv2\.php/i.test(pageUrl) && !PLAYERV2_CONFIG_RE.test(item.html)) return [];
+      try {
+        return await extractPlayerv2TokenizedCandidatesFromHtml(
+          item.html,
+          pageUrl,
+          signal,
+          opts?.playerv2Diag
+        );
+      } catch (e: unknown) {
+        if (e instanceof Error && e.name === "AbortError") throw e;
+        return [];
+      }
+    }
+  );
+  for (const built of playerv2Results) {
+    if (!built.length) continue;
+    playerv2List.push(...built);
+    emitBatch(built, "token");
   }
 
-  return dedupeUrls([...primaryList, ...deepList, ...playerv2List]).filter((url) => {
-    const target = url.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(url) || "" : url;
-    return isStrongPlayableStreamUrl(target);
-  });
+  return normalizePlayableBatch([...rollingPrimary, ...primaryList, ...rollingDeepList, ...deepList, ...playerv2List]);
 }
 
 async function probeHlsCandidate(candidateUrl: string, opts?: ProbeHlsOptions) {
@@ -748,14 +1001,75 @@ async function probeHlsCandidate(candidateUrl: string, opts?: ProbeHlsOptions) {
 }
 
 async function filterPlayableCandidates(input: string[], opts?: FilterPlayableOptions) {
-  const out: string[] = [];
   const limit = opts?.maxChecks && opts.maxChecks > 0 ? opts.maxChecks : input.length;
-  for (const candidate of input.slice(0, limit)) {
+  const scoped = input.slice(0, limit);
+  if (!scoped.length) return [];
+  const concurrency = opts?.concurrency ?? PROBE_CONCURRENCY;
+  const checks = await mapWithConcurrency(scoped, concurrency, async (candidate) => {
     if (opts?.signal?.aborted) throw new DOMException("aborted", "AbortError");
     const ok = await probeHlsCandidate(candidate, opts);
-    if (ok) out.push(candidate);
-  }
-  return out;
+    return { candidate, ok };
+  });
+  return checks.filter((x) => x.ok).map((x) => x.candidate);
+}
+
+async function expandCandidatesWithManifestVariants(
+  input: string[],
+  opts?: ProbeHlsOptions & { maxParents?: number; maxVariantsPerParent?: number; concurrency?: number }
+) {
+  const base = dedupeUrls(input || []);
+  if (!base.length) return [];
+
+  const signal = opts?.signal;
+  const timeoutMs = opts?.timeoutMs ?? CANDIDATE_PROBE_TIMEOUT_MS;
+  const maxParents = opts?.maxParents && opts.maxParents > 0 ? opts.maxParents : 8;
+  const maxVariantsPerParent =
+    opts?.maxVariantsPerParent && opts.maxVariantsPerParent > 0 ? opts.maxVariantsPerParent : 12;
+  const concurrency = opts?.concurrency ?? EXPAND_VARIANTS_CONCURRENCY;
+  const extrasByParent = await mapWithConcurrency(
+    base.slice(0, maxParents),
+    concurrency,
+    async (candidate): Promise<string[]> => {
+      if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+      try {
+        const res = await fetchWithTimeout(
+          candidate,
+          {
+            method: "GET",
+            cache: "no-store",
+            credentials: "same-origin",
+            headers: { "x-embed-proxy-probe": "1" },
+          },
+          timeoutMs,
+          signal
+        );
+        if (!res.ok) return [];
+
+        const contentType = (res.headers.get("content-type") || "").toLowerCase();
+        const text = await res.text();
+        const hasExtM3u = /^\s*#EXTM3U/m.test(text);
+        if (!contentTypeLooksLikeHls(contentType) && !hasExtM3u) return [];
+
+        const local: string[] = [];
+        const lines = extractManifestMediaUris(text, maxVariantsPerParent);
+        for (const line of lines) {
+          const item = String(line || "").trim();
+          if (!item) continue;
+          if (SEGMENT_FILE_RE.test(item)) continue;
+          if (!PLAYLIST_HINT_RE.test(item) && !item.toLowerCase().includes("m3u8")) continue;
+          const proxied = toPlayableProxyFromManifestLine(item, candidate);
+          if (proxied) local.push(proxied);
+        }
+        return local;
+      } catch (e: unknown) {
+        if (e instanceof Error && e.name === "AbortError") throw e;
+        opts?.pushDiag?.(`expand variants skipped: ${e instanceof Error ? e.message : String(e)}`);
+        return [];
+      }
+    }
+  );
+  const extras = extrasByParent.flat();
+  return dedupeUrls([...base, ...extras]);
 }
 
 export default function WatchPage() {
@@ -777,6 +1091,7 @@ export default function WatchPage() {
   }, [rawId]);
 
   const [match, setMatch] = useState<MatchRow | null>(null);
+  const [derivedServerVariants, setDerivedServerVariants] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [errMsg, setErrMsg] = useState<string | null>(null);
   const [selectedServer, setSelectedServer] = useState(1);
@@ -895,19 +1210,118 @@ export default function WatchPage() {
   }, [idNum]);
 
   useEffect(() => {
+    let cancel = false;
+    const controller = new AbortController();
+    (async () => {
+      const primary = String(match?.stream_url || "").trim();
+      if (!primary || !isValidHttpUrl(primary)) {
+        setDerivedServerVariants([]);
+        return;
+      }
+      const proxied = toEmbedProxyUrl(primary, primary);
+      if (!proxied) {
+        setDerivedServerVariants([primary]);
+        return;
+      }
+      try {
+        const res = await fetchWithTimeout(
+          proxied,
+          {
+            method: "GET",
+            cache: "no-store",
+            credentials: "same-origin",
+            headers: { "x-embed-proxy-probe": "1" },
+          },
+          CANDIDATE_PROBE_TIMEOUT_MS,
+          controller.signal
+        );
+        const ct = (res.headers.get("content-type") || "").toLowerCase();
+        if (!res.ok || (!ct.includes("text/html") && !ct.includes("application/xhtml+xml"))) {
+          if (!cancel) setDerivedServerVariants([primary]);
+          return;
+        }
+        const html = await res.text();
+        const variants = extractServerVariantUrlsFromProxyHtml(html, primary);
+        if (cancel) return;
+        setDerivedServerVariants(variants.length ? variants : [primary]);
+        pushDiag(`derived servers=${variants.length || 1}`);
+      } catch (e: unknown) {
+        if (cancel) return;
+        setDerivedServerVariants([primary]);
+        pushDiag(`derive servers failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    })();
+    return () => {
+      cancel = true;
+      controller.abort();
+    };
+  }, [match?.stream_url, pushDiag]);
+
+  useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 30000);
     return () => window.clearInterval(timer);
   }, []);
 
-  const serverOptions = useMemo<ServerOption[]>(
-    () => [
-      { n: 1, label: "سيرفر 1", url: match?.stream_url ?? null },
-      { n: 2, label: "سيرفر 2", url: match?.stream_url_2 ?? null },
-      { n: 3, label: "سيرفر 3", url: match?.stream_url_3 ?? null },
-      { n: 4, label: "سيرفر 4", url: match?.stream_url_4 ?? null },
-    ],
-    [match]
-  );
+  const serverOptions = useMemo<ServerOption[]>(() => {
+    const explicit: Array<string | null> = [
+      match?.stream_url ?? null,
+      match?.stream_url_2 ?? null,
+      match?.stream_url_3 ?? null,
+      match?.stream_url_4 ?? null,
+      match?.stream_url_5 ?? null,
+      match?.stream_url_6 ?? null,
+    ];
+    const pool = dedupeUrls(derivedServerVariants.filter((u) => !!u && isValidHttpUrl(u)));
+    const byServ = new Map<number, string>();
+    const genericPool: string[] = [];
+    for (const candidate of pool) {
+      const serv = getServFromUrl(candidate);
+      if (serv !== null && serv >= 1 && serv <= 6 && !byServ.has(serv)) {
+        byServ.set(serv, candidate);
+      } else {
+        genericPool.push(candidate);
+      }
+    }
+
+    const fallbackPool = [
+      ...(byServ.get(1) ? [byServ.get(1)!] : []),
+      ...(byServ.get(2) ? [byServ.get(2)!] : []),
+      ...(byServ.get(3) ? [byServ.get(3)!] : []),
+      ...(byServ.get(4) ? [byServ.get(4)!] : []),
+      ...(byServ.get(5) ? [byServ.get(5)!] : []),
+      ...(byServ.get(6) ? [byServ.get(6)!] : []),
+      ...genericPool,
+    ];
+
+    const used = new Set<string>();
+    const claim = (value?: string | null) => {
+      const candidate = String(value || "").trim();
+      if (!candidate || !isValidHttpUrl(candidate)) return null;
+      const key = canonicalizeUrl(candidate);
+      if (!key || used.has(key)) return null;
+      used.add(key);
+      return candidate;
+    };
+
+    let fallbackIdx = 0;
+    const nextFallback = () => {
+      while (fallbackIdx < fallbackPool.length) {
+        const picked = claim(fallbackPool[fallbackIdx++]);
+        if (picked) return picked;
+      }
+      return null;
+    };
+
+    const out: ServerOption[] = [];
+    for (let i = 0; i < 6; i += 1) {
+      const n = i + 1;
+      let picked = claim(explicit[i]);
+      if (!picked) picked = claim(byServ.get(n) ?? null);
+      if (!picked) picked = nextFallback();
+      out.push({ n, label: `سيرفر ${n}`, url: picked ?? null });
+    }
+    return out;
+  }, [match, derivedServerVariants]);
 
   const validServers = useMemo(() => serverOptions.filter((s) => s.url && isValidHttpUrl(s.url)), [serverOptions]);
   useEffect(() => {
@@ -915,78 +1329,14 @@ export default function WatchPage() {
   }, [validServers, selectedServer]);
 
   useEffect(() => {
-    let cancel = false;
-    const controller = new AbortController();
-    if (!validServers.length) {
-      setServerHealth({});
-      return () => {
-        controller.abort();
-      };
-    }
-
-    setServerHealth((prev) => {
+    setServerHealth(() => {
       const next: Record<number, ServerHealthState> = {};
-      for (const s of validServers) {
-        next[s.n] = prev[s.n] === "ok" ? "ok" : "checking";
+      for (const s of serverOptions) {
+        next[s.n] = s.url && isValidHttpUrl(s.url) ? "ok" : "down";
       }
       return next;
     });
-
-    (async () => {
-      const results = await Promise.all(
-        validServers.map(async (s) => {
-          try {
-            const found = await resolveCandidatesForServer(String(s.url || ""), controller.signal, {
-              maxPlayerPages: 2,
-              maxDeepCandidates: 4,
-              maxPlayerv2Pool: 2,
-            });
-            const playable = await filterPlayableCandidates(found, {
-              signal: controller.signal,
-              timeoutMs: CANDIDATE_PROBE_TIMEOUT_MS,
-              maxChecks: 4,
-              maxChildChecks: 2,
-              pushDiag,
-            });
-            return { n: s.n, status: (playable.length ? "ok" : "down") as ServerHealthState };
-          } catch (e: unknown) {
-            if (e instanceof Error && e.name === "AbortError") return { n: s.n, status: null as ServerHealthState | null };
-            return { n: s.n, status: "down" as ServerHealthState };
-          }
-        })
-      );
-
-      if (cancel) return;
-
-      setServerHealth(() => {
-        const next: Record<number, ServerHealthState> = {};
-        for (const s of validServers) next[s.n] = "down";
-        for (const result of results) {
-          if (!result.status) continue;
-          next[result.n] = result.status;
-        }
-        return next;
-      });
-    })().catch(() => {
-      if (cancel) return;
-      setServerHealth(() => {
-        const next: Record<number, ServerHealthState> = {};
-        for (const s of validServers) next[s.n] = "down";
-        return next;
-      });
-    });
-
-    return () => {
-      cancel = true;
-      controller.abort();
-    };
-  }, [validServers, pushDiag]);
-
-  useEffect(() => {
-    if (serverHealth[selectedServer] !== "down") return;
-    const next = validServers.find((s) => serverHealth[s.n] === "ok");
-    if (next && next.n !== selectedServer) setSelectedServer(next.n);
-  }, [selectedServer, serverHealth, validServers]);
+  }, [serverOptions]);
 
   const handleVideoDoubleClick = useCallback(() => {
     const video = videoRef.current;
@@ -1001,8 +1351,7 @@ export default function WatchPage() {
   }, []);
 
   const selectedOption = validServers.find((s) => s.n === selectedServer);
-  const selectedState = selectedOption ? serverHealth[selectedOption.n] : undefined;
-  const selectedUrl = selectedOption && selectedState !== "down" ? selectedOption.url ?? "" : "";
+  const selectedUrl = selectedOption?.url ?? "";
   const status = (match?.status_key ?? "").toLowerCase();
   const startMs = match?.match_start ? new Date(match.match_start).getTime() : null;
   const prematchMs = PREMATCH_OPEN_WINDOW_MINUTES * 60 * 1000;
@@ -1034,24 +1383,39 @@ export default function WatchPage() {
         resetRecoveryState();
         return;
       }
+      const seedCandidates = (() => {
+        if (!isStrongPlayableStreamUrl(selectedUrl)) return [] as string[];
+        const proxied = toEmbedProxyUrl(selectedUrl, selectedUrl);
+        return proxied ? [proxied] : [];
+      })();
       setResolverLoading(true);
       setResolverError(null);
-      setCandidates([]);
+      setCandidates(seedCandidates);
+      if (seedCandidates.length) pushDiag(`resolve seed +${seedCandidates.length}`);
       try {
-        const finalList = await resolveCandidatesForServer(selectedUrl, controller.signal, { playerv2Diag: pushDiag });
+        const finalList = await resolveCandidatesForServer(selectedUrl, controller.signal, {
+          playerv2Diag: pushDiag,
+          parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
+          onBatchCandidates: (batch, phase) => {
+            if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
+            setCandidates((prev) => dedupeUrls([...prev, ...batch]));
+            pushDiag(`resolve batch ${phase} +${batch.length}`);
+          },
+        });
         if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
-        const playableList = await filterPlayableCandidates(finalList, {
+        const playableList = await expandCandidatesWithManifestVariants(finalList, {
           signal: controller.signal,
           timeoutMs: CANDIDATE_PROBE_TIMEOUT_MS,
-          maxChecks: 12,
-          maxChildChecks: 3,
+          maxParents: 8,
+          maxVariantsPerParent: 12,
+          concurrency: EXPAND_VARIANTS_CONCURRENCY,
           pushDiag,
         });
         if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
-
         if (!cancel) {
-          setCandidates(playableList);
-          if (!playableList.length) {
+          const merged = dedupeUrls([...seedCandidates, ...playableList]);
+          setCandidates(merged);
+          if (!merged.length) {
             setResolverError("لا يوجد بث");
             scheduleResolveRecovery("resolver-empty");
           } else {
@@ -1299,9 +1663,9 @@ export default function WatchPage() {
         <div className="mb-3 flex flex-wrap gap-2">
           {serverOptions.map((s) => {
             const hasUrl = !!s.url && isValidHttpUrl(s.url);
-            const health: ServerHealthState = hasUrl ? serverHealth[s.n] ?? "checking" : "down";
-            const ok = hasUrl && health !== "down";
-            const subtitle = !hasUrl || health === "down" ? "لا يوجد بث" : health === "checking" ? "فحص..." : null;
+            const health: ServerHealthState = hasUrl ? serverHealth[s.n] ?? "ok" : "down";
+            const ok = hasUrl;
+            const subtitle = !ok || health === "down" ? "لا يوجد بث" : null;
             return (
               <button
                 key={s.n}
@@ -1351,8 +1715,6 @@ export default function WatchPage() {
               <div className="text-white font-bold text-xl">{streamStartNotice}</div>
               {prettyStart ? <div className="text-sm text-gray-500">موعد المباراة: <span className="text-gray-300">{prettyStart}</span></div> : null}
             </div>
-          ) : resolverLoading ? (
-            <div className="flex items-center justify-center h-[55vh] min-h-[320px] text-gray-300">جاري تشغيل البث</div>
           ) : selectedHlsUrl ? (
             <div onDoubleClick={handleVideoDoubleClick} className="relative aspect-video min-h-[280px] sm:min-h-[430px] bg-black overflow-hidden">
               <video
@@ -1365,8 +1727,10 @@ export default function WatchPage() {
               />
               {playerLoading ? <div className="absolute inset-0 flex items-center justify-center bg-black/50 text-sm text-gray-200">جاري تشغيل البث</div> : null}
             </div>
+          ) : resolverLoading ? (
+            <div className="flex items-center justify-center h-[55vh] min-h-[320px] text-gray-300">جاري تشغيل البث</div>
           ) : (
-            <div className="flex items-center justify-center h-[55vh] min-h-[320px] text-gray-400 p-6 text-center">{streamStartNotice}</div>
+            <div className="flex items-center justify-center h-[55vh] min-h-[320px] text-gray-400 p-6 text-center">لا يوجد بث</div>
           )}
         </div>
 

@@ -755,7 +755,10 @@ async function waitForStableMatchCount(page, maxWaitMs = 20000, settleMs = 1400)
   let stableFor = 0;
 
   while (Date.now() - start < maxWaitMs) {
-    const count = await page.locator(".AY_Match").count().catch(() => 0);
+    const count = await page
+      .locator(".AY_Match, #ayala-today [id^='m-'][data-start], #ayala-yesterday [id^='m-'][data-start], #ayala-tomorrow [id^='m-'][data-start], [id^='m-'][data-start].AY_WithJS, [id^='m-'][data-start].MT_Loading")
+      .count()
+      .catch(() => 0);
 
     if (count > 0 && count === last) stableFor += 400;
     else stableFor = 0;
@@ -801,7 +804,7 @@ function extractAyMatchRowsFromHtml(html, pageUrl) {
   if (!text) return [];
 
   const chunks = text
-    .split(/<div\s+class=["'][^"']*(?:AY_Match|ay_1a31ddb3)[^"']*["']/i)
+    .split(/<div\s+class=["'][^"']*(?:AY_Match|AY_WithJS|MT_Loading|ay_1a31ddb3|ay_f43fbc9f)[^"']*["'][^>]*>/i)
     .slice(1);
   const out = [];
 
@@ -810,11 +813,14 @@ function extractAyMatchRowsFromHtml(html, pageUrl) {
     const chunk = endAnchor >= 0 ? c.slice(0, endAnchor + 9) : c.slice(0, 5000);
 
     const teamMatches = Array.from(
-      chunk.matchAll(/<div\s+class=["'][^"']*(?:TM_Name|ay_dea3dc0e)[^"']*["'][^>]*>([\s\S]*?)<\/div>/gi)
+      chunk.matchAll(/<div\s+class=["'][^"']*(?:TM_Name|ay_dea3dc0e|ay_30adbd22)[^"']*["'][^>]*>([\s\S]*?)<\/div>/gi)
     );
     const teams = teamMatches.map((m) => stripHtmlToText(m[1])).filter(Boolean);
 
-    const hrefRaw = (chunk.match(/<a[^>]+href=["']([^"']+)["']/i) || [])[1] || "";
+    const hrefRaw =
+      (chunk.match(/<a[^>]+href=["']([^"']*(?:\/matches\/|match=)[^"']*)["']/i) || [])[1] ||
+      (chunk.match(/<a[^>]+href=["']([^"']+)["']/i) || [])[1] ||
+      "";
     const dataStartRaw =
       (chunk.match(/\bdata-start=["']([^"']+)["']/i) || [])[1] ||
       (chunk.match(/\bdata-time=["']([^"']+)["']/i) || [])[1] ||
@@ -889,7 +895,10 @@ async function scrapeOneDay(page, dayKey, url) {
   if (DIAG) diagWrite(`list/${dayKey}.url.txt`, url + "\n");
 
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: LIST_TIMEOUT_MS });
-  await page.waitForSelector(".AY_Match, .no-data__msg, body", { timeout: 30000 });
+  await page.waitForSelector(
+    ".AY_Match, #ayala-today [id^='m-'][data-start], #ayala-yesterday [id^='m-'][data-start], #ayala-tomorrow [id^='m-'][data-start], .no-data__msg, body",
+    { timeout: 30000 }
+  );
 
   await page.waitForTimeout(900);
   await waitForStableMatchCount(page, 20000, 1400);
@@ -1004,18 +1013,57 @@ async function scrapeOneDay(page, dayKey, url) {
       return { home: null, away: null, hasAny: false };
     };
 
-    const matches = Array.from(document.querySelectorAll(".AY_Match"));
+    const cleanText = (value) => String(value || "").replace(/\s+/g, " ").trim();
+
+    const extractTeamName = (teamNode) => {
+      if (!teamNode) return "";
+      const direct = pickText(teamNode, [
+        ".TM_Name",
+        "[class*='TM_Name']",
+        ".ay_30adbd22",
+        ".team-name",
+        ".match-team-name",
+        "strong",
+        "span",
+      ]);
+      if (direct) return cleanText(direct);
+
+      const candidates = Array.from(teamNode.querySelectorAll("div,span,strong,p"))
+        .map((el) => cleanText(el.textContent || ""))
+        .filter((t) => t && !/^\d{1,2}$/.test(t) && t !== "-" && !/غير\s*معروف/i.test(t));
+      if (!candidates.length) return "";
+      candidates.sort((a, b) => b.length - a.length);
+      return candidates[0] || "";
+    };
+
+    const candidates = Array.from(
+      document.querySelectorAll(
+        ".AY_Match, #ayala-today [id^='m-'][data-start], #ayala-yesterday [id^='m-'][data-start], #ayala-tomorrow [id^='m-'][data-start], [id^='m-'][data-start].AY_WithJS, [id^='m-'][data-start].MT_Loading"
+      )
+    );
+    const matches = Array.from(new Set(candidates));
+    const seen = new Set();
 
     return matches
       .map((match) => {
-        const teams = Array.from(match.querySelectorAll(".TM_Name")).map((e) => (e.textContent || "").trim());
-        const imgs = Array.from(match.querySelectorAll(".TM_Logo img"));
-        const a = match.querySelector("a[href]");
+        const team1Node = match.querySelector(".TM1, [class*='TM1']");
+        const team2Node = match.querySelector(".TM2, [class*='TM2']");
+        const fallbackTeams = Array.from(match.querySelectorAll(".TM_Name, [class*='TM_Name'], .ay_30adbd22"))
+          .map((e) => cleanText(e.textContent || ""))
+          .filter(Boolean);
+
+        const homeTeam = extractTeamName(team1Node) || fallbackTeams[0] || "";
+        const awayTeam = extractTeamName(team2Node) || fallbackTeams[1] || "";
+
+        const allImgs = Array.from(match.querySelectorAll("img"));
+        const homeImg = team1Node?.querySelector("img") || allImgs[0] || null;
+        const awayImg = team2Node?.querySelector("img") || allImgs[1] || null;
+        const a = match.querySelector("a[href*='/matches/'], a[href*='match='], a[href]");
 
         const dataStart = (match.getAttribute("data-start") || "").trim();
         const timeText = pickText(match, [".MT_Time", ".TM_Time", ".match-time", ".MatchTime", ".AY_Time"]);
 
-        const statText = pickText(match, [".MT_Stat"]);
+        const statText = pickText(match, [".MT_Stat", ".MT_Status", ".status"]);
         const classStatus = statusFromClass(match);
 
         let statusKey = classStatus || "unknown";
@@ -1034,24 +1082,27 @@ async function scrapeOneDay(page, dayKey, url) {
 
         const matchUrl = toAbs(a?.getAttribute("href") || "");
         const scorePair = findScorePair(match, statusKey);
+        const dedupeKey = `${homeTeam}__${awayTeam}__${dataStart}__${matchUrl}`.toLowerCase();
+        if (!homeTeam || !awayTeam || !matchUrl || seen.has(dedupeKey)) return null;
+        seen.add(dedupeKey);
 
         return {
-          home_team: teams[0] || "",
-          away_team: teams[1] || "",
+          home_team: homeTeam,
+          away_team: awayTeam,
           data_start: dataStart || null,
           time_text: timeText || null,
           status_text: statText || null,
           status_key_dom: statusKey,
           result_visibility: getResultVisibility(match),
           has_score_hint: !!scorePair.hasAny,
-          home_logo: toAbs(pickLogo(imgs[0])),
-          away_logo: toAbs(pickLogo(imgs[1])),
+          home_logo: toAbs(pickLogo(homeImg)),
+          away_logo: toAbs(pickLogo(awayImg)),
           match_url: matchUrl || null,
           home_score_raw: scorePair.home,
           away_score_raw: scorePair.away,
         };
       })
-      .filter((m) => m.home_team && m.away_team && m.match_url);
+      .filter((m) => m && m.home_team && m.away_team && m.match_url);
   }, dayKey);
 
   if (rows.length) {
@@ -1099,7 +1150,7 @@ async function extractMatchMetaFromDom(page) {
       const statText = pickText(root, [".MT_Stat", ".MT_Status", ".match-status", ".MatchStatus", ".RS-status", ".status"]);
       const title = (document.title || "").trim();
 
-      const m = document.querySelector(".AY_Match");
+      const m = document.querySelector(".AY_Match, [id^='m-'][data-start], .AY_WithJS");
       const cls = (m?.className || "").toLowerCase();
       let classStatus = "";
       if (cls.includes("not-started")) classStatus = "upcoming";
