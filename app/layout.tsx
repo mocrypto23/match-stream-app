@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Match Free Stream",
-  description: "By Mohammed Ayman",
+  title: "TwoFooty",
+  description: "Free Koora By Mohammed Ayman",
 };
 
 export default function RootLayout({
