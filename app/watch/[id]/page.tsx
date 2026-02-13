@@ -30,9 +30,15 @@ const STALL_FREEZE_MS = 12000;
 const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const RESOLVE_COOLDOWN_MS = 1500;
 const CANDIDATE_PROBE_TIMEOUT_MS = 5000;
+const FAST_PHASE_PROBE_TIMEOUT_MS = 2200;
+const FAST_PHASE_MAX_PLAYER_PAGES = 2;
+const FAST_PHASE_MAX_DEEP_CANDIDATES = 4;
+const FAST_PHASE_MAX_PLAYERV2_POOL = 2;
 const RESOLVE_CHILD_CONCURRENCY = 3;
 const EXPAND_VARIANTS_CONCURRENCY = 4;
 const PROBE_CONCURRENCY = 4;
+const RESOLVE_RESULT_CACHE_TTL_MS = 75_000;
+const RESOLVE_RESULT_CACHE_MAX = 250;
 const HLS_CT = ["application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl"];
 const MEDIA_RE = /\.(?:m3u8|mp4|m4v|mov|webm|mpd|ts)(?:[?#]|$)/i;
 const SEGMENT_FILE_RE = /\.(?:ts|m4s|m4f|cmf|mp4|aac|ac3|ec3|mp3|vtt|webm|key)(?:[?#]|$)/i;
@@ -100,6 +106,48 @@ type ProbeHlsOptions = {
 };
 type FilterPlayableOptions = ProbeHlsOptions & { maxChecks?: number; concurrency?: number };
 type ResolveBatchPhase = "fast" | "deep" | "token";
+type ResolveResultCacheEntry = { expiresAt: number; candidates: string[] };
+type CandidateGroup = { key: string; primaryIndex: number; members: number[] };
+
+const resolveResultCache = new Map<string, ResolveResultCacheEntry>();
+
+function resolveResultCacheKey(sourceUrl: string) {
+  return canonicalizeUrl(sourceUrl) || String(sourceUrl || "").trim().toLowerCase();
+}
+
+function trimResolveResultCache(now = Date.now()) {
+  for (const [key, value] of resolveResultCache.entries()) {
+    if (value.expiresAt <= now) resolveResultCache.delete(key);
+  }
+  if (resolveResultCache.size <= RESOLVE_RESULT_CACHE_MAX) return;
+  while (resolveResultCache.size > RESOLVE_RESULT_CACHE_MAX) {
+    const firstKey = resolveResultCache.keys().next().value as string | undefined;
+    if (!firstKey) break;
+    resolveResultCache.delete(firstKey);
+  }
+}
+
+function getCachedResolveCandidates(sourceUrl: string) {
+  const key = resolveResultCacheKey(sourceUrl);
+  const now = Date.now();
+  const cached = resolveResultCache.get(key);
+  if (!cached || cached.expiresAt <= now) {
+    if (cached) resolveResultCache.delete(key);
+    return [] as string[];
+  }
+  return [...cached.candidates];
+}
+
+function setCachedResolveCandidates(sourceUrl: string, candidates: string[]) {
+  const cleaned = dedupeUrls((candidates || []).filter((x) => !!x));
+  if (!cleaned.length) return;
+  const now = Date.now();
+  resolveResultCache.set(resolveResultCacheKey(sourceUrl), {
+    expiresAt: now + RESOLVE_RESULT_CACHE_TTL_MS,
+    candidates: cleaned,
+  });
+  trimResolveResultCache(now);
+}
 
 function isValidHttpUrl(value: string) {
   try {
@@ -583,6 +631,101 @@ function dedupeUrls(values: string[]) {
   return out;
 }
 
+function normalizeHostRoot(hostname: string) {
+  const host = String(hostname || "").trim().toLowerCase();
+  if (!host) return host;
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(host) || host.includes(":")) return host;
+
+  const parts = host.split(".").filter(Boolean);
+  if (parts.length <= 2) return host;
+
+  const secondLevel = parts[parts.length - 2];
+  const tld = parts[parts.length - 1];
+  const maybeThirdLevelTld = new Set(["co", "com", "net", "org", "gov", "edu", "ac"]);
+  if (tld.length === 2 && maybeThirdLevelTld.has(secondLevel) && parts.length >= 3) {
+    return parts.slice(-3).join(".");
+  }
+  return parts.slice(-2).join(".");
+}
+
+function toCandidateGroupKey(value: string) {
+  const raw = value.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(value) || value : value;
+  if (!isValidHttpUrl(raw)) return canonicalizeUrl(value) || String(value || "").trim().toLowerCase();
+
+  try {
+    const u = new URL(raw);
+    const host = normalizeHostRoot(u.hostname);
+    const params = new URLSearchParams(u.search);
+
+    for (const key of [
+      "ts",
+      "token",
+      "sid",
+      "nonce",
+      "nimblesessionid",
+      "expires",
+      "exp",
+      "signature",
+      "sig",
+      "auth",
+      "key",
+      "q",
+      "quality",
+      "res",
+      "resolution",
+      "br",
+      "bitrate",
+      "height",
+      "width",
+    ]) {
+      params.delete(key);
+    }
+
+    const parts = u.pathname
+      .toLowerCase()
+      .replace(/\/+$/, "")
+      .split("/")
+      .filter(Boolean);
+    const qualityTokenRe = /^(?:\d{3,4}p|\d{3,4}k|sd|hd|fhd|uhd|low|mid|high)$/i;
+
+    if (parts.length) {
+      const last = parts[parts.length - 1];
+      if (/\.m3u8$/i.test(last)) {
+        const stem = last.replace(/\.m3u8$/i, "");
+        if (/^(?:index|master|playlist|mainindex|chunklist|live|stream)$/i.test(stem) || qualityTokenRe.test(stem)) {
+          parts.pop();
+        }
+      }
+    }
+    if (parts.length && qualityTokenRe.test(parts[parts.length - 1])) parts.pop();
+
+    const path = parts.length ? `/${parts.join("/")}` : "";
+    const stableParams = Array.from(params.entries())
+      .sort((a, b) => (a[0] === b[0] ? a[1].localeCompare(b[1]) : a[0].localeCompare(b[0])))
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join("&");
+
+    return `${host}${path}${stableParams ? `?${stableParams}` : ""}`;
+  } catch {
+    return canonicalizeUrl(value) || String(value || "").trim().toLowerCase();
+  }
+}
+
+function groupCandidates(values: string[]) {
+  const map = new Map<string, CandidateGroup>();
+  values.forEach((candidate, idx) => {
+    const key = toCandidateGroupKey(candidate);
+    const existing = map.get(key);
+    if (existing) {
+      existing.members.push(idx);
+      return;
+    }
+    map.set(key, { key, primaryIndex: idx, members: [idx] });
+  });
+
+  return Array.from(map.values()).sort((a, b) => a.primaryIndex - b.primaryIndex);
+}
+
 function normalizeHtmlForScan(html: string) {
   return String(html || "")
     .replace(/&amp;/gi, "&")
@@ -802,12 +945,14 @@ async function resolveCandidatesForServer(
     playerv2Diag?: (line: string) => void;
     onBatchCandidates?: (batch: string[], phase: ResolveBatchPhase) => void;
     parallelChildConcurrency?: number;
+    fetchTimeoutMs?: number;
   }
 ) {
   const maxPlayerPages = opts?.maxPlayerPages ?? 6;
   const maxDeepCandidates = opts?.maxDeepCandidates ?? 8;
   const maxPlayerv2Pool = opts?.maxPlayerv2Pool ?? 6;
   const parallelChildConcurrency = opts?.parallelChildConcurrency ?? RESOLVE_CHILD_CONCURRENCY;
+  const fetchTimeoutMs = opts?.fetchTimeoutMs ?? CANDIDATE_PROBE_TIMEOUT_MS;
   const sourceServ = getServFromUrl(sourceUrl);
   const sourcePathKey = normalizePathKey(sourceUrl);
   const normalizePlayableBatch = (input: string[]) =>
@@ -821,13 +966,17 @@ async function resolveCandidatesForServer(
   };
 
   const fetchHtml = async (url: string) => {
-    const res = await fetch(url, {
-      method: "GET",
-      cache: "no-store",
-      credentials: "same-origin",
-      signal,
-      headers: { "x-embed-proxy-probe": "1" },
-    });
+    const res = await fetchWithTimeout(
+      url,
+      {
+        method: "GET",
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { "x-embed-proxy-probe": "1" },
+      },
+      fetchTimeoutMs,
+      signal
+    );
     const ct = (res.headers.get("content-type") || "").toLowerCase();
     return { res, ct };
   };
@@ -1437,17 +1586,57 @@ export default function WatchPage() {
         const proxied = toEmbedProxyUrl(selectedUrl, selectedUrl);
         return proxied ? [proxied] : [];
       })();
-      setResolverLoading(true);
+      const cachedCandidates = getCachedResolveCandidates(selectedUrl);
+      const initialCandidates = dedupeUrls([...cachedCandidates, ...seedCandidates]);
+      let hadPlayable = initialCandidates.length > 0;
+      const mergeCandidates = (incoming: string[]) => {
+        if (!incoming.length) return;
+        hadPlayable = true;
+        setCandidates((prev) => {
+          const merged = dedupeUrls([...prev, ...incoming]);
+          setCachedResolveCandidates(selectedUrl, merged);
+          return merged;
+        });
+      };
+
       setResolverError(null);
-      setCandidates(seedCandidates);
+      setCandidates(initialCandidates);
+      setResolverLoading(!initialCandidates.length);
+      if (cachedCandidates.length) pushDiag(`resolve cache hit +${cachedCandidates.length}`);
       if (seedCandidates.length) pushDiag(`resolve seed +${seedCandidates.length}`);
       try {
+        const fastList = await resolveCandidatesForServer(selectedUrl, controller.signal, {
+          playerv2Diag: pushDiag,
+          parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
+          maxPlayerPages: FAST_PHASE_MAX_PLAYER_PAGES,
+          maxDeepCandidates: FAST_PHASE_MAX_DEEP_CANDIDATES,
+          maxPlayerv2Pool: FAST_PHASE_MAX_PLAYERV2_POOL,
+          fetchTimeoutMs: FAST_PHASE_PROBE_TIMEOUT_MS,
+          onBatchCandidates: (batch, phase) => {
+            if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
+            mergeCandidates(batch);
+            pushDiag(`resolve batch ${phase} +${batch.length} (fast)`);
+          },
+        });
+        if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
+        const fastMerged = dedupeUrls([...initialCandidates, ...fastList]);
+        if (fastMerged.length) {
+          hadPlayable = true;
+          setCandidates(fastMerged);
+          setCachedResolveCandidates(selectedUrl, fastMerged);
+          setPlayerError(null);
+          resetRecoveryState();
+          setResolverLoading(false);
+        } else {
+          setResolverLoading(true);
+        }
+
         const finalList = await resolveCandidatesForServer(selectedUrl, controller.signal, {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
           onBatchCandidates: (batch, phase) => {
             if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
-            setCandidates((prev) => dedupeUrls([...prev, ...batch]));
+            mergeCandidates(batch);
             pushDiag(`resolve batch ${phase} +${batch.length}`);
           },
         });
@@ -1462,20 +1651,26 @@ export default function WatchPage() {
         });
         if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
         if (!cancel) {
-          const merged = dedupeUrls([...seedCandidates, ...playableList]);
+          const merged = dedupeUrls([...fastMerged, ...playableList]);
           setCandidates(merged);
+          if (merged.length) setCachedResolveCandidates(selectedUrl, merged);
           if (!merged.length) {
             setResolverError("لا يوجد بث");
             scheduleResolveRecovery("resolver-empty");
           } else {
+            hadPlayable = true;
             setPlayerError(null);
             resetRecoveryState();
           }
         }
       } catch (e: unknown) {
         if (!cancel && !(e instanceof Error && e.name === "AbortError")) {
-          setResolverError(e instanceof Error ? e.message : "فشل استخراج المصادر.");
-          scheduleResolveRecovery("resolver-error");
+          if (!hadPlayable) {
+            setResolverError(e instanceof Error ? e.message : "فشل استخراج المصادر.");
+            scheduleResolveRecovery("resolver-error");
+          } else {
+            pushDiag(`resolve background error: ${e instanceof Error ? e.message : String(e)}`);
+          }
         }
       } finally {
         if (!cancel && activeResolveIdRef.current === resolveId) {
@@ -1492,6 +1687,11 @@ export default function WatchPage() {
   }, [selectedUrl, shouldBlockStream, pushDiag, resolveRevision, scheduleResolveRecovery, resetRecoveryState]);
 
   const selectedHlsUrl = candidates[selectedCandidate] || "";
+  const candidateGroups = useMemo(() => groupCandidates(candidates), [candidates]);
+  const activeCandidateGroupIndex = useMemo(
+    () => candidateGroups.findIndex((g) => g.members.includes(selectedCandidate)),
+    [candidateGroups, selectedCandidate]
+  );
 
   useEffect(() => {
     const video = videoRef.current;
@@ -1738,22 +1938,25 @@ export default function WatchPage() {
           })}
         </div>
 
-        {candidates.length > 0 ? (
+        {candidateGroups.length > 0 ? (
           <div className="mb-3 rounded-2xl border border-blue-800/30 bg-[#0f1520] p-4">
             <div className="text-xl sm:text-2xl font-black text-blue-300 mb-3">مصادر سيرفر {selectedServer}</div>
             <div className="flex flex-wrap gap-2">
-              {candidates.map((c, idx) => (
+              {candidateGroups.map((group, idx) => (
                 <button
-                  key={`${c}-${idx}`}
-                  onClick={() => setSelectedCandidate(idx)}
+                  key={`${group.key}-${idx}`}
+                  onClick={() => setSelectedCandidate(group.primaryIndex)}
                   className={[
                     "rounded-lg border px-4 py-2 text-sm font-bold transition-colors min-w-[96px]",
-                    idx === selectedCandidate
+                    idx === activeCandidateGroupIndex
                       ? "border-blue-500 bg-blue-900/20 text-blue-100"
                       : "border-gray-700 bg-[#0b0f15] text-gray-100 hover:border-blue-600/50",
                   ].join(" ")}
                 >
-                  مصدر {idx + 1}
+                  <div>مصدر {idx + 1}</div>
+                  {group.members.length > 1 ? (
+                    <div className="mt-0.5 text-[10px] font-semibold text-blue-200/80">جودات متعددة</div>
+                  ) : null}
                 </button>
               ))}
             </div>
@@ -1767,18 +1970,13 @@ export default function WatchPage() {
               {prettyStart ? <div className="text-sm text-gray-500">موعد المباراة: <span className="text-gray-300">{prettyStart}</span></div> : null}
             </div>
           ) : selectedHlsUrl ? (
-            <div onDoubleClick={handleVideoDoubleClick} className="relative aspect-video min-h-[280px] sm:min-h-[430px] bg-black overflow-hidden">
+            <div onDoubleClick={handleVideoDoubleClick} className="relative w-full aspect-video min-h-[280px] sm:min-h-[430px] bg-black overflow-hidden">
               <video
                 ref={videoRef}
                 playsInline
                 preload="auto"
                 onDoubleClick={handleVideoDoubleClick}
                 className="w-full h-full bg-black"
-                onClick={(e) => {
-                  // Optional: clicking video can toggle play via Controls logic
-                  // but Controls overlay covers it usually. 
-                  // If native controls are off, we rely on custom UI.
-                }}
               />
               <VideoPlayerControls
                 videoRef={videoRef}

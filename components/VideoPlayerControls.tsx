@@ -1,14 +1,13 @@
 "use client";
 
-import React, { useCallback, useEffect, useState, useRef } from "react";
-import type Hls from "hls.js";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import Hls from "hls.js";
 
 interface VideoPlayerControlsProps {
     videoRef: React.RefObject<HTMLVideoElement | null>;
     hls?: Hls | null;
     title?: string;
     isLive?: boolean;
-    onRetry?: () => void;
 }
 
 export default function VideoPlayerControls({
@@ -16,7 +15,6 @@ export default function VideoPlayerControls({
     hls,
     title,
     isLive = true,
-    onRetry,
 }: VideoPlayerControlsProps) {
     const [isPlaying, setIsPlaying] = useState(false);
     const [volume, setVolume] = useState(1);
@@ -25,8 +23,6 @@ export default function VideoPlayerControls({
     const [showControls, setShowControls] = useState(true);
     const [progress, setProgress] = useState(0);
     const [duration, setDuration] = useState(0);
-    const [buffered, setBuffered] = useState(0);
-    const [error, setError] = useState<string | null>(null);
 
     const controlsTimeoutRef = useRef<number | null>(null);
     const containerRef = useRef<HTMLDivElement>(null);
@@ -60,16 +56,11 @@ export default function VideoPlayerControls({
         };
         const onTimeUpdate = () => {
             setProgress(video.currentTime);
-            // Rough buffer check
-            if (video.buffered.length > 0) {
-                setBuffered(video.buffered.end(video.buffered.length - 1));
-            }
         };
         const onDurationChange = () => {
             setDuration(video.duration);
         };
         const onError = () => {
-            setError(video.error?.message || "Error");
             setShowControls(true);
         };
 
@@ -173,16 +164,33 @@ export default function VideoPlayerControls({
             style={{ background: showControls ? "linear-gradient(to top, rgba(0,0,0,0.8), transparent 30%)" : "transparent" }}
         >
             {/* Top Bar */}
-            <div className="p-4 flex justify-between items-start bg-gradient-to-b from-black/60 to-transparent">
+            <div
+                className="flex justify-between items-start gap-3 bg-gradient-to-b from-black/60 to-transparent"
+                style={{
+                    paddingLeft: "max(1rem, env(safe-area-inset-left))",
+                    paddingRight: "max(1rem, env(safe-area-inset-right))",
+                    paddingTop: "max(0.75rem, env(safe-area-inset-top))",
+                    paddingBottom: "0.75rem",
+                }}
+            >
                 <div className="text-white font-bold drop-shadow-md">
                     {title || (isLive ? "Live Stream" : "Video")}
                 </div>
-                {isLive && (
-                    <div className="flex items-center gap-2 bg-red-600/80 px-2 py-1 rounded text-xs font-bold text-white shadow-sm backdrop-blur-sm">
-                        <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
-                        LIVE
-                    </div>
-                )}
+                <div className="flex items-center gap-2 shrink-0">
+                    {isLive && (
+                        <div className="flex items-center gap-2 bg-red-600/80 px-2 py-1 rounded text-xs font-bold text-white shadow-sm backdrop-blur-sm">
+                            <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
+                            LIVE
+                        </div>
+                    )}
+                    <button
+                        onClick={toggleFullscreen}
+                        className="inline-flex sm:hidden items-center justify-center text-white hover:text-blue-400 transition-colors"
+                        aria-label="Fullscreen"
+                    >
+                        <FullscreenIcon size={22} isFs={isFullscreen} />
+                    </button>
+                </div>
             </div>
 
             {/* Center Play Button (only if paused/buffering) */}
@@ -196,7 +204,13 @@ export default function VideoPlayerControls({
 
             {/* Bottom Controls */}
             <div
-                className="p-4 bg-black/40 backdrop-blur-md border-t border-white/10"
+                className="bg-black/40 backdrop-blur-md border-t border-white/10"
+                style={{
+                    paddingLeft: "max(1rem, env(safe-area-inset-left))",
+                    paddingRight: "max(1rem, env(safe-area-inset-right))",
+                    paddingTop: "0.75rem",
+                    paddingBottom: "max(0.75rem, env(safe-area-inset-bottom))",
+                }}
                 onClick={(e) => e.stopPropagation()} // Prevent playing when clicking bar
             >
                 {/* Progress Bar (if not live or valid duration) */}
@@ -216,11 +230,11 @@ export default function VideoPlayerControls({
                     </div>
                 )}
 
-                <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-4">
+                <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-3 min-w-0">
                         <button
                             onClick={togglePlay}
-                            className="text-white hover:text-blue-400 transition-colors focus:outline-none"
+                            className="shrink-0 text-white hover:text-blue-400 transition-colors focus:outline-none"
                         >
                             {isPlaying ? <PauseIcon /> : <PlayIcon />}
                         </button>
@@ -247,8 +261,8 @@ export default function VideoPlayerControls({
 
                     </div>
 
-                    <div className="flex items-center gap-4">
-                        <button onClick={toggleFullscreen} className="text-white hover:text-blue-400 transition-colors">
+                    <div className="hidden sm:flex items-center gap-4 shrink-0">
+                        <button onClick={toggleFullscreen} className="text-white hover:text-blue-400 transition-colors" aria-label="Fullscreen">
                             <FullscreenIcon isFs={isFullscreen} />
                         </button>
                     </div>
@@ -315,30 +329,40 @@ function QualitySelector({ hls }: { hls: Hls }) {
     const [showMenu, setShowMenu] = useState(false);
 
     useEffect(() => {
-        const onLevelSwitched = (_: any, data: { level: number }) => { // eslint-disable-line @typescript-eslint/no-explicit-any
+        setLevel(hls.currentLevel);
+        const onLevelSwitched = (_event: string, data: { level: number }) => {
             setLevel(data.level);
         };
-        hls.on((window as any).Hls.Events.LEVEL_SWITCHED, onLevelSwitched);
+        hls.on(Hls.Events.LEVEL_SWITCHED, onLevelSwitched);
         return () => {
-            hls.off((window as any).Hls.Events.LEVEL_SWITCHED, onLevelSwitched);
+            hls.off(Hls.Events.LEVEL_SWITCHED, onLevelSwitched);
         };
     }, [hls]);
 
     const levels = hls.levels || [];
     if (levels.length <= 1) return null;
 
+    const applyLevel = (nextLevel: number, e: React.MouseEvent<HTMLButtonElement>) => {
+        e.stopPropagation();
+        // Hls.js quality switch API is implemented via mutable property assignment.
+        // eslint-disable-next-line react-hooks/immutability
+        hls.currentLevel = nextLevel;
+        setLevel(nextLevel);
+        setShowMenu(false);
+    };
+
     return (
         <div className="relative">
             <button
                 onClick={(e) => { e.stopPropagation(); setShowMenu(!showMenu); }}
-                className="text-xs font-bold text-gray-300 hover:text-white border border-gray-600 rounded px-2 py-1"
+                className="text-[11px] sm:text-xs font-bold text-gray-300 hover:text-white border border-gray-600 rounded px-2 py-1 whitespace-nowrap"
             >
                 {level === -1 ? "Auto" : `${levels[level]?.height}p`}
             </button>
             {showMenu && (
                 <div className="absolute bottom-full mb-2 left-0 bg-black/90 border border-gray-700 rounded-lg p-2 flex flex-col gap-1 min-w-[80px]">
                     <button
-                        onClick={(e) => { e.stopPropagation(); /* eslint-disable-next-line */ hls.currentLevel = -1; setShowMenu(false); }}
+                        onClick={(e) => applyLevel(-1, e)}
                         className={`text-left text-xs px-2 py-1 rounded ${level === -1 ? "bg-blue-600 text-white" : "text-gray-300 hover:bg-white/10"}`}
                     >
                         Auto
@@ -346,7 +370,7 @@ function QualitySelector({ hls }: { hls: Hls }) {
                     {levels.map((lvl, idx) => (
                         <button
                             key={idx}
-                            onClick={(e) => { e.stopPropagation(); /* eslint-disable-next-line */ hls.currentLevel = idx; setShowMenu(false); }}
+                            onClick={(e) => applyLevel(idx, e)}
                             className={`text-left text-xs px-2 py-1 rounded ${level === idx ? "bg-blue-600 text-white" : "text-gray-300 hover:bg-white/10"}`}
                         >
                             {lvl.height}p

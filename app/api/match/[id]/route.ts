@@ -292,7 +292,12 @@ export async function GET(req: Request, ctx: Ctx) {
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   if (!data) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-  const res = NextResponse.json(data as MatchApiRow);
+  let payload = data as MatchApiRow;
+  try {
+    payload = await hydrateStreamFallbacks(payload);
+  } catch {}
+
+  const res = NextResponse.json(payload);
   res.headers.set("Cache-Control", "public, s-maxage=10, stale-while-revalidate=60");
   return res;
 }
