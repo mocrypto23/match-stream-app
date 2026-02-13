@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+﻿import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -285,6 +285,16 @@ function rewriteAttributeUrls(html: string, baseUrl: string, depth: number) {
           : `${prefix}about:blank${suffix}`;
       }
 
+      // VAST/VMAP blocking
+      if (
+        absolute.includes("vast.xml") || 
+        absolute.includes("vmap.xml") || 
+        absolute.includes("ad_tag") ||
+        absolute.includes("ima3.js")
+      ) {
+         return `${prefix}about:blank${suffix}`;
+      }
+
       let rewritten = absolute;
       try {
         const maybeProxy = new URL(absolute);
@@ -301,6 +311,7 @@ function rewriteAttributeUrls(html: string, baseUrl: string, depth: number) {
 
   return out;
 }
+
 
 function rewriteSrcsetUrls(html: string, baseUrl: string, depth: number) {
   const nextDepth = Math.min(MAX_PROXY_DEPTH, depth + 1);
@@ -458,24 +469,69 @@ function rewriteM3u8Manifest(
   };
 
   const lines = String(manifest || "").split(/\r?\n/);
+  const outLines: string[] = [];
+  let isInsideAdBlock = false;
 
-  return lines
-    .map((line) => {
-      const trimmed = line.trim();
-      if (!trimmed) return line;
+  const AD_SEGMENT_PATTERNS = [
+    /ad_/i,
+    /_ad\./i,
+    /google_/i,
+    /doubleclick/i,
+    /segment_ad/i,
+    /advert/i,
+    /sponsored/i,
+    /promo_/i,
+    /stitched/i,
+  ];
 
-      if (trimmed.startsWith("#")) {
-        // Handle tags like: #EXT-X-KEY:METHOD=AES-128,URI="key.key"
-        return line.replace(/URI=(["'])([^"']+)\1/gi, (_full, quote: string, rawUri: string) => {
-          const rewritten = toProxyUri(rawUri);
-          return `URI=${quote}${rewritten}${quote}`;
-        });
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    if (line.startsWith("#")) {
+      // SCTE-35 or custom ad markers
+      if (
+        line.startsWith("#EXT-X-CUE-OUT") ||
+        line.startsWith("#EXT-X-SCTE35") ||
+        line.startsWith("#EXT-X-DATERANGE:ID=\"ad")
+      ) {
+        isInsideAdBlock = true;
+        continue;
+      }
+      if (line.startsWith("#EXT-X-CUE-IN")) {
+        isInsideAdBlock = false;
+        continue;
       }
 
-      return toProxyUri(trimmed);
-    })
-    .join("\n");
+      // Handle tags like: #EXT-X-KEY:METHOD=AES-128,URI="key.key"
+      if (line.includes("URI=")) {
+        outLines.push(
+          line.replace(/URI=(["'])([^"']+)\1/gi, (_full, quote, rawUri) => {
+            const rewritten = toProxyUri(rawUri);
+            return `URI=${quote}${rewritten}${quote}`;
+          })
+        );
+      } else {
+        outLines.push(line);
+      }
+      continue;
+    }
+
+    // It is a segment URI
+    if (isInsideAdBlock || AD_SEGMENT_PATTERNS.some((p) => p.test(line))) {
+      // Skip this segment
+      if (outLines.length > 0 && outLines[outLines.length - 1].startsWith("#EXTINF")) {
+        outLines.pop();
+      }
+      continue;
+    }
+
+    outLines.push(toProxyUri(line));
+  }
+
+  return outLines.join("\n");
 }
+
 
 function shouldUseManifestCacheForTarget(target: URL) {
   const value = `${target.pathname}${target.search}`.toLowerCase();
@@ -2252,3 +2308,5 @@ export async function POST(req: Request) {
 export async function HEAD(req: Request) {
   return handleProxyRequest(req);
 }
+
+

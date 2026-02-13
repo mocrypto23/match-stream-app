@@ -1,0 +1,359 @@
+"use client";
+
+import React, { useCallback, useEffect, useState, useRef } from "react";
+import type Hls from "hls.js";
+
+interface VideoPlayerControlsProps {
+    videoRef: React.RefObject<HTMLVideoElement | null>;
+    hls?: Hls | null;
+    title?: string;
+    isLive?: boolean;
+    onRetry?: () => void;
+}
+
+export default function VideoPlayerControls({
+    videoRef,
+    hls,
+    title,
+    isLive = true,
+    onRetry,
+}: VideoPlayerControlsProps) {
+    const [isPlaying, setIsPlaying] = useState(false);
+    const [volume, setVolume] = useState(1);
+    const [isMuted, setIsMuted] = useState(true);
+    const [isFullscreen, setIsFullscreen] = useState(false);
+    const [showControls, setShowControls] = useState(true);
+    const [progress, setProgress] = useState(0);
+    const [duration, setDuration] = useState(0);
+    const [buffered, setBuffered] = useState(0);
+    const [error, setError] = useState<string | null>(null);
+
+    const controlsTimeoutRef = useRef<number | null>(null);
+    const containerRef = useRef<HTMLDivElement>(null);
+
+    // Handle inactivity to hide controls
+    const resetControlsTimeout = useCallback(() => {
+        setShowControls(true);
+        if (controlsTimeoutRef.current) window.clearTimeout(controlsTimeoutRef.current);
+        if (isPlaying) {
+            controlsTimeoutRef.current = window.setTimeout(() => {
+                setShowControls(false);
+            }, 3000);
+        }
+    }, [isPlaying]);
+
+    useEffect(() => {
+        const video = videoRef.current;
+        if (!video) return;
+
+        const onPlay = () => {
+            setIsPlaying(true);
+            resetControlsTimeout();
+        };
+        const onPause = () => {
+            setIsPlaying(false);
+            setShowControls(true);
+        };
+        const onVolumeChange = () => {
+            setVolume(video.volume);
+            setIsMuted(video.muted);
+        };
+        const onTimeUpdate = () => {
+            setProgress(video.currentTime);
+            // Rough buffer check
+            if (video.buffered.length > 0) {
+                setBuffered(video.buffered.end(video.buffered.length - 1));
+            }
+        };
+        const onDurationChange = () => {
+            setDuration(video.duration);
+        };
+        const onError = () => {
+            setError(video.error?.message || "Error");
+            setShowControls(true);
+        };
+
+        video.addEventListener("play", onPlay);
+        video.addEventListener("pause", onPause);
+        video.addEventListener("volumechange", onVolumeChange);
+        video.addEventListener("timeupdate", onTimeUpdate);
+        video.addEventListener("durationchange", onDurationChange);
+        video.addEventListener("error", onError);
+
+        // Initial state
+        setIsPlaying(!video.paused);
+        setVolume(video.volume);
+        setIsMuted(video.muted);
+
+        return () => {
+            video.removeEventListener("play", onPlay);
+            video.removeEventListener("pause", onPause);
+            video.removeEventListener("volumechange", onVolumeChange);
+            video.removeEventListener("timeupdate", onTimeUpdate);
+            video.removeEventListener("durationchange", onDurationChange);
+            video.removeEventListener("error", onError);
+        };
+    }, [videoRef, resetControlsTimeout]);
+
+    // Handle Fullscreen changes
+    useEffect(() => {
+        const onFsChange = () => {
+            setIsFullscreen(!!document.fullscreenElement);
+        };
+        document.addEventListener("fullscreenchange", onFsChange);
+        return () => document.removeEventListener("fullscreenchange", onFsChange);
+    }, []);
+
+    const togglePlay = useCallback((e?: React.MouseEvent) => {
+        e?.stopPropagation();
+        const video = videoRef.current;
+        if (!video) return;
+        if (video.paused) {
+            video.play().catch(() => { });
+        } else {
+            video.pause();
+        }
+        resetControlsTimeout();
+    }, [videoRef, resetControlsTimeout]);
+
+    const toggleMute = useCallback((e?: React.MouseEvent) => {
+        e?.stopPropagation();
+        const video = videoRef.current;
+        if (!video) return;
+        video.muted = !video.muted;
+        resetControlsTimeout();
+    }, [videoRef, resetControlsTimeout]);
+
+    const handleVolumeChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+        const video = videoRef.current;
+        if (!video) return;
+        const val = Number(e.target.value);
+        video.volume = val;
+        if (val > 0) video.muted = false;
+        resetControlsTimeout();
+    }, [videoRef, resetControlsTimeout]);
+
+    const toggleFullscreen = useCallback((e?: React.MouseEvent) => {
+        e?.stopPropagation();
+        const video = videoRef.current;
+        // We try to find the container or use video
+        const target = containerRef.current?.parentElement || video;
+        if (!target) return;
+
+        if (!document.fullscreenElement) {
+            target.requestFullscreen?.().catch(() => { });
+        } else {
+            document.exitFullscreen?.().catch(() => { });
+        }
+        resetControlsTimeout();
+    }, [videoRef, resetControlsTimeout]);
+
+    const handleSeek = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+        const video = videoRef.current;
+        if (!video) return;
+        const time = Number(e.target.value);
+        video.currentTime = time;
+        resetControlsTimeout();
+    }, [videoRef, resetControlsTimeout]);
+
+    const formatTime = (s: number) => {
+        if (!Number.isFinite(s)) return "0:00";
+        const m = Math.floor(s / 60);
+        const sec = Math.floor(s % 60);
+        return `${m}:${sec < 10 ? "0" : ""}${sec}`;
+    };
+
+    return (
+        <div
+            ref={containerRef}
+            className={`absolute inset-0 z-50 flex flex-col justify-between transition-opacity duration-300 ${showControls ? "opacity-100" : "opacity-0 hover:opacity-100"
+                }`}
+            onMouseMove={resetControlsTimeout}
+            onClick={togglePlay} // Clicking background toggles play
+            style={{ background: showControls ? "linear-gradient(to top, rgba(0,0,0,0.8), transparent 30%)" : "transparent" }}
+        >
+            {/* Top Bar */}
+            <div className="p-4 flex justify-between items-start bg-gradient-to-b from-black/60 to-transparent">
+                <div className="text-white font-bold drop-shadow-md">
+                    {title || (isLive ? "Live Stream" : "Video")}
+                </div>
+                {isLive && (
+                    <div className="flex items-center gap-2 bg-red-600/80 px-2 py-1 rounded text-xs font-bold text-white shadow-sm backdrop-blur-sm">
+                        <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
+                        LIVE
+                    </div>
+                )}
+            </div>
+
+            {/* Center Play Button (only if paused/buffering) */}
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                {!isPlaying && (
+                    <div className="w-16 h-16 rounded-full bg-white/20 backdrop-blur-md flex items-center justify-center border border-white/30 shadow-xl transition-transform transform scale-100">
+                        <PlayIcon size={32} fill="white" />
+                    </div>
+                )}
+            </div>
+
+            {/* Bottom Controls */}
+            <div
+                className="p-4 bg-black/40 backdrop-blur-md border-t border-white/10"
+                onClick={(e) => e.stopPropagation()} // Prevent playing when clicking bar
+            >
+                {/* Progress Bar (if not live or valid duration) */}
+                {!isLive && duration > 0 && (
+                    <div className="flex items-center gap-3 text-xs font-mono text-gray-300 mb-2">
+                        <span>{formatTime(progress)}</span>
+                        <input
+                            type="range"
+                            min={0}
+                            max={duration}
+                            step={0.1}
+                            value={progress}
+                            onChange={handleSeek}
+                            className="flex-1 accent-blue-500 h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer"
+                        />
+                        <span>{formatTime(duration)}</span>
+                    </div>
+                )}
+
+                <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-4">
+                        <button
+                            onClick={togglePlay}
+                            className="text-white hover:text-blue-400 transition-colors focus:outline-none"
+                        >
+                            {isPlaying ? <PauseIcon /> : <PlayIcon />}
+                        </button>
+
+                        <div className="flex items-center gap-2 group">
+                            <button onClick={toggleMute} className="text-white hover:text-blue-400 transition-colors">
+                                {isMuted || volume === 0 ? <MuteIcon /> : <VolumeIcon />}
+                            </button>
+                            <input
+                                type="range"
+                                min={0}
+                                max={1}
+                                step={0.05}
+                                value={isMuted ? 0 : volume}
+                                onChange={handleVolumeChange}
+                                className="w-0 group-hover:w-20 transition-all duration-300 h-1 accent-blue-500 bg-gray-600 rounded-lg appearance-none cursor-pointer"
+                            />
+                        </div>
+
+                        {/* Quality Selector (if HLS levels exist) */}
+                        {hls && hls.levels && hls.levels.length > 0 && (
+                            <QualitySelector hls={hls} />
+                        )}
+
+                    </div>
+
+                    <div className="flex items-center gap-4">
+                        <button onClick={toggleFullscreen} className="text-white hover:text-blue-400 transition-colors">
+                            <FullscreenIcon isFs={isFullscreen} />
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+// Icons
+function PlayIcon({ size = 24, fill = "currentColor" }: { size?: number, fill?: string }) {
+    return (
+        <svg width={size} height={size} viewBox="0 0 24 24" fill={fill} stroke="currentColor" strokeWidth="0" strokeLinecap="round" strokeLinejoin="round">
+            <polygon points="5 3 19 12 5 21 5 3"></polygon>
+        </svg>
+    );
+}
+
+function PauseIcon({ size = 24 }: { size?: number }) {
+    return (
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" stroke="none">
+            <rect x="6" y="4" width="4" height="16"></rect>
+            <rect x="14" y="4" width="4" height="16"></rect>
+        </svg>
+    );
+}
+
+function VolumeIcon({ size = 24 }: { size?: number }) {
+    return (
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+            <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+        </svg>
+    );
+}
+
+function MuteIcon({ size = 24 }: { size?: number }) {
+    return (
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+            <line x1="23" y1="9" x2="17" y2="15"></line>
+            <line x1="17" y1="9" x2="23" y2="15"></line>
+        </svg>
+    );
+}
+
+function FullscreenIcon({ size = 24, isFs = false }: { size?: number, isFs?: boolean }) {
+    if (isFs) {
+        return (
+            <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"></path>
+            </svg>
+        )
+    }
+    return (
+        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"></path>
+        </svg>
+    );
+}
+
+function QualitySelector({ hls }: { hls: Hls }) {
+    const [level, setLevel] = useState(hls.currentLevel);
+    const [showMenu, setShowMenu] = useState(false);
+
+    useEffect(() => {
+        const onLevelSwitched = (_: any, data: { level: number }) => { // eslint-disable-line @typescript-eslint/no-explicit-any
+            setLevel(data.level);
+        };
+        hls.on((window as any).Hls.Events.LEVEL_SWITCHED, onLevelSwitched);
+        return () => {
+            hls.off((window as any).Hls.Events.LEVEL_SWITCHED, onLevelSwitched);
+        };
+    }, [hls]);
+
+    const levels = hls.levels || [];
+    if (levels.length <= 1) return null;
+
+    return (
+        <div className="relative">
+            <button
+                onClick={(e) => { e.stopPropagation(); setShowMenu(!showMenu); }}
+                className="text-xs font-bold text-gray-300 hover:text-white border border-gray-600 rounded px-2 py-1"
+            >
+                {level === -1 ? "Auto" : `${levels[level]?.height}p`}
+            </button>
+            {showMenu && (
+                <div className="absolute bottom-full mb-2 left-0 bg-black/90 border border-gray-700 rounded-lg p-2 flex flex-col gap-1 min-w-[80px]">
+                    <button
+                        onClick={(e) => { e.stopPropagation(); /* eslint-disable-next-line */ hls.currentLevel = -1; setShowMenu(false); }}
+                        className={`text-left text-xs px-2 py-1 rounded ${level === -1 ? "bg-blue-600 text-white" : "text-gray-300 hover:bg-white/10"}`}
+                    >
+                        Auto
+                    </button>
+                    {levels.map((lvl, idx) => (
+                        <button
+                            key={idx}
+                            onClick={(e) => { e.stopPropagation(); /* eslint-disable-next-line */ hls.currentLevel = idx; setShowMenu(false); }}
+                            className={`text-left text-xs px-2 py-1 rounded ${level === idx ? "bg-blue-600 text-white" : "text-gray-300 hover:bg-white/10"}`}
+                        >
+                            {lvl.height}p
+                        </button>
+                    ))}
+                </div>
+            )}
+        </div>
+    )
+}
