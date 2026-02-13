@@ -18,7 +18,7 @@ export default function VideoPlayerControls({
 }: VideoPlayerControlsProps) {
     const [isPlaying, setIsPlaying] = useState(false);
     const [volume, setVolume] = useState(1);
-    const [isMuted, setIsMuted] = useState(true);
+    const [isMuted, setIsMuted] = useState(false);
     const [isFullscreen, setIsFullscreen] = useState(false);
     const [showControls, setShowControls] = useState(true);
     const [progress, setProgress] = useState(0);
@@ -160,7 +160,6 @@ export default function VideoPlayerControls({
             className={`absolute inset-0 z-50 flex flex-col justify-between transition-opacity duration-300 ${showControls ? "opacity-100" : "opacity-0 hover:opacity-100"
                 }`}
             onMouseMove={resetControlsTimeout}
-            onClick={togglePlay} // Clicking background toggles play
             style={{ background: showControls ? "linear-gradient(to top, rgba(0,0,0,0.8), transparent 30%)" : "transparent" }}
         >
             {/* Top Bar */}
@@ -183,20 +182,13 @@ export default function VideoPlayerControls({
                             LIVE
                         </div>
                     )}
-                    <button
-                        onClick={toggleFullscreen}
-                        className="inline-flex sm:hidden items-center justify-center text-white hover:text-blue-400 transition-colors"
-                        aria-label="Fullscreen"
-                    >
-                        <FullscreenIcon size={22} isFs={isFullscreen} />
-                    </button>
                 </div>
             </div>
 
             {/* Center Play Button (only if paused/buffering) */}
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                 {!isPlaying && (
-                    <div className="w-16 h-16 rounded-full bg-white/20 backdrop-blur-md flex items-center justify-center border border-white/30 shadow-xl transition-transform transform scale-100 pointer-events-auto cursor-pointer hover:scale-110">
+                    <div className="w-16 h-16 rounded-full bg-white/20 backdrop-blur-md flex items-center justify-center border border-white/30 shadow-xl transition-transform transform scale-100">
                         <PlayIcon size={32} fill="white" />
                     </div>
                 )}
@@ -253,15 +245,13 @@ export default function VideoPlayerControls({
                                 className="w-0 group-hover:w-20 transition-all duration-300 h-1 accent-blue-500 bg-gray-600 rounded-lg appearance-none cursor-pointer"
                             />
                         </div>
+                    </div>
 
+                    <div className="flex items-center gap-4 shrink-0">
                         {/* Quality Selector (if HLS levels exist) */}
                         {hls && hls.levels && hls.levels.length > 0 && (
                             <QualitySelector hls={hls} />
                         )}
-
-                    </div>
-
-                    <div className="hidden sm:flex items-center gap-4 shrink-0">
                         <button onClick={toggleFullscreen} className="text-white hover:text-blue-400 transition-colors" aria-label="Fullscreen">
                             <FullscreenIcon isFs={isFullscreen} />
                         </button>

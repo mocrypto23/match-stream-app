@@ -28,6 +28,8 @@ type ServerHealthState = "ok" | "down";
 
 const PREMATCH_OPEN_WINDOW_MINUTES = 30;
 const STALL_FREEZE_MS = 12000;
+const PLAYER_LOADING_OVERLAY_DELAY_MS = 600;
+const DEFAULT_PLAYER_QUALITY_HEIGHT = 480;
 const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const RESOLVE_COOLDOWN_MS = 1500;
 const CANDIDATE_PROBE_TIMEOUT_MS = 5000;
@@ -277,6 +279,23 @@ function qualityRank(value?: string | null) {
   if (!q) return -1;
   const n = Number.parseInt(q.replace("p", ""), 10);
   return Number.isFinite(n) ? n : -1;
+}
+
+function pickDefaultHlsLevel(levels: Array<{ height?: number }>, preferredHeight = DEFAULT_PLAYER_QUALITY_HEIGHT) {
+  const normalized = levels
+    .map((level, idx) => ({ idx, height: Number(level?.height) }))
+    .filter((item) => Number.isFinite(item.height) && item.height > 0)
+    .sort((a, b) => a.height - b.height);
+
+  if (!normalized.length) return -1;
+
+  const exact = normalized.find((item) => item.height === preferredHeight);
+  if (exact) return exact.idx;
+
+  const lowerOrEqual = [...normalized].reverse().find((item) => item.height <= preferredHeight);
+  if (lowerOrEqual) return lowerOrEqual.idx;
+
+  return normalized[0].idx;
 }
 
 function toEmbedProxyUrl(rawUrl?: string | null, ref?: string) {
@@ -1372,6 +1391,8 @@ export default function WatchPage() {
   const [playerError, setPlayerError] = useState<string | null>(null);
   const [serverHealth, setServerHealth] = useState<Record<number, ServerHealthState>>({});
   const [diagLogs, setDiagLogs] = useState<string[]>([]);
+  const candidatesRef = useRef<string[]>([]);
+  const selectedCandidateRef = useRef(0);
   const recoveryTimerRef = useRef<number | null>(null);
   const recoveryAttemptRef = useRef(0);
   const lastResolveKickRef = useRef(0);
@@ -1386,6 +1407,40 @@ export default function WatchPage() {
     if (!diagEnabled) return;
     setDiagLogs((prev) => [line, ...prev].slice(0, 120));
   }, [diagEnabled]);
+
+  useEffect(() => {
+    candidatesRef.current = candidates;
+  }, [candidates]);
+
+  useEffect(() => {
+    selectedCandidateRef.current = selectedCandidate;
+  }, [selectedCandidate]);
+
+  const applyCandidatesPreservingSelection = useCallback((nextCandidates: string[]) => {
+    const next = dedupeUrls(nextCandidates);
+    const prev = candidatesRef.current;
+    const prevIdx = selectedCandidateRef.current;
+    const prevUrl = prev[prevIdx] || "";
+    let nextIdx = prevIdx;
+
+    if (!next.length) {
+      nextIdx = 0;
+    } else if (prevUrl) {
+      const prevKey = canonicalizeUrl(prevUrl) || prevUrl;
+      const foundIdx = next.findIndex((item) => (canonicalizeUrl(item) || item) === prevKey);
+      if (foundIdx >= 0) nextIdx = foundIdx;
+      else if (nextIdx >= next.length) nextIdx = 0;
+    } else if (nextIdx >= next.length) {
+      nextIdx = 0;
+    }
+
+    candidatesRef.current = next;
+    if (nextIdx !== prevIdx) {
+      selectedCandidateRef.current = nextIdx;
+      setSelectedCandidate(nextIdx);
+    }
+    setCandidates(next);
+  }, []);
 
   const clearRecoveryTimer = useCallback(() => {
     if (recoveryTimerRef.current !== null) {
@@ -1596,12 +1651,16 @@ export default function WatchPage() {
   const shouldBlockStream = !(status === "live" || status === "finished") && !hasStartedByTime && status === "upcoming";
 
   useEffect(() => {
+    selectedCandidateRef.current = 0;
     setSelectedCandidate(0);
     setPlayerError(null);
     resetRecoveryState();
   }, [selectedServer, resetRecoveryState]);
   useEffect(() => {
-    if (selectedCandidate >= candidates.length) setSelectedCandidate(0);
+    if (selectedCandidate >= candidates.length) {
+      selectedCandidateRef.current = 0;
+      setSelectedCandidate(0);
+    }
   }, [candidates.length, selectedCandidate]);
 
   useEffect(() => {
@@ -1612,7 +1671,7 @@ export default function WatchPage() {
     resolveLockRef.current = true;
     (async () => {
       if (!selectedUrl || shouldBlockStream) {
-        setCandidates([]);
+        applyCandidatesPreservingSelection([]);
         setResolverError(null);
         setResolverLoading(false);
         resolveLockRef.current = false;
@@ -1631,15 +1690,13 @@ export default function WatchPage() {
       const mergeCandidates = (incoming: string[]) => {
         if (!incoming.length) return;
         hadPlayable = true;
-        setCandidates((prev) => {
-          const merged = dedupeUrls([...prev, ...incoming]);
-          if (!disableResolveCache) setCachedResolveCandidates(selectedUrl, merged);
-          return merged;
-        });
+        const merged = dedupeUrls([...candidatesRef.current, ...incoming]);
+        applyCandidatesPreservingSelection(merged);
+        if (!disableResolveCache) setCachedResolveCandidates(selectedUrl, merged);
       };
 
       setResolverError(null);
-      setCandidates(initialCandidates);
+      applyCandidatesPreservingSelection(initialCandidates);
       setResolverLoading(!initialCandidates.length);
       if (cachedCandidates.length) pushDiag(`resolve cache hit +${cachedCandidates.length}`);
       if (seedCandidates.length) pushDiag(`resolve seed +${seedCandidates.length}`);
@@ -1661,7 +1718,7 @@ export default function WatchPage() {
         const fastMerged = dedupeUrls([...initialCandidates, ...fastList]);
         if (fastMerged.length) {
           hadPlayable = true;
-          setCandidates(fastMerged);
+          applyCandidatesPreservingSelection(fastMerged);
           if (!disableResolveCache) setCachedResolveCandidates(selectedUrl, fastMerged);
           setPlayerError(null);
           resetRecoveryState();
@@ -1700,7 +1757,7 @@ export default function WatchPage() {
           });
           const merged = verified.length ? verified : mergedRaw;
           if (mergedRaw.length) pushDiag(`probe ok ${merged.length}/${mergedRaw.length}`);
-          setCandidates(merged);
+          applyCandidatesPreservingSelection(merged);
           if (merged.length && !disableResolveCache) setCachedResolveCandidates(selectedUrl, merged);
           if (!merged.length) {
             setResolverError("لا يوجد بث");
@@ -1732,7 +1789,15 @@ export default function WatchPage() {
       controller.abort();
       if (activeResolveIdRef.current === resolveId) resolveLockRef.current = false;
     };
-  }, [selectedUrl, shouldBlockStream, pushDiag, resolveRevision, scheduleResolveRecovery, resetRecoveryState]);
+  }, [
+    selectedUrl,
+    shouldBlockStream,
+    pushDiag,
+    resolveRevision,
+    scheduleResolveRecovery,
+    resetRecoveryState,
+    applyCandidatesPreservingSelection,
+  ]);
 
   const selectedHlsUrl = candidates[selectedCandidate] || "";
   const candidateGroups = useMemo(() => groupCandidates(candidates), [candidates]);
@@ -1747,8 +1812,8 @@ export default function WatchPage() {
     let cancel = false;
     let hls: Hls | null = null;
     const current = selectedCandidate;
-    const total = candidates.length;
     let freezeTriggered = false;
+    let loadingOverlayTimer: number | null = null;
     const timeoutHandles: number[] = [];
     const queueTimeout = (fn: () => void, delayMs: number) => {
       const id = window.setTimeout(() => {
@@ -1769,15 +1834,45 @@ export default function WatchPage() {
       if (Number.isFinite(currentTime) && currentTime >= 0) lastProgressRef.current = currentTime;
       lastProgressAtRef.current = Date.now();
     };
+    const clearLoadingOverlayTimer = () => {
+      if (loadingOverlayTimer !== null) {
+        window.clearTimeout(loadingOverlayTimer);
+        loadingOverlayTimer = null;
+      }
+    };
+    const showPlayerLoadingDelayed = () => {
+      if (loadingOverlayTimer !== null) return;
+      loadingOverlayTimer = window.setTimeout(() => {
+        loadingOverlayTimer = null;
+        if (cancel) return;
+        setPlayerLoading(true);
+      }, PLAYER_LOADING_OVERLAY_DELAY_MS);
+    };
+    const hidePlayerLoading = () => {
+      clearLoadingOverlayTimer();
+      setPlayerLoading(false);
+    };
+    const playWithAutoplayFallback = () => {
+      video.play().catch(() => {
+        if (cancel) return;
+        video.muted = true;
+        video.defaultMuted = true;
+        video.setAttribute("muted", "");
+        video.play().catch(() => { });
+      });
+    };
     const moveNext = (reason: string) => {
+      const total = candidatesRef.current.length;
       if (current + 1 < total) {
-        setSelectedCandidate(current + 1);
+        const nextIndex = current + 1;
+        selectedCandidateRef.current = nextIndex;
+        setSelectedCandidate(nextIndex);
         setPlayerError(`تعثر المصدر الحالي (${reason})، جاري التحويل تلقائيًا للمصدر التالي.`);
       } else {
         setPlayerError("فشل تشغيل كل مصادر HLS الداخلية.");
         scheduleResolveRecovery(`player-exhausted:${reason}`, true);
       }
-      setPlayerLoading(false);
+      hidePlayerLoading();
     };
     const reset = () => {
       try { video.pause(); } catch { }
@@ -1786,20 +1881,24 @@ export default function WatchPage() {
     };
     clearStallWatchdog();
     reset();
-    setPlayerLoading(false);
+    hidePlayerLoading();
     setPlayerError(null);
     if (shouldBlockStream || !selectedHlsUrl) return;
     setPlayerLoading(true);
+    video.volume = 1;
+    video.muted = false;
+    video.defaultMuted = false;
+    video.removeAttribute("muted");
     markProgress();
     let fatalRetries = 0;
     const onLoaded = () => {
       if (cancel) return;
       markProgress();
-      setPlayerLoading(false);
+      hidePlayerLoading();
     };
     const onWaiting = () => {
       if (cancel) return;
-      setPlayerLoading(true);
+      showPlayerLoadingDelayed();
       try {
         hls?.startLoad();
       } catch { }
@@ -1814,10 +1913,13 @@ export default function WatchPage() {
       freezeTriggered = false;
       markProgress();
       resetRecoveryState();
-      setPlayerLoading(false);
+      hidePlayerLoading();
       setPlayerError(null);
     };
-    const onTimeUpdate = () => markProgress();
+    const onTimeUpdate = () => {
+      markProgress();
+      if (!video.paused && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) hidePlayerLoading();
+    };
     video.addEventListener("loadeddata", onLoaded);
     video.addEventListener("waiting", onWaiting);
     video.addEventListener("stalled", onWaiting);
@@ -1826,7 +1928,7 @@ export default function WatchPage() {
     if (shouldUseNativeHls(video)) {
       video.src = selectedHlsUrl;
       video.load();
-      video.play().catch(() => { });
+      playWithAutoplayFallback();
     } else if (Hls.isSupported()) {
       hls = new Hls({
         enableWorker: true,
@@ -1850,11 +1952,16 @@ export default function WatchPage() {
       hls.on(Hls.Events.MEDIA_ATTACHED, () => hls?.loadSource(selectedHlsUrl));
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         if (cancel) return;
+        const defaultLevel = pickDefaultHlsLevel(hls?.levels || []);
+        if (defaultLevel >= 0 && hls) {
+          // Hls.js quality switch API is implemented via mutable property assignment.
+          hls.currentLevel = defaultLevel;
+        }
         markProgress();
         resetRecoveryState();
-        setPlayerLoading(false);
+        hidePlayerLoading();
         setPlayerError(null);
-        video.play().catch(() => { });
+        playWithAutoplayFallback();
       });
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (cancel || !data.fatal) return;
@@ -1878,7 +1985,7 @@ export default function WatchPage() {
       hls.attachMedia(video);
     } else {
       setPlayerError("متصفحك لا يدعم تشغيل HLS داخليًا.");
-      setPlayerLoading(false);
+      hidePlayerLoading();
     }
 
     stallTimerRef.current = window.setInterval(() => {
@@ -1900,6 +2007,7 @@ export default function WatchPage() {
         video.networkState === HTMLMediaElement.NETWORK_IDLE;
       if (!waitingState || stalledFor < STALL_FREEZE_MS || freezeTriggered) return;
       freezeTriggered = true;
+      const total = candidatesRef.current.length;
       pushDiag(`stall-freeze ${stalledFor}ms source=${current + 1}/${Math.max(1, total)}`);
       try {
         hls?.startLoad();
@@ -1913,6 +2021,7 @@ export default function WatchPage() {
     return () => {
       cancel = true;
       for (const id of timeoutHandles) window.clearTimeout(id);
+      clearLoadingOverlayTimer();
       clearStallWatchdog();
       video.removeEventListener("loadeddata", onLoaded);
       video.removeEventListener("waiting", onWaiting);
@@ -1926,7 +2035,6 @@ export default function WatchPage() {
   }, [
     selectedHlsUrl,
     selectedCandidate,
-    candidates.length,
     shouldBlockStream,
     pushDiag,
     scheduleResolveRecovery,
@@ -2022,7 +2130,6 @@ export default function WatchPage() {
               <video
                 ref={videoRef}
                 playsInline
-                muted
                 autoPlay
                 preload="auto"
                 onDoubleClick={handleVideoDoubleClick}
