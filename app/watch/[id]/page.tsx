@@ -2,6 +2,7 @@
 
 import Hls from "hls.js";
 import Link from "next/link";
+import VideoPlayerControls from "@/components/VideoPlayerControls";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -229,8 +230,8 @@ function toPlayableProxyFromManifestLine(rawLine: string, parentCandidateUrl: st
   const parentTarget = parentCandidateUrl.startsWith("/api/embed-proxy?")
     ? getProxyTargetUrl(parentCandidateUrl)
     : isValidHttpUrl(parentCandidateUrl)
-    ? parentCandidateUrl
-    : null;
+      ? parentCandidateUrl
+      : null;
 
   if (isValidHttpUrl(line)) {
     return toEmbedProxyUrl(line, parentTarget || line);
@@ -336,7 +337,7 @@ function materializeTemplateUrl(raw: string, sourceUrl: string) {
   let matchId = "";
   try {
     matchId = String(new URL(sourceUrl).searchParams.get("match") || "").trim();
-  } catch {}
+  } catch { }
   if (!matchId) return "";
 
   const encoded = encodeURIComponent(matchId);
@@ -592,7 +593,7 @@ function extractPlayerv2ConfigFromHtml(html: string, pageUrl: string) {
         const normalized = ensureTrailingSlash(domain);
         if (normalized) domains.add(normalized);
       }
-    } catch {}
+    } catch { }
   }
 
   for (const m of text.matchAll(/data-(?:mobile-)?path=["']([^"']+)["']/gi)) {
@@ -603,7 +604,7 @@ function extractPlayerv2ConfigFromHtml(html: string, pageUrl: string) {
   if (!domains.size) {
     try {
       domains.add(`${new URL(pageUrl).origin}/`);
-    } catch {}
+    } catch { }
   }
 
   if (!domains.size) {
@@ -674,7 +675,7 @@ async function requestPlayerv2TokenFromProxy(
       let json: unknown = null;
       try {
         json = JSON.parse(text);
-      } catch {}
+      } catch { }
 
       const data = json as Record<string, unknown> | null;
       const token =
@@ -1094,6 +1095,8 @@ export default function WatchPage() {
   const [derivedServerVariants, setDerivedServerVariants] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [errMsg, setErrMsg] = useState<string | null>(null);
+  const [hlsInstance, setHlsInstance] = useState<Hls | null>(null);
+
   const [selectedServer, setSelectedServer] = useState(1);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [resolverLoading, setResolverLoading] = useState(false);
@@ -1317,8 +1320,12 @@ export default function WatchPage() {
       const n = i + 1;
       let picked = claim(explicit[i]);
       if (!picked) picked = claim(byServ.get(n) ?? null);
-      if (!picked) picked = nextFallback();
-      out.push({ n, label: `سيرفر ${n}`, url: picked ?? null });
+
+      // Strict separation: Server 1 & 2 should not consume generic fallbacks
+      if (!picked && n > 2) picked = nextFallback();
+
+      const label = `سيرفر ${n}`;
+      out.push({ n, label, url: picked ?? null });
     }
     return out;
   }, [match, derivedServerVariants]);
@@ -1342,11 +1349,11 @@ export default function WatchPage() {
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) {
-      video.play().catch(() => {});
+      video.play().catch(() => { });
     }
     const host = playerHostRef.current || video;
     if (!document.fullscreenElement) {
-      host.requestFullscreen?.().catch(() => {});
+      host.requestFullscreen?.().catch(() => { });
     }
   }, []);
 
@@ -1483,7 +1490,7 @@ export default function WatchPage() {
       setPlayerLoading(false);
     };
     const reset = () => {
-      try { video.pause(); } catch {}
+      try { video.pause(); } catch { }
       video.removeAttribute("src");
       video.load();
     };
@@ -1505,11 +1512,11 @@ export default function WatchPage() {
       setPlayerLoading(true);
       try {
         hls?.startLoad();
-      } catch {}
+      } catch { }
       queueTimeout(() => {
         try {
-          video.play().catch(() => {});
-        } catch {}
+          video.play().catch(() => { });
+        } catch { }
       }, 150);
     };
     const onPlaying = () => {
@@ -1529,7 +1536,7 @@ export default function WatchPage() {
     if (video.canPlayType("application/vnd.apple.mpegurl")) {
       video.src = selectedHlsUrl;
       video.load();
-      video.play().catch(() => {});
+      video.play().catch(() => { });
     } else if (Hls.isSupported()) {
       hls = new Hls({
         enableWorker: true,
@@ -1549,6 +1556,7 @@ export default function WatchPage() {
         abrBandWidthFactor: 0.85,
         abrBandWidthUpFactor: 0.7,
       });
+      setHlsInstance(hls);
       hls.on(Hls.Events.MEDIA_ATTACHED, () => hls?.loadSource(selectedHlsUrl));
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         if (cancel) return;
@@ -1556,7 +1564,7 @@ export default function WatchPage() {
         resetRecoveryState();
         setPlayerLoading(false);
         setPlayerError(null);
-        video.play().catch(() => {});
+        video.play().catch(() => { });
       });
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (cancel || !data.fatal) return;
@@ -1605,10 +1613,10 @@ export default function WatchPage() {
       pushDiag(`stall-freeze ${stalledFor}ms source=${current + 1}/${Math.max(1, total)}`);
       try {
         hls?.startLoad();
-      } catch {}
+      } catch { }
       try {
-        video.play().catch(() => {});
-      } catch {}
+        video.play().catch(() => { });
+      } catch { }
       queueTimeout(() => moveNext("stall"), 250);
     }, 1500);
 
@@ -1621,7 +1629,8 @@ export default function WatchPage() {
       video.removeEventListener("stalled", onWaiting);
       video.removeEventListener("playing", onPlaying);
       video.removeEventListener("timeupdate", onTimeUpdate);
-      try { hls?.destroy(); } catch {}
+      try { hls?.destroy(); } catch { }
+      setHlsInstance(null);
       reset();
     };
   }, [
@@ -1676,8 +1685,8 @@ export default function WatchPage() {
                   selectedServer === s.n && ok
                     ? "bg-blue-600/20 text-blue-300 border-blue-600/50"
                     : ok
-                    ? "bg-[#121212] text-gray-200 border-gray-800 hover:border-blue-600/40"
-                    : "bg-[#0f0f0f] text-gray-500 border-gray-900 cursor-not-allowed",
+                      ? "bg-[#121212] text-gray-200 border-gray-800 hover:border-blue-600/40"
+                      : "bg-[#0f0f0f] text-gray-500 border-gray-900 cursor-not-allowed",
                 ].join(" ")}
               >
                 <div>{s.label}</div>
@@ -1719,11 +1728,21 @@ export default function WatchPage() {
             <div onDoubleClick={handleVideoDoubleClick} className="relative aspect-video min-h-[280px] sm:min-h-[430px] bg-black overflow-hidden">
               <video
                 ref={videoRef}
-                controls
                 playsInline
                 preload="auto"
                 onDoubleClick={handleVideoDoubleClick}
                 className="w-full h-full bg-black"
+                onClick={(e) => {
+                  // Optional: clicking video can toggle play via Controls logic
+                  // but Controls overlay covers it usually. 
+                  // If native controls are off, we rely on custom UI.
+                }}
+              />
+              <VideoPlayerControls
+                videoRef={videoRef}
+                hls={hlsInstance}
+                title={`${home} ${match?.match_start ? "" : ""} vs ${away}`}
+                isLive={true}
               />
               {playerLoading ? <div className="absolute inset-0 flex items-center justify-center bg-black/50 text-sm text-gray-200">جاري تشغيل البث</div> : null}
             </div>

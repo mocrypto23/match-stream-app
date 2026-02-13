@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "TwoFooty",
-  description: "Free Koora By Mohammed Ayman",
+  description: "Free Matches By Mohammed Ayman",
 };
 
 export default function RootLayout({
