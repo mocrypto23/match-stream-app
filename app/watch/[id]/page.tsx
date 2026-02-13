@@ -26,6 +26,13 @@ type MatchRow = {
 type ServerOption = { n: number; label: string; url: string | null };
 type ServerHealthState = "ok" | "down";
 
+const SERVER_SOURCE_LABELS: Record<number, string> = {
+  1: "سيرفر 1 ",
+  2: "سيرفر 2 ",
+  3: "سيرفر 3 ",
+  4: "سيرفر 4 ",
+};
+
 const PREMATCH_OPEN_WINDOW_MINUTES = 30;
 const STALL_FREEZE_MS = 12000;
 const PLAYER_LOADING_OVERLAY_DELAY_MS = 600;
@@ -654,6 +661,36 @@ function extractPlayableCandidatesFromProxyHtml(html: string, sourceUrl: string)
   return out;
 }
 
+function isLikelyChannelLandingPlayerPageUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!isValidHttpUrl(raw)) return false;
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    if (!host.endsWith("sia-bth.net") && !host.endsWith("kooraxx.com")) return false;
+
+    const path = u.pathname.toLowerCase().replace(/\/+$/, "");
+    if (!path || path === "/") return false;
+    if (
+      path.startsWith("/wp-") ||
+      path.includes("/author/") ||
+      path.includes("/tag/") ||
+      path.includes("/category/") ||
+      path.includes("/feed") ||
+      path.includes("/comments") ||
+      path.includes("/matches/")
+    ) {
+      return false;
+    }
+
+    const segments = path.split("/").filter(Boolean);
+    if (!segments.length || segments.length > 2) return false;
+    return segments.every((part) => /^[a-z0-9-]+$/i.test(part));
+  } catch {
+    return false;
+  }
+}
+
 function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: string) {
   const text = String(html || "")
     .replace(/&amp;/gi, "&")
@@ -662,6 +699,7 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
     .replace(/\\\//g, "/");
   const out: string[] = [];
   const seen = new Set<string>();
+  const isPlayerLike = (url: string) => PLAYER_PAGE_HINT_RE.test(url) || isLikelyChannelLandingPlayerPageUrl(url);
   const add = (raw: string) => {
     let v = String(raw || "").trim().replace(/[),;]+$/g, "");
     if (v.includes("${")) {
@@ -674,7 +712,7 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
       const target = getProxyTargetUrl(v);
       if (!target || !isValidHttpUrl(target)) return;
       if (isClearlyNonStreamUrl(target) || isStrongPlayableStreamUrl(target)) return;
-      if (!PLAYER_PAGE_HINT_RE.test(target)) return;
+      if (!isPlayerLike(target)) return;
       const key = canonicalizeUrl(v);
       if (!key || seen.has(key)) return;
       seen.add(key);
@@ -684,7 +722,7 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
 
     if (!isValidHttpUrl(v)) return;
     if (isClearlyNonStreamUrl(v) || isStrongPlayableStreamUrl(v)) return;
-    if (!PLAYER_PAGE_HINT_RE.test(v)) return;
+    if (!isPlayerLike(v)) return;
     const proxied = toEmbedProxyUrl(v, sourceUrl);
     if (!proxied) return;
     const key = canonicalizeUrl(proxied);
@@ -1110,9 +1148,9 @@ async function resolveCandidatesForServer(
     }
     return true;
   };
-  const playerPages = extractPlayerPageCandidatesFromProxyHtml(html, sourceUrl).filter((p) =>
-    isSameServerVariantPage(p)
-  );
+  const playerPages = extractPlayerPageCandidatesFromProxyHtml(html, sourceUrl);
+  const maxPlayerCrawlDepth = 3;
+  const maxCrawledPlayerPages = Math.max(maxPlayerPages, maxPlayerPages * 3);
   const deepList: string[] = [];
   const rollingDeepList: string[] = [];
   const playerv2HtmlPool: Array<{ pageUrl: string; html: string }> = [];
@@ -1122,51 +1160,119 @@ async function resolveCandidatesForServer(
     rolling: string[];
     playerv2: { pageUrl: string; html: string } | null;
     playable: string[];
+    nextPlayerPages: string[];
+    baseUrl: string;
   };
-  const emptyChildResult: ChildResolveResult = { deep: [], rolling: [], playerv2: null, playable: [] };
-  const childResults = await mapWithConcurrency(
-    playerPages.slice(0, maxPlayerPages),
-    parallelChildConcurrency,
-    async (pageUrl): Promise<ChildResolveResult> => {
-      if (signal.aborted) throw new DOMException("aborted", "AbortError");
-      try {
-        const childProbe = pageUrl.startsWith("/api/embed-proxy?") ? pageUrl : toEmbedProxyUrl(pageUrl, sourceUrl);
-        if (!childProbe) return emptyChildResult;
+  type PlayerQueueItem = { pageUrl: string; depth: number; parentRef: string };
+  const emptyChildResult: ChildResolveResult = {
+    deep: [],
+    rolling: [],
+    playerv2: null,
+    playable: [],
+    nextPlayerPages: [],
+    baseUrl: "",
+  };
 
-        const child = await fetchHtml(childProbe);
-        if (HLS_CT.some((x) => child.ct.includes(x))) {
-          return { deep: [childProbe], rolling: [], playerv2: null, playable: [childProbe] };
-        }
+  const enqueuePlayerPages = (
+    queue: PlayerQueueItem[],
+    visited: Set<string>,
+    candidates: string[],
+    depth: number,
+    parentRef: string
+  ) => {
+    for (const candidate of candidates) {
+      if (!isSameServerVariantPage(candidate)) continue;
+      const key = canonicalizeUrl(candidate) || String(candidate || "").trim().toLowerCase();
+      if (!key || visited.has(key)) continue;
+      visited.add(key);
+      queue.push({ pageUrl: candidate, depth, parentRef });
+      if (queue.length >= maxCrawledPlayerPages * 2) break;
+    }
+  };
 
-        if (!child.ct.includes("text/html") && !child.ct.includes("application/xhtml+xml")) {
-          return emptyChildResult;
-        }
+  const analyzePlayerPage = async (item: PlayerQueueItem): Promise<ChildResolveResult> => {
+    if (signal.aborted) throw new DOMException("aborted", "AbortError");
+    try {
+      const pageTargetUrl = item.pageUrl.startsWith("/api/embed-proxy?")
+        ? getProxyTargetUrl(item.pageUrl) || ""
+        : item.pageUrl;
+      const pageBaseUrl = isValidHttpUrl(pageTargetUrl) ? pageTargetUrl : item.parentRef;
+      const childProbe = item.pageUrl.startsWith("/api/embed-proxy?")
+        ? item.pageUrl
+        : toEmbedProxyUrl(item.pageUrl, item.parentRef || sourceUrl);
+      if (!childProbe) return { ...emptyChildResult, baseUrl: pageBaseUrl };
 
-        const childHtml = await child.res.text();
-        const childList = extractPlayableCandidatesFromProxyHtml(childHtml, pageUrl);
-        const childRolling = extractRollingHlsCandidatesFromHtml(childHtml, pageUrl);
+      const child = await fetchHtml(childProbe);
+      if (HLS_CT.some((x) => child.ct.includes(x))) {
         return {
-          deep: childList,
-          rolling: childRolling,
-          playerv2: { pageUrl, html: childHtml },
-          playable: [...childRolling, ...childList],
+          deep: [childProbe],
+          rolling: [],
+          playerv2: null,
+          playable: [childProbe],
+          nextPlayerPages: [],
+          baseUrl: pageBaseUrl,
         };
-      } catch (e: unknown) {
-        if (e instanceof Error && e.name === "AbortError") throw e;
-        return emptyChildResult;
       }
-    }
-  );
 
-  for (const childResult of childResults) {
-    if (signal.aborted) break;
-    if (childResult.playerv2) playerv2HtmlPool.push(childResult.playerv2);
-    if (childResult.rolling.length) rollingDeepList.push(...childResult.rolling);
-    if (childResult.deep.length && deepList.length < maxDeepCandidates) {
-      const remaining = maxDeepCandidates - deepList.length;
-      deepList.push(...childResult.deep.slice(0, remaining));
+      if (!child.ct.includes("text/html") && !child.ct.includes("application/xhtml+xml")) {
+        return { ...emptyChildResult, baseUrl: pageBaseUrl };
+      }
+
+      const childHtml = await child.res.text();
+      const extractionBaseUrl = pageBaseUrl || sourceUrl;
+      const childList = extractPlayableCandidatesFromProxyHtml(childHtml, extractionBaseUrl);
+      const childRolling = extractRollingHlsCandidatesFromHtml(childHtml, extractionBaseUrl);
+      const nextPlayerPages = extractPlayerPageCandidatesFromProxyHtml(childHtml, extractionBaseUrl);
+      return {
+        deep: childList,
+        rolling: childRolling,
+        playerv2: pageBaseUrl && isValidHttpUrl(pageBaseUrl) ? { pageUrl: pageBaseUrl, html: childHtml } : null,
+        playable: [...childRolling, ...childList],
+        nextPlayerPages,
+        baseUrl: pageBaseUrl,
+      };
+    } catch (e: unknown) {
+      if (e instanceof Error && e.name === "AbortError") throw e;
+      return { ...emptyChildResult, baseUrl: item.parentRef };
     }
-    emitBatch(childResult.playable, "deep");
+  };
+
+  const queue: PlayerQueueItem[] = [];
+  const visitedPlayerPages = new Set<string>();
+  enqueuePlayerPages(queue, visitedPlayerPages, playerPages.slice(0, maxPlayerPages), 1, sourceUrl);
+
+  let crawledPages = 0;
+  while (queue.length && crawledPages < maxCrawledPlayerPages) {
+    if (signal.aborted) throw new DOMException("aborted", "AbortError");
+    const remaining = maxCrawledPlayerPages - crawledPages;
+    const batchSize = Math.min(parallelChildConcurrency, remaining, queue.length);
+    if (batchSize <= 0) break;
+    const batch = queue.splice(0, batchSize);
+    const batchResults = await mapWithConcurrency(
+      batch,
+      Math.min(parallelChildConcurrency, batch.length),
+      async (item): Promise<{ item: PlayerQueueItem; result: ChildResolveResult }> => {
+        const result = await analyzePlayerPage(item);
+        return { item, result };
+      }
+    );
+    crawledPages += batch.length;
+
+    for (const { item, result } of batchResults) {
+      if (signal.aborted) break;
+      if (result.playerv2) playerv2HtmlPool.push(result.playerv2);
+      if (result.rolling.length) rollingDeepList.push(...result.rolling);
+      if (result.deep.length && deepList.length < maxDeepCandidates) {
+        const remainingDeep = maxDeepCandidates - deepList.length;
+        deepList.push(...result.deep.slice(0, remainingDeep));
+      }
+      emitBatch(result.playable, "deep");
+
+      if (item.depth >= maxPlayerCrawlDepth || !result.nextPlayerPages.length) continue;
+      const nextParentRef =
+        result.baseUrl && isValidHttpUrl(result.baseUrl) ? result.baseUrl : item.parentRef || sourceUrl;
+      enqueuePlayerPages(queue, visitedPlayerPages, result.nextPlayerPages, item.depth + 1, nextParentRef);
+    }
   }
 
   const playerv2List: string[] = [];
@@ -1340,7 +1446,8 @@ async function expandCandidatesWithManifestVariants(
           const item = String(line || "").trim();
           if (!item) continue;
           if (SEGMENT_FILE_RE.test(item)) continue;
-          if (!PLAYLIST_HINT_RE.test(item) && !item.toLowerCase().includes("m3u8")) continue;
+          const qualityLike = /(?:^|[_-])(?:\d{3,4}p|sd|hd|fhd|uhd)(?:$|[/?#])/i.test(item);
+          if (!PLAYLIST_HINT_RE.test(item) && !item.toLowerCase().includes("m3u8") && !qualityLike) continue;
           const proxied = toPlayableProxyFromManifestLine(item, candidate);
           if (proxied) local.push(proxied);
         }
@@ -1608,7 +1715,7 @@ export default function WatchPage() {
       const n = i + 1;
       const raw = String(explicit[i] || "").trim();
       const url = raw && isValidHttpUrl(raw) ? raw : null;
-      const label = `سيرفر ${n}`;
+      const label = SERVER_SOURCE_LABELS[n] || `سيرفر ${n}`;
       out.push({ n, label, url });
     }
     return out;
@@ -1642,6 +1749,7 @@ export default function WatchPage() {
   }, []);
 
   const selectedOption = validServers.find((s) => s.n === selectedServer);
+  const selectedServerLabel = selectedOption?.label || SERVER_SOURCE_LABELS[selectedServer] || `سيرفر ${selectedServer}`;
   const selectedUrl = selectedOption?.url ?? "";
   const status = (match?.status_key ?? "").toLowerCase();
   const startMs = match?.match_start ? new Date(match.match_start).getTime() : null;
@@ -2063,7 +2171,7 @@ export default function WatchPage() {
         <div className="mb-4 rounded-2xl border border-gray-800 bg-gradient-to-r from-[#1b1b1b] via-[#111111] to-[#1b1b1b] p-5 shadow-2xl">
           <div className="flex flex-col items-center text-center gap-2">
             <div className="text-2xl sm:text-3xl font-black">لا يوجد اعلانات</div>
-            <div className="text-sm sm:text-base text-gray-300">دبل كليك على الفيديو وحيشتغل مباشرة</div>
+            <div className="text-sm sm:text-base text-gray-300">كبر الفيديو وعييييش</div>
           </div>
         </div>
 
@@ -2096,7 +2204,7 @@ export default function WatchPage() {
 
         {candidateGroups.length > 0 ? (
           <div className="mb-3 rounded-2xl border border-blue-800/30 bg-[#0f1520] p-4">
-            <div className="text-xl sm:text-2xl font-black text-blue-300 mb-3">مصادر سيرفر {selectedServer}</div>
+            <div className="text-xl sm:text-2xl font-black text-blue-300 mb-3">مصادر {selectedServerLabel}</div>
             <div className="flex flex-wrap gap-2">
               {candidateGroups.map((group, idx) => (
                 <button

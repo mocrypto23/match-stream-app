@@ -3,7 +3,7 @@
  * Unified Scraper (Yesterday / Today / Tomorrow) + Deep Stream Link Extractor
  * + SIIIR.TV (Server 2) extractor
  * + LIVEHD77 (Server 3) extractor
- * + YALA-LIVE (Server 4) extractor
+ * + LIVEKORA (Server 4) extractor
  * + TSKORA (Server 5) extractor
  * + 1KORA (Server 6) extractor
  *
@@ -92,14 +92,14 @@ const LIVEHD = {
   listUrl: "https://livehd77.pro/liive/",
   host: "livehd77.pro",
 };
-// YALA-LIVE source (Server 4)
+// LIVEKORA source (Server 4) - replaces old yala-live source
 const YALA = {
   dayUrl: {
-    yesterday: "https://www.yala-live.tv/matches-yesterday/",
-    today: "https://www.yala-live.tv/matches-today/",
-    tomorrow: "https://www.yala-live.tv/matches-tomorrow/",
+    yesterday: null,
+    today: "https://www.livekora.vip/today-matches/",
+    tomorrow: null,
   },
-  siteHost: "yala-live.tv",
+  siteHost: "livekora.vip",
 };
 // TSKORA source (Server 5)
 const TSKORA = {
@@ -116,8 +116,29 @@ const ONEKORA = {
   siteHost: "1kora.com",
   maxArticles: 24,
 };
-// User requested disabling old Server-4 source (YALA).
-const ENABLE_SERVER4_YALA = false;
+// LIVEKORA source toggle (Server 4). Enabled by default; set ENABLE_SERVER4_YALA=0 to disable.
+const ENABLE_SERVER4_YALA = String(process.env.ENABLE_SERVER4_YALA ?? "1") !== "0";
+
+const SERVER_SLOT_DOMAIN_WHITELIST = Object.freeze({
+  1: ["bein-live.com"],
+  2: ["siiir.tv", "yallashot.us", "aleynoxitram.sbs"],
+  3: ["livehd77.pro", "alkoora.live"],
+  4: ["livekora.vip", "koooralive.click", "kooraxx.com", "sia-bth.net"],
+  5: ["tskoralive.com", "pyxq.online"],
+  6: ["1kora.com", "ahlamontada.com"],
+});
+
+const STREAM_SLOT_FIELD_BY_SLOT = Object.freeze({
+  1: "stream_url",
+  2: "stream_url_2",
+  3: "stream_url_3",
+  4: "stream_url_4",
+  5: "stream_url_5",
+  6: "stream_url_6",
+  7: "stream_url_7",
+});
+
+const LIVEKORA_SLOT4_HOST_HINTS = SERVER_SLOT_DOMAIN_WHITELIST[4];
 // ===================== Anti-Ads Config =====================
 const AD_HOSTS = [
   "doubleclick.net",
@@ -796,7 +817,7 @@ async function waitForStableMatchCount(page, maxWaitMs = 20000, settleMs = 1400)
 
   while (Date.now() - start < maxWaitMs) {
     const count = await page
-      .locator(".AY_Match, #ayala-today [id^='m-'][data-start], #ayala-yesterday [id^='m-'][data-start], #ayala-tomorrow [id^='m-'][data-start], [id^='m-'][data-start].AY_WithJS, [id^='m-'][data-start].MT_Loading")
+      .locator(".AY_Match, .match-container, #ayala-today [id^='m-'][data-start], #ayala-yesterday [id^='m-'][data-start], #ayala-tomorrow [id^='m-'][data-start], [id^='m-'][data-start].AY_WithJS, [id^='m-'][data-start].MT_Loading")
       .count()
       .catch(() => 0);
 
@@ -850,7 +871,74 @@ function extractAyMatchRowsFromHtml(html, pageUrl) {
     if (typeof m.index !== "number") continue;
     starts.push({ index: m.index, attrs: m[1] || "" });
   }
-  if (!starts.length) return [];
+  if (!starts.length) {
+    const benacerRows = [];
+    const blocks = text.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi);
+    for (const block of blocks) {
+      const href = normalizeUrl(block[1] || "", pageUrl);
+      const chunk = String(block[2] || "");
+      if (!href || !/match-container/i.test(chunk)) continue;
+
+      const teams = Array.from(
+        chunk.matchAll(/<div[^>]*class=["'][^"']*team-name[^"']*["'][^>]*>([\s\S]*?)<\/div>/gi)
+      )
+        .map((m) => stripHtmlToText(m[1] || ""))
+        .filter(Boolean);
+      if (teams.length < 2) continue;
+
+      const timeTextRaw =
+        (chunk.match(/<div[^>]*id=["']match-time["'][^>]*>([\s\S]*?)<\/div>/i) || [])[1] ||
+        (chunk.match(/<div[^>]*class=["'][^"']*match-time[^"']*["'][^>]*>([\s\S]*?)<\/div>/i) || [])[1] ||
+        "";
+      const statusTextRaw =
+        (chunk.match(/<div[^>]*class=["'][^"']*match-status-text[^"']*["'][^>]*>([\s\S]*?)<\/div>/i) || [])[1] ||
+        (chunk.match(/<div[^>]*class=["'][^"']*match-status[^"']*["'][^>]*>([\s\S]*?)<\/div>/i) || [])[1] ||
+        "";
+      const channelTextRaw = (() => {
+        const li = Array.from(chunk.matchAll(/<li[^>]*>\s*<span[^>]*>([\s\S]*?)<\/span>\s*<\/li>/gi)).map((m) =>
+          stripHtmlToText(m[1] || "")
+        );
+        return li[1] || li[0] || "";
+      })();
+      const dataStartRaw =
+        (chunk.match(/\bdata-start=["']([^"']+)["']/i) || [])[1] ||
+        (() => {
+          const unix = (chunk.match(/\bdata-start-time=["'](\d{9,13})["']/i) || [])[1] || "";
+          if (!unix) return "";
+          const asNum = Number.parseInt(unix, 10);
+          if (!Number.isFinite(asNum) || asNum <= 0) return "";
+          const ms = unix.length > 10 ? asNum : asNum * 1000;
+          try {
+            return new Date(ms).toISOString();
+          } catch {
+            return "";
+          }
+        })();
+
+      const imgCandidates = Array.from(
+        chunk.matchAll(/<img[^>]+(?:data-src|data-lazy-src|data-original|src)=["']([^"']+)["'][^>]*>/gi)
+      )
+        .map((m) => normalizeUrl(m[1] || "", pageUrl))
+        .filter(Boolean);
+
+      benacerRows.push({
+        home_team: teams[0],
+        away_team: teams[1],
+        match_url: href,
+        data_start: normalizeSpaces(dataStartRaw) || null,
+        status_text: stripHtmlToText(statusTextRaw) || null,
+        status_key_dom: statusKeyFromText(stripHtmlToText(statusTextRaw || "")) || "unknown",
+        time_text: stripHtmlToText(timeTextRaw) || null,
+        channel_text: stripHtmlToText(channelTextRaw) || null,
+        home_logo: imgCandidates[0] || null,
+        away_logo: imgCandidates[1] || null,
+        has_score_hint: false,
+        home_score_raw: null,
+        away_score_raw: null,
+      });
+    }
+    return benacerRows;
+  }
 
   const parseStatusKey = (classRaw, statusTextRaw) => {
     const textStatus = statusKeyFromText(stripHtmlToText(statusTextRaw || ""));
@@ -2087,8 +2175,18 @@ function canonTeamName(v) {
     ["\u0627\u0633\u062A\u0642\u0644\u0627\u0644\u0637\u0647\u0631\u0627\u0646", "\u0627\u0633\u062A\u0642\u0644\u0627\u0644"],
     ["\u0627\u0633\u062A\u0642\u0644\u0627\u0644\u062A\u0647\u0631\u0627\u0646", "\u0627\u0633\u062A\u0642\u0644\u0627\u0644"],
     ["\u0627\u0644\u062D\u0633\u064A\u0646\u0627\u0631\u0628\u062F", "\u0627\u0644\u062D\u0633\u064A\u0646"],
+    ["\u0628\u064A\u0632\u0627", "\u0628\u064A\u0633\u0627"],
+    ["\u0645\u0627\u064A\u0646\u062A\u0633", "\u0645\u0627\u064A\u0646\u0632"],
+    ["\u0633\u0627\u0646\u062C\u0631\u0645\u0627\u0646", "\u0633\u0627\u0646\u062C\u064A\u0631\u0645\u0627\u0646"],
     ["\u0645\u0627\u0646", "\u0645\u0627\u0646\u0634\u0633\u062A\u0631"],
     ["man", "manchester"],
+  ]);
+
+  const removablePrefixes = new Set([
+    "\u0633\u062A\u0627\u062F",
+    "\u0627\u0633\u062A\u0627\u062F",
+    "stad",
+    "stade",
   ]);
 
   const removableSuffixes = new Set([
@@ -2116,6 +2214,12 @@ function canonTeamName(v) {
       return tokenAliases.get(out) || out;
     })
     .filter(Boolean);
+
+  if (tokens.length > 1) {
+    while (tokens.length > 1 && removablePrefixes.has(tokens[0])) {
+      tokens.shift();
+    }
+  }
 
   if (tokens.length > 1) {
     while (tokens.length > 1 && removableSuffixes.has(tokens[tokens.length - 1])) {
@@ -2158,25 +2262,53 @@ function findLivehdFallbackUrl(rows, { matchDay, homeTeam, awayTeam }) {
 
   let best = null;
   let bestScore = 0;
+  let secondBestScore = 0;
+  let bestMeta = null;
 
   for (const r of rows) {
     if (!r || !r.livehd_stream_url) continue;
     if (String(r.match_day || "") !== String(matchDay || "")) continue;
 
-    const direct =
-      teamSoftMatchScore(homeTeam, r.home_team) + teamSoftMatchScore(awayTeam, r.away_team);
-    const swapped =
-      teamSoftMatchScore(homeTeam, r.away_team) + teamSoftMatchScore(awayTeam, r.home_team);
+    const directHome = teamSoftMatchScore(homeTeam, r.home_team);
+    const directAway = teamSoftMatchScore(awayTeam, r.away_team);
+    const swappedHome = teamSoftMatchScore(homeTeam, r.away_team);
+    const swappedAway = teamSoftMatchScore(awayTeam, r.home_team);
+    const direct = directHome + directAway;
+    const swapped = swappedHome + swappedAway;
     const score = Math.max(direct, swapped);
+    const usedSwapped = swapped > direct;
+    const sideA = usedSwapped ? swappedHome : directHome;
+    const sideB = usedSwapped ? swappedAway : directAway;
+    const sideMin = Math.min(sideA, sideB);
+    const sideMax = Math.max(sideA, sideB);
 
     if (score > bestScore) {
+      secondBestScore = bestScore;
       bestScore = score;
       best = r;
+      bestMeta = { sideMin, sideMax };
+      continue;
+    }
+    if (score > secondBestScore) {
+      secondBestScore = score;
     }
   }
 
   // 4 = two strong partial matches or better.
   if (best && bestScore >= 4) return best.livehd_stream_url;
+
+  // Allow close matches when both sides are non-trivial and winner is clear.
+  if (
+    best &&
+    bestMeta &&
+    bestScore >= 3.5 &&
+    bestMeta.sideMin >= 1.5 &&
+    bestMeta.sideMax >= 2 &&
+    bestScore - secondBestScore >= 0.5
+  ) {
+    return best.livehd_stream_url;
+  }
+
   return null;
 }
 
@@ -2259,6 +2391,222 @@ function isSiiirUrl(u) {
   }
 }
 
+function slotFieldFromSlot(slot) {
+  return STREAM_SLOT_FIELD_BY_SLOT[slot] || `stream_url_${slot}`;
+}
+
+function hostMatchesAnyHint(hostname, hints) {
+  if (!hostname) return false;
+  const host = String(hostname).toLowerCase().trim();
+  const normalizedHints = (hints || [])
+    .map((h) => String(h || "").toLowerCase().trim())
+    .filter(Boolean);
+  if (!normalizedHints.length) return false;
+  return normalizedHints.some((hint) => host === hint || host.endsWith("." + hint));
+}
+
+function createServerIsolationStats() {
+  return {
+    isolation_reject_server2: 0,
+    isolation_reject_server3: 0,
+    isolation_reject_server4: 0,
+    rejection_samples: [],
+  };
+}
+
+function noteServerIsolationReject(stats, slot, url, reason, context = {}) {
+  if (!stats) return;
+  if (slot === 2) stats.isolation_reject_server2 += 1;
+  if (slot === 3) stats.isolation_reject_server3 += 1;
+  if (slot === 4) stats.isolation_reject_server4 += 1;
+
+  if (Array.isArray(stats.rejection_samples) && stats.rejection_samples.length < 40) {
+    stats.rejection_samples.push({
+      slot,
+      field: slotFieldFromSlot(slot),
+      url: String(url || ""),
+      reason: reason || "isolation_reject",
+      match_key: context.matchKey || null,
+      stage: context.stage || null,
+    });
+  }
+}
+
+function validateServerUrlBySlot(slot, url, { stats = null, reason = "", matchKey = null, stage = "" } = {}) {
+  const normalized = normalizeUrl(url, url);
+  if (!normalized) return null;
+
+  let allowed = false;
+  let rejectReason = reason || "slot_mismatch";
+
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname.toLowerCase();
+
+    switch (slot) {
+      case 1: {
+        allowed = hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[1]) && /\/matches\//i.test(path);
+        if (!allowed) rejectReason = reason || "server1_requires_bein_match_page";
+        break;
+      }
+      case 2: {
+        const isPlayerv2 = /\/playerv2\.php(\?|$)/i.test(`${parsed.pathname}${parsed.search}`);
+        const hostLooksSiiir = hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[2]);
+        allowed = isPlayerv2 && (hostLooksSiiir || !isClearlyNonStreamUrl(normalized));
+        if (!allowed) rejectReason = reason || "server2_requires_playerv2";
+        break;
+      }
+      case 3: {
+        allowed =
+          looksLikePlayerUrl(normalized) &&
+          !isClearlyNonStreamUrl(normalized) &&
+          hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[3]) &&
+          !/livehd77\.pro\/(liive|matches-today|category|author|tag)\//i.test(normalized);
+        if (!allowed) rejectReason = reason || "server3_requires_livehd_domain";
+        break;
+      }
+      case 4: {
+        allowed =
+          looksLikePlayerUrl(normalized) &&
+          !isClearlyNonStreamUrl(normalized) &&
+          hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[4]);
+        if (!allowed) rejectReason = reason || "server4_requires_livekora_domain";
+        break;
+      }
+      case 5: {
+        const hostAllowed = hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[5]);
+        const isTskoraPage = hostMatchesAnyHint(host, ["tskoralive.com"]);
+        const isPlayerLike = looksLikePlayerUrl(normalized) || /\/watch\//i.test(path);
+        allowed = hostAllowed && !isClearlyNonStreamUrl(normalized) && (isTskoraPage || isPlayerLike);
+        if (!allowed) rejectReason = reason || "server5_requires_tskora_domain";
+        break;
+      }
+      case 6: {
+        allowed = hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[6]) && !isClearlyNonStreamUrl(normalized);
+        if (!allowed) rejectReason = reason || "server6_requires_1kora_domain";
+        break;
+      }
+      case 7: {
+        allowed = false;
+        rejectReason = reason || "server7_reserved";
+        break;
+      }
+      default: {
+        allowed = false;
+        rejectReason = reason || "unknown_slot";
+        break;
+      }
+    }
+  } catch {
+    allowed = false;
+    rejectReason = reason || "invalid_url";
+  }
+
+  if (!allowed) {
+    noteServerIsolationReject(stats, slot, normalized, rejectReason, { matchKey, stage });
+    return null;
+  }
+  return normalized;
+}
+
+function sanitizeRowBySlotContract(row, { stats = null, stage = "sanitize", matchKey = null } = {}) {
+  if (!row || typeof row !== "object") return row;
+  const out = { ...row };
+  out.stream_url = validateServerUrlBySlot(1, out.stream_url, {
+    stats,
+    reason: "sanitize_server1",
+    matchKey: matchKey || out.match_key || null,
+    stage,
+  });
+  out.stream_url_2 = validateServerUrlBySlot(2, out.stream_url_2, {
+    stats,
+    reason: "sanitize_server2",
+    matchKey: matchKey || out.match_key || null,
+    stage,
+  });
+  out.stream_url_3 = validateServerUrlBySlot(3, out.stream_url_3, {
+    stats,
+    reason: "sanitize_server3",
+    matchKey: matchKey || out.match_key || null,
+    stage,
+  });
+  out.stream_url_4 = validateServerUrlBySlot(4, out.stream_url_4, {
+    stats,
+    reason: "sanitize_server4",
+    matchKey: matchKey || out.match_key || null,
+    stage,
+  });
+  out.stream_url_5 = validateServerUrlBySlot(5, out.stream_url_5, {
+    stats,
+    reason: "sanitize_server5",
+    matchKey: matchKey || out.match_key || null,
+    stage,
+  });
+  out.stream_url_6 = validateServerUrlBySlot(6, out.stream_url_6, {
+    stats,
+    reason: "sanitize_server6",
+    matchKey: matchKey || out.match_key || null,
+    stage,
+  });
+  out.stream_url_7 = null;
+  return out;
+}
+
+function collectSlotUrlSamples(rows, fieldName, limit = 5) {
+  const out = [];
+  const cap = Math.max(1, Number(limit) || 1);
+  for (const row of rows || []) {
+    if (!row || !row[fieldName]) continue;
+    const raw = normalizeUrl(row[fieldName], row[fieldName]);
+    if (!raw) continue;
+    try {
+      const u = new URL(raw);
+      out.push({
+        match_key: row.match_key || null,
+        field: fieldName,
+        host: u.hostname.toLowerCase(),
+        url: raw,
+      });
+    } catch {
+      out.push({
+        match_key: row.match_key || null,
+        field: fieldName,
+        host: null,
+        url: raw,
+      });
+    }
+    if (out.length >= cap) break;
+  }
+  return out;
+}
+
+function collectLivekoraLeakSamples(rows, { limit = 6 } = {}) {
+  const out = [];
+  const fieldsToCheck = ["stream_url", "stream_url_2", "stream_url_3", "stream_url_5", "stream_url_6", "stream_url_7"];
+  const cap = Math.max(1, Number(limit) || 1);
+  for (const row of rows || []) {
+    for (const field of fieldsToCheck) {
+      const raw = normalizeUrl(row?.[field], row?.[field]);
+      if (!raw) continue;
+      try {
+        const host = new URL(raw).hostname.toLowerCase();
+        if (!hostMatchesAnyHint(host, LIVEKORA_SLOT4_HOST_HINTS)) continue;
+      } catch {
+        continue;
+      }
+
+      out.push({
+        match_key: row?.match_key || null,
+        field,
+        url: raw,
+      });
+      if (out.length >= cap) return out;
+    }
+  }
+  return out;
+}
+
 function shouldPreserveExistingRow(row, { allowSiiirFallbackRows = false } = {}) {
   if (!row) return false;
   if (isBeinMatchPageUrl(row.stream_url)) return true;
@@ -2266,17 +2614,55 @@ function shouldPreserveExistingRow(row, { allowSiiirFallbackRows = false } = {})
   return false;
 }
 
-function preferExistingUrl(newUrl, oldUrl) {
-  if (!newUrl && oldUrl) return oldUrl;
-  if (newUrl && !oldUrl) return newUrl;
-  if (!newUrl && !oldUrl) return null;
-  if (isWeakStreamUrl(newUrl) && !isWeakStreamUrl(oldUrl)) return oldUrl;
-  return newUrl;
+function preferExistingUrl(slot, newUrl, oldUrl, options = {}) {
+  const baseContext = {
+    stats: options.stats || null,
+    matchKey: options.matchKey || null,
+    stage: options.stage || "merge_prefer",
+  };
+  const newCandidate = validateServerUrlBySlot(slot, newUrl, {
+    ...baseContext,
+    reason: options.reasonNew || `prefer_slot${slot}_new_invalid`,
+  });
+  const oldCandidate = validateServerUrlBySlot(slot, oldUrl, {
+    ...baseContext,
+    reason: options.reasonOld || `prefer_slot${slot}_old_invalid`,
+  });
+
+  if (!newCandidate && oldCandidate) return oldCandidate;
+  if (newCandidate && !oldCandidate) return newCandidate;
+  if (!newCandidate && !oldCandidate) return null;
+  if (isWeakStreamUrl(newCandidate) && !isWeakStreamUrl(oldCandidate)) return oldCandidate;
+  return newCandidate;
 }
 
-function preferPrimarySourceUrl(newUrl, oldUrl) {
-  if (isBeinMatchPageUrl(newUrl)) return newUrl;
-  return preferExistingUrl(newUrl, oldUrl);
+function isLegacyServer4YalaUrl(value) {
+  const normalized = normalizeUrl(value, value);
+  if (!normalized) return false;
+  try {
+    const host = new URL(normalized).hostname.toLowerCase();
+    return host.endsWith("yala-live.tv") || host.endsWith("sia-bth.net") || host.endsWith("kooraxx.com");
+  } catch {
+    return false;
+  }
+}
+
+function preferPrimarySourceUrl(newUrl, oldUrl, options = {}) {
+  const baseContext = {
+    stats: options.stats || null,
+    matchKey: options.matchKey || null,
+    stage: options.stage || "merge_prefer_primary",
+  };
+  const newCandidate = validateServerUrlBySlot(1, newUrl, {
+    ...baseContext,
+    reason: options.reasonNew || "prefer_server1_new_invalid",
+  });
+  const oldCandidate = validateServerUrlBySlot(1, oldUrl, {
+    ...baseContext,
+    reason: options.reasonOld || "prefer_server1_old_invalid",
+  });
+  if (newCandidate && isBeinMatchPageUrl(newCandidate)) return newCandidate;
+  return oldCandidate;
 }
 
 async function fetchExistingForDays(days) {
@@ -2309,7 +2695,7 @@ async function fetchExistingForDays(days) {
   return Array.isArray(data) ? data : [];
 }
 
-function mergeWithExisting({ newRows, existingRows, allowSiiirFallbackRows = false }) {
+function mergeWithExisting({ newRows, existingRows, allowSiiirFallbackRows = false, isolationStats = null }) {
   const nowMs = Date.now();
 
   const existingMap = new Map();
@@ -2329,15 +2715,39 @@ function mergeWithExisting({ newRows, existingRows, allowSiiirFallbackRows = fal
       if (!out.away_logo && old.away_logo) out.away_logo = old.away_logo;
 
       // Server 1
-      out.stream_url = preferPrimarySourceUrl(out.stream_url, old.stream_url);
+      out.stream_url = preferPrimarySourceUrl(out.stream_url, old.stream_url, {
+        stats: isolationStats,
+        matchKey: k,
+        stage: "merge_prefer_primary",
+      });
 
       // Servers 2..7 (preserve if new scrape missing)
-      out.stream_url_2 = preferExistingUrl(out.stream_url_2, old.stream_url_2);
-      out.stream_url_3 = preferExistingUrl(out.stream_url_3, old.stream_url_3);
-      out.stream_url_4 = preferExistingUrl(out.stream_url_4, old.stream_url_4);
-      out.stream_url_5 = preferExistingUrl(out.stream_url_5, old.stream_url_5);
-      out.stream_url_6 = preferExistingUrl(out.stream_url_6, old.stream_url_6);
-      out.stream_url_7 = preferExistingUrl(out.stream_url_7, old.stream_url_7);
+      out.stream_url_2 = preferExistingUrl(2, out.stream_url_2, old.stream_url_2, {
+        stats: isolationStats,
+        matchKey: k,
+        stage: "merge_prefer_server2",
+      });
+      out.stream_url_3 = preferExistingUrl(3, out.stream_url_3, old.stream_url_3, {
+        stats: isolationStats,
+        matchKey: k,
+        stage: "merge_prefer_server3",
+      });
+      out.stream_url_4 = preferExistingUrl(4, out.stream_url_4, old.stream_url_4, {
+        stats: isolationStats,
+        matchKey: k,
+        stage: "merge_prefer_server4",
+      });
+      out.stream_url_5 = preferExistingUrl(5, out.stream_url_5, old.stream_url_5, {
+        stats: isolationStats,
+        matchKey: k,
+        stage: "merge_prefer_server5",
+      });
+      out.stream_url_6 = preferExistingUrl(6, out.stream_url_6, old.stream_url_6, {
+        stats: isolationStats,
+        matchKey: k,
+        stage: "merge_prefer_server6",
+      });
+      out.stream_url_7 = null;
 
       const oldMs = parseMs(old.match_start);
       const newMs = parseMs(out.match_start);
@@ -2400,11 +2810,19 @@ function mergeWithExisting({ newRows, existingRows, allowSiiirFallbackRows = fal
     // Strict isolation: no cross-server dedup in merge
     // Drop weak leftovers for newer optional servers.
     if (isWeakStreamUrl(out.stream_url_4)) out.stream_url_4 = null;
+    if (isLegacyServer4YalaUrl(out.stream_url_4)) out.stream_url_4 = null;
     if (isWeakStreamUrl(out.stream_url_5)) out.stream_url_5 = null;
     if (isWeakStreamUrl(out.stream_url_6)) out.stream_url_6 = null;
     if (isWeakStreamUrl(out.stream_url_7)) out.stream_url_7 = null;
 
-    mergedMap.set(k, out);
+    mergedMap.set(
+      k,
+      sanitizeRowBySlotContract(out, {
+        stats: isolationStats,
+        stage: "merge_row_finalize",
+        matchKey: k,
+      })
+    );
   }
 
   // 2. Preserve Existing Rows (Fix for disappearing matches)
@@ -2436,8 +2854,16 @@ function mergeWithExisting({ newRows, existingRows, allowSiiirFallbackRows = fal
         preserved.away_score = scoreFromText.away;
       }
     }
+    if (isLegacyServer4YalaUrl(preserved.stream_url_4)) preserved.stream_url_4 = null;
     console.log(`[merge] preserving missed match from DB: ${preserved.home_team} vs ${preserved.away_team}`);
-    mergedMap.set(k, preserved);
+    mergedMap.set(
+      k,
+      sanitizeRowBySlotContract(preserved, {
+        stats: isolationStats,
+        stage: "merge_preserved_row_finalize",
+        matchKey: k,
+      })
+    );
   }
 
   return { mergedRows: Array.from(mergedMap.values()) };
@@ -2882,7 +3308,7 @@ async function scrapeAyMatchDay(page, { sourceName, dayKey, url, diagPrefix }) {
 
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: LIST_TIMEOUT_MS });
-    await page.waitForSelector(".AY_Match, body", { timeout: 30000 });
+    await page.waitForSelector(".AY_Match, .match-container, body", { timeout: 30000 });
     await page.waitForTimeout(900);
     await waitForStableMatchCount(page, 18000, 1200).catch(() => { });
 
@@ -2919,26 +3345,73 @@ async function scrapeAyMatchDay(page, { sourceName, dayKey, url, diagPrefix }) {
         return "unknown";
       };
 
-      const cards = Array.from(document.querySelectorAll(".AY_Match"));
+      const toIsoFromUnix = (raw) => {
+        const v = String(raw || "").trim();
+        if (!/^\d{9,13}$/.test(v)) return "";
+        const asNum = Number.parseInt(v, 10);
+        if (!Number.isFinite(asNum) || asNum <= 0) return "";
+        const ms = v.length > 10 ? asNum : asNum * 1000;
+        try {
+          const d = new Date(ms);
+          const t = d.getTime();
+          if (!Number.isFinite(t)) return "";
+          return d.toISOString();
+        } catch {
+          return "";
+        }
+      };
+
+      const cards = Array.from(document.querySelectorAll(".AY_Match, .match-container"));
       return cards
         .map((match) => {
-          const teams = Array.from(match.querySelectorAll(".TM_Name"))
-            .map((e) => (e.textContent || "").trim())
-            .filter(Boolean);
+          const isBenacer = (match.className || "").toLowerCase().includes("match-container");
+          const teams = isBenacer
+            ? Array.from(match.querySelectorAll(".right-team .team-name, .left-team .team-name, .team-name"))
+              .map((e) => (e.textContent || "").trim())
+              .filter(Boolean)
+            : Array.from(match.querySelectorAll(".TM_Name"))
+              .map((e) => (e.textContent || "").trim())
+              .filter(Boolean);
 
-          const allLinks = Array.from(match.querySelectorAll("a[href]"))
-            .map((a) => a.getAttribute("href") || "")
-            .filter(Boolean)
-            .map((u) => toAbs(u))
-            .filter(Boolean);
+          const allLinks = isBenacer
+            ? (() => {
+              const out = [];
+              const holder = match.closest("a[href]");
+              if (holder) out.push(holder.getAttribute("href") || "");
+              out.push(...Array.from(match.querySelectorAll("a[href]")).map((a) => a.getAttribute("href") || ""));
+              return out
+                .filter(Boolean)
+                .map((u) => toAbs(u))
+                .filter(Boolean);
+            })()
+            : Array.from(match.querySelectorAll("a[href]"))
+              .map((a) => a.getAttribute("href") || "")
+              .filter(Boolean)
+              .map((u) => toAbs(u))
+              .filter(Boolean);
 
-          const dataStart =
-            (match.getAttribute("data-start") || "").trim() ||
-            (match.querySelector(".MT_Time")?.getAttribute("data-start") || "").trim();
+          const dataStart = (() => {
+            if (isBenacer) {
+              const fromDateAttr = (match.querySelector(".date")?.getAttribute("data-start") || "").trim();
+              if (fromDateAttr) return fromDateAttr;
+              const fromUnix = toIsoFromUnix(match.getAttribute("data-start-time"));
+              if (fromUnix) return fromUnix;
+            }
+            return (
+              (match.getAttribute("data-start") || "").trim() ||
+              (match.querySelector(".MT_Time")?.getAttribute("data-start") || "").trim()
+            );
+          })();
 
-          const statusText = pickText(match, [".MT_Stat", ".match-status", ".status"]);
-          const timeText = pickText(match, [".MT_Time", ".match-time", ".time"]);
-          const channelText = pickText(match, [".MT_Channel", ".TM_Channel", ".channel", ".ch"]);
+          const statusText = isBenacer
+            ? pickText(match, [".match-status-text", ".match-status", ".status"])
+            : pickText(match, [".MT_Stat", ".match-status", ".status"]);
+          const timeText = isBenacer
+            ? pickText(match, ["#match-time", ".match-time", ".time"])
+            : pickText(match, [".MT_Time", ".match-time", ".time"]);
+          const channelText = isBenacer
+            ? pickText(match, [".match-info li:nth-child(2) span", ".match-info li span", ".channel", ".ch"])
+            : pickText(match, [".MT_Channel", ".TM_Channel", ".channel", ".ch"]);
           const statusKey = statusFromClass(match);
 
           const matchUrl = allLinks[0] || "";
@@ -3083,7 +3556,7 @@ async function resolveStreamFromPage(page, pageUrl, { preferredHostHints = [] } 
 
 async function scrapeYalaDay(page, dayKey) {
   return scrapeAyMatchDay(page, {
-    sourceName: "YALA",
+    sourceName: "LIVEKORA",
     dayKey,
     url: YALA.dayUrl[dayKey],
     diagPrefix: "yala",
@@ -3105,6 +3578,11 @@ function deriveYalaFallbackPlayerUrl(rawUrl) {
 
     if ((host === "e.kooraxx.com" || host.endsWith(".kooraxx.com")) && looksLikePlayerUrl(normalized)) {
       return normalized;
+    }
+
+    if (host === "pl.koooralive.click" || host.endsWith(".koooralive.click")) {
+      if (path.includes("/albaplayer/") && looksLikePlayerUrl(normalized)) return normalized;
+      if (path) return `${u.protocol}//${u.host}/albaplayer/${path.replace(/^\/+|\/+$/g, "")}/`;
     }
   } catch { }
 
@@ -3137,7 +3615,7 @@ async function enrichYalaWithStreams(browser, rows) {
       if (!item) break;
 
       const { r, idx } = item;
-      console.log(`🟡 YALA [W${workerId}] (${idx + 1}/${rows.length}): ${r.home_team} vs ${r.away_team}`);
+      console.log(`🟡 LIVEKORA [W${workerId}] (${idx + 1}/${rows.length}): ${r.home_team} vs ${r.away_team}`);
 
       const raw = normalizeUrl(r.match_url, r.match_url);
       let finalUrl = null;
@@ -3152,7 +3630,16 @@ async function enrichYalaWithStreams(browser, rows) {
 
         if (!finalUrl) {
           finalUrl = await resolveStreamFromPage(page, raw, {
-            preferredHostHints: ["kooraxx.com", "a.sia-bth.net", "koora", "kora", "albaplayer", "pyxq.online"],
+            preferredHostHints: [
+              "koooralive.click",
+              "livekora.vip",
+              "kooraxx.com",
+              "a.sia-bth.net",
+              "koora",
+              "kora",
+              "albaplayer",
+              "pyxq.online",
+            ],
           });
         }
 
@@ -3568,7 +4055,7 @@ async function enrichOneKoraWithStreams(browser, articleUrls) {
 // ===================== Main =====================
 async function startScraping() {
   console.log(
-    "🚀 بدء السكرابر (bein-live) + Server2 (SIIIR) + Server3 (LIVEHD77) + Server4 (YALA) + Server5 (TSKORA) + Server6 (1KORA) ..."
+    "🚀 بدء السكرابر (bein-live) + Server2 (SIIIR) + Server3 (LIVEHD77) + Server4 (LIVEKORA) + Server5 (TSKORA) + Server6 (1KORA) ..."
   );
 
   diagTouch();
@@ -3595,6 +4082,7 @@ async function startScraping() {
     // 1) bein-live schedule
     const all = [];
     let usedPrimarySiiirFallback = false;
+    const isolationStats = createServerIsolationStats();
     for (const d of DAYS) {
       let rows = [];
       try {
@@ -3685,8 +4173,7 @@ async function startScraping() {
       if (!livehdMap.has(k)) livehdMap.set(k, r.livehd_stream_url);
     }
 
-    // 4) YALA-LIVE lists + resolve stream url (Server 4)
-    // Disabled by user request: old Server-4 source removed from active pipeline.
+    // 4) LIVEKORA lists + resolve stream url (Server 4)
     let yalaEnriched = [];
     const yalaDirectRows = [];
     const yalaDirectMap = new Map();
@@ -3706,11 +4193,13 @@ async function startScraping() {
 
       const yalaAll = [];
       for (const d of DAYS) {
+        const dayUrl = YALA.dayUrl[d.key];
+        if (!dayUrl) continue;
         try {
           const rows = await scrapeYalaDay(yalaListPage, d.key);
           yalaAll.push(...rows);
         } catch (e) {
-          console.error(`⚠️ YALA list fail ${d.key}:`, e.message);
+          console.error(`⚠️ LIVEKORA list fail ${d.key}:`, e.message);
           if (DIAG) diagWrite(`yala/errors_${d.key}.txt`, String(e?.stack || e?.message || e));
         }
       }
@@ -3758,7 +4247,7 @@ async function startScraping() {
         );
       }
     } else {
-      console.log("⏭️ YALA source disabled (Server 4 old source removed).");
+      console.log("⏭️ LIVEKORA source disabled (Server 4).");
     }
 
     // 5) TSKORA lists (Server 5)
@@ -3869,6 +4358,12 @@ async function startScraping() {
 
       const finalStreamUrl = m.match_url || m.deep_stream_url;
       const match_key = keyOfTeams(match_day, m.home_team, m.away_team);
+      const primaryServer1 = validateServerUrlBySlot(1, finalStreamUrl, {
+        stats: isolationStats,
+        reason: "extract_server1_invalid",
+        matchKey: match_key,
+        stage: "extract",
+      });
 
       // Server 2 (SIIIR)
       let server2 = siiirMap.get(match_key) || null;
@@ -3879,6 +4374,12 @@ async function startScraping() {
         if (directSiiirServer2) server2 = directSiiirServer2;
       }
       if (server2 && !/\/playerv2\.php(\?|$)/i.test(String(server2))) server2 = null;
+      server2 = validateServerUrlBySlot(2, server2, {
+        stats: isolationStats,
+        reason: "extract_server2_invalid",
+        matchKey: match_key,
+        stage: "extract",
+      });
 
       // Server 3 (LIVEHD77)
       let server3 = livehdMap.get(match_key) || null;
@@ -3901,13 +4402,49 @@ async function startScraping() {
       ) {
         server3 = null;
       }
+      server3 = validateServerUrlBySlot(3, server3, {
+        stats: isolationStats,
+        reason: "extract_server3_invalid",
+        matchKey: match_key,
+        stage: "extract",
+      });
 
-      // Server 4 (YALA), Server 5 (TSKORA), Server 6 (1KORA), Server 7 (reserved)
+      // Server 4 (LIVEKORA), Server 5 (TSKORA), Server 6 (1KORA), Server 7 (reserved)
       let server4 = yalaMap.get(match_key) || yalaDirectMap.get(match_key) || null;
+      if (!server4) {
+        server4 =
+          findYalaFallbackUrl(yalaEnriched, {
+            matchDay: match_day,
+            homeTeam: m.home_team,
+            awayTeam: m.away_team,
+          }) ||
+          findYalaFallbackUrl(yalaDirectRows, {
+            matchDay: match_day,
+            homeTeam: m.home_team,
+            awayTeam: m.away_team,
+          }) ||
+          null;
+      }
       if (server4 && !looksLikePlayerUrl(server4)) server4 = null;
+      server4 = validateServerUrlBySlot(4, server4, {
+        stats: isolationStats,
+        reason: "extract_server4_invalid",
+        matchKey: match_key,
+        stage: "extract",
+      });
 
-      const server5 = tskoraMap.get(match_key) || null;
-      const server6 = oneKoraMap.get(match_key) || null;
+      const server5 = validateServerUrlBySlot(5, tskoraMap.get(match_key) || null, {
+        stats: isolationStats,
+        reason: "extract_server5_invalid",
+        matchKey: match_key,
+        stage: "extract",
+      });
+      const server6 = validateServerUrlBySlot(6, oneKoraMap.get(match_key) || null, {
+        stats: isolationStats,
+        reason: "extract_server6_invalid",
+        matchKey: match_key,
+        stage: "extract",
+      });
       const server7 = null;
 
       // Strict isolation: each server keeps its own URL, no cross-server dedup
@@ -3917,7 +4454,7 @@ async function startScraping() {
         away_team: m.away_team,
         home_logo: m.home_logo,
         away_logo: m.away_logo,
-        stream_url: finalStreamUrl,
+        stream_url: primaryServer1,
         stream_url_2: server2,
         stream_url_3: server3,
         stream_url_4: server4,
@@ -3936,7 +4473,12 @@ async function startScraping() {
 
     const normalized = Array.from(normalizedByKey.values());
     const finalRows = normalized.filter(
-      (r) => r.match_key && r.match_day && r.home_team && r.away_team && r.stream_url
+      (r) =>
+        r.match_key &&
+        r.match_day &&
+        r.home_team &&
+        r.away_team &&
+        (r.stream_url || r.stream_url_2 || r.stream_url_3 || r.stream_url_4 || r.stream_url_5 || r.stream_url_6)
     );
 
     if (!finalRows.length) {
@@ -3948,11 +4490,22 @@ async function startScraping() {
     const daysToRefresh = [matchDayFromKey("yesterday"), matchDayFromKey("today"), matchDayFromKey("tomorrow")].filter(Boolean);
 
     const existing = await fetchExistingForDays(daysToRefresh);
-    const { mergedRows } = mergeWithExisting({
+    const { mergedRows: mergedRowsRaw } = mergeWithExisting({
       newRows: finalRows,
       existingRows: existing,
       allowSiiirFallbackRows: usedPrimarySiiirFallback,
+      isolationStats,
     });
+    const mergedRows = mergedRowsRaw.map((row) =>
+      sanitizeRowBySlotContract(row, {
+        stats: isolationStats,
+        stage: "post_merge_pre_rpc",
+        matchKey: row?.match_key || null,
+      })
+    );
+
+    const livekoraServer4Samples = collectSlotUrlSamples(mergedRows, "stream_url_4", 6);
+    const livekoraLeaks = collectLivekoraLeakSamples(mergedRows, { limit: 6 });
 
     if (DIAG) {
       diagWrite("final_rows.json", JSON.stringify(mergedRows, null, 2));
@@ -3969,6 +4522,12 @@ async function startScraping() {
             yala_count: yalaEnriched.length,
             tskora_count: tskoraEnriched.length,
             onekora_count: oneKoraEnriched.length,
+            isolation_reject_server2: isolationStats.isolation_reject_server2,
+            isolation_reject_server3: isolationStats.isolation_reject_server3,
+            isolation_reject_server4: isolationStats.isolation_reject_server4,
+            isolation_reject_samples: isolationStats.rejection_samples.slice(0, 12),
+            livekora_server4_samples: livekoraServer4Samples,
+            livekora_outside_server4_samples: livekoraLeaks,
           },
           null,
           2
@@ -3980,6 +4539,17 @@ async function startScraping() {
     console.log(`📌 أيام التحديث: ${daysToRefresh.join(" , ")}`);
     console.log(`⬆️ صفوف نهائية بعد الدمج: ${mergedRows.length}`);
     console.log(`🟣 primary siiir fallback used: ${usedPrimarySiiirFallback}`);
+    console.log("🧱 isolation counters:", {
+      isolation_reject_server2: isolationStats.isolation_reject_server2,
+      isolation_reject_server3: isolationStats.isolation_reject_server3,
+      isolation_reject_server4: isolationStats.isolation_reject_server4,
+    });
+    console.log("🧪 livekora sample in stream_url_4:", livekoraServer4Samples);
+    if (livekoraLeaks.length) {
+      console.warn("⚠️ livekora URL outside stream_url_4 detected:", livekoraLeaks);
+    } else {
+      console.log("✅ isolation check: livekora appears only in stream_url_4.");
+    }
     console.log(`🗂️ جدول: ${TABLE_NAME}`);
 
     console.log("🧪 payload row sample:", {

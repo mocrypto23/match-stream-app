@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "cleanup:server-slots": "node scripts/cleanup-server-slot-mismatch.js"
   },
   "dependencies": {
     "@ghostery/adblocker-playwright": "^2.13.3",
