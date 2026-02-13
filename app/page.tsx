@@ -8,6 +8,7 @@ const TZ = "Africa/Cairo";
 
 type MatchRow = {
   id: number;
+  match_key?: string | null;
   home_team: string;
   away_team: string;
   home_logo?: string | null;
@@ -111,7 +112,8 @@ function isFinishedByTime(matchStart: any) {
   if (!start) return false;
 
   const now = new Date();
-  const endMs = 2 * 60 * 60 * 1000 + 15 * 60 * 1000;
+  // Relaxed to 3 hours (180 mins) to avoid hiding matches that go into extra time/penalties
+  const endMs = 3 * 60 * 60 * 1000;
   return now.getTime() > start.getTime() + endMs;
 }
 
@@ -181,15 +183,18 @@ export default function Home() {
 
       const sk = normalizeStatusKey(m.status_key);
 
+      // If DB explicitly says live/finished, trust it first (especially for "today")
       if (day === "today") {
-        if (sk === "live" || sk === "finished") return sk;
+        if (sk === "live") return "live";
+        if (sk === "finished") return "finished";
       }
 
       if (day === "tomorrow") return "upcoming" as const;
 
-      const scores = hasScores(m);
-      if (scores && isFinishedByTime(m.match_start)) return "finished" as const;
+      // Fallback to time-based if status is unknown/upcoming but time passed
+      if (isFinishedByTime(m.match_start)) return "finished" as const;
       if (isLiveWindow(m.match_start)) return "live" as const;
+
       return "upcoming" as const;
     };
 
@@ -257,32 +262,39 @@ export default function Home() {
 
             const sk = normalizeStatusKey(match.status_key);
             const fallbackLive = day === "today" && isLiveWindow(match.match_start);
-            const fallbackFinished = day === "today" && scores && isFinishedByTime(match.match_start);
+            const fallbackFinished = day === "today" && isFinishedByTime(match.match_start);
 
             const status =
               day === "yesterday"
                 ? "finished"
                 : day === "tomorrow"
-                ? "upcoming"
-                : sk === "live" || sk === "finished"
-                ? sk
-                : fallbackFinished
-                ? "finished"
-                : fallbackLive
-                ? "live"
-                : "upcoming";
+                  ? "upcoming"
+                  : sk === "live" || sk === "finished"
+                    ? sk
+                    : fallbackFinished
+                      ? "finished"
+                      : fallbackLive
+                        ? "live"
+                        : "upcoming";
 
             const centerText =
-              status !== "upcoming" && scores ? `${match.home_score} - ${match.away_score}` : match.match_time || "—";
+              status === "upcoming"
+                ? match.match_time || "—"
+                : scores
+                  ? `${match.home_score} - ${match.away_score}`
+                  : status === "finished"
+                    ? "— - —"
+                    : match.match_time || "—";
 
             const canNavigate = day !== "yesterday" && Boolean(match?.id);
+            const watchHref = `/watch/${match.id}`;
 
             return (
               <div
                 key={match.id}
                 onClick={() => {
                   if (!canNavigate) return;
-                  window.location.href = `/watch/${match.id}`;
+                  window.location.href = watchHref;
                 }}
                 className={[
                   "bg-[#121212] border border-gray-800 p-6 rounded-[2rem] flex justify-between items-center shadow-2xl group",

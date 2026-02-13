@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type MatchRow = {
   id: number;
+  match_key?: string | null;
   home_team?: string | null;
   away_team?: string | null;
   home_logo?: string | null;
@@ -78,7 +79,6 @@ const STREAM_STRONG_HINTS = [
   ".m3u8",
   "/hls/",
   "/live/",
-  "/kooora/",
   "playlist",
   "chunks",
   "master.m3u8",
@@ -107,7 +107,7 @@ type ProbeHlsOptions = {
 type FilterPlayableOptions = ProbeHlsOptions & { maxChecks?: number; concurrency?: number };
 type ResolveBatchPhase = "fast" | "deep" | "token";
 type ResolveResultCacheEntry = { expiresAt: number; candidates: string[] };
-type CandidateGroup = { key: string; primaryIndex: number; members: number[] };
+type CandidateGroup = { key: string; primaryIndex: number; members: number[]; label: string };
 
 const resolveResultCache = new Map<string, ResolveResultCacheEntry>();
 
@@ -226,6 +226,59 @@ function canonicalizeUrl(value: string) {
   }
 }
 
+function toUnderlyingUrl(value: string) {
+  const v = String(value || "").trim();
+  if (!v) return "";
+  if (!v.startsWith("/api/embed-proxy?")) return v;
+  return getProxyTargetUrl(v) || v;
+}
+
+function isPlayerv2LikeUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  return /\/playerv2\.php(?:\?|$)/i.test(raw) || /[?&]action=generate_token(?:&|$)/i.test(raw);
+}
+
+function normalizeQualityTag(raw?: string | null) {
+  const v = String(raw || "").trim().toLowerCase();
+  if (!v) return null;
+  if (/^\d{3,4}p$/.test(v)) return v;
+  if (v === "sd") return "480p";
+  if (v === "hd") return "720p";
+  if (v === "fhd") return "1080p";
+  if (v === "uhd" || v === "4k" || v === "2160p") return "2160p";
+  return null;
+}
+
+function extractQualityTagFromUrl(value: string) {
+  const raw = toUnderlyingUrl(value);
+  if (!isValidHttpUrl(raw)) return null;
+  try {
+    const u = new URL(raw);
+    const pathname = u.pathname.toLowerCase();
+
+    const pathMatch = pathname.match(/[_-](\d{3,4}p|sd|hd|fhd|uhd)(?:\.m3u8)?(?:$|[/?])/i);
+    const fromPath = normalizeQualityTag(pathMatch?.[1] || "");
+    if (fromPath) return fromPath;
+
+    const fromQuery =
+      normalizeQualityTag(u.searchParams.get("quality")) ||
+      normalizeQualityTag(u.searchParams.get("res")) ||
+      normalizeQualityTag(u.searchParams.get("resolution")) ||
+      normalizeQualityTag(u.searchParams.get("height"));
+    if (fromQuery) return fromQuery;
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function qualityRank(value?: string | null) {
+  const q = normalizeQualityTag(value);
+  if (!q) return -1;
+  const n = Number.parseInt(q.replace("p", ""), 10);
+  return Number.isFinite(n) ? n : -1;
+}
+
 function toEmbedProxyUrl(rawUrl?: string | null, ref?: string) {
   const value = String(rawUrl || "").trim();
   if (!value) return "";
@@ -251,6 +304,17 @@ function formatTimeOnlyAr(ms?: number | null) {
   const d = new Date(ms);
   if (Number.isNaN(d.getTime())) return null;
   return new Intl.DateTimeFormat("ar-EG", { timeStyle: "short" }).format(d);
+}
+
+function shouldUseNativeHls(video: HTMLVideoElement) {
+  const canNative = video.canPlayType("application/vnd.apple.mpegurl");
+  if (!canNative) return false;
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent.toLowerCase();
+  const isSafari =
+    ua.includes("safari") && !/(chrome|chromium|crios|edg|opr|opera|fxios|firefox|android)/.test(ua);
+  const isIOS = /iphone|ipad|ipod/.test(ua);
+  return isSafari || isIOS;
 }
 
 function contentTypeLooksLikeHls(contentType: string) {
@@ -704,8 +768,9 @@ function toCandidateGroupKey(value: string) {
       .sort((a, b) => (a[0] === b[0] ? a[1].localeCompare(b[1]) : a[0].localeCompare(b[0])))
       .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
       .join("&");
+    const quality = extractQualityTagFromUrl(value) || "auto";
 
-    return `${host}${path}${stableParams ? `?${stableParams}` : ""}`;
+    return `${host}${path}${stableParams ? `?${stableParams}` : ""}|q=${quality}`;
   } catch {
     return canonicalizeUrl(value) || String(value || "").trim().toLowerCase();
   }
@@ -715,15 +780,23 @@ function groupCandidates(values: string[]) {
   const map = new Map<string, CandidateGroup>();
   values.forEach((candidate, idx) => {
     const key = toCandidateGroupKey(candidate);
+    const quality = extractQualityTagFromUrl(candidate);
+    const label = quality ? quality : "";
     const existing = map.get(key);
     if (existing) {
       existing.members.push(idx);
+      if (!existing.label && label) existing.label = label;
       return;
     }
-    map.set(key, { key, primaryIndex: idx, members: [idx] });
+    map.set(key, { key, primaryIndex: idx, members: [idx], label });
   });
 
-  return Array.from(map.values()).sort((a, b) => a.primaryIndex - b.primaryIndex);
+  return Array.from(map.values()).sort((a, b) => {
+    const aq = qualityRank(a.label);
+    const bq = qualityRank(b.label);
+    if (aq !== bq) return bq - aq;
+    return a.primaryIndex - b.primaryIndex;
+  });
 }
 
 function normalizeHtmlForScan(html: string) {
@@ -1384,13 +1457,21 @@ export default function WatchPage() {
         return;
       }
       try {
-        const res = await fetch(`/api/match/${encodeURIComponent(String(idNum))}`);
+        const requestUrl = `/api/match/${encodeURIComponent(String(idNum))}`;
+        const res = await fetch(requestUrl);
         const json = await res.json().catch(() => null);
         if (cancel) return;
         if (!res.ok) {
           setErrMsg(json?.error || `فشل تحميل المباراة (${res.status})`);
         } else {
-          setMatch(json as MatchRow);
+          const loaded = json as MatchRow;
+          setMatch(loaded);
+
+          const loadedId = Number.isFinite(Number(loaded?.id)) ? Number(loaded.id) : null;
+          if (loadedId && loadedId !== idNum) {
+            const nextUrl = `/watch/${loadedId}`;
+            router.replace(nextUrl);
+          }
         }
       } catch (e: unknown) {
         if (!cancel) setErrMsg(e instanceof Error ? e.message : "Network error");
@@ -1401,7 +1482,7 @@ export default function WatchPage() {
     return () => {
       cancel = true;
     };
-  }, [idNum]);
+  }, [idNum, router]);
 
   useEffect(() => {
     let cancel = false;
@@ -1457,6 +1538,7 @@ export default function WatchPage() {
   }, []);
 
   const serverOptions = useMemo<ServerOption[]>(() => {
+    // Strict isolation: each server only uses its own dedicated URL
     const explicit: Array<string | null> = [
       match?.stream_url ?? null,
       match?.stream_url_2 ?? null,
@@ -1465,61 +1547,17 @@ export default function WatchPage() {
       match?.stream_url_5 ?? null,
       match?.stream_url_6 ?? null,
     ];
-    const pool = dedupeUrls(derivedServerVariants.filter((u) => !!u && isValidHttpUrl(u)));
-    const byServ = new Map<number, string>();
-    const genericPool: string[] = [];
-    for (const candidate of pool) {
-      const serv = getServFromUrl(candidate);
-      if (serv !== null && serv >= 1 && serv <= 6 && !byServ.has(serv)) {
-        byServ.set(serv, candidate);
-      } else {
-        genericPool.push(candidate);
-      }
-    }
-
-    const fallbackPool = [
-      ...(byServ.get(1) ? [byServ.get(1)!] : []),
-      ...(byServ.get(2) ? [byServ.get(2)!] : []),
-      ...(byServ.get(3) ? [byServ.get(3)!] : []),
-      ...(byServ.get(4) ? [byServ.get(4)!] : []),
-      ...(byServ.get(5) ? [byServ.get(5)!] : []),
-      ...(byServ.get(6) ? [byServ.get(6)!] : []),
-      ...genericPool,
-    ];
-
-    const used = new Set<string>();
-    const claim = (value?: string | null) => {
-      const candidate = String(value || "").trim();
-      if (!candidate || !isValidHttpUrl(candidate)) return null;
-      const key = canonicalizeUrl(candidate);
-      if (!key || used.has(key)) return null;
-      used.add(key);
-      return candidate;
-    };
-
-    let fallbackIdx = 0;
-    const nextFallback = () => {
-      while (fallbackIdx < fallbackPool.length) {
-        const picked = claim(fallbackPool[fallbackIdx++]);
-        if (picked) return picked;
-      }
-      return null;
-    };
 
     const out: ServerOption[] = [];
     for (let i = 0; i < 6; i += 1) {
       const n = i + 1;
-      let picked = claim(explicit[i]);
-      if (!picked) picked = claim(byServ.get(n) ?? null);
-
-      // Strict separation: Server 1 & 2 should not consume generic fallbacks
-      if (!picked && n > 2) picked = nextFallback();
-
+      const raw = String(explicit[i] || "").trim();
+      const url = raw && isValidHttpUrl(raw) ? raw : null;
       const label = `سيرفر ${n}`;
-      out.push({ n, label, url: picked ?? null });
+      out.push({ n, label, url });
     }
     return out;
-  }, [match, derivedServerVariants]);
+  }, [match]);
 
   const validServers = useMemo(() => serverOptions.filter((s) => s.url && isValidHttpUrl(s.url)), [serverOptions]);
   useEffect(() => {
@@ -1586,7 +1624,8 @@ export default function WatchPage() {
         const proxied = toEmbedProxyUrl(selectedUrl, selectedUrl);
         return proxied ? [proxied] : [];
       })();
-      const cachedCandidates = getCachedResolveCandidates(selectedUrl);
+      const disableResolveCache = isPlayerv2LikeUrl(selectedUrl);
+      const cachedCandidates = disableResolveCache ? [] : getCachedResolveCandidates(selectedUrl);
       const initialCandidates = dedupeUrls([...cachedCandidates, ...seedCandidates]);
       let hadPlayable = initialCandidates.length > 0;
       const mergeCandidates = (incoming: string[]) => {
@@ -1594,7 +1633,7 @@ export default function WatchPage() {
         hadPlayable = true;
         setCandidates((prev) => {
           const merged = dedupeUrls([...prev, ...incoming]);
-          setCachedResolveCandidates(selectedUrl, merged);
+          if (!disableResolveCache) setCachedResolveCandidates(selectedUrl, merged);
           return merged;
         });
       };
@@ -1623,7 +1662,7 @@ export default function WatchPage() {
         if (fastMerged.length) {
           hadPlayable = true;
           setCandidates(fastMerged);
-          setCachedResolveCandidates(selectedUrl, fastMerged);
+          if (!disableResolveCache) setCachedResolveCandidates(selectedUrl, fastMerged);
           setPlayerError(null);
           resetRecoveryState();
           setResolverLoading(false);
@@ -1651,9 +1690,18 @@ export default function WatchPage() {
         });
         if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
         if (!cancel) {
-          const merged = dedupeUrls([...fastMerged, ...playableList]);
+          const mergedRaw = dedupeUrls([...fastMerged, ...playableList]);
+          const verified = await filterPlayableCandidates(mergedRaw, {
+            signal: controller.signal,
+            timeoutMs: CANDIDATE_PROBE_TIMEOUT_MS,
+            maxChecks: Math.min(24, mergedRaw.length),
+            concurrency: Math.min(3, PROBE_CONCURRENCY),
+            pushDiag,
+          });
+          const merged = verified.length ? verified : mergedRaw;
+          if (mergedRaw.length) pushDiag(`probe ok ${merged.length}/${mergedRaw.length}`);
           setCandidates(merged);
-          if (merged.length) setCachedResolveCandidates(selectedUrl, merged);
+          if (merged.length && !disableResolveCache) setCachedResolveCandidates(selectedUrl, merged);
           if (!merged.length) {
             setResolverError("لا يوجد بث");
             scheduleResolveRecovery("resolver-empty");
@@ -1775,7 +1823,7 @@ export default function WatchPage() {
     video.addEventListener("stalled", onWaiting);
     video.addEventListener("playing", onPlaying);
     video.addEventListener("timeupdate", onTimeUpdate);
-    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+    if (shouldUseNativeHls(video)) {
       video.src = selectedHlsUrl;
       video.load();
       video.play().catch(() => { });
@@ -1953,7 +2001,7 @@ export default function WatchPage() {
                       : "border-gray-700 bg-[#0b0f15] text-gray-100 hover:border-blue-600/50",
                   ].join(" ")}
                 >
-                  <div>مصدر {idx + 1}</div>
+                  <div>{group.label ? `جودة ${group.label}` : `مصدر ${idx + 1}`}</div>
                   {group.members.length > 1 ? (
                     <div className="mt-0.5 text-[10px] font-semibold text-blue-200/80">جودات متعددة</div>
                   ) : null}
@@ -1974,6 +2022,8 @@ export default function WatchPage() {
               <video
                 ref={videoRef}
                 playsInline
+                muted
+                autoPlay
                 preload="auto"
                 onDoubleClick={handleVideoDoubleClick}
                 className="w-full h-full bg-black"

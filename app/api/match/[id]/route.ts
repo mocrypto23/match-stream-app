@@ -7,6 +7,7 @@ export const dynamic = "force-dynamic";
 type Ctx = { params: Promise<{ id?: string }> };
 type MatchApiRow = {
   id: number;
+  match_key?: string | null;
   home_team?: string | null;
   away_team?: string | null;
   home_logo?: string | null;
@@ -23,9 +24,9 @@ type MatchApiRow = {
 };
 
 const SELECT_WITH_SERVER_7 =
-  "id,home_team,away_team,home_logo,away_logo,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,stream_url_6,stream_url_7,match_start,status_key";
+  "id,match_key,home_team,away_team,home_logo,away_logo,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,stream_url_6,stream_url_7,match_start,status_key";
 const SELECT_LEGACY =
-  "id,home_team,away_team,home_logo,away_logo,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,match_start,status_key";
+  "id,match_key,home_team,away_team,home_logo,away_logo,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,match_start,status_key";
 const RESOLVE_TIMEOUT_MS = 4500;
 const RESOLVE_CACHE_TTL_MS = 60_000;
 const RESOLVE_CACHE_MAX = 250;
@@ -263,15 +264,12 @@ function extractIdFromPath(req: Request) {
   return parts[parts.length - 1] || null;
 }
 
-export async function GET(req: Request, ctx: Ctx) {
-  const { id: fromParams } = await ctx.params;
-  const raw = fromParams ?? extractIdFromPath(req);
-  const id = raw ? Number.parseInt(raw, 10) : NaN;
+function cleanMatchKey(raw: unknown) {
+  const v = typeof raw === "string" ? raw.trim() : "";
+  return v ? v : null;
+}
 
-  if (!raw || !Number.isFinite(id) || id <= 0) {
-    return NextResponse.json({ error: "Invalid id", raw }, { status: 400 });
-  }
-
+async function fetchMatchById(id: number) {
   let { data, error } = await supabaseAdmin
     .from("match-stream-app")
     .select(SELECT_WITH_SERVER_7)
@@ -287,6 +285,65 @@ export async function GET(req: Request, ctx: Ctx) {
 
     error = legacyRes.error;
     data = legacyRes.data ? { ...legacyRes.data, stream_url_6: null, stream_url_7: null } : legacyRes.data;
+  }
+
+  return {
+    data: (data ?? null) as MatchApiRow | null,
+    error: (error ?? null) as { message: string } | null,
+  };
+}
+
+async function fetchMatchByKey(matchKey: string) {
+  let { data, error } = await supabaseAdmin
+    .from("match-stream-app")
+    .select(SELECT_WITH_SERVER_7)
+    .eq("match_key", matchKey)
+    .order("id", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error && /stream_url_6|stream_url_7/i.test(error.message || "")) {
+    const legacyRes = await supabaseAdmin
+      .from("match-stream-app")
+      .select(SELECT_LEGACY)
+      .eq("match_key", matchKey)
+      .order("id", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    error = legacyRes.error;
+    data = legacyRes.data ? { ...legacyRes.data, stream_url_6: null, stream_url_7: null } : legacyRes.data;
+  }
+
+  return {
+    data: (data ?? null) as MatchApiRow | null,
+    error: (error ?? null) as { message: string } | null,
+  };
+}
+
+export async function GET(req: Request, ctx: Ctx) {
+  const { id: fromParams } = await ctx.params;
+  const requestUrl = new URL(req.url);
+  const raw = fromParams ?? extractIdFromPath(req);
+  const keyHint = cleanMatchKey(requestUrl.searchParams.get("k"));
+  const id = raw ? Number.parseInt(raw, 10) : NaN;
+  const hasValidId = Number.isFinite(id) && id > 0;
+
+  if (!hasValidId && !keyHint) {
+    return NextResponse.json({ error: "Invalid id", raw, key: keyHint }, { status: 400 });
+  }
+
+  let data: MatchApiRow | null = null;
+  let error: { message: string } | null = null;
+  if (hasValidId) {
+    const byId = await fetchMatchById(id);
+    data = byId.data;
+    error = byId.error;
+  }
+  if (!error && !data && keyHint) {
+    const byKey = await fetchMatchByKey(keyHint);
+    data = byKey.data;
+    error = byKey.error;
   }
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });

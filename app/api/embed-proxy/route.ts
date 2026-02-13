@@ -2232,7 +2232,7 @@ async function handleProxyRequest(req: Request) {
           rawManifest,
           target.toString(),
           depth,
-          safeReferrer || target.toString()
+          target.toString()
         );
         const headers = withProxyMetaHeaders(filterResponseHeaders(upstream.headers, { html: false }));
         headers.set("content-type", "application/vnd.apple.mpegurl; charset=utf-8");

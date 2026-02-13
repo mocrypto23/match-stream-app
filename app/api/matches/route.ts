@@ -8,6 +8,7 @@ const TABLE = "match-stream-app";
 
 type MatchApiRow = {
   id: number;
+  match_key?: string | null;
   home_team?: string | null;
   away_team?: string | null;
   home_logo?: string | null;
@@ -106,7 +107,7 @@ export async function GET(req: Request) {
   const { data, error } = await supabaseAdmin
     .from(TABLE)
     .select(
-      "id,home_team,away_team,home_logo,away_logo,match_day,match_start,match_time,home_score,away_score,status_key"
+      "id,match_key,home_team,away_team,home_logo,away_logo,match_day,match_start,match_time,home_score,away_score,status_key"
     )
     .eq("match_day", day)
     .order("match_start", { ascending: true, nullsFirst: false })

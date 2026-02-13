@@ -78,11 +78,14 @@ const DAYS = [
 // SIIIR source (Server 2)
 const SIIIR = {
   dayUrl: {
-    yesterday: "https://w4.siiir.tv/yesterday-matches/",
-    today: "https://w4.siiir.tv/today-matches/",
-    tomorrow: "https://w4.siiir.tv/tomorrow-matches/",
+    yesterday: "https://w5.siiir.tv/yesterday-matches/",
+    today: "https://w5.siiir.tv/today-matches/",
+    tomorrow: "https://w5.siiir.tv/tomorrow-matches/",
   },
-  
+
+};
+const PRIMARY_FALLBACK_SIIIR_DAY_URL = {
+  today: "https://w5.siiir.tv/today-matches/",
 };
 // LIVEHD77 source (Server 3 - today only)
 const LIVEHD = {
@@ -201,7 +204,7 @@ function dbg(...args) {
 function ensureDir(p) {
   try {
     fs.mkdirSync(p, { recursive: true });
-  } catch {}
+  } catch { }
 }
 
 function diagRoot() {
@@ -217,7 +220,7 @@ function diagTouch() {
       path.join(dir, "_touch.txt"),
       `ok ${new Date().toISOString()} headless=${HEADLESS} node=${process.version}\n`
     );
-  } catch {}
+  } catch { }
 }
 
 function diagWrite(rel, content) {
@@ -228,7 +231,7 @@ function diagWrite(rel, content) {
     const full = path.join(dir, rel);
     ensureDir(path.dirname(full));
     fs.writeFileSync(full, content ?? "");
-  } catch {}
+  } catch { }
 }
 
 async function diagShot(page, rel) {
@@ -239,7 +242,7 @@ async function diagShot(page, rel) {
     const full = path.join(dir, rel);
     ensureDir(path.dirname(full));
     await page.screenshot({ path: full, fullPage: true });
-  } catch {}
+  } catch { }
 }
 
 diagTouch();
@@ -307,19 +310,19 @@ async function resolveFinalUrlViaBrowser(context, startUrl, { timeoutMs = 20000 
 
   const onPopup = async (p) => {
     try {
-      await p.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => {});
+      await p.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => { });
       remember(p.url());
-    } catch {}
-    try { await p.close(); } catch {}
+    } catch { }
+    try { await p.close(); } catch { }
   };
 
   const onCtxPage = async (p) => {
     if (p === page) return;
     try {
-      await p.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => {});
+      await p.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => { });
       remember(p.url());
-    } catch {}
-    try { await p.close(); } catch {}
+    } catch { }
+    try { await p.close(); } catch { }
   };
 
   page.on("popup", onPopup);
@@ -341,9 +344,9 @@ async function resolveFinalUrlViaBrowser(context, startUrl, { timeoutMs = 20000 
 
     return finalUrl;
   } finally {
-    try { page.off("popup", onPopup); } catch {}
-    try { context.off("page", onCtxPage); } catch {}
-    try { await page.close(); } catch {}
+    try { page.off("popup", onPopup); } catch { }
+    try { context.off("page", onCtxPage); } catch { }
+    try { await page.close(); } catch { }
   }
 }
 
@@ -351,7 +354,7 @@ function isJunkCandidateUrl(url) {
   if (!url) return true;
   const u = String(url).toLowerCase();
   return (
-/\.(css|js|png|jpg|jpeg|gif|svg|webp|avif|woff|woff2|ttf|eot|ico|json|map|m3u8|ts|m4s|mp4|mpd|webm)(\?.*)?$/.test(u) ||
+    /\.(css|js|png|jpg|jpeg|gif|svg|webp|avif|woff|woff2|ttf|eot|ico|json|map|m3u8|ts|m4s|mp4|mpd|webm)(\?.*)?$/.test(u) ||
     u.includes("cloudflareinsights.com") ||
     u.includes("beacon.min.js") ||
     u.includes("cf-beacon") ||
@@ -396,7 +399,7 @@ function hasAnyHostHint(url, hints) {
       if (!domainHint) return false;
       return host === domainHint || host.endsWith("." + domainHint);
     });
-  } catch {}
+  } catch { }
 
   // Fallback for non-URL strings only.
   if (parsedAsUrl) return false;
@@ -484,7 +487,7 @@ async function applyStealth(page) {
             ? Promise.resolve({ state: Notification.permission })
             : originalQuery(parameters);
       }
-    } catch {}
+    } catch { }
   });
 }
 
@@ -497,7 +500,7 @@ async function applyAntiAds(context, page) {
   page.on("dialog", async (d) => {
     try {
       await d.dismiss();
-    } catch {}
+    } catch { }
   });
 
   await page.addInitScript((adHosts, adultHints) => {
@@ -523,11 +526,11 @@ async function applyAntiAds(context, page) {
       window.open = function (url, name, features) {
         try {
           if (url && isBlockedUrl(url)) return null;
-        } catch {}
+        } catch { }
         return origOpen(url, name, features);
       };
 
-      window.alert = () => {};
+      window.alert = () => { };
       window.confirm = () => false;
       window.prompt = () => null;
 
@@ -535,7 +538,7 @@ async function applyAntiAds(context, page) {
         get() {
           return null;
         },
-        set() {},
+        set() { },
       });
 
       document.addEventListener(
@@ -549,11 +552,11 @@ async function applyAntiAds(context, page) {
               ev.stopPropagation();
               if (typeof ev.stopImmediatePropagation === "function") ev.stopImmediatePropagation();
             }
-          } catch {}
+          } catch { }
         },
         true
       );
-    } catch {}
+    } catch { }
   }, AD_HOSTS, ADULT_HINTS);
 
   await page.route("**/*", (route) => {
@@ -657,7 +660,8 @@ function prettyTimeFromIso(iso) {
 }
 
 function isValidGoalNumber(n) {
-  return Number.isFinite(n) && n >= 0 && n <= 30;
+  // Practical football score guardrail to avoid parsing kickoff times as scores (e.g. 05:25).
+  return Number.isFinite(n) && n >= 0 && n <= 15;
 }
 
 function parseScore(raw) {
@@ -669,11 +673,47 @@ function parseScore(raw) {
   return n;
 }
 
+function normalizeStoredScore(raw) {
+  if (typeof raw !== "number") return null;
+  return isValidGoalNumber(raw) ? raw : null;
+}
+
+function extractScorePairFromText(raw) {
+  const s = normalizeDigits(String(raw || "")).trim();
+  if (!s) return null;
+  const m = s.match(/(\d{1,2})\s*[-:]\s*(\d{1,2})/);
+  if (!m) return null;
+  const home = parseScore(m[1]);
+  const away = parseScore(m[2]);
+  if (home === null || away === null) return null;
+  return { home, away };
+}
+
 function parseMs(iso) {
   if (!iso) return null;
   const d = new Date(iso);
   const t = d.getTime();
   return Number.isFinite(t) ? t : null;
+}
+
+function isLikelyFinishedByTime(matchStartIso, windowMs = 3 * 60 * 60 * 1000) {
+  const startMs = parseMs(matchStartIso);
+  if (startMs === null) return false;
+  return Date.now() > startMs + windowMs;
+}
+
+function normalizeStatusKeyValue(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  if (s === "live" || s === "finished" || s === "upcoming") return s;
+  return "unknown";
+}
+
+function pickKnownStatusKey(...values) {
+  for (const value of values) {
+    const normalized = normalizeStatusKeyValue(value);
+    if (normalized !== "unknown") return normalized;
+  }
+  return "unknown";
 }
 
 function statusKeyFromText(statusText) {
@@ -682,7 +722,7 @@ function statusKeyFromText(statusText) {
   const s = s0.toLowerCase();
 
   if (/لم\s*تبدأ|not started|upcoming|scheduled/i.test(s0)) return "upcoming";
-  if (s0.includes("جارية") || s0.includes("مباشر") || s0.includes("الآن")) return "live";
+  if (s0.includes("جارية") || s0.includes("مباشر") || s0.includes("الآن") || s0.includes("الان")) return "live";
   if (s0.includes("انتهت") || s0.includes("انتهى") || s0.includes("نهاية")) return "finished";
 
   if (/\blive\b|in progress|\bnow\b/i.test(s)) return "live";
@@ -706,7 +746,7 @@ function normalizeUrl(raw, baseUrl) {
   }
   try {
     if (!/^https?:\/\//i.test(u)) u = new URL(u, baseUrl).toString();
-  } catch {}
+  } catch { }
   return /^https?:\/\//i.test(u) ? u : null;
 }
 
@@ -723,10 +763,10 @@ function scoreCandidate(u) {
   let score = 0;
   if (s.includes("albaplayer")) score += 250;
   if (s.includes("kora-live")) score += 200;
-// ❌ ممنوع m3u8 (بيعمل مشاكل عندك في التخزين)
-// خليه يخسر فورًا بدل ما يكسب
-if (isMediaAssetUrl(s)) return -99999;
-if (s.includes("playerv2.php")) score += 1200;
+  // ❌ ممنوع m3u8 (بيعمل مشاكل عندك في التخزين)
+  // خليه يخسر فورًا بدل ما يكسب
+  if (isMediaAssetUrl(s)) return -99999;
+  if (s.includes("playerv2.php")) score += 1200;
   if (s.includes("embed")) score += 80;
   if (s.includes("player")) score += 60;
   if (s.includes("iframe")) score += 40;
@@ -734,7 +774,7 @@ if (s.includes("playerv2.php")) score += 1200;
 
   if (s.includes("bein-live.com") && s.includes("match")) score -= 120;
 
-if (s.includes("aleynoxitram.sbs") && s.includes("/hard/") && s.includes("match=")) score -= 1200;
+  if (s.includes("aleynoxitram.sbs") && s.includes("/hard/") && s.includes("match=")) score -= 1200;
   if (s.includes("sir-tv.tv/wp-content/uploads/")) score -= 500;
   if (s.includes("cloudflareinsights.com") || s.includes("beacon.min.js")) score -= 500;
 
@@ -803,14 +843,41 @@ function extractAyMatchRowsFromHtml(html, pageUrl) {
   const text = String(html || "");
   if (!text) return [];
 
-  const chunks = text
-    .split(/<div\s+class=["'][^"']*(?:AY_Match|AY_WithJS|MT_Loading|ay_1a31ddb3|ay_f43fbc9f)[^"']*["'][^>]*>/i)
-    .slice(1);
+  const cardStartRe =
+    /<div\s+([^>]*class=["'][^"']*(?:AY_Match|AY_WithJS|MT_Loading|ay_1a31ddb3|ay_f43fbc9f)[^"']*["'][^>]*)>/gi;
+  const starts = [];
+  for (const m of text.matchAll(cardStartRe)) {
+    if (typeof m.index !== "number") continue;
+    starts.push({ index: m.index, attrs: m[1] || "" });
+  }
+  if (!starts.length) return [];
+
+  const parseStatusKey = (classRaw, statusTextRaw) => {
+    const textStatus = statusKeyFromText(stripHtmlToText(statusTextRaw || ""));
+    if (textStatus !== "unknown") return textStatus;
+
+    const cls = String(classRaw || "").toLowerCase();
+    if (cls.includes("not-started")) return "upcoming";
+    if (cls.includes("live")) return "live";
+    if (cls.includes("finished") || cls.includes("ended")) return "finished";
+    return "unknown";
+  };
+
+  const strictParseGoal = (value) => {
+    const s = normalizeDigits(stripHtmlToText(value || ""));
+    if (!/^\d{1,2}$/.test(s)) return null;
+    const n = Number.parseInt(s, 10);
+    if (!Number.isFinite(n) || n < 0 || n > 30) return null;
+    return String(n);
+  };
+
   const out = [];
 
-  for (const c of chunks) {
-    const endAnchor = c.search(/<\/a>\s*<\/div>/i);
-    const chunk = endAnchor >= 0 ? c.slice(0, endAnchor + 9) : c.slice(0, 5000);
+  for (let i = 0; i < starts.length; i++) {
+    const start = starts[i];
+    const end = starts[i + 1]?.index ?? text.length;
+    const chunk = text.slice(start.index, end);
+    const attrs = start.attrs || "";
 
     const teamMatches = Array.from(
       chunk.matchAll(/<div\s+class=["'][^"']*(?:TM_Name|ay_dea3dc0e|ay_30adbd22)[^"']*["'][^>]*>([\s\S]*?)<\/div>/gi)
@@ -822,11 +889,15 @@ function extractAyMatchRowsFromHtml(html, pageUrl) {
       (chunk.match(/<a[^>]+href=["']([^"']+)["']/i) || [])[1] ||
       "";
     const dataStartRaw =
+      (attrs.match(/\bdata-start=["']([^"']+)["']/i) || [])[1] ||
       (chunk.match(/\bdata-start=["']([^"']+)["']/i) || [])[1] ||
       (chunk.match(/\bdata-time=["']([^"']+)["']/i) || [])[1] ||
       "";
     const timeTextRaw =
-      (chunk.match(/<span[^>]*class=["'][^"']*(?:MT_Time|ay_0ce77098)[^"']*["'][^>]*>([\s\S]*?)<\/span>/i) || [])[1] ||
+      (chunk.match(/<span[^>]*class=["'][^"']*(?:MT_Time|ay_0ce77098|ay_e2e911b4)[^"']*["'][^>]*>([\s\S]*?)<\/span>/i) || [])[1] ||
+      "";
+    const statusTextRaw =
+      (chunk.match(/<div[^>]*class=["'][^"']*(?:MT_Stat|MT_Status|status|ay_f9b08507)[^"']*["'][^>]*>([\s\S]*?)<\/div>/i) || [])[1] ||
       "";
     const channelTextRaw =
       (chunk.match(/<li[^>]*>([\s\S]*?)<\/li>/i) || [])[1] ||
@@ -837,6 +908,22 @@ function extractAyMatchRowsFromHtml(html, pageUrl) {
     )
       .map((m) => normalizeUrl(m[1] || "", pageUrl))
       .filter(Boolean);
+    let goalRaw = Array.from(
+      chunk.matchAll(/<span[^>]*class=["'][^"']*RS-goals[^"']*["'][^>]*>([\s\S]*?)<\/span>/gi)
+    ).map((m) => m[1] || "");
+    if (goalRaw.length < 2) {
+      goalRaw = Array.from(
+        chunk.matchAll(
+          /<span[^>]*class=["'][^"']*(?:score-1|score-2|host_goals|guest_goals|home_score|away_score)[^"']*["'][^>]*>([\s\S]*?)<\/span>/gi
+        )
+      ).map((m) => m[1] || "");
+    }
+    const homeScoreRaw = goalRaw.length >= 1 ? strictParseGoal(goalRaw[0]) : null;
+    const awayScoreRaw = goalRaw.length >= 2 ? strictParseGoal(goalRaw[1]) : null;
+    const statusKey = parseStatusKey(attrs, statusTextRaw);
+    const hasScoreHint = homeScoreRaw !== null && awayScoreRaw !== null;
+    const hideUpcomingZero =
+      statusKey === "upcoming" && homeScoreRaw === "0" && awayScoreRaw === "0";
 
     const href = normalizeUrl(hrefRaw, pageUrl);
     if (!href || teams.length < 2) continue;
@@ -846,12 +933,15 @@ function extractAyMatchRowsFromHtml(html, pageUrl) {
       away_team: teams[1],
       match_url: href,
       data_start: normalizeSpaces(dataStartRaw) || null,
-      status_text: null,
-      status_key_dom: "unknown",
+      status_text: stripHtmlToText(statusTextRaw) || null,
+      status_key_dom: statusKey || "unknown",
       time_text: stripHtmlToText(timeTextRaw) || null,
       channel_text: stripHtmlToText(channelTextRaw) || null,
       home_logo: imgCandidates[0] || null,
       away_logo: imgCandidates[1] || null,
+      has_score_hint: hasScoreHint && !hideUpcomingZero,
+      home_score_raw: hideUpcomingZero ? null : homeScoreRaw,
+      away_score_raw: hideUpcomingZero ? null : awayScoreRaw,
     });
   }
 
@@ -876,7 +966,7 @@ async function fetchAyMatchRowsFallback(url, dayKey) {
     const final = rows
       .map((r) => {
         const iso = toIsoFromDataStart(r.data_start);
-        const match_day = cairoDayFromIso(iso) || matchDayFromKey(dayKey);
+        const match_day = matchDayFromKey(dayKey) || cairoDayFromIso(iso);
         return { ...r, match_day };
       })
       .filter((r) => r.home_team && r.away_team && r.match_url && r.match_day);
@@ -886,6 +976,24 @@ async function fetchAyMatchRowsFallback(url, dayKey) {
   } catch {
     return [];
   }
+}
+
+function convertAyFallbackRowsToListRows(rows) {
+  return (rows || []).map((r) => ({
+    home_team: r.home_team,
+    away_team: r.away_team,
+    data_start: r.data_start || null,
+    time_text: r.time_text || null,
+    status_text: r.status_text || null,
+    status_key_dom: r.status_key_dom || "unknown",
+    result_visibility: "unknown",
+    has_score_hint: !!r.has_score_hint,
+    home_logo: r.home_logo || null,
+    away_logo: r.away_logo || null,
+    match_url: r.match_url,
+    home_score_raw: r.home_score_raw ?? null,
+    away_score_raw: r.away_score_raw ?? null,
+  }));
 }
 
 // ===================== Scrape List (bein-live) =====================
@@ -906,14 +1014,14 @@ async function scrapeOneDay(page, dayKey, url) {
   try {
     await page.mouse.wheel(0, 1400);
     await page.waitForTimeout(700);
-  } catch {}
+  } catch { }
 
   await diagShot(page, `list/${dayKey}.png`);
   if (DIAG) {
     try {
       const html = await page.content();
       diagWrite(`list/${dayKey}.html`, html.slice(0, 350000));
-    } catch {}
+    } catch { }
   }
 
   try {
@@ -923,7 +1031,7 @@ async function scrapeOneDay(page, dayKey, url) {
       console.error("⚠️ BOT/Challenge hints detected on list page (runner may be blocked).");
       if (DIAG) diagWrite(`list/${dayKey}.body.txt`, bodyText);
     }
-  } catch {}
+  } catch { }
 
   const rows = await page.evaluate((DAY_KEY) => {
     const BASE = "https://www.bein-live.com";
@@ -965,6 +1073,18 @@ async function scrapeOneDay(page, dayKey, url) {
       return "";
     };
 
+    const statusFromText = (raw) => {
+      const t = String(raw || "").toLowerCase().trim();
+      if (!t) return "";
+      if (t.includes("لم") && (t.includes("تبدأ") || t.includes("تبدا") || t.includes("يبدأ") || t.includes("يبدا"))) return "upcoming";
+      if (t.includes("جارية") || t.includes("مباشر") || t.includes("الآن") || t.includes("الان")) return "live";
+      if (t.includes("انتهت") || t.includes("انتهى") || t.includes("نهاية")) return "finished";
+      if (/not started|upcoming|scheduled/i.test(t)) return "upcoming";
+      if (/live|in progress|now/i.test(t)) return "live";
+      if (/ft|full ?time|finished|ended|final/i.test(t)) return "finished";
+      return "";
+    };
+
     const getResultVisibility = (match) => {
       const res = match.querySelector(".MT_Result");
       if (!res) return "missing";
@@ -973,12 +1093,15 @@ async function scrapeOneDay(page, dayKey, url) {
       try {
         const cs = window.getComputedStyle(res);
         if (cs && cs.display === "none") return "hidden";
-      } catch {}
+      } catch { }
       return "visible";
     };
 
     const strictParseGoal = (t) => {
-      const s = String(t || "").trim();
+      const s = String(t || "")
+        .replace(/[٠-٩]/g, (ch) => "٠١٢٣٤٥٦٧٨٩".indexOf(ch))
+        .replace(/[۰-۹]/g, (ch) => "۰۱۲۳۴۵۶۷۸۹".indexOf(ch))
+        .trim();
       if (!/^\d{1,2}$/.test(s)) return null;
       const n = parseInt(s, 10);
       if (!Number.isFinite(n) || n < 0 || n > 30) return null;
@@ -1002,16 +1125,40 @@ async function scrapeOneDay(page, dayKey, url) {
         }
       }
 
-      const scoreText = pickText(match, [".RS-score", ".RS-Score", ".MT_Score", ".MatchScore", ".match-score", ".score"]);
+      const scoreText = String(
+        pickText(match, [".RS-score", ".RS-Score", ".MT_Score", ".MatchScore", ".match-score", ".score"])
+      )
+        .replace(/[٠-٩]/g, (ch) => "٠١٢٣٤٥٦٧٨٩".indexOf(ch))
+        .replace(/[۰-۹]/g, (ch) => "۰۱۲۳۴۵۶۷۸۹".indexOf(ch));
       const m1 = scoreText.match(/(\d{1,2})\s*[-:]\s*(\d{1,2})/);
-      if (m1) {
-        const a = strictParseGoal(m1[1]);
-        const b = strictParseGoal(m1[2]);
-        if (a !== null && b !== null) return { home: String(a), away: String(b), hasAny: true };
-      }
+        if (m1) {
+          const a = strictParseGoal(m1[1]);
+          const b = strictParseGoal(m1[2]);
+          if (a !== null && b !== null) return { home: String(a), away: String(b), hasAny: true };
+        }
 
-      return { home: null, away: null, hasAny: false };
-    };
+        const sideA = strictParseGoal(
+          pickText(match, [".score-1", ".score1", ".host_goals", ".home_score", "[class*='score-1']"])
+        );
+        const sideB = strictParseGoal(
+          pickText(match, [".score-2", ".score2", ".guest_goals", ".away_score", "[class*='score-2']"])
+        );
+        if (sideA !== null && sideB !== null) {
+          return { home: String(sideA), away: String(sideB), hasAny: true };
+        }
+
+        const resultText = String(pickText(match, [".MT_Result", ".ay_abe0d7ce", ".result", ".match-result"]))
+          .replace(/[٠-٩]/g, (ch) => "٠١٢٣٤٥٦٧٨٩".indexOf(ch))
+          .replace(/[۰-۹]/g, (ch) => "۰۱۲۳۴۵۶۷۸۹".indexOf(ch));
+        const m2 = resultText.match(/(\d{1,2})\s*[-:xX]\s*(\d{1,2})/);
+        if (m2) {
+          const a = strictParseGoal(m2[1]);
+          const b = strictParseGoal(m2[2]);
+          if (a !== null && b !== null) return { home: String(a), away: String(b), hasAny: true };
+        }
+
+        return { home: null, away: null, hasAny: false };
+      };
 
     const cleanText = (value) => String(value || "").replace(/\s+/g, " ").trim();
 
@@ -1065,17 +1212,9 @@ async function scrapeOneDay(page, dayKey, url) {
 
         const statText = pickText(match, [".MT_Stat", ".MT_Status", ".status"]);
         const classStatus = statusFromClass(match);
+        const textStatus = statusFromText(statText);
 
-        let statusKey = classStatus || "unknown";
-        if (statusKey === "unknown" && statText) {
-          const t = statText.toLowerCase();
-          if (t.includes("لم") && (t.includes("تبدأ") || t.includes("تبدا") || t.includes("يبدأ") || t.includes("يبدا")))
-            statusKey = "upcoming";
-          else if (t.includes("جارية") || t.includes("مباشر") || t.includes("الآن"))
-            statusKey = "live";
-          else if (t.includes("انتهت") || t.includes("انتهى") || t.includes("نهاية"))
-            statusKey = "finished";
-        }
+        let statusKey = textStatus || classStatus || "unknown";
 
         if (statusKey === "unknown" && DAY_KEY === "yesterday") statusKey = "finished";
         if (statusKey === "unknown" && DAY_KEY === "tomorrow") statusKey = "upcoming";
@@ -1105,28 +1244,85 @@ async function scrapeOneDay(page, dayKey, url) {
       .filter((m) => m && m.home_team && m.away_team && m.match_url);
   }, dayKey);
 
+  const fallbackRows = await fetchAyMatchRowsFallback(url, dayKey);
+  const converted = convertAyFallbackRowsToListRows(fallbackRows);
+  if (rows.length && converted.length) {
+    const rowKey = (row) => {
+      const iso = toIsoFromDataStart(row?.data_start);
+      const day = matchDayFromKey(dayKey) || cairoDayFromIso(iso) || "";
+      return keyOfTeams(day, row?.home_team, row?.away_team);
+    };
+
+    const mergedMap = new Map();
+    for (const base of rows) mergedMap.set(rowKey(base), { ...base });
+
+    let added = 0;
+    let enriched = 0;
+    for (const candidate of converted) {
+      const key = rowKey(candidate);
+      if (!key) continue;
+      const current = mergedMap.get(key);
+      if (!current) {
+        mergedMap.set(key, { ...candidate });
+        added += 1;
+        continue;
+      }
+
+      let changed = false;
+      const merged = { ...current };
+
+      if (!merged.data_start && candidate.data_start) {
+        merged.data_start = candidate.data_start;
+        changed = true;
+      }
+      if ((!merged.status_key_dom || merged.status_key_dom === "unknown") && candidate.status_key_dom && candidate.status_key_dom !== "unknown") {
+        merged.status_key_dom = candidate.status_key_dom;
+        changed = true;
+      }
+      if (!merged.status_text && candidate.status_text) {
+        merged.status_text = candidate.status_text;
+        changed = true;
+      }
+      if (!merged.time_text && candidate.time_text) {
+        merged.time_text = candidate.time_text;
+        changed = true;
+      }
+      if ((!merged.home_score_raw || !merged.away_score_raw) && candidate.home_score_raw !== null && candidate.away_score_raw !== null) {
+        merged.home_score_raw = candidate.home_score_raw;
+        merged.away_score_raw = candidate.away_score_raw;
+        merged.has_score_hint = true;
+        changed = true;
+      }
+      if (!merged.home_logo && candidate.home_logo) {
+        merged.home_logo = candidate.home_logo;
+        changed = true;
+      }
+      if (!merged.away_logo && candidate.away_logo) {
+        merged.away_logo = candidate.away_logo;
+        changed = true;
+      }
+      if (!merged.match_url && candidate.match_url) {
+        merged.match_url = candidate.match_url;
+        changed = true;
+      }
+
+      if (changed) {
+        mergedMap.set(key, merged);
+        enriched += 1;
+      }
+    }
+
+    const merged = Array.from(mergedMap.values());
+    console.log(`[bein] ${dayKey}: ${rows.length} (browser) + ${added} added + ${enriched} enriched => ${merged.length}`);
+    if (DIAG) diagWrite(`rows/raw_${dayKey}.json`, JSON.stringify(merged, null, 2));
+    return merged;
+  }
+
   if (rows.length) {
-    console.log(`📦 ${dayKey}: ${rows.length} مباراة`);
+    console.log(`[bein] ${dayKey}: ${rows.length} (browser)`);
     if (DIAG) diagWrite(`rows/raw_${dayKey}.json`, JSON.stringify(rows, null, 2));
     return rows;
   }
-
-  const fallbackRows = await fetchAyMatchRowsFallback(url, dayKey);
-  const converted = fallbackRows.map((r) => ({
-    home_team: r.home_team,
-    away_team: r.away_team,
-    data_start: r.data_start || null,
-    time_text: r.time_text || null,
-    status_text: r.status_text || null,
-    status_key_dom: r.status_key_dom || "unknown",
-    result_visibility: "unknown",
-    has_score_hint: false,
-    home_logo: r.home_logo || null,
-    away_logo: r.away_logo || null,
-    match_url: r.match_url,
-    home_score_raw: null,
-    away_score_raw: null,
-  }));
 
   console.log(`📦 ${dayKey}: 0 (browser) -> ${converted.length} (http fallback)`);
   if (DIAG) diagWrite(`rows/raw_${dayKey}.json`, JSON.stringify(converted, null, 2));
@@ -1157,16 +1353,25 @@ async function extractMatchMetaFromDom(page) {
       else if (cls.includes("live")) classStatus = "live";
       else if (cls.includes("finished") || cls.includes("ended")) classStatus = "finished";
 
-      let statusKey = classStatus || "unknown";
-      if (statusKey === "unknown" && statText) {
-        const t = statText.toLowerCase();
-        if (t.includes("لم") && (t.includes("تبدأ") || t.includes("تبدا") || t.includes("يبدأ") || t.includes("يبدا"))) statusKey = "upcoming";
-        else if (t.includes("جارية") || t.includes("مباشر") || t.includes("الآن")) statusKey = "live";
-        else if (t.includes("انتهت") || t.includes("انتهى") || t.includes("نهاية")) statusKey = "finished";
-      }
+      const statusFromText = (raw) => {
+        const t = String(raw || "").toLowerCase().trim();
+        if (!t) return "";
+        if (t.includes("لم") && (t.includes("تبدأ") || t.includes("تبدا") || t.includes("يبدأ") || t.includes("يبدا"))) return "upcoming";
+        if (t.includes("جارية") || t.includes("مباشر") || t.includes("الآن") || t.includes("الان")) return "live";
+        if (t.includes("انتهت") || t.includes("انتهى") || t.includes("نهاية")) return "finished";
+        if (/not started|upcoming|scheduled/i.test(t)) return "upcoming";
+        if (/live|in progress|now/i.test(t)) return "live";
+        if (/ft|full ?time|finished|ended|final/i.test(t)) return "finished";
+        return "";
+      };
+
+      let statusKey = statusFromText(statText) || classStatus || "unknown";
 
       const strictParseGoal = (x) => {
-        const s = String(x || "").trim();
+        const s = String(x || "")
+          .replace(/[٠-٩]/g, (ch) => "٠١٢٣٤٥٦٧٨٩".indexOf(ch))
+          .replace(/[۰-۹]/g, (ch) => "۰۱۲۳۴۵۶۷۸۹".indexOf(ch))
+          .trim();
         if (!/^\d{1,2}$/.test(s)) return null;
         const n = parseInt(s, 10);
         if (!Number.isFinite(n) || n < 0 || n > 30) return null;
@@ -1190,11 +1395,45 @@ async function extractMatchMetaFromDom(page) {
         }
 
         if (!hasAny) {
-          const scoreText = pickText(root, [".RS-score", ".RS-Score", ".MT_Score", ".MatchScore", ".match-score", ".score"]);
+          const scoreText = String(
+            pickText(root, [".RS-score", ".RS-Score", ".MT_Score", ".MatchScore", ".match-score", ".score"])
+          )
+            .replace(/[٠-٩]/g, (ch) => "٠١٢٣٤٥٦٧٨٩".indexOf(ch))
+            .replace(/[۰-۹]/g, (ch) => "۰۱۲۳۴۵۶۷۸۹".indexOf(ch));
           const m1 = scoreText.match(/(\d{1,2})\s*[-:]\s*(\d{1,2})/);
           if (m1) {
             const a = strictParseGoal(m1[1]);
             const b = strictParseGoal(m1[2]);
+            if (a !== null && b !== null) {
+              home = String(a);
+              away = String(b);
+              hasAny = true;
+            }
+          }
+        }
+
+        if (!hasAny) {
+          const sideA = strictParseGoal(
+            pickText(root, [".score-1", ".score1", ".host_goals", ".home_score", "[class*='score-1']"])
+          );
+          const sideB = strictParseGoal(
+            pickText(root, [".score-2", ".score2", ".guest_goals", ".away_score", "[class*='score-2']"])
+          );
+          if (sideA !== null && sideB !== null) {
+            home = String(sideA);
+            away = String(sideB);
+            hasAny = true;
+          }
+        }
+
+        if (!hasAny) {
+          const resultText = String(pickText(root, [".MT_Result", ".ay_abe0d7ce", ".result", ".match-result"]))
+            .replace(/[٠-٩]/g, (ch) => "٠١٢٣٤٥٦٧٨٩".indexOf(ch))
+            .replace(/[۰-۹]/g, (ch) => "۰۱۲۳۴۵۶۷۸۹".indexOf(ch));
+          const m2 = resultText.match(/(\d{1,2})\s*[-:xX]\s*(\d{1,2})/);
+          if (m2) {
+            const a = strictParseGoal(m2[1]);
+            const b = strictParseGoal(m2[2]);
             if (a !== null && b !== null) {
               home = String(a);
               away = String(b);
@@ -1233,30 +1472,30 @@ async function getDeepMatchDetails(page, matchUrl) {
     try {
       const u = req.url();
       if (u) candidates.add(u);
-    } catch {}
+    } catch { }
   };
 
   const onPopup = async (p) => {
     try {
-      await p.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => {});
+      await p.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => { });
       const u = p.url();
       if (u) candidates.add(u);
-    } catch {}
+    } catch { }
     try {
       await p.close();
-    } catch {}
+    } catch { }
   };
 
   const onCtxPage = async (p) => {
     if (p === page) return;
     try {
-      await p.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => {});
+      await p.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => { });
       const u = p.url();
       if (u) candidates.add(u);
-    } catch {}
+    } catch { }
     try {
       await p.close();
-    } catch {}
+    } catch { }
   };
 
   page.on("request", onReq);
@@ -1280,7 +1519,7 @@ async function getDeepMatchDetails(page, matchUrl) {
           await page.waitForTimeout(900);
         }
       }
-    } catch {}
+    } catch { }
 
     const domUrls = await page
       .evaluate(() => {
@@ -1307,7 +1546,7 @@ async function getDeepMatchDetails(page, matchUrl) {
         const u = fr.url();
         if (u) candidates.add(u);
       });
-    } catch {}
+    } catch { }
 
     await page.waitForTimeout(800);
     const meta2 = await extractMatchMetaFromDom(page);
@@ -1319,14 +1558,14 @@ async function getDeepMatchDetails(page, matchUrl) {
       deep_has_score_hint: meta2.deep_has_score_hint || meta.deep_has_score_hint,
     };
 
-   const cleanUrls = Array.from(candidates)
-  .map((u) => normalizeUrl(u, matchUrl))
-.filter((u) => u && !isJunkCandidateUrl(u) && !isAdHost(u) && !isAdultUrl(u) && u !== matchUrl)
-  // ✅ امنع أي ملفات ستريم/segments نهائيًا (مش صفحة)
-  .filter((u) => !isMediaAssetUrl(u));
+    const cleanUrls = Array.from(candidates)
+      .map((u) => normalizeUrl(u, matchUrl))
+      .filter((u) => u && !isJunkCandidateUrl(u) && !isAdHost(u) && !isAdultUrl(u) && u !== matchUrl)
+      // ✅ امنع أي ملفات ستريم/segments نهائيًا (مش صفحة)
+      .filter((u) => !isMediaAssetUrl(u));
 
 
-const best = pickBestUrl(cleanUrls);
+    const best = pickBestUrl(cleanUrls);
 
     dbg(`   🎯 Best Link for ${matchUrl}: ${best || "None"}`);
 
@@ -1340,13 +1579,13 @@ const best = pickBestUrl(cleanUrls);
   } finally {
     try {
       page.off("request", onReq);
-    } catch {}
+    } catch { }
     try {
       page.off("popup", onPopup);
-    } catch {}
+    } catch { }
     try {
       ctx.off("page", onCtxPage);
-    } catch {}
+    } catch { }
   }
 }
 
@@ -1391,13 +1630,13 @@ async function scrapeSiiirDay(page, dayKey) {
   await page.waitForTimeout(900);
   try {
     await waitForStableMatchCount(page, 20000, 1400);
-  } catch {}
+  } catch { }
 
   await diagShot(page, `siiir/list_${dayKey}.png`);
   if (DIAG) {
     try {
       diagWrite(`siiir/list_${dayKey}.html`, (await page.content()).slice(0, 350000));
-    } catch {}
+    } catch { }
   }
 
   // نقرأ الكروت من صفحة اليوم
@@ -1416,12 +1655,12 @@ async function scrapeSiiirDay(page, dayKey) {
       const dataStart = (timeEl?.getAttribute("data-start") || "").trim();
 
       const a =
-  match.querySelector('a[href*="aleynoxitram.sbs/hard/"]') ||
-  match.querySelector('a[href*="/hard/"]') ||
-  match.querySelector('a[href*="playerv2.php"]') ||
-  match.querySelector("a[href]");
+        match.querySelector('a[href*="aleynoxitram.sbs/hard/"]') ||
+        match.querySelector('a[href*="/hard/"]') ||
+        match.querySelector('a[href*="playerv2.php"]') ||
+        match.querySelector("a[href]");
 
-const hrefRaw = a?.getAttribute("href") || "";
+      const hrefRaw = a?.getAttribute("href") || "";
 
 
       let href = "";
@@ -1448,7 +1687,7 @@ const hrefRaw = a?.getAttribute("href") || "";
     .map((r) => {
       const iso = toIsoFromDataStart(r.data_start);
       const match_day = cairoDayFromIso(iso) || matchDayFromKey(dayKey);
-      return { ...r, match_day };
+      return { ...r, match_day, _day_key: dayKey };
     })
     .filter((r) => r.home_team && r.away_team && r.match_page_url && r.match_day);
 
@@ -1466,6 +1705,7 @@ const hrefRaw = a?.getAttribute("href") || "";
       away_team: r.away_team,
       data_start: r.data_start || null,
       match_day: r.match_day,
+      _day_key: dayKey,
     }))
     .filter((r) => r.home_team && r.away_team && r.match_page_url && r.match_day);
   console.log(`🟣 SIIIR ${dayKey}: 0 (browser) -> ${converted.length} (http fallback)`);
@@ -1529,7 +1769,7 @@ async function resolveSiiirPlayerV2UrlViaHttp(matchPageUrl) {
       const finalUrlObj = new URL(finalPageUrl);
       matchId = normalizeDigits(finalUrlObj.searchParams.get("match") || "").trim().replace(/^match/i, "");
       if (!/^\d{1,5}$/.test(matchId)) matchId = "";
-    } catch {}
+    } catch { }
 
     const applyMatchTemplate = (value) => {
       if (!matchId) return String(value || "");
@@ -1590,30 +1830,30 @@ async function resolveSiiirPlayerIframeSrc(page, matchPageUrl) {
     try {
       const u = req.url();
       if (u) candidates.add(u);
-    } catch {}
+    } catch { }
   };
 
   const onPopup = async (p) => {
     try {
-      await p.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => {});
+      await p.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => { });
       const u = p.url();
       if (u) candidates.add(u);
-    } catch {}
+    } catch { }
     try {
       await p.close();
-    } catch {}
+    } catch { }
   };
 
   const onCtxPage = async (p) => {
     if (p === page) return;
     try {
-      await p.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => {});
+      await p.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => { });
       const u = p.url();
       if (u) candidates.add(u);
-    } catch {}
+    } catch { }
     try {
       await p.close();
-    } catch {}
+    } catch { }
   };
 
   page.on("request", onReq);
@@ -1645,7 +1885,7 @@ async function resolveSiiirPlayerIframeSrc(page, matchPageUrl) {
             return fu;
           }
         }
-      } catch {}
+      } catch { }
 
       // 2) DOM collection (iframes + links + scripts)
       const domUrls = await page
@@ -1658,12 +1898,12 @@ async function resolveSiiirPlayerIframeSrc(page, matchPageUrl) {
           document.querySelectorAll("iframe[src], iframe[data-src]").forEach((f) => {
             push(f.getAttribute("src"));
             push(f.getAttribute("data-src"));
-            try { push(f.src); } catch {}
+            try { push(f.src); } catch { }
           });
 
           document.querySelectorAll("a[href]").forEach((a) => {
             push(a.getAttribute("href"));
-            try { push(a.href); } catch {}
+            try { push(a.href); } catch { }
           });
 
           const scriptsText = Array.from(document.scripts).map((s) => s.textContent || "").join("\n");
@@ -1744,9 +1984,9 @@ async function resolveSiiirPlayerIframeSrc(page, matchPageUrl) {
     dbg("⚠️ SIIIR resolve error:", e?.message || e);
     return null;
   } finally {
-    try { page.off("request", onReq); } catch {}
-    try { page.off("popup", onPopup); } catch {}
-    try { ctx.off("page", onCtxPage); } catch {}
+    try { page.off("request", onReq); } catch { }
+    try { page.off("popup", onPopup); } catch { }
+    try { ctx.off("page", onCtxPage); } catch { }
   }
 }
 
@@ -1996,7 +2236,35 @@ function isWeakStreamUrl(u) {
   return !goodHints.some((h) => s.includes(h));
 }
 
+function isBeinMatchPageUrl(u) {
+  const normalized = normalizeUrl(u, u);
+  if (!normalized) return false;
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname.toLowerCase();
+    return host.endsWith("bein-live.com") && /\/matches\//i.test(path);
+  } catch {
+    return false;
+  }
+}
 
+function isSiiirUrl(u) {
+  const normalized = normalizeUrl(u, u);
+  if (!normalized) return false;
+  try {
+    return new URL(normalized).hostname.toLowerCase().endsWith("siiir.tv");
+  } catch {
+    return false;
+  }
+}
+
+function shouldPreserveExistingRow(row, { allowSiiirFallbackRows = false } = {}) {
+  if (!row) return false;
+  if (isBeinMatchPageUrl(row.stream_url)) return true;
+  if (allowSiiirFallbackRows && isSiiirUrl(row.stream_url)) return true;
+  return false;
+}
 
 function preferExistingUrl(newUrl, oldUrl) {
   if (!newUrl && oldUrl) return oldUrl;
@@ -2006,12 +2274,17 @@ function preferExistingUrl(newUrl, oldUrl) {
   return newUrl;
 }
 
+function preferPrimarySourceUrl(newUrl, oldUrl) {
+  if (isBeinMatchPageUrl(newUrl)) return newUrl;
+  return preferExistingUrl(newUrl, oldUrl);
+}
+
 async function fetchExistingForDays(days) {
   let { data, error } = await supabase
     .from(TABLE_NAME)
     .select(
-      "match_key,home_team,away_team,home_logo,away_logo,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,stream_url_6,stream_url_7,match_day,match_start,match_time,home_score,away_score"
-)
+      "match_key,home_team,away_team,home_logo,away_logo,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,stream_url_6,stream_url_7,match_day,match_start,match_time,home_score,away_score,status_key,status_text"
+    )
 
     .in("match_day", days);
 
@@ -2019,7 +2292,7 @@ async function fetchExistingForDays(days) {
     const legacy = await supabase
       .from(TABLE_NAME)
       .select(
-        "match_key,home_team,away_team,home_logo,away_logo,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,match_day,match_start,match_time,home_score,away_score"
+        "match_key,home_team,away_team,home_logo,away_logo,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,match_day,match_start,match_time,home_score,away_score,status_key,status_text"
       )
       .in("match_day", days);
 
@@ -2036,7 +2309,7 @@ async function fetchExistingForDays(days) {
   return Array.isArray(data) ? data : [];
 }
 
-function mergeWithExisting({ newRows, existingRows }) {
+function mergeWithExisting({ newRows, existingRows, allowSiiirFallbackRows = false }) {
   const nowMs = Date.now();
 
   const existingMap = new Map();
@@ -2044,6 +2317,7 @@ function mergeWithExisting({ newRows, existingRows }) {
 
   const mergedMap = new Map();
 
+  // 1. Process New Rows
   for (const r of newRows) {
     const k = keyOfRow(r);
     const old = existingMap.get(k);
@@ -2055,7 +2329,7 @@ function mergeWithExisting({ newRows, existingRows }) {
       if (!out.away_logo && old.away_logo) out.away_logo = old.away_logo;
 
       // Server 1
-      out.stream_url = preferExistingUrl(out.stream_url, old.stream_url);
+      out.stream_url = preferPrimarySourceUrl(out.stream_url, old.stream_url);
 
       // Servers 2..7 (preserve if new scrape missing)
       out.stream_url_2 = preferExistingUrl(out.stream_url_2, old.stream_url_2);
@@ -2077,39 +2351,53 @@ function mergeWithExisting({ newRows, existingRows }) {
         }
       }
 
-      const newHS = typeof out.home_score === "number" ? out.home_score : null;
-      const newAS = typeof out.away_score === "number" ? out.away_score : null;
-      const oldHS = typeof old.home_score === "number" ? old.home_score : null;
-      const oldAS = typeof old.away_score === "number" ? old.away_score : null;
+      const newHS = normalizeStoredScore(out.home_score);
+      const newAS = normalizeStoredScore(out.away_score);
+      const oldHS = normalizeStoredScore(old.home_score);
+      const oldAS = normalizeStoredScore(old.away_score);
 
-      const oldHasScore = oldHS !== null || oldAS !== null;
-      const newHasScore = newHS !== null || newAS !== null;
+      const oldHasScore = oldHS !== null && oldAS !== null;
+      const newHasScore = newHS !== null && newAS !== null;
+
+      if (newHasScore) {
+        out.home_score = newHS;
+        out.away_score = newAS;
+      } else {
+        out.home_score = null;
+        out.away_score = null;
+      }
 
       if (!newHasScore && oldHasScore) {
         out.home_score = oldHS;
         out.away_score = oldAS;
       }
+
+      const newStatusKey = String(out.status_key || "").trim().toLowerCase();
+      const oldStatusKey = String(old.status_key || "").trim().toLowerCase();
+      if ((!newStatusKey || newStatusKey === "unknown") && oldStatusKey && oldStatusKey !== "unknown") {
+        out.status_key = oldStatusKey;
+      }
+      if (!String(out.status_text || "").trim() && String(old.status_text || "").trim()) {
+        out.status_text = old.status_text;
+      }
     }
 
-    const deduped = dedupeServerUrls({
-      baseUrl: out.stream_url,
-      candidates: [
-        out.stream_url_2,
-        out.stream_url_3,
-        out.stream_url_4,
-        out.stream_url_5,
-        out.stream_url_6,
-        out.stream_url_7,
-      ],
-    });
+    const finalStatus = normalizeStatusKeyValue(out.status_key);
+    if ((finalStatus === "unknown" || finalStatus === "upcoming") && isLikelyFinishedByTime(out.match_start)) {
+      out.status_key = "finished";
+    }
+    if (
+      normalizeStatusKeyValue(out.status_key) === "finished" &&
+      (typeof out.home_score !== "number" || typeof out.away_score !== "number")
+    ) {
+      const scoreFromText = extractScorePairFromText(out.status_text);
+      if (scoreFromText) {
+        out.home_score = scoreFromText.home;
+        out.away_score = scoreFromText.away;
+      }
+    }
 
-    out.stream_url_2 = deduped[0];
-    out.stream_url_3 = deduped[1];
-    out.stream_url_4 = deduped[2];
-    out.stream_url_5 = deduped[3];
-    out.stream_url_6 = deduped[4];
-    out.stream_url_7 = deduped[5];
-
+    // Strict isolation: no cross-server dedup in merge
     // Drop weak leftovers for newer optional servers.
     if (isWeakStreamUrl(out.stream_url_4)) out.stream_url_4 = null;
     if (isWeakStreamUrl(out.stream_url_5)) out.stream_url_5 = null;
@@ -2119,7 +2407,75 @@ function mergeWithExisting({ newRows, existingRows }) {
     mergedMap.set(k, out);
   }
 
+  // 2. Preserve Existing Rows (Fix for disappearing matches)
+  for (const r of existingRows) {
+    const k = keyOfRow(r);
+    if (mergedMap.has(k)) continue;
+    const preserved = { ...r };
+    if (!shouldPreserveExistingRow(preserved, { allowSiiirFallbackRows })) {
+      console.log(`[merge] dropping stale external row: ${preserved.home_team} vs ${preserved.away_team}`);
+      continue;
+    }
+    preserved.home_score = normalizeStoredScore(preserved.home_score);
+    preserved.away_score = normalizeStoredScore(preserved.away_score);
+    if (preserved.home_score === null || preserved.away_score === null) {
+      preserved.home_score = null;
+      preserved.away_score = null;
+    }
+    const preservedStatus = normalizeStatusKeyValue(preserved.status_key);
+    if ((preservedStatus === "unknown" || preservedStatus === "upcoming") && isLikelyFinishedByTime(preserved.match_start)) {
+      preserved.status_key = "finished";
+    }
+    if (
+      normalizeStatusKeyValue(preserved.status_key) === "finished" &&
+      (typeof preserved.home_score !== "number" || typeof preserved.away_score !== "number")
+    ) {
+      const scoreFromText = extractScorePairFromText(preserved.status_text);
+      if (scoreFromText) {
+        preserved.home_score = scoreFromText.home;
+        preserved.away_score = scoreFromText.away;
+      }
+    }
+    console.log(`[merge] preserving missed match from DB: ${preserved.home_team} vs ${preserved.away_team}`);
+    mergedMap.set(k, preserved);
+  }
+
   return { mergedRows: Array.from(mergedMap.values()) };
+}
+
+async function backfillDynamicMatchFields(rows) {
+  const valid = Array.isArray(rows) ? rows.filter((r) => r && r.match_key) : [];
+  if (!valid.length) return { ok: 0, fail: 0 };
+
+  let ok = 0;
+  let fail = 0;
+  const chunkSize = 20;
+
+  for (let i = 0; i < valid.length; i += chunkSize) {
+    const chunk = valid.slice(i, i + chunkSize);
+    await Promise.all(
+      chunk.map(async (row) => {
+        const payload = {
+          match_start: row.match_start || null,
+          match_time: row.match_time || null,
+          home_score: typeof row.home_score === "number" ? row.home_score : null,
+          away_score: typeof row.away_score === "number" ? row.away_score : null,
+          status_key: row.status_key || null,
+          status_text: row.status_text || null,
+        };
+
+        const { error } = await supabase.from(TABLE_NAME).update(payload).eq("match_key", row.match_key);
+        if (error) {
+          fail += 1;
+          if (DIAG) diagWrite(`post_rpc/errors_${Date.now()}.txt`, `${row.match_key}: ${error.message}\n`);
+          return;
+        }
+        ok += 1;
+      })
+    );
+  }
+
+  return { ok, fail };
 }
 // ===================== LIVEHD77 (Server 3) =====================
 function scoreLivehdCandidate(u) {
@@ -2188,14 +2544,14 @@ async function collectLivehdCandidateUrlsFromPage(page, baseUrl) {
   try {
     const current = page.url();
     if (current) out.add(current);
-  } catch {}
+  } catch { }
 
   try {
     for (const fr of page.frames()) {
       const u = fr.url();
       if (u) out.add(u);
     }
-  } catch {}
+  } catch { }
 
   const domUrls = await page
     .evaluate(() => {
@@ -2222,7 +2578,7 @@ async function collectLivehdCandidateUrlsFromPage(page, baseUrl) {
         push(el.getAttribute("data-src"));
         try {
           push(el.src);
-        } catch {}
+        } catch { }
       });
 
       document.querySelectorAll("a[href]").forEach((a) => {
@@ -2231,7 +2587,7 @@ async function collectLivehdCandidateUrlsFromPage(page, baseUrl) {
         push(href);
         try {
           push(a.href);
-        } catch {}
+        } catch { }
       });
 
       const scriptsText = Array.from(document.scripts)
@@ -2266,7 +2622,7 @@ async function scrapeLivehdToday(page) {
     if (DIAG) {
       try {
         diagWrite("livehd/list_today.html", (await page.content()).slice(0, 350000));
-      } catch {}
+      } catch { }
     }
 
     const rows = await page.evaluate(() => {
@@ -2340,7 +2696,7 @@ async function scrapeLivehdToday(page) {
 async function resolveLivehdFromTvPage(page, tvUrl) {
   try {
     await page.goto(tvUrl, { waitUntil: "domcontentloaded", timeout: DEEP_TIMEOUT_MS, referer: LIVEHD.listUrl });
-    await page.waitForSelector("iframe, body", { timeout: 12000 }).catch(() => {});
+    await page.waitForSelector("iframe, body", { timeout: 12000 }).catch(() => { });
     await page.waitForTimeout(800);
 
     const candidates = await collectLivehdCandidateUrlsFromPage(page, tvUrl);
@@ -2351,12 +2707,67 @@ async function resolveLivehdFromTvPage(page, tvUrl) {
   }
 }
 
+async function resolveLivehdStreamViaHttp(matchUrl) {
+  if (!matchUrl) return null;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+    const resp = await fetch(matchUrl, {
+      method: "GET",
+      headers: { ...DEFAULT_HTTP_HEADERS, Referer: LIVEHD.listUrl },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!resp.ok) return null;
+
+    const html = await resp.text();
+    const candidates = [];
+
+    // Extract iframes/links
+    // Simple regex for src="..."
+    const srcMatches = html.matchAll(/(?:src|href)=["']([^"']+)["']/gi);
+    for (const m of srcMatches) {
+      if (m[1]) candidates.push(m[1]);
+    }
+
+    // Scripts
+    const scriptUrls = html.match(/https?:\/\/[^"'`\s<>()]+/gi) || [];
+    candidates.push(...scriptUrls);
+
+    const clean = candidates
+      .map(u => normalizeUrl(u, matchUrl))
+      .filter(Boolean)
+      .filter(u => !isClearlyNonStreamUrl(u));
+
+    // Filter for LiveHD specific patterns
+    const good = clean.filter(u => {
+      const s = u.toLowerCase();
+      return s.includes("albaplayer") || s.includes("playerv2.php") || s.includes("/tv/") || s.includes("embed") || s.includes("player");
+    });
+
+    const best = pickBestLivehdUrl(good, { baseUrl: matchUrl });
+    if (best) return normalizeLivehdServer3Url(best);
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function resolveLivehdStream(page, matchUrl) {
   if (!matchUrl) return null;
 
+  // ⚡ HTTP Fast Path
+  const fast = await resolveLivehdStreamViaHttp(matchUrl);
+  if (fast) {
+    dbg(`🟢 LIVEHD fast-http: ${fast}`);
+    return fast;
+  }
+
   try {
     await page.goto(matchUrl, { waitUntil: "domcontentloaded", timeout: DEEP_TIMEOUT_MS, referer: LIVEHD.listUrl });
-    await page.waitForSelector("iframe, a[href], body", { timeout: 12000 }).catch(() => {});
+    await page.waitForSelector("iframe, a[href], body", { timeout: 12000 }).catch(() => { });
     await page.waitForTimeout(800);
 
     const candidates = await collectLivehdCandidateUrlsFromPage(page, matchUrl);
@@ -2473,13 +2884,13 @@ async function scrapeAyMatchDay(page, { sourceName, dayKey, url, diagPrefix }) {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: LIST_TIMEOUT_MS });
     await page.waitForSelector(".AY_Match, body", { timeout: 30000 });
     await page.waitForTimeout(900);
-    await waitForStableMatchCount(page, 18000, 1200).catch(() => {});
+    await waitForStableMatchCount(page, 18000, 1200).catch(() => { });
 
     await diagShot(page, `${diagPrefix}/list_${dayKey}.png`);
     if (DIAG) {
       try {
         diagWrite(`${diagPrefix}/list_${dayKey}.html`, (await page.content()).slice(0, 350000));
-      } catch {}
+      } catch { }
     }
 
     const rows = await page.evaluate(() => {
@@ -2584,7 +2995,7 @@ async function resolveStreamFromPage(page, pageUrl, { preferredHostHints = [] } 
 
   try {
     await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: DEEP_TIMEOUT_MS });
-    await page.waitForSelector("iframe, a[href], body", { timeout: 12000 }).catch(() => {});
+    await page.waitForSelector("iframe, a[href], body", { timeout: 12000 }).catch(() => { });
     await page.waitForTimeout(900);
 
     const domUrls = await page
@@ -2601,14 +3012,14 @@ async function resolveStreamFromPage(page, pageUrl, { preferredHostHints = [] } 
           push(el.getAttribute("data-src"));
           try {
             push(el.src);
-          } catch {}
+          } catch { }
         });
 
         document.querySelectorAll("a[href]").forEach((el) => {
           push(el.getAttribute("href"));
           try {
             push(el.href);
-          } catch {}
+          } catch { }
         });
 
         document.querySelectorAll("video[src], source[src]").forEach((el) => {
@@ -2695,7 +3106,7 @@ function deriveYalaFallbackPlayerUrl(rawUrl) {
     if ((host === "e.kooraxx.com" || host.endsWith(".kooraxx.com")) && looksLikePlayerUrl(normalized)) {
       return normalized;
     }
-  } catch {}
+  } catch { }
 
   return null;
 }
@@ -2767,6 +3178,47 @@ async function scrapeTskoraDay(page, dayKey) {
   });
 }
 
+async function resolveAyStreamViaHttp(url, preferredHostHints = []) {
+  if (!url) return null;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: DEFAULT_HTTP_HEADERS,
+      redirect: "follow",
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    if (!resp.ok) return null;
+
+    const html = await resp.text();
+    const candidates = [];
+    const srcMatches = html.matchAll(/(?:src|href)=["']([^"']+)["']/gi);
+    for (const m of srcMatches) {
+      if (m[1]) candidates.push(m[1]);
+    }
+    const scriptUrls = html.match(/https?:\/\/[^"'`\s<>()]+/gi) || [];
+    candidates.push(...scriptUrls);
+
+    const clean = candidates
+      .map(u => normalizeUrl(u, url))
+      .filter(Boolean)
+      .filter(u => !isClearlyNonStreamUrl(u));
+
+    // Filter for strong player hints
+    const pool = clean.filter(u => looksLikePlayerUrl(u));
+
+    if (pool.length) {
+      return pool[0];
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function enrichTskoraWithStreams(browser, rows) {
   if (!rows.length) return [];
 
@@ -2799,13 +3251,20 @@ async function enrichTskoraWithStreams(browser, rows) {
       let finalUrl = null;
 
       if (raw) {
-        finalUrl = await resolveStreamFromPage(page, raw, {
-          preferredHostHints: ["pyxq.online", "albaplayer", "koora", "kora"],
-        });
+        // ⚡ HTTP Fast Path
+        finalUrl = await resolveAyStreamViaHttp(raw, ["pyxq.online", "albaplayer", "koora", "kora"]);
+        if (finalUrl) {
+          dbg(`🟠 TSKORA fast-http: ${finalUrl}`);
+        } else {
+          // Browser fallback
+          finalUrl = await resolveStreamFromPage(page, raw, {
+            preferredHostHints: ["pyxq.online", "albaplayer", "koora", "kora"],
+          });
 
-        if (!finalUrl) {
-          const fallback = pickTskoraStreamUrl(raw);
-          finalUrl = looksLikePlayerUrl(fallback) ? fallback : null;
+          if (!finalUrl) {
+            const fallback = pickTskoraStreamUrl(raw);
+            finalUrl = looksLikePlayerUrl(fallback) ? fallback : null;
+          }
         }
       }
 
@@ -2837,7 +3296,7 @@ function pickTskoraStreamUrl(rawUrl) {
         return `${u.protocol}//${u.host}/albaplayer/${slug}/`;
       }
     }
-  } catch {}
+  } catch { }
 
   return normalized;
 }
@@ -2897,7 +3356,7 @@ async function scrapeOneKoraArticleList(page) {
     if (DIAG) {
       try {
         diagWrite("onekora/list.html", (await page.content()).slice(0, 350000));
-      } catch {}
+      } catch { }
     }
 
     const articleLinks = await page.evaluate(() => {
@@ -2933,7 +3392,7 @@ async function scrapeOneKoraArticleList(page) {
 async function resolveOneKoraArticle(page, articleUrl) {
   try {
     await page.goto(articleUrl, { waitUntil: "domcontentloaded", timeout: DEEP_TIMEOUT_MS, referer: ONEKORA.listUrl });
-    await page.waitForSelector("h1, a[href], iframe, body", { timeout: 12000 }).catch(() => {});
+    await page.waitForSelector("h1, a[href], iframe, body", { timeout: 12000 }).catch(() => { });
     await page.waitForTimeout(800);
 
     const articleMeta = await page.evaluate(() => {
@@ -3008,6 +3467,58 @@ async function resolveOneKoraArticle(page, articleUrl) {
   }
 }
 
+async function resolveOneKoraArticleViaHttp(articleUrl) {
+  if (!articleUrl) return null;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+    const resp = await fetch(articleUrl, {
+      method: "GET",
+      headers: { ...DEFAULT_HTTP_HEADERS, Referer: ONEKORA.listUrl },
+      redirect: "follow",
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    if (!resp.ok) return null;
+
+    const html = await resp.text();
+    const h1 = (html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i) || [])[1];
+    const title = (html.match(/<title>([\s\S]*?)<\/title>/i) || [])[1];
+    const parsedTeams = parseOneKoraTeamsFromTitle(stripHtmlToText(h1 || title));
+
+    if (!parsedTeams?.home_team || !parsedTeams?.away_team) return null;
+
+    // Find links
+    const candidates = [];
+    const srcMatches = html.matchAll(/(?:src|href)=["']([^"']+)["']/gi);
+    for (const m of srcMatches) { if (m[1]) candidates.push(m[1]); }
+    const scriptUrls = html.match(/https?:\/\/[^"'`\s<>()]+/gi) || [];
+    candidates.push(...scriptUrls);
+
+    const clean = candidates
+      .map(u => normalizeUrl(u, articleUrl))
+      .filter(Boolean)
+      .filter(u => !isClearlyNonStreamUrl(u))
+      .filter(u => !hostMatches(u, ONEKORA.siteHost));
+
+    clean.sort((a, b) => scoreOneKoraCandidate(b) - scoreOneKoraCandidate(a));
+    const best = clean[0];
+
+    if (!best || scoreOneKoraCandidate(best) < -500) return null;
+    // Avoid complex resolves on HTTP path
+    if (/ahlamontada\.com/i.test(best)) return null;
+
+    return {
+      ...parsedTeams,
+      match_day: matchDayFromKey("today"),
+      article_url: articleUrl,
+      onekora_stream_url: best
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function enrichOneKoraWithStreams(browser, articleUrls) {
   if (!articleUrls.length) return [];
 
@@ -3035,7 +3546,16 @@ async function enrichOneKoraWithStreams(browser, articleUrls) {
       const { u, idx } = item;
 
       console.log(`🟣 1KORA [W${workerId}] (${idx + 1}/${articleUrls.length}): ${u}`);
-      out[idx] = await resolveOneKoraArticle(page, u);
+
+      // ⚡ HTTP Fast Path
+      let res = await resolveOneKoraArticleViaHttp(u);
+      if (res) {
+        dbg(`🟣 1KORA fast-http: ${res.onekora_stream_url}`);
+        out[idx] = res;
+      } else {
+        // Fallback
+        out[idx] = await resolveOneKoraArticle(page, u);
+      }
     }
 
     await context.close();
@@ -3074,14 +3594,25 @@ async function startScraping() {
   try {
     // 1) bein-live schedule
     const all = [];
+    let usedPrimarySiiirFallback = false;
     for (const d of DAYS) {
+      let rows = [];
       try {
-        const rows = await scrapeOneDay(page, d.key, d.url);
-        all.push(...rows.map((r) => ({ ...r, _day_key: d.key })));
+        rows = await scrapeOneDay(page, d.key, d.url);
       } catch (e) {
         console.error(`⚠️ فشل سحب ${d.key}:`, e.message);
         if (DIAG) diagWrite(`errors/${d.key}.txt`, String(e?.stack || e?.message || e));
       }
+
+      if (!rows.length && PRIMARY_FALLBACK_SIIIR_DAY_URL[d.key]) {
+        const fallbackUrl = PRIMARY_FALLBACK_SIIIR_DAY_URL[d.key];
+        console.warn(`⚠️ primary fallback active (${d.key}): ${fallbackUrl}`);
+        const fallbackRows = await fetchAyMatchRowsFallback(fallbackUrl, d.key);
+        rows = convertAyFallbackRowsToListRows(fallbackRows);
+        if (rows.length) usedPrimarySiiirFallback = true;
+      }
+
+      all.push(...rows.map((r) => ({ ...r, _day_key: d.key })));
     }
 
     if (!all.length) {
@@ -3115,8 +3646,8 @@ async function startScraping() {
         if (DIAG) diagWrite(`siiir/errors_${d.key}.txt`, String(e?.stack || e?.message || e));
       }
     }
-    await siiirListPage.close().catch(() => {});
-    await siiirListContext.close().catch(() => {});
+    await siiirListPage.close().catch(() => { });
+    await siiirListContext.close().catch(() => { });
 
     const siiirEnriched = await enrichSiiirWithPlayerUrls(browser, siiirAll);
 
@@ -3142,8 +3673,8 @@ async function startScraping() {
     await applyAntiAds(livehdListContext, livehdListPage);
 
     const livehdRows = await scrapeLivehdToday(livehdListPage);
-    await livehdListPage.close().catch(() => {});
-    await livehdListContext.close().catch(() => {});
+    await livehdListPage.close().catch(() => { });
+    await livehdListContext.close().catch(() => { });
 
     const livehdEnriched = await enrichLivehdWithStreams(browser, livehdRows);
 
@@ -3183,8 +3714,8 @@ async function startScraping() {
           if (DIAG) diagWrite(`yala/errors_${d.key}.txt`, String(e?.stack || e?.message || e));
         }
       }
-      await yalaListPage.close().catch(() => {});
-      await yalaListContext.close().catch(() => {});
+      await yalaListPage.close().catch(() => { });
+      await yalaListContext.close().catch(() => { });
 
       const directRows = yalaAll
         .map((r) => {
@@ -3253,8 +3784,8 @@ async function startScraping() {
         if (DIAG) diagWrite(`tskora/errors_${d.key}.txt`, String(e?.stack || e?.message || e));
       }
     }
-    await tskoraPage.close().catch(() => {});
-    await tskoraContext.close().catch(() => {});
+    await tskoraPage.close().catch(() => { });
+    await tskoraContext.close().catch(() => { });
 
     const tskoraEnriched = await enrichTskoraWithStreams(browser, tskoraAll);
     const tskoraMap = new Map();
@@ -3277,8 +3808,8 @@ async function startScraping() {
     const oneKoraListPage = await oneKoraListContext.newPage();
     await applyAntiAds(oneKoraListContext, oneKoraListPage);
     const oneKoraArticles = await scrapeOneKoraArticleList(oneKoraListPage);
-    await oneKoraListPage.close().catch(() => {});
-    await oneKoraListContext.close().catch(() => {});
+    await oneKoraListPage.close().catch(() => { });
+    await oneKoraListContext.close().catch(() => { });
 
     const oneKoraEnriched = await enrichOneKoraWithStreams(browser, oneKoraArticles);
     const oneKoraMap = new Map();
@@ -3289,14 +3820,15 @@ async function startScraping() {
     }
 
     // 7) Normalize bein-live rows + attach servers 2..7
-    const normalized = enriched.map((m) => {
+    const normalizedByKey = new Map();
+    for (const m of enriched) {
       const isoFromAttr = toIsoFromDataStart(m.data_start);
-      const match_day = cairoDayFromIso(isoFromAttr) || matchDayFromKey(m._day_key);
+      const match_day = matchDayFromKey(m._day_key) || cairoDayFromIso(isoFromAttr);
       const match_start = isoFromAttr || null;
 
-      const statusKeyDom = (m.deep_status_key_dom || m.status_key_dom || "unknown").toLowerCase();
-      const statusTextRaw = m.deep_status_text || m.status_text || "";
-      let statusKey = statusKeyDom !== "unknown" ? statusKeyDom : statusKeyFromText(statusTextRaw);
+      const statusTextRaw = String(m.deep_status_text || m.status_text || "").trim();
+      let statusKey = pickKnownStatusKey(m.deep_status_key_dom, m.status_key_dom);
+      if (statusKey === "unknown") statusKey = statusKeyFromText(statusTextRaw);
 
       if (statusKey === "unknown") {
         if (m._day_key === "yesterday") statusKey = "finished";
@@ -3306,19 +3838,46 @@ async function startScraping() {
 
       const homeScoreRaw = m.deep_home_score_raw ?? m.home_score_raw;
       const awayScoreRaw = m.deep_away_score_raw ?? m.away_score_raw;
-      const home_score = statusKey === "upcoming" ? null : parseScore(homeScoreRaw);
-      const away_score = statusKey === "upcoming" ? null : parseScore(awayScoreRaw);
+      let home_score = statusKey === "upcoming" ? null : parseScore(homeScoreRaw);
+      let away_score = statusKey === "upcoming" ? null : parseScore(awayScoreRaw);
+      if (statusKey !== "upcoming" && (home_score === null || away_score === null)) {
+        const pairFromStatus = extractScorePairFromText(statusTextRaw);
+        if (pairFromStatus) {
+          home_score = pairFromStatus.home;
+          away_score = pairFromStatus.away;
+        }
+      }
+      if (statusKey !== "upcoming" && (home_score === null || away_score === null)) {
+        // Do not infer scores from kickoff time text (e.g. 05:25).
+      }
+      if (
+        statusKey === "unknown" &&
+        home_score !== null &&
+        away_score !== null &&
+        m._day_key !== "tomorrow"
+      ) {
+        statusKey =
+          m._day_key === "yesterday" || isLikelyFinishedByTime(match_start)
+            ? "finished"
+            : "live";
+      }
 
       const match_time =
         statusKey === "upcoming"
           ? m.time_text || prettyTimeFromIso(match_start) || "-"
           : prettyTimeFromIso(match_start) || m.time_text || "-";
 
-      const finalStreamUrl = m.deep_stream_url || m.match_url;
+      const finalStreamUrl = m.match_url || m.deep_stream_url;
       const match_key = keyOfTeams(match_day, m.home_team, m.away_team);
 
       // Server 2 (SIIIR)
       let server2 = siiirMap.get(match_key) || null;
+      if (!server2) {
+        const directSiiirServer2 = [m.match_url, m.deep_stream_url]
+          .map((u) => normalizeUrl(u, m.match_url || m.deep_stream_url || ""))
+          .find((u) => u && /\/playerv2\.php(\?|$)/i.test(String(u)));
+        if (directSiiirServer2) server2 = directSiiirServer2;
+      }
       if (server2 && !/\/playerv2\.php(\?|$)/i.test(String(server2))) server2 = null;
 
       // Server 3 (LIVEHD77)
@@ -3345,53 +3904,40 @@ async function startScraping() {
 
       // Server 4 (YALA), Server 5 (TSKORA), Server 6 (1KORA), Server 7 (reserved)
       let server4 = yalaMap.get(match_key) || yalaDirectMap.get(match_key) || null;
-      if (!server4) {
-        server4 = findYalaFallbackUrl(yalaEnriched, {
-          matchDay: match_day,
-          homeTeam: m.home_team,
-          awayTeam: m.away_team,
-        });
-      }
-      if (!server4) {
-        server4 = findYalaFallbackUrl(yalaDirectRows, {
-          matchDay: match_day,
-          homeTeam: m.home_team,
-          awayTeam: m.away_team,
-        });
-      }
       if (server4 && !looksLikePlayerUrl(server4)) server4 = null;
 
       const server5 = tskoraMap.get(match_key) || null;
       const server6 = oneKoraMap.get(match_key) || null;
       const server7 = null;
 
-      const dedupedServers = dedupeServerUrls({
-        baseUrl: finalStreamUrl,
-        candidates: [server2, server3, server4, server5, server6, server7],
-      });
-
-      return {
+      // Strict isolation: each server keeps its own URL, no cross-server dedup
+      normalizedByKey.set(match_key, {
         match_key,
         home_team: m.home_team,
         away_team: m.away_team,
         home_logo: m.home_logo,
         away_logo: m.away_logo,
         stream_url: finalStreamUrl,
-        stream_url_2: dedupedServers[0],
-        stream_url_3: dedupedServers[1],
-        stream_url_4: dedupedServers[2],
-        stream_url_5: dedupedServers[3],
-        stream_url_6: dedupedServers[4],
-        stream_url_7: dedupedServers[5],
+        stream_url_2: server2,
+        stream_url_3: server3,
+        stream_url_4: server4,
+        stream_url_5: server5,
+        stream_url_6: server6,
+        stream_url_7: server7,
         match_day,
         match_start: match_start || null,
         match_time,
         home_score,
         away_score,
-      };
-    });
+        status_key: statusKey,
+        status_text: statusTextRaw || null,
+      });
+    }
 
-    const finalRows = normalized.filter((r) => r.match_key && r.match_day && r.home_team && r.away_team && r.stream_url);
+    const normalized = Array.from(normalizedByKey.values());
+    const finalRows = normalized.filter(
+      (r) => r.match_key && r.match_day && r.home_team && r.away_team && r.stream_url
+    );
 
     if (!finalRows.length) {
       console.log("⚠️ لا توجد بيانات صالحة للإدخال.");
@@ -3402,7 +3948,11 @@ async function startScraping() {
     const daysToRefresh = [matchDayFromKey("yesterday"), matchDayFromKey("today"), matchDayFromKey("tomorrow")].filter(Boolean);
 
     const existing = await fetchExistingForDays(daysToRefresh);
-    const { mergedRows } = mergeWithExisting({ newRows: finalRows, existingRows: existing });
+    const { mergedRows } = mergeWithExisting({
+      newRows: finalRows,
+      existingRows: existing,
+      allowSiiirFallbackRows: usedPrimarySiiirFallback,
+    });
 
     if (DIAG) {
       diagWrite("final_rows.json", JSON.stringify(mergedRows, null, 2));
@@ -3413,6 +3963,7 @@ async function startScraping() {
             ts: new Date().toISOString(),
             daysToRefresh,
             count: mergedRows.length,
+            used_primary_siiir_fallback: usedPrimarySiiirFallback,
             siiir_count: siiirEnriched.length,
             livehd_count: livehdEnriched.length,
             yala_count: yalaEnriched.length,
@@ -3428,20 +3979,21 @@ async function startScraping() {
     console.log(`\n🔁 تحديث ذري عبر RPC: ${RPC_NAME}`);
     console.log(`📌 أيام التحديث: ${daysToRefresh.join(" , ")}`);
     console.log(`⬆️ صفوف نهائية بعد الدمج: ${mergedRows.length}`);
+    console.log(`🟣 primary siiir fallback used: ${usedPrimarySiiirFallback}`);
     console.log(`🗂️ جدول: ${TABLE_NAME}`);
 
-console.log("🧪 payload row sample:", {
-  match_key: mergedRows?.[0]?.match_key,
-  stream_url: mergedRows?.[0]?.stream_url,
-  stream_url_2: mergedRows?.[0]?.stream_url_2,
-  stream_url_3: mergedRows?.[0]?.stream_url_3,
-  stream_url_4: mergedRows?.[0]?.stream_url_4,
-  stream_url_5: mergedRows?.[0]?.stream_url_5,
-  stream_url_6: mergedRows?.[0]?.stream_url_6,
-  stream_url_7: mergedRows?.[0]?.stream_url_7,
-  home_logo: mergedRows?.[0]?.home_logo,
-  away_logo: mergedRows?.[0]?.away_logo,
-});
+    console.log("🧪 payload row sample:", {
+      match_key: mergedRows?.[0]?.match_key,
+      stream_url: mergedRows?.[0]?.stream_url,
+      stream_url_2: mergedRows?.[0]?.stream_url_2,
+      stream_url_3: mergedRows?.[0]?.stream_url_3,
+      stream_url_4: mergedRows?.[0]?.stream_url_4,
+      stream_url_5: mergedRows?.[0]?.stream_url_5,
+      stream_url_6: mergedRows?.[0]?.stream_url_6,
+      stream_url_7: mergedRows?.[0]?.stream_url_7,
+      home_logo: mergedRows?.[0]?.home_logo,
+      away_logo: mergedRows?.[0]?.away_logo,
+    });
 
 
     const rpcRes = await supabase.rpc(RPC_NAME, {
@@ -3455,6 +4007,13 @@ console.log("🧪 payload row sample:", {
       return;
     }
 
+    const postRpc = await backfillDynamicMatchFields(mergedRows);
+    if (postRpc.fail > 0) {
+      console.error(`⚠️ post-RPC backfill partial: ok=${postRpc.ok}, fail=${postRpc.fail}`);
+    } else {
+      console.log(`🩹 post-RPC backfill: ${postRpc.ok} row(s) updated.`);
+    }
+
     console.log("✅ تم التحديث بنجاح (Server2..Server6 مفعلة، Server7 محجوز لحين تحديد المصدر).");
   } catch (err) {
     console.error("❌ فشل السكرابر:", err.message);
@@ -3462,14 +4021,16 @@ console.log("🧪 payload row sample:", {
     try {
       await page.screenshot({ path: "debug.png", fullPage: true });
       console.log("🧩 تم حفظ debug.png لفحص الصفحة.");
-    } catch {}
+    } catch { }
   } finally {
     try {
       await page.close();
       await listContext.close();
-    } catch {}
+    } catch { }
     await browser.close();
   }
 }
 
 startScraping();
+
+

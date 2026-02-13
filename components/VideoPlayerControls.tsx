@@ -196,7 +196,7 @@ export default function VideoPlayerControls({
             {/* Center Play Button (only if paused/buffering) */}
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                 {!isPlaying && (
-                    <div className="w-16 h-16 rounded-full bg-white/20 backdrop-blur-md flex items-center justify-center border border-white/30 shadow-xl transition-transform transform scale-100">
+                    <div className="w-16 h-16 rounded-full bg-white/20 backdrop-blur-md flex items-center justify-center border border-white/30 shadow-xl transition-transform transform scale-100 pointer-events-auto cursor-pointer hover:scale-110">
                         <PlayIcon size={32} fill="white" />
                     </div>
                 )}
@@ -340,7 +340,7 @@ function QualitySelector({ hls }: { hls: Hls }) {
     }, [hls]);
 
     const levels = hls.levels || [];
-    if (levels.length <= 1) return null;
+    if (levels.length < 1) return null;
 
     const applyLevel = (nextLevel: number, e: React.MouseEvent<HTMLButtonElement>) => {
         e.stopPropagation();
