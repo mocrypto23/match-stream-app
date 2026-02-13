@@ -398,18 +398,60 @@ function extractRollingConfigFromHtml(html: string): AlbaRollingConfig | null {
   const cfgMatch = text.match(
     /const\s+C\s*=\s*\{[\s\S]*?ch\s*:\s*['"]([^'"]+)['"][\s\S]*?dm\s*:\s*\[([^\]]+)\][\s\S]*?iv\s*:\s*(\d+)/i
   );
-  if (!cfgMatch?.[1] || !cfgMatch?.[2]) return null;
+  if (cfgMatch?.[1] && cfgMatch?.[2]) {
+    const ch = String(cfgMatch[1]).trim();
+    if (!ch) return null;
+    const dm: string[] = [];
+    for (const m of cfgMatch[2].matchAll(/["']([^"']+)["']/g)) {
+      const v = String(m[1] || "").trim();
+      if (v) dm.push(v);
+    }
+    const ivRaw = Number.parseInt(String(cfgMatch[3] || ""), 10);
+    const iv = Number.isFinite(ivRaw) && ivRaw > 0 ? ivRaw : 1800000;
+    if (!dm.length) return null;
+    return { ch, dm: Array.from(new Set(dm)), iv };
+  }
 
-  const ch = String(cfgMatch[1]).trim();
-  if (!ch) return null;
+  // Fallback for pages that build rolling HLS urls like:
+  // const D=["domain-a","domain-b"]; ... `https://${prefix}.${D[idx]}/hls/ch9/master.m3u8`
+  const domainPoolMatch = text.match(/const\s+D\s*=\s*\[([^\]]+)\]/i);
+  const channelMatch = text.match(/\/hls\/([a-z0-9_-]+)\/master\.m3u8/i);
+  if (!domainPoolMatch?.[1] || !channelMatch?.[1]) return null;
+
   const dm: string[] = [];
-  for (const m of cfgMatch[2].matchAll(/["']([^"']+)["']/g)) {
+  for (const m of domainPoolMatch[1].matchAll(/["']([^"']+)["']/g)) {
     const v = String(m[1] || "").trim();
     if (v) dm.push(v);
   }
-  const ivRaw = Number.parseInt(String(cfgMatch[3] || ""), 10);
-  const iv = Number.isFinite(ivRaw) && ivRaw > 0 ? ivRaw : 1800000;
   if (!dm.length) return null;
+
+  const ch = String(channelMatch[1]).trim();
+  if (!ch) return null;
+
+  const intervalExpr =
+    text.match(/Date\.now\(\)\s*\/\s*([0-9eE+*.\/\-\s]+)/i)?.[1] ||
+    text.match(/Math\.floor\(\s*Date\.now\(\)\s*\/\s*([0-9eE+*.\/\-\s]+)/i)?.[1] ||
+    "";
+  const ivParsed = (() => {
+    const expr = intervalExpr.replace(/\s+/g, "");
+    if (!expr || !/^[0-9eE+*.\/-]+$/.test(expr)) return Number.NaN;
+    if (/^[0-9eE+.-]+$/.test(expr)) return Number(expr);
+
+    const tokens = expr.split(/([*/])/).filter(Boolean);
+    if (!tokens.length || tokens.length % 2 === 0) return Number.NaN;
+    let value = Number(tokens[0]);
+    if (!Number.isFinite(value)) return Number.NaN;
+    for (let i = 1; i < tokens.length; i += 2) {
+      const op = tokens[i];
+      const next = Number(tokens[i + 1]);
+      if (!Number.isFinite(next)) return Number.NaN;
+      if (op === "*") value *= next;
+      else if (op === "/") value /= next;
+      else return Number.NaN;
+    }
+    return value;
+  })();
+  const iv = Number.isFinite(ivParsed) && ivParsed > 0 ? Math.round(ivParsed) : 1800000;
   return { ch, dm: Array.from(new Set(dm)), iv };
 }
 
