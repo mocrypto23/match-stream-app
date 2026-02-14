@@ -5,9 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "node server.js",
-    "start:next": "next start",
-    "scrape": "node scraper.js",
+    "start": "next start",
     "lint": "eslint",
     "cleanup:server-slots": "node scripts/cleanup-server-slot-mismatch.js"
   },
@@ -17,7 +15,6 @@
     "axios": "^1.13.2",
     "cross-fetch": "^4.1.0",
     "dotenv": "^17.2.3",
-    "express": "^5.2.1",
     "hls.js": "^1.6.15",
     "next": "16.1.1",
     "playwright": "^1.57.0",
