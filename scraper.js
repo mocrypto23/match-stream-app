@@ -96,7 +96,7 @@ const LIVEHD = {
 const YALA = {
   dayUrl: {
     yesterday: null,
-    today: "https://www.livekora.vip/today-matches/",
+    today: "http://www.livekora.vip/today-matches/",
     tomorrow: null,
   },
   siteHost: "livekora.vip",
@@ -2679,7 +2679,7 @@ function sanitizeRowBySlotContract(row, { stats = null, stage = "sanitize", matc
     matchKey: matchKey || out.match_key || null,
     stage,
   });
-  out.stream_url_4 = validateServerUrlBySlot(4, out.stream_url_4, {
+  out.stream_url_4 = validateServerUrlBySlot(4, normalizeYalaServer4UrlForPlayback(out.stream_url_4), {
     stats,
     reason: "sanitize_server4",
     matchKey: matchKey || out.match_key || null,
@@ -2798,16 +2798,18 @@ function shouldPreserveExistingRow(row, { allowSiiirFallbackRows = false, dropPr
 }
 
 function preferExistingUrl(slot, newUrl, oldUrl, options = {}) {
+  const normalizedNewUrl = slot === 4 ? normalizeYalaServer4UrlForPlayback(newUrl) : newUrl;
+  const normalizedOldUrl = slot === 4 ? normalizeYalaServer4UrlForPlayback(oldUrl) : oldUrl;
   const baseContext = {
     stats: options.stats || null,
     matchKey: options.matchKey || null,
     stage: options.stage || "merge_prefer",
   };
-  const newCandidate = validateServerUrlBySlot(slot, newUrl, {
+  const newCandidate = validateServerUrlBySlot(slot, normalizedNewUrl, {
     ...baseContext,
     reason: options.reasonNew || `prefer_slot${slot}_new_invalid`,
   });
-  const oldCandidate = validateServerUrlBySlot(slot, oldUrl, {
+  const oldCandidate = validateServerUrlBySlot(slot, normalizedOldUrl, {
     ...baseContext,
     reason: options.reasonOld || `prefer_slot${slot}_old_invalid`,
   });
@@ -3782,6 +3784,26 @@ function deriveYalaFallbackPlayerUrl(rawUrl) {
   return null;
 }
 
+function normalizeYalaServer4UrlForPlayback(rawUrl) {
+  const normalized = normalizeUrl(rawUrl, rawUrl);
+  if (!normalized) return null;
+  try {
+    const u = new URL(normalized);
+    const host = u.hostname.toLowerCase();
+    const shouldForceHttp =
+      host === "livekora.vip" ||
+      host.endsWith(".livekora.vip") ||
+      host === "koooralive.click" ||
+      host.endsWith(".koooralive.click");
+    if (!shouldForceHttp) return normalized;
+    if (u.protocol === "http:") return normalized;
+    u.protocol = "http:";
+    return u.toString();
+  } catch {
+    return normalized;
+  }
+}
+
 async function enrichYalaWithStreams(browser, rows) {
   if (!rows.length) return [];
 
@@ -3839,7 +3861,7 @@ async function enrichYalaWithStreams(browser, rows) {
         if (finalUrl && !looksLikePlayerUrl(finalUrl)) finalUrl = null;
       }
 
-      out[idx] = { ...r, yala_stream_url: finalUrl };
+      out[idx] = { ...r, yala_stream_url: normalizeYalaServer4UrlForPlayback(finalUrl) };
     }
 
     await context.close();
@@ -4403,7 +4425,7 @@ async function startScraping() {
           let direct = deriveYalaFallbackPlayerUrl(raw);
           if (!direct && raw && looksLikePlayerUrl(raw) && !isClearlyNonStreamUrl(raw)) direct = raw;
           if (!direct || !looksLikePlayerUrl(direct)) return null;
-          return { ...r, yala_stream_url: direct };
+          return { ...r, yala_stream_url: normalizeYalaServer4UrlForPlayback(direct) };
         })
         .filter(Boolean);
       yalaDirectRows.push(...directRows);
@@ -4643,6 +4665,7 @@ async function startScraping() {
           }) ||
           null;
       }
+      server4 = normalizeYalaServer4UrlForPlayback(server4);
       if (server4 && !looksLikePlayerUrl(server4)) server4 = null;
       server4 = validateServerUrlBySlot(4, server4, {
         stats: isolationStats,

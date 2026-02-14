@@ -49,6 +49,7 @@ const EXPAND_VARIANTS_CONCURRENCY = 4;
 const PROBE_CONCURRENCY = 4;
 const RESOLVE_RESULT_CACHE_TTL_MS = 75_000;
 const RESOLVE_RESULT_CACHE_MAX = 250;
+const NO_STREAM_SELECTED_SERVER_MESSAGE = "لا يوجد بث في هذا السيرفر لهذه المباراة";
 const HLS_CT = ["application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl"];
 const MEDIA_RE = /\.(?:m3u8|mp4|m4v|mov|webm|mpd|ts)(?:[?#]|$)/i;
 const SEGMENT_FILE_RE = /\.(?:ts|m4s|m4f|cmf|mp4|aac|ac3|ec3|mp3|vtt|webm|key)(?:[?#]|$)/i;
@@ -97,7 +98,7 @@ const STREAM_STRONG_HINTS = [
   "token=",
   "sid=",
 ];
-const PLAYER_PAGE_HINT_RE = /\/albaplayer\/|\/alba\.php|\/playerv2\.php|\/embed\b|\/player\b|\/tv\//i;
+const PLAYER_PAGE_HINT_RE = /\/albaplayer\/|\/alba\.php|\/playerv2\.php|\/embed\b|\/player\b|\/tv\/|\/chtv\/|\/ch\d+\.php(?:[?#]|$)/i;
 const PLAYERV2_CONFIG_RE = /window\.tabsConfig\s*=\s*(\{[\s\S]*?\});/i;
 
 const PLAYERV2_FALLBACK_DOMAINS = [
@@ -658,6 +659,7 @@ function extractPlayableCandidatesFromProxyHtml(html: string, sourceUrl: string)
   for (const m of text.match(/\/api\/embed-proxy\?[^"'`\s<>()]+/gi) || []) add(m);
   for (const m of text.match(/https?:\/\/[^"'`\s<>()]+\.m3u8[^"'`\s<>()]*/gi) || []) add(m);
   for (const m of text.match(/https?:\/\/[^"'`\s<>()]+/gi) || []) add(m);
+  for (const m of extractPlayableUrlsFromPackedEval(text)) add(m);
   return out;
 }
 
@@ -691,6 +693,21 @@ function isLikelyChannelLandingPlayerPageUrl(value?: string | null) {
   }
 }
 
+function isKnownRelayPlayerPageUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!isValidHttpUrl(raw)) return false;
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase();
+    const stream = String(u.searchParams.get("stream") || "").trim();
+    if (host.endsWith("popcdn.day") && /\/go\.php$/i.test(path) && !!stream) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: string) {
   const text = String(html || "")
     .replace(/&amp;/gi, "&")
@@ -699,7 +716,8 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
     .replace(/\\\//g, "/");
   const out: string[] = [];
   const seen = new Set<string>();
-  const isPlayerLike = (url: string) => PLAYER_PAGE_HINT_RE.test(url) || isLikelyChannelLandingPlayerPageUrl(url);
+  const isPlayerLike = (url: string) =>
+    PLAYER_PAGE_HINT_RE.test(url) || isLikelyChannelLandingPlayerPageUrl(url) || isKnownRelayPlayerPageUrl(url);
   const add = (raw: string) => {
     let v = String(raw || "").trim().replace(/[),;]+$/g, "");
     if (v.includes("${")) {
@@ -750,6 +768,79 @@ function dedupeUrls(values: string[]) {
     out.push(value);
   }
   return out;
+}
+
+function escapeRegExp(value: string) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function decodeJsPackedLiteral(raw: string) {
+  return String(raw || "")
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_m, hex: string) => {
+      const code = Number.parseInt(hex, 16);
+      return Number.isFinite(code) ? String.fromCharCode(code) : "";
+    })
+    .replace(/\\x([0-9a-fA-F]{2})/g, (_m, hex: string) => {
+      const code = Number.parseInt(hex, 16);
+      return Number.isFinite(code) ? String.fromCharCode(code) : "";
+    })
+    .replace(/\\'/g, "'")
+    .replace(/\\"/g, "\"")
+    .replace(/\\\\/g, "\\");
+}
+
+function encodePackedIndex(index: number, radix: number) {
+  const digits = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const base = Number.isFinite(radix) ? Math.floor(radix) : 10;
+  if (base >= 2 && base <= 36) return index.toString(base);
+  if (base > 36 && base <= digits.length) {
+    if (index === 0) return "0";
+    let n = index;
+    let out = "";
+    while (n > 0) {
+      out = digits[n % base] + out;
+      n = Math.floor(n / base);
+    }
+    return out;
+  }
+  return index.toString(10);
+}
+
+function unpackDeanEdwardsPacker(packed: string, radix: number, count: number, dictionary: string[]) {
+  let out = String(packed || "");
+  const max = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+  const base = Number.isFinite(radix) ? Math.floor(radix) : 10;
+  for (let i = max - 1; i >= 0; i -= 1) {
+    const replacement = dictionary[i];
+    if (!replacement) continue;
+    const token = encodePackedIndex(i, base);
+    if (!token) continue;
+    out = out.replace(new RegExp(`\\b${escapeRegExp(token)}\\b`, "g"), replacement);
+  }
+  return out;
+}
+
+function extractPlayableUrlsFromPackedEval(html: string) {
+  const out = new Set<string>();
+  const pattern =
+    /eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\(\s*(['"])([\s\S]*?)\1\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(['"])([\s\S]*?)\5\.split\(\s*['"]\|['"]\s*\)/g;
+
+  for (const m of html.matchAll(pattern)) {
+    const packed = decodeJsPackedLiteral(m[2] || "");
+    const radix = Number.parseInt(m[3] || "10", 10);
+    const count = Number.parseInt(m[4] || "0", 10);
+    const dictionary = decodeJsPackedLiteral(m[6] || "").split("|");
+    if (!packed || !Number.isFinite(radix) || !Number.isFinite(count)) continue;
+
+    const unpacked = unpackDeanEdwardsPacker(packed, radix, count, dictionary);
+    for (const urlMatch of unpacked.matchAll(/https?:\/\/[^"'`\s<>()]+/gi)) {
+      const value = String(urlMatch[0] || "").trim();
+      if (!value) continue;
+      out.add(value);
+    }
+  }
+
+  return Array.from(out);
 }
 
 function normalizeHostRoot(hostname: string) {
@@ -1868,7 +1959,7 @@ export default function WatchPage() {
           applyCandidatesPreservingSelection(merged);
           if (merged.length && !disableResolveCache) setCachedResolveCandidates(selectedUrl, merged);
           if (!merged.length) {
-            setResolverError("لا يوجد بث");
+            setResolverError(NO_STREAM_SELECTED_SERVER_MESSAGE);
             scheduleResolveRecovery("resolver-empty");
           } else {
             hadPlayable = true;
@@ -2154,6 +2245,7 @@ export default function WatchPage() {
   const streamStartNotice = streamOpenLabel
     ? `سيبدأ البث في الساعة ${streamOpenLabel} (قبل ساعة المباراة بنصف ساعة)`
     : "سيبدأ البث قبل ساعة المباراة بنصف ساعة";
+  const noStreamLabel = selectedUrl ? NO_STREAM_SELECTED_SERVER_MESSAGE : "لا يوجد بث";
   const home = match?.home_team ?? "الفريق الأول";
   const away = match?.away_team ?? "الفريق الثاني";
 
@@ -2254,7 +2346,7 @@ export default function WatchPage() {
           ) : resolverLoading ? (
             <div className="flex items-center justify-center h-[55vh] min-h-[320px] text-gray-300">جاري تشغيل البث</div>
           ) : (
-            <div className="flex items-center justify-center h-[55vh] min-h-[320px] text-gray-400 p-6 text-center">لا يوجد بث</div>
+            <div className="flex items-center justify-center h-[55vh] min-h-[320px] text-gray-400 p-6 text-center">{noStreamLabel}</div>
           )}
         </div>
 
