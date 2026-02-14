@@ -2328,6 +2328,12 @@ function canonTeamName(v) {
     ["\u0633\u0627\u0646\u062C\u0631\u0645\u0627\u0646", "\u0633\u0627\u0646\u062C\u064A\u0631\u0645\u0627\u0646"],
     ["\u0645\u0627\u0646", "\u0645\u0627\u0646\u0634\u0633\u062A\u0631"],
     ["man", "manchester"],
+    ["\u0628\u064A\u062A\u0631\u0648", "\u0628\u062A\u0631\u0648"],
+    ["\u0627\u062A\u0644\u062A\u064A\u0643\u0648", "\u0627\u062A\u0644\u064A\u062A\u0643\u0648"],
+    ["\u0627\u062A\u0644\u0627\u0646\u062A\u0627", "\u0627\u062A\u0627\u0644\u0627\u0646\u062A\u0627"],
+    ["\u0628\u064A\u062A\u0631\u0648\u0627\u062A\u0644\u062A\u064A\u0643\u0648", "\u0628\u062A\u0631\u0648\u0627\u062A\u0644\u064A\u062A\u0643\u0648"],
+    ["\u0628\u064A\u062A\u0631\u0648\u0627\u062A\u0644\u064A\u062A\u0643\u0648", "\u0628\u062A\u0631\u0648\u0627\u062A\u0644\u064A\u062A\u0643\u0648"],
+    ["\u0628\u062A\u0631\u0648\u0627\u062A\u0644\u062A\u064A\u0643\u0648", "\u0628\u062A\u0631\u0648\u0627\u062A\u0644\u064A\u062A\u0643\u0648"],
   ]);
 
   const removablePrefixes = new Set([
@@ -2487,9 +2493,11 @@ function findYalaFallbackUrl(rows, { matchDay, homeTeam, awayTeam }) {
 }
 
 function keyOfRow(r) {
-  // لو match_key موجود استخدمه (أفضل وأثبت)
+  // Prefer recomputed key so old stored keys with spelling drift don't fork one match into duplicates.
+  const recomputed = keyOfTeams(r?.match_day, r?.home_team, r?.away_team);
+  if (recomputed) return recomputed;
   if (r && r.match_key) return String(r.match_key);
-  return keyOfTeams(r.match_day, r.home_team, r.away_team);
+  return "";
 }
 
 
@@ -4881,3 +4889,4 @@ async function startScraping() {
 }
 
 startScraping();
+

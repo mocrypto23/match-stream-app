@@ -39,7 +39,7 @@ const PLAYER_LOADING_OVERLAY_DELAY_MS = 600;
 const DEFAULT_PLAYER_QUALITY_HEIGHT = 480;
 const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const RESOLVE_COOLDOWN_MS = 1500;
-const CANDIDATE_PROBE_TIMEOUT_MS = 5000;
+const CANDIDATE_PROBE_TIMEOUT_MS = 6500;
 const FAST_PHASE_PROBE_TIMEOUT_MS = 2200;
 const FAST_PHASE_MAX_PLAYER_PAGES = 2;
 const FAST_PHASE_MAX_DEEP_CANDIDATES = 4;
@@ -157,6 +157,10 @@ function setCachedResolveCandidates(sourceUrl: string, candidates: string[]) {
     candidates: cleaned,
   });
   trimResolveResultCache(now);
+}
+
+function clearCachedResolveCandidates(sourceUrl: string) {
+  resolveResultCache.delete(resolveResultCacheKey(sourceUrl));
 }
 
 function isValidHttpUrl(value: string) {
@@ -632,6 +636,8 @@ function extractPlayableCandidatesFromProxyHtml(html: string, sourceUrl: string)
     .replace(/\\\//g, "/");
   const out: string[] = [];
   const seen = new Set<string>();
+  const isPlayableLike = (value: string) =>
+    isStrongPlayableStreamUrl(value) || isLikelyLivePhpEndpointUrl(value);
   const add = (raw: string) => {
     let v = String(raw || "").trim().replace(/[),;]+$/g, "");
     if (v.includes("${")) {
@@ -641,14 +647,14 @@ function extractPlayableCandidatesFromProxyHtml(html: string, sourceUrl: string)
     if (!v) return;
     if (v.startsWith("/api/embed-proxy?")) {
       const target = getProxyTargetUrl(v);
-      if (!target || !isStrongPlayableStreamUrl(target)) return;
+      if (!target || !isPlayableLike(target)) return;
       const key = canonicalizeUrl(v);
       if (!key || seen.has(key)) return;
       seen.add(key);
       out.push(v);
       return;
     }
-    if (!isStrongPlayableStreamUrl(v)) return;
+    if (!isPlayableLike(v)) return;
     const proxied = toEmbedProxyUrl(v, sourceUrl);
     if (!proxied) return;
     const key = canonicalizeUrl(proxied);
@@ -660,6 +666,7 @@ function extractPlayableCandidatesFromProxyHtml(html: string, sourceUrl: string)
   for (const m of text.match(/https?:\/\/[^"'`\s<>()]+\.m3u8[^"'`\s<>()]*/gi) || []) add(m);
   for (const m of text.match(/https?:\/\/[^"'`\s<>()]+/gi) || []) add(m);
   for (const m of extractPlayableUrlsFromPackedEval(text)) add(m);
+  for (const m of extractBase64DecodedUrlsFromHtml(text, sourceUrl)) add(m);
   return out;
 }
 
@@ -708,6 +715,104 @@ function isKnownRelayPlayerPageUrl(value?: string | null) {
   }
 }
 
+function isKnownEmbeddedLivePhpPlayerUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!isValidHttpUrl(raw)) return false;
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase().replace(/\/+$/, "");
+    const knownHost =
+      host.endsWith("lifekora.com") ||
+      host.endsWith("taktikora.live") ||
+      host.endsWith("koora-stream.top") ||
+      host.endsWith("dynamicsafari.net");
+    if (!knownHost) return false;
+    return /\/(?:splayer\/)?live\d+\.php$/i.test(path) || /\/chtv\/ch\d+\.php$/i.test(path);
+  } catch {
+    return false;
+  }
+}
+
+function isLikelyLivePhpEndpointUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!isValidHttpUrl(raw) || isClearlyNonStreamUrl(raw)) return false;
+  try {
+    const u = new URL(raw);
+    const path = u.pathname.toLowerCase();
+    const hasPlay = u.searchParams.has("play");
+    const hasStream = u.searchParams.has("stream");
+    if (/\/live\d+\.php$/i.test(path) && (hasPlay || hasStream)) return true;
+    if (/\/(?:stream|live)\.php$/i.test(path) && (hasPlay || hasStream)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function decodeBase64Literal(raw: string) {
+  let value = String(raw || "").trim();
+  if (!value) return "";
+  value = value.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
+  if (!/^[A-Za-z0-9+/=]+$/.test(value)) return "";
+  if (value.length % 4) value = `${value}${"=".repeat(4 - (value.length % 4))}`;
+  try {
+    return atob(value);
+  } catch {
+    return "";
+  }
+}
+
+function extractBase64DecodedUrlsFromHtml(html: string, sourceUrl: string) {
+  const text = normalizeHtmlForScan(html)
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#39;/gi, "'")
+    .replace(/\\(["'])/g, "$1");
+  const tokens = new Set<string>();
+  const addToken = (raw: string) => {
+    const v = String(raw || "").trim();
+    if (!v || v.length < 8 || v.length > 4096) return;
+    tokens.add(v);
+  };
+
+  for (const m of text.matchAll(/atob\(\s*(['"])([A-Za-z0-9+/_=-]{8,})\1\s*\)/gi)) addToken(m[2] || "");
+  for (const m of text.matchAll(/\b(?:encoded(?:url|src)?|base64(?:url|src)?|b64(?:url|src)?)\b\s*[:=]\s*\\?(['"])([A-Za-z0-9+/_=-]{8,})\\?\1/gi))
+    addToken(m[2] || "");
+
+  const out = new Set<string>();
+  const addResolved = (raw: string) => {
+    const value = String(raw || "").trim();
+    if (!value) return;
+    if (isValidHttpUrl(value)) {
+      out.add(value);
+      return;
+    }
+    const looksRelativePhp = /^(?:\/|\.\/|\.\.\/|[a-z0-9_.-]+\/|[a-z0-9_.-]+\.php)/i.test(value);
+    const looksPlayableHint = /\.php/i.test(value) || /[?&](?:play|stream)=/i.test(value);
+    if (!looksRelativePhp || !looksPlayableHint) return;
+    try {
+      const abs = new URL(value, sourceUrl).toString();
+      if (isValidHttpUrl(abs)) out.add(abs);
+    } catch { }
+  };
+
+  for (const token of tokens) {
+    const decoded = decodeBase64Literal(token);
+    if (!decoded) continue;
+    const normalized = normalizeHtmlForScan(decoded)
+      .replace(/&quot;/gi, "\"")
+      .replace(/&#39;/gi, "'")
+      .replace(/\\(["'])/g, "$1");
+    for (const m of normalized.match(/https?:\/\/[^"'`\s<>()]+/gi) || []) addResolved(m);
+    for (const m of normalized.match(/(?:^|[\s"'`=])((?:\/|\.\/|\.\.\/)?[a-z0-9_.-]+(?:\/[a-z0-9_.-]+)*\.php(?:\?[^"'`\s<>()]+)?)/gi) || []) {
+      const rel = String(m || "").replace(/^[\s"'`=]+/, "");
+      addResolved(rel);
+    }
+  }
+
+  return Array.from(out);
+}
+
 function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: string) {
   const text = String(html || "")
     .replace(/&amp;/gi, "&")
@@ -717,7 +822,10 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
   const out: string[] = [];
   const seen = new Set<string>();
   const isPlayerLike = (url: string) =>
-    PLAYER_PAGE_HINT_RE.test(url) || isLikelyChannelLandingPlayerPageUrl(url) || isKnownRelayPlayerPageUrl(url);
+    PLAYER_PAGE_HINT_RE.test(url) ||
+    isLikelyChannelLandingPlayerPageUrl(url) ||
+    isKnownRelayPlayerPageUrl(url) ||
+    isKnownEmbeddedLivePhpPlayerUrl(url);
   const add = (raw: string) => {
     let v = String(raw || "").trim().replace(/[),;]+$/g, "");
     if (v.includes("${")) {
@@ -729,7 +837,7 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
     if (v.startsWith("/api/embed-proxy?")) {
       const target = getProxyTargetUrl(v);
       if (!target || !isValidHttpUrl(target)) return;
-      if (isClearlyNonStreamUrl(target) || isStrongPlayableStreamUrl(target)) return;
+      if (isClearlyNonStreamUrl(target) || isStrongPlayableStreamUrl(target) || isLikelyLivePhpEndpointUrl(target)) return;
       if (!isPlayerLike(target)) return;
       const key = canonicalizeUrl(v);
       if (!key || seen.has(key)) return;
@@ -739,7 +847,7 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
     }
 
     if (!isValidHttpUrl(v)) return;
-    if (isClearlyNonStreamUrl(v) || isStrongPlayableStreamUrl(v)) return;
+    if (isClearlyNonStreamUrl(v) || isStrongPlayableStreamUrl(v) || isLikelyLivePhpEndpointUrl(v)) return;
     if (!isPlayerLike(v)) return;
     const proxied = toEmbedProxyUrl(v, sourceUrl);
     if (!proxied) return;
@@ -755,6 +863,7 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
     add(m);
   for (const m of text.match(/https?:\/\/[^\s"'`<>()]+\/playerv2\.php\?[^"'`\s<>]*\$\{matchId\}[^"'`\s<>]*/gi) || [])
     add(m);
+  for (const m of extractBase64DecodedUrlsFromHtml(text, sourceUrl)) add(m);
   return out;
 }
 
@@ -1167,6 +1276,7 @@ async function resolveCandidatesForServer(
     onBatchCandidates?: (batch: string[], phase: ResolveBatchPhase) => void;
     parallelChildConcurrency?: number;
     fetchTimeoutMs?: number;
+    allowSamePathServVariants?: boolean;
   }
 ) {
   const maxPlayerPages = opts?.maxPlayerPages ?? 6;
@@ -1174,12 +1284,13 @@ async function resolveCandidatesForServer(
   const maxPlayerv2Pool = opts?.maxPlayerv2Pool ?? 6;
   const parallelChildConcurrency = opts?.parallelChildConcurrency ?? RESOLVE_CHILD_CONCURRENCY;
   const fetchTimeoutMs = opts?.fetchTimeoutMs ?? CANDIDATE_PROBE_TIMEOUT_MS;
+  const allowSamePathServVariants = opts?.allowSamePathServVariants ?? false;
   const sourceServ = getServFromUrl(sourceUrl);
   const sourcePathKey = normalizePathKey(sourceUrl);
   const normalizePlayableBatch = (input: string[]) =>
     dedupeUrls(input).filter((url) => {
       const target = url.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(url) || "" : url;
-      return isStrongPlayableStreamUrl(target);
+      return isStrongPlayableStreamUrl(target) || isLikelyLivePhpEndpointUrl(target);
     });
   const emitBatch = (batch: string[], phase: ResolveBatchPhase) => {
     const normalized = normalizePlayableBatch(batch);
@@ -1202,7 +1313,7 @@ async function resolveCandidatesForServer(
     return { res, ct };
   };
 
-  if (isStrongPlayableStreamUrl(sourceUrl)) {
+  if (isStrongPlayableStreamUrl(sourceUrl) || isLikelyLivePhpEndpointUrl(sourceUrl)) {
     const one = toEmbedProxyUrl(sourceUrl, sourceUrl);
     if (one) emitBatch([one], "fast");
     return one ? [one] : [];
@@ -1234,14 +1345,14 @@ async function resolveCandidatesForServer(
       return true;
     }
 
-    if (targetServ !== null && normalizePathKey(target) === sourcePathKey) {
+    if (!allowSamePathServVariants && targetServ !== null && normalizePathKey(target) === sourcePathKey) {
       return false;
     }
     return true;
   };
   const playerPages = extractPlayerPageCandidatesFromProxyHtml(html, sourceUrl);
-  const maxPlayerCrawlDepth = 3;
-  const maxCrawledPlayerPages = Math.max(maxPlayerPages, maxPlayerPages * 3);
+  const maxPlayerCrawlDepth = 5;
+  const maxCrawledPlayerPages = Math.max(maxPlayerPages, maxPlayerPages * 6);
   const deepList: string[] = [];
   const rollingDeepList: string[] = [];
   const playerv2HtmlPool: Array<{ pageUrl: string; html: string }> = [];
@@ -1878,11 +1989,11 @@ export default function WatchPage() {
         return;
       }
       const seedCandidates = (() => {
-        if (!isStrongPlayableStreamUrl(selectedUrl)) return [] as string[];
+        if (!isStrongPlayableStreamUrl(selectedUrl) && !isLikelyLivePhpEndpointUrl(selectedUrl)) return [] as string[];
         const proxied = toEmbedProxyUrl(selectedUrl, selectedUrl);
         return proxied ? [proxied] : [];
       })();
-      const disableResolveCache = isPlayerv2LikeUrl(selectedUrl);
+      const disableResolveCache = selectedServer === 3 || isPlayerv2LikeUrl(selectedUrl);
       const cachedCandidates = disableResolveCache ? [] : getCachedResolveCandidates(selectedUrl);
       const initialCandidates = dedupeUrls([...cachedCandidates, ...seedCandidates]);
       let hadPlayable = initialCandidates.length > 0;
@@ -1903,6 +2014,7 @@ export default function WatchPage() {
         const fastList = await resolveCandidatesForServer(selectedUrl, controller.signal, {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
+          allowSamePathServVariants: selectedServer === 3,
           maxPlayerPages: FAST_PHASE_MAX_PLAYER_PAGES,
           maxDeepCandidates: FAST_PHASE_MAX_DEEP_CANDIDATES,
           maxPlayerv2Pool: FAST_PHASE_MAX_PLAYERV2_POOL,
@@ -1929,6 +2041,7 @@ export default function WatchPage() {
         const finalList = await resolveCandidatesForServer(selectedUrl, controller.signal, {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
+          allowSamePathServVariants: selectedServer === 3,
           onBatchCandidates: (batch, phase) => {
             if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
             mergeCandidates(batch);
@@ -1946,21 +2059,23 @@ export default function WatchPage() {
         });
         if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
         if (!cancel) {
-          const mergedRaw = dedupeUrls([...fastMerged, ...playableList]);
+          const mergedRaw = dedupeUrls([...candidatesRef.current, ...fastMerged, ...finalList, ...playableList]);
           const verified = await filterPlayableCandidates(mergedRaw, {
             signal: controller.signal,
             timeoutMs: CANDIDATE_PROBE_TIMEOUT_MS,
-            maxChecks: Math.min(24, mergedRaw.length),
+            maxChecks: Math.min(36, mergedRaw.length),
             concurrency: Math.min(3, PROBE_CONCURRENCY),
             pushDiag,
           });
-          const merged = verified.length ? verified : mergedRaw;
+          const merged = verified;
           if (mergedRaw.length) pushDiag(`probe ok ${merged.length}/${mergedRaw.length}`);
           applyCandidatesPreservingSelection(merged);
           if (merged.length && !disableResolveCache) setCachedResolveCandidates(selectedUrl, merged);
           if (!merged.length) {
+            clearCachedResolveCandidates(selectedUrl);
             setResolverError(NO_STREAM_SELECTED_SERVER_MESSAGE);
-            scheduleResolveRecovery("resolver-empty");
+            if (selectedServer !== 3) scheduleResolveRecovery("resolver-empty");
+            else resetRecoveryState();
           } else {
             hadPlayable = true;
             setPlayerError(null);
@@ -1971,7 +2086,8 @@ export default function WatchPage() {
         if (!cancel && !(e instanceof Error && e.name === "AbortError")) {
           if (!hadPlayable) {
             setResolverError(e instanceof Error ? e.message : "فشل استخراج المصادر.");
-            scheduleResolveRecovery("resolver-error");
+            if (selectedServer !== 3) scheduleResolveRecovery("resolver-error");
+            else resetRecoveryState();
           } else {
             pushDiag(`resolve background error: ${e instanceof Error ? e.message : String(e)}`);
           }
@@ -1990,6 +2106,7 @@ export default function WatchPage() {
     };
   }, [
     selectedUrl,
+    selectedServer,
     shouldBlockStream,
     pushDiag,
     resolveRevision,
@@ -2069,7 +2186,13 @@ export default function WatchPage() {
         setPlayerError(`تعثر المصدر الحالي (${reason})، جاري التحويل تلقائيًا للمصدر التالي.`);
       } else {
         setPlayerError("فشل تشغيل كل مصادر HLS الداخلية.");
-        scheduleResolveRecovery(`player-exhausted:${reason}`, true);
+        if (selectedServer === 3) {
+          applyCandidatesPreservingSelection([]);
+          setResolverError(NO_STREAM_SELECTED_SERVER_MESSAGE);
+          resetRecoveryState();
+        } else {
+          scheduleResolveRecovery(`player-exhausted:${reason}`, true);
+        }
       }
       hidePlayerLoading();
     };
@@ -2234,8 +2357,11 @@ export default function WatchPage() {
   }, [
     selectedHlsUrl,
     selectedCandidate,
+    selectedServer,
     shouldBlockStream,
     pushDiag,
+    applyCandidatesPreservingSelection,
+    setResolverError,
     scheduleResolveRecovery,
     resetRecoveryState,
   ]);
