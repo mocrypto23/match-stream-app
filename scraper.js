@@ -4861,7 +4861,7 @@ async function startScraping() {
     if (rpcRes.error) {
       console.error("❌ RPC Error:", rpcRes.error.message);
       if (DIAG) diagWrite("rpc_error.txt", rpcRes.error.message);
-      return;
+      throw new Error(`RPC Error: ${rpcRes.error.message}`);
     }
 
     const postRpc = await backfillDynamicMatchFields(mergedRows);
@@ -4879,6 +4879,7 @@ async function startScraping() {
       await page.screenshot({ path: "debug.png", fullPage: true });
       console.log("🧩 تم حفظ debug.png لفحص الصفحة.");
     } catch { }
+    throw err;
   } finally {
     try {
       await page.close();
@@ -4888,5 +4889,17 @@ async function startScraping() {
   }
 }
 
-startScraping();
+module.exports = {
+  startScraping,
+};
+
+if (require.main === module) {
+  startScraping().catch((err) => {
+    console.error("scraper exit:", err?.message || err);
+    process.exitCode = 1;
+  });
+}
+
+
+
 

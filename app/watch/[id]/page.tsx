@@ -2067,7 +2067,7 @@ export default function WatchPage() {
             concurrency: Math.min(3, PROBE_CONCURRENCY),
             pushDiag,
           });
-          const merged = verified;
+          const merged = verified.length ? verified : (selectedServer === 3 ? mergedRaw : []);
           if (mergedRaw.length) pushDiag(`probe ok ${merged.length}/${mergedRaw.length}`);
           applyCandidatesPreservingSelection(merged);
           if (merged.length && !disableResolveCache) setCachedResolveCandidates(selectedUrl, merged);
