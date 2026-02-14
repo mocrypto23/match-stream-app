@@ -1084,6 +1084,154 @@ function convertAyFallbackRowsToListRows(rows) {
   }));
 }
 
+function dayKeyFromMatchDay(matchDay) {
+  const day = String(matchDay || "").trim();
+  if (!day) return null;
+  if (day === matchDayFromKey("yesterday")) return "yesterday";
+  if (day === matchDayFromKey("today")) return "today";
+  if (day === matchDayFromKey("tomorrow")) return "tomorrow";
+  return null;
+}
+
+function toScheduleSeedRow(row, { sourceName = "unknown", dayKeyFallback = null, matchUrlField = "match_url" } = {}) {
+  if (!row || typeof row !== "object") return null;
+
+  const homeTeam = normalizeSpaces(row.home_team || "");
+  const awayTeam = normalizeSpaces(row.away_team || "");
+  if (!homeTeam || !awayTeam) return null;
+
+  const rawMatchUrl = row[matchUrlField] || row.match_url || row.match_page_url || row.article_url || null;
+  const matchUrl = rawMatchUrl ? normalizeUrl(rawMatchUrl, rawMatchUrl) || null : null;
+
+  const dataStart = row.data_start || row.match_start || null;
+  const iso = toIsoFromDataStart(dataStart);
+  const matchDay = row.match_day || matchDayFromKey(dayKeyFallback) || cairoDayFromIso(iso);
+  if (!matchDay) return null;
+
+  const statusKeyRaw = String(row.status_key_dom || row.status_key || "unknown").trim().toLowerCase();
+  const statusKey = statusKeyRaw || "unknown";
+
+  return {
+    home_team: homeTeam,
+    away_team: awayTeam,
+    data_start: dataStart || null,
+    time_text: row.time_text || null,
+    status_text: row.status_text || null,
+    status_key_dom: statusKey,
+    result_visibility: row.result_visibility || "unknown",
+    has_score_hint: !!row.has_score_hint || (row.home_score_raw !== null && row.away_score_raw !== null),
+    home_logo: row.home_logo || null,
+    away_logo: row.away_logo || null,
+    match_url: matchUrl,
+    home_score_raw: row.home_score_raw ?? null,
+    away_score_raw: row.away_score_raw ?? null,
+    match_day: matchDay,
+    _day_key: dayKeyFallback || dayKeyFromMatchDay(matchDay),
+    _seed_source: sourceName,
+  };
+}
+
+function mergeScheduleSeedRow(baseRow, patchRow) {
+  const out = { ...baseRow };
+  let changed = false;
+
+  const fill = (field, predicate = (v) => !!v) => {
+    if (predicate(out[field])) return;
+    if (!predicate(patchRow[field])) return;
+    out[field] = patchRow[field];
+    changed = true;
+  };
+
+  fill("match_url");
+  fill("data_start");
+  fill("time_text");
+  fill("status_text");
+  fill("home_logo");
+  fill("away_logo");
+  fill("_day_key");
+
+  if ((!out.status_key_dom || out.status_key_dom === "unknown") && patchRow.status_key_dom && patchRow.status_key_dom !== "unknown") {
+    out.status_key_dom = patchRow.status_key_dom;
+    changed = true;
+  }
+  if (!out.has_score_hint && patchRow.has_score_hint) {
+    out.has_score_hint = true;
+    changed = true;
+  }
+  if ((out.home_score_raw === null || out.home_score_raw === undefined) && patchRow.home_score_raw !== null && patchRow.home_score_raw !== undefined) {
+    out.home_score_raw = patchRow.home_score_raw;
+    changed = true;
+  }
+  if ((out.away_score_raw === null || out.away_score_raw === undefined) && patchRow.away_score_raw !== null && patchRow.away_score_raw !== undefined) {
+    out.away_score_raw = patchRow.away_score_raw;
+    changed = true;
+  }
+
+  return { row: out, changed };
+}
+
+function appendScheduleSeedRows(seedMap, rows, options = {}) {
+  const stats = {
+    source: options.sourceName || "unknown",
+    input: Array.isArray(rows) ? rows.length : 0,
+    added: 0,
+    enriched: 0,
+  };
+
+  if (!Array.isArray(rows) || !rows.length) return stats;
+
+  for (const row of rows) {
+    const seed = toScheduleSeedRow(row, options);
+    if (!seed) continue;
+
+    const key = keyOfTeams(seed.match_day, seed.home_team, seed.away_team);
+    if (!key) continue;
+
+    const existing = seedMap.get(key);
+    if (!existing) {
+      seedMap.set(key, seed);
+      stats.added += 1;
+      continue;
+    }
+
+    const merged = mergeScheduleSeedRow(existing, seed);
+    seedMap.set(key, merged.row);
+    if (merged.changed) stats.enriched += 1;
+  }
+
+  return stats;
+}
+
+function buildScheduleSeedRows({
+  primaryRows = [],
+  siiirRows = [],
+  livehdRows = [],
+  livekoraRows = [],
+  tskoraRows = [],
+  onekoraRows = [],
+} = {}) {
+  const seedMap = new Map();
+  const stats = [];
+
+  stats.push(appendScheduleSeedRows(seedMap, primaryRows, { sourceName: "bein" }));
+  stats.push(appendScheduleSeedRows(seedMap, siiirRows, { sourceName: "siiir", matchUrlField: "match_page_url" }));
+  stats.push(appendScheduleSeedRows(seedMap, livehdRows, { sourceName: "livehd", dayKeyFallback: "today" }));
+  stats.push(appendScheduleSeedRows(seedMap, livekoraRows, { sourceName: "livekora", dayKeyFallback: "today" }));
+  stats.push(appendScheduleSeedRows(seedMap, tskoraRows, { sourceName: "tskora" }));
+  stats.push(
+    appendScheduleSeedRows(seedMap, onekoraRows, {
+      sourceName: "onekora",
+      dayKeyFallback: "today",
+      matchUrlField: "article_url",
+    })
+  );
+
+  return {
+    rows: Array.from(seedMap.values()),
+    stats,
+  };
+}
+
 // ===================== Scrape List (bein-live) =====================
 async function scrapeOneDay(page, dayKey, url) {
   console.log(`\n🔎 سحب: ${dayKey} => ${url}`);
@@ -4104,12 +4252,10 @@ async function startScraping() {
     }
 
     if (!all.length) {
-      console.log("⚠️ لم يتم العثور على مباريات.");
-      if (DIAG) diagWrite("summary.json", JSON.stringify({ note: "no matches found" }, null, 2));
-      return;
+      console.warn("[warn] Primary schedule source returned 0 rows. Continuing with fallback schedule sources.");
     }
 
-    const enriched = await enrichWithDeepLinks(browser, all);
+    const enriched = all.length ? await enrichWithDeepLinks(browser, all) : [];
 
     // 2) SIIIR lists + resolve iframe src
     const siiirListContext = await browser.newContext({
@@ -4175,6 +4321,7 @@ async function startScraping() {
 
     // 4) LIVEKORA lists + resolve stream url (Server 4)
     let yalaEnriched = [];
+    const yalaAll = [];
     const yalaDirectRows = [];
     const yalaDirectMap = new Map();
     const yalaMap = new Map();
@@ -4191,7 +4338,6 @@ async function startScraping() {
       const yalaListPage = await yalaListContext.newPage();
       await applyAntiAds(yalaListContext, yalaListPage);
 
-      const yalaAll = [];
       for (const d of DAYS) {
         const dayUrl = YALA.dayUrl[d.key];
         if (!dayUrl) continue;
@@ -4308,11 +4454,38 @@ async function startScraping() {
       if (!oneKoraMap.has(k)) oneKoraMap.set(k, r.onekora_stream_url);
     }
 
-    // 7) Normalize bein-live rows + attach servers 2..7
+    const { rows: scheduleSeedRows, stats: scheduleSeedStats } = buildScheduleSeedRows({
+      primaryRows: enriched,
+      siiirRows: siiirAll,
+      livehdRows,
+      livekoraRows: yalaAll,
+      tskoraRows: tskoraAll,
+      onekoraRows: oneKoraEnriched,
+    });
+
+    if (!scheduleSeedRows.length) {
+      console.log("⚠️ no schedule rows could be built from any source.");
+      if (DIAG) {
+        diagWrite(
+          "summary.json",
+          JSON.stringify(
+            {
+              note: "no schedule rows from all sources",
+              schedule_seed_stats: scheduleSeedStats,
+            },
+            null,
+            2
+          )
+        );
+      }
+      return;
+    }
+
+    // 7) Normalize schedule seed rows + attach servers 2..7
     const normalizedByKey = new Map();
-    for (const m of enriched) {
+    for (const m of scheduleSeedRows) {
       const isoFromAttr = toIsoFromDataStart(m.data_start);
-      const match_day = matchDayFromKey(m._day_key) || cairoDayFromIso(isoFromAttr);
+      const match_day = m.match_day || matchDayFromKey(m._day_key) || cairoDayFromIso(isoFromAttr);
       const match_start = isoFromAttr || null;
 
       const statusTextRaw = String(m.deep_status_text || m.status_text || "").trim();
@@ -4517,6 +4690,9 @@ async function startScraping() {
             daysToRefresh,
             count: mergedRows.length,
             used_primary_siiir_fallback: usedPrimarySiiirFallback,
+            seed_rows_count: scheduleSeedRows.length,
+            seed_source_stats: scheduleSeedStats,
+            seed_primary_rows_count: enriched.length,
             siiir_count: siiirEnriched.length,
             livehd_count: livehdEnriched.length,
             yala_count: yalaEnriched.length,
@@ -4539,6 +4715,7 @@ async function startScraping() {
     console.log(`📌 أيام التحديث: ${daysToRefresh.join(" , ")}`);
     console.log(`⬆️ صفوف نهائية بعد الدمج: ${mergedRows.length}`);
     console.log(`🟣 primary siiir fallback used: ${usedPrimarySiiirFallback}`);
+    console.log("📍 schedule seed sources:", scheduleSeedStats);
     console.log("🧱 isolation counters:", {
       isolation_reject_server2: isolationStats.isolation_reject_server2,
       isolation_reject_server3: isolationStats.isolation_reject_server3,
@@ -4602,5 +4779,3 @@ async function startScraping() {
 }
 
 startScraping();
-
-
