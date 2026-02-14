@@ -4,6 +4,8 @@ on:
   schedule:
    - cron: "3/5 * * * *"
   workflow_dispatch:
+  repository_dispatch:
+    types: [run_my_scraper]
 
 concurrency:
   group: scrape-matches
@@ -57,6 +59,7 @@ jobs:
         run: node scraper.js
 
       - name: Trigger on-demand revalidation
+        continue-on-error: true
         env:
           SITE_URL: ${{ secrets.SITE_URL }}
           REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
@@ -88,6 +91,7 @@ jobs:
 
       - name: Diagnose Supabase rows (today)
         if: always()
+        continue-on-error: true
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -96,6 +100,7 @@ jobs:
 
       - name: Probe site rendering (runner)
         if: always()
+        continue-on-error: true
         env:
           HEADLESS: 1
           TZ: Africa/Cairo
