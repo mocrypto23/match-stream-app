@@ -6,7 +6,7 @@ const port = Number.parseInt(process.env.PORT || "8080", 10);
 
 let activeRun = null;
 
-app.get("/", async (_req, res) => {
+async function triggerScraper(_req, res) {
   if (activeRun) {
     return res.status(200).send("Scraper is already running.");
   }
@@ -26,7 +26,13 @@ app.get("/", async (_req, res) => {
     const message = err?.message || String(err);
     return res.status(500).send(`Scraper failed: ${message}`);
   }
-});
+}
+
+// Cloud Scheduler commonly calls POST, while manual checks use GET.
+app.get("/", triggerScraper);
+app.post("/", triggerScraper);
+app.get("/run", triggerScraper);
+app.post("/run", triggerScraper);
 
 app.get("/healthz", (_req, res) => {
   res.status(200).send("ok");
