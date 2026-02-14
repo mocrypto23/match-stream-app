@@ -1,8 +1,6 @@
 name: Scrape matches (15m)
 
 on:
-  schedule:
-   - cron: "3/5 * * * *"
   workflow_dispatch:
   repository_dispatch:
     types: [run_my_scraper]
