@@ -2755,8 +2755,27 @@ function collectLivekoraLeakSamples(rows, { limit = 6 } = {}) {
   return out;
 }
 
-function shouldPreserveExistingRow(row, { allowSiiirFallbackRows = false } = {}) {
+function hasAnyBackupServerUrl(row) {
+  if (!row || typeof row !== "object") return false;
+  return !!(
+    normalizeUrl(row.stream_url_2, row.stream_url_2) ||
+    normalizeUrl(row.stream_url_3, row.stream_url_3) ||
+    normalizeUrl(row.stream_url_4, row.stream_url_4) ||
+    normalizeUrl(row.stream_url_5, row.stream_url_5) ||
+    normalizeUrl(row.stream_url_6, row.stream_url_6)
+  );
+}
+
+function isPrimaryOnlyRow(row) {
+  if (!row || typeof row !== "object") return false;
+  const primary = normalizeUrl(row.stream_url, row.stream_url);
+  if (!primary) return false;
+  return !hasAnyBackupServerUrl(row);
+}
+
+function shouldPreserveExistingRow(row, { allowSiiirFallbackRows = false, dropPrimaryOnlyRows = false } = {}) {
   if (!row) return false;
+  if (dropPrimaryOnlyRows && isPrimaryOnlyRow(row)) return false;
   if (isBeinMatchPageUrl(row.stream_url)) return true;
   if (allowSiiirFallbackRows && isSiiirUrl(row.stream_url)) return true;
   return false;
@@ -2843,7 +2862,13 @@ async function fetchExistingForDays(days) {
   return Array.isArray(data) ? data : [];
 }
 
-function mergeWithExisting({ newRows, existingRows, allowSiiirFallbackRows = false, isolationStats = null }) {
+function mergeWithExisting({
+  newRows,
+  existingRows,
+  allowSiiirFallbackRows = false,
+  dropPrimaryOnlyRows = false,
+  isolationStats = null,
+}) {
   const nowMs = Date.now();
 
   const existingMap = new Map();
@@ -2963,14 +2988,16 @@ function mergeWithExisting({ newRows, existingRows, allowSiiirFallbackRows = fal
     if (isWeakStreamUrl(out.stream_url_6)) out.stream_url_6 = null;
     if (isWeakStreamUrl(out.stream_url_7)) out.stream_url_7 = null;
 
-    mergedMap.set(
-      k,
-      sanitizeRowBySlotContract(out, {
-        stats: isolationStats,
-        stage: "merge_row_finalize",
-        matchKey: k,
-      })
-    );
+    const sanitizedOut = sanitizeRowBySlotContract(out, {
+      stats: isolationStats,
+      stage: "merge_row_finalize",
+      matchKey: k,
+    });
+    if (dropPrimaryOnlyRows && isPrimaryOnlyRow(sanitizedOut)) {
+      console.log(`[merge] dropping primary-only row while server1 degraded: ${sanitizedOut.home_team} vs ${sanitizedOut.away_team}`);
+      continue;
+    }
+    mergedMap.set(k, sanitizedOut);
   }
 
   // 2. Preserve Existing Rows (Fix for disappearing matches)
@@ -2978,7 +3005,7 @@ function mergeWithExisting({ newRows, existingRows, allowSiiirFallbackRows = fal
     const k = keyOfRow(r);
     if (mergedMap.has(k)) continue;
     const preserved = { ...r };
-    if (!shouldPreserveExistingRow(preserved, { allowSiiirFallbackRows })) {
+    if (!shouldPreserveExistingRow(preserved, { allowSiiirFallbackRows, dropPrimaryOnlyRows })) {
       console.log(`[merge] dropping stale external row: ${preserved.home_team} vs ${preserved.away_team}`);
       continue;
     }
@@ -3004,14 +3031,16 @@ function mergeWithExisting({ newRows, existingRows, allowSiiirFallbackRows = fal
     }
     if (isLegacyServer4YalaUrl(preserved.stream_url_4)) preserved.stream_url_4 = null;
     console.log(`[merge] preserving missed match from DB: ${preserved.home_team} vs ${preserved.away_team}`);
-    mergedMap.set(
-      k,
-      sanitizeRowBySlotContract(preserved, {
-        stats: isolationStats,
-        stage: "merge_preserved_row_finalize",
-        matchKey: k,
-      })
-    );
+    const sanitizedPreserved = sanitizeRowBySlotContract(preserved, {
+      stats: isolationStats,
+      stage: "merge_preserved_row_finalize",
+      matchKey: k,
+    });
+    if (dropPrimaryOnlyRows && isPrimaryOnlyRow(sanitizedPreserved)) {
+      console.log(`[merge] dropping primary-only preserved row while server1 degraded: ${sanitizedPreserved.home_team} vs ${sanitizedPreserved.away_team}`);
+      continue;
+    }
+    mergedMap.set(k, sanitizedPreserved);
   }
 
   return { mergedRows: Array.from(mergedMap.values()) };
@@ -4661,21 +4690,51 @@ async function startScraping() {
     }
 
     const daysToRefresh = [matchDayFromKey("yesterday"), matchDayFromKey("today"), matchDayFromKey("tomorrow")].filter(Boolean);
+    const primaryServer1Degraded = usedPrimarySiiirFallback || !all.length;
 
     const existing = await fetchExistingForDays(daysToRefresh);
     const { mergedRows: mergedRowsRaw } = mergeWithExisting({
       newRows: finalRows,
       existingRows: existing,
       allowSiiirFallbackRows: usedPrimarySiiirFallback,
+      dropPrimaryOnlyRows: primaryServer1Degraded,
       isolationStats,
     });
-    const mergedRows = mergedRowsRaw.map((row) =>
+    let mergedRows = mergedRowsRaw.map((row) =>
       sanitizeRowBySlotContract(row, {
         stats: isolationStats,
         stage: "post_merge_pre_rpc",
         matchKey: row?.match_key || null,
       })
     );
+    let droppedPrimaryOnlyRows = 0;
+    if (primaryServer1Degraded) {
+      const before = mergedRows.length;
+      mergedRows = mergedRows.filter((row) => !isPrimaryOnlyRow(row));
+      droppedPrimaryOnlyRows = before - mergedRows.length;
+      if (droppedPrimaryOnlyRows > 0) {
+        console.log(`🧹 dropped primary-only rows while server1 degraded: ${droppedPrimaryOnlyRows}`);
+      }
+    }
+
+    if (!mergedRows.length) {
+      console.log("⚠️ no rows left after primary-only cleanup.");
+      if (DIAG) {
+        diagWrite(
+          "summary.json",
+          JSON.stringify(
+            {
+              note: "no rows left after primary-only cleanup",
+              primary_server1_degraded: primaryServer1Degraded,
+              dropped_primary_only_rows: droppedPrimaryOnlyRows,
+            },
+            null,
+            2
+          )
+        );
+      }
+      return;
+    }
 
     const livekoraServer4Samples = collectSlotUrlSamples(mergedRows, "stream_url_4", 6);
     const livekoraLeaks = collectLivekoraLeakSamples(mergedRows, { limit: 6 });
@@ -4690,6 +4749,8 @@ async function startScraping() {
             daysToRefresh,
             count: mergedRows.length,
             used_primary_siiir_fallback: usedPrimarySiiirFallback,
+            primary_server1_degraded: primaryServer1Degraded,
+            dropped_primary_only_rows: droppedPrimaryOnlyRows,
             seed_rows_count: scheduleSeedRows.length,
             seed_source_stats: scheduleSeedStats,
             seed_primary_rows_count: enriched.length,
@@ -4715,6 +4776,8 @@ async function startScraping() {
     console.log(`📌 أيام التحديث: ${daysToRefresh.join(" , ")}`);
     console.log(`⬆️ صفوف نهائية بعد الدمج: ${mergedRows.length}`);
     console.log(`🟣 primary siiir fallback used: ${usedPrimarySiiirFallback}`);
+    console.log(`🔎 primary server1 degraded: ${primaryServer1Degraded}`);
+    console.log(`🧹 dropped primary-only rows: ${droppedPrimaryOnlyRows}`);
     console.log("📍 schedule seed sources:", scheduleSeedStats);
     console.log("🧱 isolation counters:", {
       isolation_reject_server2: isolationStats.isolation_reject_server2,
