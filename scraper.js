@@ -2757,13 +2757,29 @@ function collectLivekoraLeakSamples(rows, { limit = 6 } = {}) {
 
 function hasAnyBackupServerUrl(row) {
   if (!row || typeof row !== "object") return false;
+  const server5 = normalizeUrl(row.stream_url_5, row.stream_url_5);
+  const server5Strong = server5 && !isWeakGenericServer5Url(server5);
   return !!(
     normalizeUrl(row.stream_url_2, row.stream_url_2) ||
     normalizeUrl(row.stream_url_3, row.stream_url_3) ||
     normalizeUrl(row.stream_url_4, row.stream_url_4) ||
-    normalizeUrl(row.stream_url_5, row.stream_url_5) ||
+    server5Strong ||
     normalizeUrl(row.stream_url_6, row.stream_url_6)
   );
+}
+
+function isWeakGenericServer5Url(value) {
+  const normalized = normalizeUrl(value, value);
+  if (!normalized) return false;
+  try {
+    const u = new URL(normalized);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase();
+    if (!host.endsWith("pyxq.online")) return false;
+    return /^\/albaplayer\/(ontime\d*|bein(?:-?sport)?-?\d+|max\d+|ssc\d+|stars?|beinsports?\d+)\/?$/i.test(path);
+  } catch {
+    return false;
+  }
 }
 
 function isPrimaryOnlyRow(row) {
