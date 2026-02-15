@@ -1155,13 +1155,18 @@ function extractPlayerv2ConfigFromHtml(html: string, pageUrl: string) {
     if (v) paths.add(v);
   }
 
-  if (!domains.size) {
-    try {
-      domains.add(`${new URL(pageUrl).origin}/`);
-    } catch { }
-  }
+  // Always include the page origin as a candidate domain when possible.
+  // Some playerv2 variants don't expose activeDomains/tabsConfig, so we need fallbacks too.
+  let pageHost = "";
+  try {
+    const u = new URL(pageUrl);
+    pageHost = String(u.hostname || "").toLowerCase();
+    const origin = ensureTrailingSlash(u.origin);
+    if (origin) domains.add(origin);
+  } catch { }
 
-  if (!domains.size) {
+  // YallaShot playerv2 pages often omit activeDomains; add known working subdomains.
+  if (pageHost.endsWith("yallashot.us")) {
     for (const fallback of PLAYERV2_FALLBACK_DOMAINS) {
       const normalized = ensureTrailingSlash(fallback);
       if (normalized) domains.add(normalized);
@@ -1207,8 +1212,19 @@ async function requestPlayerv2TokenFromProxy(
   const proxy = toEmbedProxyUrl(endpoint, playerv2Url);
   if (!proxy) return null;
 
+  // yallashot token endpoint is picky about `fp` format; short alnum tends to work.
+  const fpCandidates = (() => {
+    const alpha = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const pick = (len: number) => {
+      let out = "";
+      for (let i = 0; i < len; i += 1) out += alpha[Math.floor(Math.random() * alpha.length)];
+      return out;
+    };
+    return [pick(6), pick(6), "abc123", "null"];
+  })();
+
   const payloads = [
-    new URLSearchParams({ path: tokenPath, fp: `${Math.random().toString(36).slice(2)}${Date.now()}` }).toString(),
+    ...fpCandidates.map((fp) => new URLSearchParams({ path: tokenPath, fp }).toString()),
     new URLSearchParams({ path: tokenPath }).toString(),
   ];
 
