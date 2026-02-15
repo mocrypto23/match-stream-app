@@ -155,7 +155,7 @@ const SERVER_SLOT_DOMAIN_WHITELIST = Object.freeze({
   1: ["bein-live.com"],
   2: ["siiir.tv", "yallashot.us", "aleynoxitram.sbs"],
   3: ["livehd77.pro", "alkoora.live"],
-  4: ["livekora.vip", "koooralive.click", "kooraxx.com", "sia-bth.net"],
+  4: ["livekora.vip", "koooralive.click", "gomatch-live.com", "kooraxx.com", "sia-bth.net"],
   5: ["tskoralive.com", "pyxq.online"],
   6: ["1kora.com", "ahlamontada.com"],
 });
