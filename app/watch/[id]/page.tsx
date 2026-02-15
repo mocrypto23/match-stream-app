@@ -473,6 +473,34 @@ function normalizePathKey(value: string) {
   }
 }
 
+function expandLivehdTvServVariants(value: string) {
+  const raw = String(value || "").trim();
+  if (!isValidHttpUrl(raw)) return [] as string[];
+
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    if (!(host === "livehd77.pro" || host.endsWith(".livehd77.pro"))) return [] as string[];
+
+    const path = u.pathname.toLowerCase();
+    if (!/^\/tv\/[^/?#]+\/?$/.test(path)) return [] as string[];
+
+    const currentServRaw = (u.searchParams.get("serv") || "").trim();
+    if (currentServRaw && !/^[01]$/.test(currentServRaw)) return [] as string[];
+
+    const order = currentServRaw === "0" ? ["0", "1"] : ["1", "0"];
+    const out: string[] = [];
+    for (const serv of order) {
+      const next = new URL(u.toString());
+      next.searchParams.set("serv", serv);
+      out.push(next.toString());
+    }
+    return dedupeUrls(out);
+  } catch {
+    return [] as string[];
+  }
+}
+
 function materializeTemplateUrl(raw: string, sourceUrl: string) {
   let value = String(raw || "").trim();
   if (!value.includes("${")) return value;
@@ -837,26 +865,37 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
     if (v.startsWith("/api/embed-proxy?")) {
       const target = getProxyTargetUrl(v);
       if (!target || !isValidHttpUrl(target)) return;
-      if (isClearlyNonStreamUrl(target) || isStrongPlayableStreamUrl(target) || isLikelyLivePhpEndpointUrl(target)) return;
-      if (!isPlayerLike(target)) return;
-      const key = canonicalizeUrl(v);
-      if (!key || seen.has(key)) return;
-      seen.add(key);
-      out.push(v);
+      const expandedTargets = dedupeUrls([target, ...expandLivehdTvServVariants(target)]);
+      for (const candidate of expandedTargets) {
+        if (isClearlyNonStreamUrl(candidate) || isStrongPlayableStreamUrl(candidate) || isLikelyLivePhpEndpointUrl(candidate))
+          continue;
+        if (!isPlayerLike(candidate)) continue;
+        const proxied = toEmbedProxyUrl(candidate, sourceUrl);
+        if (!proxied) continue;
+        const key = canonicalizeUrl(proxied);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        out.push(proxied);
+      }
       return;
     }
 
     if (!isValidHttpUrl(v)) return;
-    if (isClearlyNonStreamUrl(v) || isStrongPlayableStreamUrl(v) || isLikelyLivePhpEndpointUrl(v)) return;
-    if (!isPlayerLike(v)) return;
-    const proxied = toEmbedProxyUrl(v, sourceUrl);
-    if (!proxied) return;
-    const key = canonicalizeUrl(proxied);
-    if (!key || seen.has(key)) return;
-    seen.add(key);
-    out.push(proxied);
+    const expanded = dedupeUrls([v, ...expandLivehdTvServVariants(v)]);
+    for (const candidate of expanded) {
+      if (isClearlyNonStreamUrl(candidate) || isStrongPlayableStreamUrl(candidate) || isLikelyLivePhpEndpointUrl(candidate))
+        continue;
+      if (!isPlayerLike(candidate)) continue;
+      const proxied = toEmbedProxyUrl(candidate, sourceUrl);
+      if (!proxied) continue;
+      const key = canonicalizeUrl(proxied);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(proxied);
+    }
   };
 
+  for (const variant of expandLivehdTvServVariants(sourceUrl)) add(variant);
   for (const m of text.match(/\/api\/embed-proxy\?[^"'`\s<>()]+/gi) || []) add(m);
   for (const m of text.match(/https?:\/\/[^"'`\s<>()]+/gi) || []) add(m);
   for (const m of text.match(/https?:\/\/[^\s"'`<>()]+\/playerv2\.php\?[^"'`\s<>]*\$\{encodeURIComponent\(\s*matchId\s*\)\}[^"'`\s<>]*/gi) || [])
