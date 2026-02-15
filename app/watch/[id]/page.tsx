@@ -806,6 +806,10 @@ function extractBase64DecodedUrlsFromHtml(html: string, sourceUrl: string) {
   for (const m of text.matchAll(/atob\(\s*(['"])([A-Za-z0-9+/_=-]{8,})\1\s*\)/gi)) addToken(m[2] || "");
   for (const m of text.matchAll(/\b(?:encoded(?:url|src)?|base64(?:url|src)?|b64(?:url|src)?)\b\s*[:=]\s*\\?(['"])([A-Za-z0-9+/_=-]{8,})\\?\1/gi))
     addToken(m[2] || "");
+  // AlbaPlayer (Server 4) frequently embeds HLS urls as base64 literals:
+  // AlbaPlayerControl('aHR0cHM6Ly8uLi5zdHJlYW0ubTN1OA==','hls');
+  for (const m of text.matchAll(/AlbaPlayerControl\(\s*\\?(['"])([A-Za-z0-9+/_=-]{16,})\\?\1\s*,\s*\\?(['"])(?:hls|m3u8)\\?\3/gi))
+    addToken(m[2] || "");
 
   const out = new Set<string>();
   const addResolved = (raw: string) => {
