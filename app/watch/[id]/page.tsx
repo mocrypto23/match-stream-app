@@ -323,6 +323,18 @@ function toEmbedProxyUrl(rawUrl?: string | null, ref?: string) {
   return `/api/embed-proxy?${q.toString()}`;
 }
 
+function toEmbedProxyUrlUnstable(rawUrl?: string | null, ref?: string) {
+  const value = String(rawUrl || "").trim();
+  if (!value) return "";
+  if (value.startsWith("/api/embed-proxy?")) return value;
+  if (!isValidHttpUrl(value)) return "";
+  const q = new URLSearchParams();
+  q.set("url", value);
+  q.set("depth", "0");
+  if (ref && isValidHttpUrl(ref)) q.set("ref", ref);
+  return `/api/embed-proxy?${q.toString()}`;
+}
+
 function formatStartTimeAr(iso?: string | null) {
   if (!iso) return null;
   const d = new Date(iso);
@@ -824,8 +836,8 @@ function extractBase64DecodedUrlsFromHtml(html: string, sourceUrl: string) {
   for (const m of text.matchAll(/\b(?:encoded(?:url|src)?|base64(?:url|src)?|b64(?:url|src)?)\b\s*[:=]\s*\\?(['"])([A-Za-z0-9+/_=-]{8,})\\?\1/gi))
     addToken(m[2] || "");
   // AlbaPlayer (Server 4) frequently embeds HLS urls as base64 literals:
-  // AlbaPlayerControl('aHR0cHM6Ly8uLi5zdHJlYW0ubTN1OA==','hls');
-  for (const m of text.matchAll(/AlbaPlayerControl\(\s*\\?(['"])([A-Za-z0-9+/_=-]{16,})\\?\1\s*,\s*\\?(['"])(?:hls|m3u8)\\?\3/gi))
+  // AlbaPlayerControl('aHR0cHM6Ly8uLi5zdHJlYW0ubTN1OA==','plyr');
+  for (const m of text.matchAll(/AlbaPlayerControl\(\s*\\?(['"])([A-Za-z0-9+/_=-]{16,})\\?\1\s*,\s*\\?(['"])([a-z0-9_-]{2,16})\\?\3/gi))
     addToken(m[2] || "");
 
   const out = new Set<string>();
@@ -2029,6 +2041,8 @@ export default function WatchPage() {
   const selectedOption = validServers.find((s) => s.n === selectedServer);
   const selectedServerLabel = selectedOption?.label || SERVER_SOURCE_LABELS[selectedServer] || `سيرفر ${selectedServer}`;
   const selectedUrl = selectedOption?.url ?? "";
+  const useIframePlayer = selectedServer === 2 && isPlayerv2LikeUrl(selectedUrl);
+  const iframeSrc = useIframePlayer ? toEmbedProxyUrlUnstable(selectedUrl, selectedUrl) : "";
   const status = (match?.status_key ?? "").toLowerCase();
   const startMs = match?.match_start ? new Date(match.match_start).getTime() : null;
   const prematchMs = PREMATCH_OPEN_WINDOW_MINUTES * 60 * 1000;
@@ -2056,7 +2070,7 @@ export default function WatchPage() {
     activeResolveIdRef.current = resolveId;
     resolveLockRef.current = true;
     (async () => {
-      if (!selectedUrl || shouldBlockStream) {
+      if (!selectedUrl || shouldBlockStream || useIframePlayer) {
         applyCandidatesPreservingSelection([]);
         setResolverError(null);
         setResolverLoading(false);
@@ -2184,6 +2198,7 @@ export default function WatchPage() {
     selectedUrl,
     selectedServer,
     shouldBlockStream,
+    useIframePlayer,
     pushDiag,
     resolveRevision,
     scheduleResolveRecovery,
@@ -2526,6 +2541,16 @@ export default function WatchPage() {
             <div className="flex flex-col gap-2 items-center justify-center h-[55vh] min-h-[320px] text-gray-400 p-6 text-center">
               <div className="text-white font-bold text-xl">{streamStartNotice}</div>
               {prettyStart ? <div className="text-sm text-gray-500">موعد المباراة: <span className="text-gray-300">{prettyStart}</span></div> : null}
+            </div>
+          ) : useIframePlayer && iframeSrc ? (
+            <div className="relative w-full aspect-video min-h-[280px] sm:min-h-[430px] bg-black overflow-hidden">
+              <iframe
+                src={iframeSrc}
+                title={selectedServerLabel}
+                allow="autoplay; fullscreen"
+                allowFullScreen
+                className="absolute inset-0 w-full h-full border-0"
+              />
             </div>
           ) : selectedHlsUrl ? (
             <div onDoubleClick={handleVideoDoubleClick} className="relative w-full aspect-video min-h-[280px] sm:min-h-[430px] bg-black overflow-hidden">

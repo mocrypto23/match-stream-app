@@ -1120,7 +1120,7 @@ function appendBeforeBody(html: string, snippet: string) {
   return `${html}${snippet}`;
 }
 
-function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number) {
+function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number, stableMode: boolean) {
   let out = String(html || "");
   const host = normalizeHost(target.hostname);
   const nextDepth = Math.min(MAX_PROXY_DEPTH, depth + 1);
@@ -1146,14 +1146,16 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number) {
       (_full, quote: string, suffix: string) => `${quote}${proxiedTokenEndpoint}${suffix || ""}${quote}`
     );
 
-    // Remove heavy obfuscated player scripts, then mount a controlled HLS fallback.
-    out = out.replace(
-      /<script[^>]+src=["'][^"']*(337ea903f50ac981414dfdddg0dssfsfsss459sc142984finalv3obv23|a3f0c6c86ccc3ece5dscs899e90s2)\.js[^"']*["'][^>]*>\s*<\/script>/gi,
-      ""
-    );
+    // In stable mode we strip heavy obfuscated player scripts and mount a controlled HLS fallback.
+    // In non-stable mode we preserve the original player scripts (needed for some upstream protections).
+    if (stableMode) {
+      out = out.replace(
+        /<script[^>]+src=["'][^"']*(337ea903f50ac981414dfdddg0dssfsfsss459sc142984finalv3obv23|a3f0c6c86ccc3ece5dscs899e90s2)\.js[^"']*["'][^>]*>\s*<\/script>/gi,
+        ""
+      );
 
-    const hlsLibUrl = buildProxyUrl("https://cdn.jsdelivr.net/npm/hls.js@latest", nextDepth, target.toString());
-    const fallbackScript = `
+      const hlsLibUrl = buildProxyUrl("https://cdn.jsdelivr.net/npm/hls.js@latest", nextDepth, target.toString());
+      const fallbackScript = `
 <script>
 (() => {
   const tokenEndpoint = ${JSON.stringify(proxiedTokenEndpoint)};
@@ -1665,8 +1667,9 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number) {
 })();
 </script>`;
 
-    if (/<\/body>/i.test(out)) out = out.replace(/<\/body>/i, `${fallbackScript}</body>`);
-    else out += fallbackScript;
+      if (/<\/body>/i.test(out)) out = out.replace(/<\/body>/i, `${fallbackScript}</body>`);
+      else out += fallbackScript;
+    }
   }
 
   if (host.endsWith("kooraxx.com") || host.endsWith("sia-bth.net")) {
@@ -2281,7 +2284,7 @@ async function handleProxyRequest(req: Request) {
     let html = await upstream.text();
     html = rewriteAttributeUrls(html, target.toString(), depth);
     html = rewriteSrcsetUrls(html, target.toString(), depth);
-    html = rewriteKnownInlineEndpoints(html, target, depth);
+    html = rewriteKnownInlineEndpoints(html, target, depth, stableMode);
     html = bypassHostLockChecks(html, target);
     html = injectProtection(html, buildInjection(depth, target.toString(), stableMode));
 
