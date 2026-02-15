@@ -18,6 +18,9 @@
  *  - DEBUG (default: 0)
  *  - DIAG (default: 0)
  *  - CONCURRENCY (default: 2)
+ *  - SCRAPE_DAY_SCOPE (default: "today_only") -> "today_only" | "all" | comma list ("today,yesterday")
+ *  - PRESERVE_FUTURE_ROWS (default: 0 when today_only, else 1)
+ *  - CLEANUP_OLD_FINISHED (default: 1)
  */
 
 const { chromium } = require("playwright");
@@ -81,6 +84,28 @@ const DAYS = [
   { key: "today", url: "https://www.bein-live.com/matches-today_1/" },
   { key: "tomorrow", url: "https://www.bein-live.com/matches-tomorrow/" },
 ];
+
+const ALL_DAY_KEYS = DAYS.map((d) => d.key);
+const SCRAPE_DAY_SCOPE_RAW = String(process.env.SCRAPE_DAY_SCOPE || "today_only").trim().toLowerCase();
+const ACTIVE_DAY_KEYS = (() => {
+  if (!SCRAPE_DAY_SCOPE_RAW || SCRAPE_DAY_SCOPE_RAW === "today_only" || SCRAPE_DAY_SCOPE_RAW === "today") {
+    return ["today"];
+  }
+  if (SCRAPE_DAY_SCOPE_RAW === "all") {
+    return [...ALL_DAY_KEYS];
+  }
+
+  const requested = SCRAPE_DAY_SCOPE_RAW
+    .split(",")
+    .map((x) => x.trim().toLowerCase())
+    .filter(Boolean);
+  const valid = requested.filter((k) => ALL_DAY_KEYS.includes(k));
+  return valid.length ? Array.from(new Set(valid)) : ["today"];
+})();
+const ACTIVE_DAYS = DAYS.filter((d) => ACTIVE_DAY_KEYS.includes(d.key));
+const PRESERVE_FUTURE_ROWS =
+  String(process.env.PRESERVE_FUTURE_ROWS ?? (ACTIVE_DAY_KEYS.includes("tomorrow") ? "1" : "0")) !== "0";
+const CLEANUP_OLD_FINISHED = String(process.env.CLEANUP_OLD_FINISHED ?? "1") !== "0";
 
 // SIIIR source (Server 2)
 const SIIIR = {
@@ -2804,9 +2829,13 @@ function isPrimaryOnlyRow(row) {
   return !hasAnyBackupServerUrl(row);
 }
 
-function shouldPreserveExistingRow(row, { allowSiiirFallbackRows = false, dropPrimaryOnlyRows = false } = {}) {
+function shouldPreserveExistingRow(
+  row,
+  { allowSiiirFallbackRows = false, dropPrimaryOnlyRows = false, preserveFutureRows = true, todayDay = null } = {}
+) {
   if (!row) return false;
   if (dropPrimaryOnlyRows && isPrimaryOnlyRow(row)) return false;
+  if (!preserveFutureRows && todayDay && String(row.match_day || "") > String(todayDay)) return false;
   if (isBeinMatchPageUrl(row.stream_url)) return true;
   if (allowSiiirFallbackRows && isSiiirUrl(row.stream_url)) return true;
   return false;
@@ -2900,6 +2929,8 @@ function mergeWithExisting({
   existingRows,
   allowSiiirFallbackRows = false,
   dropPrimaryOnlyRows = false,
+  preserveFutureRows = true,
+  todayDay = null,
   isolationStats = null,
 }) {
   const nowMs = Date.now();
@@ -3038,7 +3069,14 @@ function mergeWithExisting({
     const k = keyOfRow(r);
     if (mergedMap.has(k)) continue;
     const preserved = { ...r };
-    if (!shouldPreserveExistingRow(preserved, { allowSiiirFallbackRows, dropPrimaryOnlyRows })) {
+    if (
+      !shouldPreserveExistingRow(preserved, {
+        allowSiiirFallbackRows,
+        dropPrimaryOnlyRows,
+        preserveFutureRows,
+        todayDay,
+      })
+    ) {
       console.log(`[merge] dropping stale external row: ${preserved.home_team} vs ${preserved.away_team}`);
       continue;
     }
@@ -3112,6 +3150,24 @@ async function backfillDynamicMatchFields(rows) {
   }
 
   return { ok, fail };
+}
+
+async function cleanupOldFinishedRows({ olderThanDay }) {
+  if (!CLEANUP_OLD_FINISHED) return { skipped: true, deleted: 0, error: null };
+  const cutoff = String(olderThanDay || "").trim();
+  if (!cutoff) return { skipped: true, deleted: 0, error: null };
+
+  const { count, error } = await supabase
+    .from(TABLE_NAME)
+    .delete({ count: "exact" })
+    .lt("match_day", cutoff)
+    .eq("status_key", "finished");
+
+  if (error) {
+    console.error("⚠️ cleanup old finished rows failed:", error.message);
+    return { skipped: false, deleted: 0, error };
+  }
+  return { skipped: false, deleted: Number(count) || 0, error: null };
 }
 // ===================== LIVEHD77 (Server 3) =====================
 function scoreLivehdCandidate(u) {
@@ -4287,6 +4343,7 @@ async function startScraping() {
   console.log(
     "🚀 بدء السكرابر (bein-live) + Server2 (SIIIR) + Server3 (LIVEHD77) + Server4 (LIVEKORA) + Server5 (TSKORA) + Server6 (1KORA) ..."
   );
+  console.log(`⚙️ day scope: ${SCRAPE_DAY_SCOPE_RAW} => [${ACTIVE_DAY_KEYS.join(", ")}]`);
 
   diagTouch();
 
@@ -4313,7 +4370,7 @@ async function startScraping() {
     const all = [];
     let usedPrimarySiiirFallback = false;
     const isolationStats = createServerIsolationStats();
-    for (const d of DAYS) {
+    for (const d of ACTIVE_DAYS) {
       let rows = [];
       try {
         rows = await scrapeOneDay(page, d.key, d.url);
@@ -4353,7 +4410,7 @@ async function startScraping() {
     await applyAntiAds(siiirListContext, siiirListPage);
 
     const siiirAll = [];
-    for (const d of DAYS) {
+    for (const d of ACTIVE_DAYS) {
       try {
         const rows = await scrapeSiiirDay(siiirListPage, d.key);
         siiirAll.push(...rows);
@@ -4420,7 +4477,7 @@ async function startScraping() {
       const yalaListPage = await yalaListContext.newPage();
       await applyAntiAds(yalaListContext, yalaListPage);
 
-      for (const d of DAYS) {
+      for (const d of ACTIVE_DAYS) {
         const dayUrl = YALA.dayUrl[d.key];
         if (!dayUrl) continue;
         try {
@@ -4492,7 +4549,7 @@ async function startScraping() {
     await applyAntiAds(tskoraContext, tskoraPage);
 
     const tskoraAll = [];
-    for (const d of DAYS) {
+    for (const d of ACTIVE_DAYS) {
       try {
         const rows = await scrapeTskoraDay(tskoraPage, d.key);
         tskoraAll.push(...rows);
@@ -4744,6 +4801,7 @@ async function startScraping() {
     }
 
     const daysToRefresh = [matchDayFromKey("yesterday"), matchDayFromKey("today"), matchDayFromKey("tomorrow")].filter(Boolean);
+    const todayDay = matchDayFromKey("today");
     const primaryServer1Degraded = usedPrimarySiiirFallback || !all.length;
 
     const existing = await fetchExistingForDays(daysToRefresh);
@@ -4752,6 +4810,8 @@ async function startScraping() {
       existingRows: existing,
       allowSiiirFallbackRows: usedPrimarySiiirFallback,
       dropPrimaryOnlyRows: primaryServer1Degraded,
+      preserveFutureRows: PRESERVE_FUTURE_ROWS,
+      todayDay,
       isolationStats,
     });
     let mergedRows = mergedRowsRaw.map((row) =>
@@ -4876,6 +4936,11 @@ async function startScraping() {
       console.error(`⚠️ post-RPC backfill partial: ok=${postRpc.ok}, fail=${postRpc.fail}`);
     } else {
       console.log(`🩹 post-RPC backfill: ${postRpc.ok} row(s) updated.`);
+    }
+
+    const cleanup = await cleanupOldFinishedRows({ olderThanDay: matchDayFromKey("yesterday") });
+    if (!cleanup.skipped && !cleanup.error) {
+      console.log(`🧽 cleanup old finished rows (< yesterday): ${cleanup.deleted}`);
     }
 
     console.log("✅ تم التحديث بنجاح (Server2..Server6 مفعلة، Server7 محجوز لحين تحديد المصدر).");

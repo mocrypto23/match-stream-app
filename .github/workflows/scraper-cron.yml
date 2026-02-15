@@ -56,6 +56,9 @@ jobs:
           LIST_TIMEOUT_MS: 45000
           DEEP_TIMEOUT_MS: 30000
           HTTP_TIMEOUT_MS: 12000
+          SCRAPE_DAY_SCOPE: today_only
+          PRESERVE_FUTURE_ROWS: 0
+          CLEANUP_OLD_FINISHED: 1
           TZ: Africa/Cairo
         run: node scraper.js
 
