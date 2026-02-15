@@ -57,9 +57,16 @@ const DEBUG = (process.env.DEBUG ?? "0") === "1";
 const DIAG = (process.env.DIAG ?? "0") === "1";
 const CONCURRENCY = Math.max(1, parseInt(process.env.CONCURRENCY || "2", 10) || 2);
 
-const LIST_TIMEOUT_MS = 60000;
-const DEEP_TIMEOUT_MS = 45000;
-const HTTP_TIMEOUT_MS = 20000;
+function intEnv(name, fallback, min = 1, max = 300000) {
+  const raw = process.env[name];
+  const parsed = Number.parseInt(String(raw ?? ""), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+const LIST_TIMEOUT_MS = intEnv("LIST_TIMEOUT_MS", 60000, 10000, 180000);
+const DEEP_TIMEOUT_MS = intEnv("DEEP_TIMEOUT_MS", 45000, 10000, 180000);
+const HTTP_TIMEOUT_MS = intEnv("HTTP_TIMEOUT_MS", 20000, 5000, 120000);
 const DEFAULT_HTTP_HEADERS = {
   "user-agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",

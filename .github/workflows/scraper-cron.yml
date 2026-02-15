@@ -49,10 +49,13 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           RPC_NAME: refresh_match_stream_app
-          CONCURRENCY: 2
+          CONCURRENCY: 3
           HEADLESS: 1
           DEBUG: 0
-          DIAG: 1
+          DIAG: 0
+          LIST_TIMEOUT_MS: 45000
+          DEEP_TIMEOUT_MS: 30000
+          HTTP_TIMEOUT_MS: 12000
           TZ: Africa/Cairo
         run: node scraper.js
 
@@ -88,7 +91,7 @@ jobs:
           fi
 
       - name: Diagnose Supabase rows (today)
-        if: always()
+        if: always() && github.event_name == 'workflow_dispatch'
         continue-on-error: true
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -97,15 +100,17 @@ jobs:
         run: node scripts/diag-supabase.js
 
       - name: Probe site rendering (runner)
-        if: always()
+        if: always() && github.event_name == 'workflow_dispatch'
         continue-on-error: true
         env:
           HEADLESS: 1
           TZ: Africa/Cairo
+          DIAG_GOTO_TIMEOUT_MS: 15000
+          DIAG_GOTO_RETRIES: 1
         run: node scripts/diag-site.js
 
       - name: List diagnostics files
-        if: always()
+        if: always() && github.event_name == 'workflow_dispatch'
         run: |
           echo "=== diag tree ==="
           ls -la
@@ -113,7 +118,7 @@ jobs:
           find diag -type f -maxdepth 3 -print || true
 
       - name: Upload diagnostics
-        if: always()
+        if: always() && github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: diag
