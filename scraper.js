@@ -2443,6 +2443,374 @@ function teamSoftMatchScore(teamA, teamB) {
   return 0;
 }
 
+function isEditDistanceAtMost(a0, b0, maxDist = 1) {
+  const a = String(a0 || "");
+  const b = String(b0 || "");
+  if (!a || !b) return false;
+  if (a === b) return true;
+
+  const la0 = a.length;
+  const lb0 = b.length;
+  if (Math.abs(la0 - lb0) > maxDist) return false;
+
+  // Ensure a is shorter (or equal) to save memory.
+  let s = a;
+  let t = b;
+  let ls = la0;
+  let lt = lb0;
+  if (ls > lt) {
+    s = b;
+    t = a;
+    ls = lb0;
+    lt = la0;
+  }
+
+  const prev = new Array(ls + 1);
+  for (let i = 0; i <= ls; i += 1) prev[i] = i;
+
+  for (let j = 1; j <= lt; j += 1) {
+    const cur = new Array(ls + 1);
+    cur[0] = j;
+    let rowMin = cur[0];
+    const tj = t[j - 1];
+
+    for (let i = 1; i <= ls; i += 1) {
+      const cost = s[i - 1] === tj ? 0 : 1;
+      const del = prev[i] + 1;
+      const ins = cur[i - 1] + 1;
+      const sub = prev[i - 1] + cost;
+      const v = Math.min(del, ins, sub);
+      cur[i] = v;
+      if (v < rowMin) rowMin = v;
+    }
+
+    if (rowMin > maxDist) return false;
+    for (let i = 0; i <= ls; i += 1) prev[i] = cur[i];
+  }
+
+  return prev[ls] <= maxDist;
+}
+
+function teamSoftEqual(teamA, teamB, { minLen = 6 } = {}) {
+  const a = canonTeamName(teamA);
+  const b = canonTeamName(teamB);
+  if (!a || !b) return false;
+  if (a === b) return true;
+
+  const min = Math.min(a.length, b.length);
+  if (min < minLen) return false;
+
+  const maxDist = min >= 10 ? 2 : 1;
+  return isEditDistanceAtMost(a, b, maxDist);
+}
+
+function teamSoftEqualScore(teamA, teamB, { minLen = 6 } = {}) {
+  const a = canonTeamName(teamA);
+  const b = canonTeamName(teamB);
+  if (!a || !b) return 0;
+  if (a === b) return 3;
+
+  const min = Math.min(a.length, b.length);
+  if (min < minLen) return 0;
+
+  const maxDist = min >= 10 ? 2 : 1;
+  return isEditDistanceAtMost(a, b, maxDist) ? 2 : 0;
+}
+
+function rowQualityScore(row) {
+  if (!row || typeof row !== "object") return 0;
+  let score = 0;
+  if (row.home_logo) score += 10;
+  if (row.away_logo) score += 10;
+  if (parseMs(row.match_start) !== null) score += 12;
+
+  if (isBeinMatchPageUrl(row.stream_url)) score += 80;
+  if (row.stream_url_2) score += 18;
+  if (row.stream_url_3) score += 18;
+  if (row.stream_url_4) score += 18;
+  if (row.stream_url_5) score += 18;
+  if (row.stream_url_6) score += 18;
+
+  if (typeof row.home_score === "number" && typeof row.away_score === "number") score += 6;
+
+  const sk = normalizeStatusKeyValue(row.status_key);
+  if (sk === "live") score += 4;
+  if (sk === "finished") score += 2;
+  return score;
+}
+
+function mergeDuplicateMatchRows(primary, secondary, { isolationStats = null, matchKey = null, stage = "soft_dedupe" } = {}) {
+  const a = primary || {};
+  const b = secondary || {};
+  const out = { ...a };
+
+  if (!out.home_logo && b.home_logo) out.home_logo = b.home_logo;
+  if (!out.away_logo && b.away_logo) out.away_logo = b.away_logo;
+
+  out.stream_url = preferPrimarySourceUrl(out.stream_url, b.stream_url, {
+    stats: isolationStats,
+    matchKey: matchKey || out.match_key || b.match_key || null,
+    stage,
+  });
+  out.stream_url_2 = preferExistingUrl(2, out.stream_url_2, b.stream_url_2, {
+    stats: isolationStats,
+    matchKey: matchKey || out.match_key || b.match_key || null,
+    stage,
+  });
+  out.stream_url_3 = preferExistingUrl(3, out.stream_url_3, b.stream_url_3, {
+    stats: isolationStats,
+    matchKey: matchKey || out.match_key || b.match_key || null,
+    stage,
+  });
+  out.stream_url_4 = preferExistingUrl(4, out.stream_url_4, b.stream_url_4, {
+    stats: isolationStats,
+    matchKey: matchKey || out.match_key || b.match_key || null,
+    stage,
+  });
+  out.stream_url_5 = preferExistingUrl(5, out.stream_url_5, b.stream_url_5, {
+    stats: isolationStats,
+    matchKey: matchKey || out.match_key || b.match_key || null,
+    stage,
+  });
+  out.stream_url_6 = preferExistingUrl(6, out.stream_url_6, b.stream_url_6, {
+    stats: isolationStats,
+    matchKey: matchKey || out.match_key || b.match_key || null,
+    stage,
+  });
+  out.stream_url_7 = null;
+
+  if ((!out.match_start || parseMs(out.match_start) === null) && b.match_start && parseMs(b.match_start) !== null) {
+    out.match_start = b.match_start;
+  }
+  if (!String(out.match_time || "").trim() && String(b.match_time || "").trim()) {
+    out.match_time = b.match_time;
+  }
+
+  const aHasScore = typeof out.home_score === "number" && typeof out.away_score === "number";
+  const bHasScore = typeof b.home_score === "number" && typeof b.away_score === "number";
+  if (!aHasScore && bHasScore) {
+    out.home_score = normalizeStoredScore(b.home_score);
+    out.away_score = normalizeStoredScore(b.away_score);
+  }
+
+  const outStatus = normalizeStatusKeyValue(out.status_key);
+  const bStatus = normalizeStatusKeyValue(b.status_key);
+  if ((outStatus === "unknown" || outStatus === "upcoming") && (bStatus === "live" || bStatus === "finished")) {
+    out.status_key = bStatus;
+  }
+  if (!String(out.status_text || "").trim() && String(b.status_text || "").trim()) {
+    out.status_text = b.status_text;
+  }
+
+  return out;
+}
+
+function softMatchKeyParts(row) {
+  const day = String(row?.match_day || "").trim();
+  const ms = parseMs(row?.match_start);
+  const bucketMs = 10 * 60 * 1000;
+  const bucket = ms === null ? null : Math.round(ms / bucketMs);
+  const url = normalizeUrl(row?.stream_url, row?.stream_url) || null;
+  const home = canonTeamName(row?.home_team || "");
+  const away = canonTeamName(row?.away_team || "");
+  return { day, ms, bucket, url: url ? url.toLowerCase() : null, home, away };
+}
+
+function scoreRowPairSoft(a, b) {
+  const directA = teamSoftEqualScore(a?.home_team, b?.home_team) + teamSoftEqualScore(a?.away_team, b?.away_team);
+  const swappedA = teamSoftEqualScore(a?.home_team, b?.away_team) + teamSoftEqualScore(a?.away_team, b?.home_team);
+  const teamScore = Math.max(directA, swappedA);
+
+  let timeScore = 0;
+  const am = parseMs(a?.match_start);
+  const bm = parseMs(b?.match_start);
+  if (am !== null && bm !== null) {
+    const diff = Math.abs(am - bm);
+    if (diff <= 5 * 60 * 1000) timeScore = 1.0;
+    else if (diff <= 15 * 60 * 1000) timeScore = 0.6;
+    else if (diff <= 20 * 60 * 1000) timeScore = 0.3;
+  }
+
+  let urlScore = 0;
+  const au = normalizeUrl(a?.stream_url, a?.stream_url);
+  const bu = normalizeUrl(b?.stream_url, b?.stream_url);
+  if (au && bu && au.toLowerCase() === bu.toLowerCase()) urlScore = 1.2;
+
+  return teamScore + timeScore + urlScore;
+}
+
+function hasAnyStreamUrlSoft(row) {
+  if (!row || typeof row !== "object") return false;
+  return !!(
+    normalizeUrl(row.stream_url, row.stream_url) ||
+    normalizeUrl(row.stream_url_2, row.stream_url_2) ||
+    normalizeUrl(row.stream_url_3, row.stream_url_3) ||
+    normalizeUrl(row.stream_url_4, row.stream_url_4) ||
+    normalizeUrl(row.stream_url_5, row.stream_url_5) ||
+    normalizeUrl(row.stream_url_6, row.stream_url_6)
+  );
+}
+
+function rowsLikelySameMatchSoft(a, b) {
+  if (!a || !b) return false;
+  if (String(a.match_day || "") !== String(b.match_day || "")) return false;
+
+  const teamDirect = teamSoftEqual(a.home_team, b.home_team) && teamSoftEqual(a.away_team, b.away_team);
+  const teamSwapped = teamSoftEqual(a.home_team, b.away_team) && teamSoftEqual(a.away_team, b.home_team);
+  if (!teamDirect && !teamSwapped) return false;
+
+  const aUrl = normalizeUrl(a.stream_url, a.stream_url);
+  const bUrl = normalizeUrl(b.stream_url, b.stream_url);
+  if (aUrl && bUrl && aUrl.toLowerCase() === bUrl.toLowerCase()) return true;
+
+  const am = parseMs(a.match_start);
+  const bm = parseMs(b.match_start);
+  if (am !== null && bm !== null) {
+    return Math.abs(am - bm) <= 20 * 60 * 1000;
+  }
+
+  // If one row is missing kickoff time, allow merge only when at least one team is an exact match.
+  // This prevents merges like "Manchester City" vs "Manchester United" which share prefixes but are different teams.
+  const usedSwapped = teamSwapped && !teamDirect;
+  const ah = canonTeamName(a.home_team);
+  const aa = canonTeamName(a.away_team);
+  const bh = canonTeamName(b.home_team);
+  const ba = canonTeamName(b.away_team);
+  let exact = 0;
+  if (!usedSwapped) {
+    if (ah && bh && ah === bh) exact += 1;
+    if (aa && ba && aa === ba) exact += 1;
+  } else {
+    if (ah && ba && ah === ba) exact += 1;
+    if (aa && bh && aa === bh) exact += 1;
+  }
+
+  // Prefer time-based matching when available.
+  const hasAnyTime = am !== null || bm !== null;
+  if (!hasAnyTime) return false;
+
+  // Require that both rows actually have stream data; prevents merging empty placeholders.
+  if (!hasAnyStreamUrlSoft(a) || !hasAnyStreamUrlSoft(b)) return false;
+
+  return exact >= 1;
+}
+
+function softDedupeMatchRows(rows, { isolationStats = null, stage = "soft_dedupe" } = {}) {
+  const input = Array.isArray(rows) ? rows.filter(Boolean) : [];
+  if (input.length <= 1) return { rows: input, dropped: 0, droppedMatchKeys: [] };
+
+  const out = [];
+  let dropped = 0;
+  const droppedMatchKeys = [];
+
+  const byDayBucket = new Map();
+  const byDayUrl = new Map();
+  const byDayTeam = new Map();
+
+  const addIndex = (row, idx) => {
+    const meta = softMatchKeyParts(row);
+    if (meta.day && meta.bucket !== null) {
+      const k = `${meta.day}||${meta.bucket}`;
+      const arr = byDayBucket.get(k) || [];
+      arr.push(idx);
+      byDayBucket.set(k, arr);
+    }
+    if (meta.day && meta.url) {
+      const k = `${meta.day}||url:${meta.url}`;
+      if (!byDayUrl.has(k)) byDayUrl.set(k, idx);
+    }
+    if (meta.day) {
+      const homeKey = meta.home && meta.home.length >= 4 ? `${meta.day}||t:${meta.home}` : null;
+      const awayKey = meta.away && meta.away.length >= 4 ? `${meta.day}||t:${meta.away}` : null;
+      for (const key of [homeKey, awayKey]) {
+        if (!key) continue;
+        const arr = byDayTeam.get(key) || [];
+        arr.push(idx);
+        byDayTeam.set(key, arr);
+      }
+    }
+  };
+
+  const candidateIndicesFor = (row) => {
+    const meta = softMatchKeyParts(row);
+    const candidates = new Set();
+    if (meta.day && meta.url) {
+      const k = `${meta.day}||url:${meta.url}`;
+      const hit = byDayUrl.get(k);
+      if (typeof hit === "number") candidates.add(hit);
+    }
+    if (meta.day && meta.bucket !== null) {
+      for (const delta of [-1, 0, 1]) {
+        const k = `${meta.day}||${meta.bucket + delta}`;
+        const arr = byDayBucket.get(k) || [];
+        for (const idx of arr) candidates.add(idx);
+      }
+    }
+    if (meta.day) {
+      const homeKey = meta.home && meta.home.length >= 4 ? `${meta.day}||t:${meta.home}` : null;
+      const awayKey = meta.away && meta.away.length >= 4 ? `${meta.day}||t:${meta.away}` : null;
+      for (const key of [homeKey, awayKey]) {
+        if (!key) continue;
+        const arr = byDayTeam.get(key) || [];
+        for (const idx of arr) candidates.add(idx);
+      }
+    }
+    return Array.from(candidates);
+  };
+
+  for (const row of input) {
+    let merged = false;
+    const candidates = candidateIndicesFor(row);
+    let bestIdx = -1;
+    let bestScore = -99999;
+    for (const idx of candidates) {
+      const cur = out[idx];
+      if (!cur) continue;
+      if (!rowsLikelySameMatchSoft(cur, row)) continue;
+      const s = scoreRowPairSoft(cur, row);
+      if (s > bestScore) {
+        bestScore = s;
+        bestIdx = idx;
+      }
+    }
+
+    if (bestIdx >= 0) {
+      const current = out[bestIdx];
+      const currentQ = rowQualityScore(current);
+      const incomingQ = rowQualityScore(row);
+
+      const preferIncoming =
+        incomingQ > currentQ ||
+        (incomingQ === currentQ && String(row.match_key || "") < String(current.match_key || ""));
+
+      const winner = preferIncoming ? row : current;
+      const loser = preferIncoming ? current : row;
+
+      const winnerKey = String(winner?.match_key || "").trim();
+      const loserKey = String(loser?.match_key || "").trim();
+      if (loserKey && loserKey !== winnerKey) droppedMatchKeys.push(loserKey);
+
+      const mergedRow = mergeDuplicateMatchRows(winner, loser, {
+        isolationStats,
+        matchKey: String(winner.match_key || current.match_key || row.match_key || "") || null,
+        stage,
+      });
+
+      out[bestIdx] = mergedRow;
+      addIndex(mergedRow, bestIdx);
+      dropped += 1;
+      merged = true;
+    }
+
+    if (!merged) {
+      out.push(row);
+      addIndex(row, out.length - 1);
+    }
+  }
+
+  return { rows: out, dropped, droppedMatchKeys };
+}
+
 function findLivehdFallbackUrl(rows, { matchDay, homeTeam, awayTeam }) {
   if (!Array.isArray(rows) || !rows.length || !matchDay || !homeTeam || !awayTeam) return null;
 
@@ -4850,6 +5218,15 @@ async function startScraping() {
       return;
     }
 
+    // Soft dedupe: merge duplicates caused by minor team-name drift (typos/transliteration).
+    // Conservative: requires same match_day + strong team match, plus kickoff proximity when available.
+    const softDeduped = softDedupeMatchRows(mergedRows, { isolationStats, stage: "post_merge_soft_dedupe" });
+    const softDedupDroppedKeys = Array.isArray(softDeduped.droppedMatchKeys) ? softDeduped.droppedMatchKeys : [];
+    if (softDeduped.dropped > 0) {
+      console.log(`[merge] soft-deduped duplicates: ${softDeduped.dropped}`);
+    }
+    mergedRows = softDeduped.rows;
+
     const livekoraServer4Samples = collectSlotUrlSamples(mergedRows, "stream_url_4", 6);
     const livekoraLeaks = collectLivekoraLeakSamples(mergedRows, { limit: 6 });
 
@@ -4929,6 +5306,29 @@ async function startScraping() {
       console.error("❌ RPC Error:", rpcRes.error.message);
       if (DIAG) diagWrite("rpc_error.txt", rpcRes.error.message);
       return;
+    }
+
+    // Remove merged-away duplicates from DB so they don't keep showing in the UI.
+    // RPC likely upserts by match_key and may not delete old keys, so we cleanup explicitly.
+    const droppedKeysUniq = Array.from(new Set((softDedupDroppedKeys || []).map((k) => String(k || "").trim()))).filter(Boolean);
+    if (droppedKeysUniq.length) {
+      if (droppedKeysUniq.length > 120) {
+        console.warn(`[merge] too many dropped keys (${droppedKeysUniq.length}); skipping delete to be safe.`);
+        if (DIAG) {
+          diagWrite(
+            `post_rpc/soft_dedupe_dropped_keys_${Date.now()}.json`,
+            JSON.stringify(droppedKeysUniq.slice(0, 200), null, 2)
+          );
+        }
+      } else {
+        const delRes = await supabase.from(TABLE_NAME).delete().in("match_key", droppedKeysUniq);
+        if (delRes.error) {
+          console.warn("[merge] failed to delete soft-deduped keys:", delRes.error.message);
+          if (DIAG) diagWrite(`post_rpc/soft_dedupe_delete_error_${Date.now()}.txt`, delRes.error.message + "\n");
+        } else {
+          console.log(`[merge] deleted merged-duplicate rows: ${droppedKeysUniq.length}`);
+        }
+      }
     }
 
     const postRpc = await backfillDynamicMatchFields(mergedRows);
