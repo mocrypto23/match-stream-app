@@ -2232,7 +2232,9 @@ async function handleProxyRequest(req: Request) {
           rawManifest,
           target.toString(),
           depth,
-          target.toString()
+          // Preserve original embed referrer for child segments; some upstreams
+          // (e.g. server4 CDNs) enforce strict Referer checks on both manifest and segments.
+          safeReferrer || target.toString()
         );
         const headers = withProxyMetaHeaders(filterResponseHeaders(upstream.headers, { html: false }));
         headers.set("content-type", "application/vnd.apple.mpegurl; charset=utf-8");

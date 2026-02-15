@@ -473,6 +473,23 @@ function normalizePathKey(value: string) {
   }
 }
 
+// Server 4 sources sometimes come from legacy mirrors (e.g. koooralive.click),
+// but the upstream HLS/CDN allows playback only when the referrer is gomatch-live.com.
+function normalizeServer4SourceUrl(value?: string | null) {
+  const raw = String(value || "").trim();
+  if (!raw || !isValidHttpUrl(raw)) return raw;
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    if (host.endsWith("koooralive.click")) {
+      u.protocol = "https:";
+      u.hostname = "pl.gomatch-live.com";
+      return u.toString();
+    }
+  } catch { }
+  return raw;
+}
+
 function expandLivehdTvServVariants(value: string) {
   const raw = String(value || "").trim();
   if (!isValidHttpUrl(raw)) return [] as string[];
@@ -1966,7 +1983,7 @@ export default function WatchPage() {
       match?.stream_url ?? null,
       match?.stream_url_2 ?? null,
       match?.stream_url_3 ?? null,
-      match?.stream_url_4 ?? null,
+      normalizeServer4SourceUrl(match?.stream_url_4 ?? null) || null,
       match?.stream_url_5 ?? null,
       match?.stream_url_6 ?? null,
     ];
