@@ -48,6 +48,11 @@ const RESOLVE_CHILD_CONCURRENCY = 3;
 const EXPAND_VARIANTS_CONCURRENCY = 4;
 const PROBE_CONCURRENCY = 4;
 const RESOLVE_RESULT_CACHE_TTL_MS = 75_000;
+const PLAYERV2_RESOLVE_CACHE_TTL_MS = 45_000;
+const PLAYERV2_STICKY_CACHE_TTL_MS = 8 * 60_000;
+const PLAYERV2_TOKEN_CACHE_TTL_MS = 120_000;
+const PLAYERV2_TOKEN_STALE_FALLBACK_MS = 15 * 60_000;
+const PLAYERV2_CACHE_MAX_CANDIDATES = 32;
 const RESOLVE_RESULT_CACHE_MAX = 250;
 const NO_STREAM_SELECTED_SERVER_MESSAGE = "لا يوجد بث في هذا السيرفر لهذه المباراة";
 const HLS_CT = ["application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl"];
@@ -117,9 +122,13 @@ type ProbeHlsOptions = {
 type FilterPlayableOptions = ProbeHlsOptions & { maxChecks?: number; concurrency?: number };
 type ResolveBatchPhase = "fast" | "deep" | "token";
 type ResolveResultCacheEntry = { expiresAt: number; candidates: string[] };
+type Playerv2StickyCacheEntry = { expiresAt: number; candidates: string[] };
+type Playerv2TokenCacheEntry = { expiresAt: number; tokenPayload: Playerv2TokenPayload };
 type CandidateGroup = { key: string; primaryIndex: number; members: number[]; label: string };
 
 const resolveResultCache = new Map<string, ResolveResultCacheEntry>();
+const playerv2StickyCache = new Map<string, Playerv2StickyCacheEntry>();
+const playerv2TokenCache = new Map<string, Playerv2TokenCacheEntry>();
 
 function resolveResultCacheKey(sourceUrl: string) {
   return canonicalizeUrl(sourceUrl) || String(sourceUrl || "").trim().toLowerCase();
@@ -149,11 +158,13 @@ function getCachedResolveCandidates(sourceUrl: string) {
 }
 
 function setCachedResolveCandidates(sourceUrl: string, candidates: string[]) {
-  const cleaned = dedupeUrls((candidates || []).filter((x) => !!x));
+  const base = dedupeUrls((candidates || []).filter((x) => !!x));
+  const cleaned = isPlayerv2LikeUrl(sourceUrl) ? compactPlayerv2Candidates(base) : base;
   if (!cleaned.length) return;
   const now = Date.now();
+  const ttlMs = isPlayerv2LikeUrl(sourceUrl) ? PLAYERV2_RESOLVE_CACHE_TTL_MS : RESOLVE_RESULT_CACHE_TTL_MS;
   resolveResultCache.set(resolveResultCacheKey(sourceUrl), {
-    expiresAt: now + RESOLVE_RESULT_CACHE_TTL_MS,
+    expiresAt: now + ttlMs,
     candidates: cleaned,
   });
   trimResolveResultCache(now);
@@ -161,6 +172,121 @@ function setCachedResolveCandidates(sourceUrl: string, candidates: string[]) {
 
 function clearCachedResolveCandidates(sourceUrl: string) {
   resolveResultCache.delete(resolveResultCacheKey(sourceUrl));
+}
+
+function playerv2CandidateFamilyKey(value: string) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const target = raw.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(raw) || "" : raw;
+  const normalized = target || raw;
+  if (!isValidHttpUrl(normalized)) {
+    return canonicalizeUrl(raw) || raw.toLowerCase();
+  }
+
+  try {
+    const u = new URL(normalized);
+    u.hash = "";
+    u.searchParams.delete("ts");
+    u.searchParams.delete("nonce");
+    u.searchParams.delete("token");
+    u.searchParams.delete("sid");
+
+    const sorted = Array.from(u.searchParams.entries()).sort(([ak, av], [bk, bv]) => {
+      if (ak !== bk) return ak.localeCompare(bk);
+      return av.localeCompare(bv);
+    });
+    const stable = new URLSearchParams();
+    for (const [k, v] of sorted) stable.append(k, v);
+    const q = stable.toString();
+    return `${u.origin}${u.pathname}${q ? `?${q}` : ""}`.toLowerCase();
+  } catch {
+    return canonicalizeUrl(raw) || raw.toLowerCase();
+  }
+}
+
+function compactPlayerv2Candidates(input: string[], max = PLAYERV2_CACHE_MAX_CANDIDATES) {
+  const list = dedupeUrls((input || []).filter((x) => !!x));
+  if (!list.length) return [] as string[];
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const item = list[i];
+    const key = playerv2CandidateFamilyKey(item) || (canonicalizeUrl(item) || item).toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+    if (out.length >= max) break;
+  }
+
+  return out.reverse();
+}
+
+function playerv2StickyCacheKey(sourceUrl: string) {
+  return canonicalizeUrl(sourceUrl) || String(sourceUrl || "").trim().toLowerCase();
+}
+
+function trimPlayerv2StickyCache(now = Date.now()) {
+  for (const [key, value] of playerv2StickyCache.entries()) {
+    if (value.expiresAt <= now || !value.candidates.length) playerv2StickyCache.delete(key);
+  }
+}
+
+function getPlayerv2StickyCandidates(sourceUrl: string) {
+  const key = playerv2StickyCacheKey(sourceUrl);
+  const now = Date.now();
+  const cached = playerv2StickyCache.get(key);
+  if (!cached || cached.expiresAt <= now) {
+    if (cached) playerv2StickyCache.delete(key);
+    return [] as string[];
+  }
+  return [...cached.candidates];
+}
+
+function setPlayerv2StickyCandidates(sourceUrl: string, candidates: string[]) {
+  const cleaned = compactPlayerv2Candidates(candidates || []);
+  if (!cleaned.length) return;
+  const now = Date.now();
+  playerv2StickyCache.set(playerv2StickyCacheKey(sourceUrl), {
+    expiresAt: now + PLAYERV2_STICKY_CACHE_TTL_MS,
+    candidates: cleaned,
+  });
+  trimPlayerv2StickyCache(now);
+}
+
+function playerv2TokenCacheKey(playerv2Url: string, tokenPath: string) {
+  const page = canonicalizeUrl(playerv2Url) || String(playerv2Url || "").trim().toLowerCase();
+  const path = normalizePlayerv2Path(tokenPath) || String(tokenPath || "").trim();
+  return `${page}|${path}`;
+}
+
+function trimPlayerv2TokenCache(now = Date.now()) {
+  for (const [key, value] of playerv2TokenCache.entries()) {
+    if (value.expiresAt + PLAYERV2_TOKEN_STALE_FALLBACK_MS <= now) playerv2TokenCache.delete(key);
+  }
+}
+
+function getCachedPlayerv2Token(playerv2Url: string, tokenPath: string, allowStale = false) {
+  const key = playerv2TokenCacheKey(playerv2Url, tokenPath);
+  const now = Date.now();
+  const cached = playerv2TokenCache.get(key);
+  if (!cached) return null;
+  if (cached.expiresAt > now) return cached.tokenPayload;
+  if (allowStale && cached.expiresAt + PLAYERV2_TOKEN_STALE_FALLBACK_MS > now) return cached.tokenPayload;
+  playerv2TokenCache.delete(key);
+  return null;
+}
+
+function setCachedPlayerv2Token(playerv2Url: string, tokenPath: string, payload: Playerv2TokenPayload) {
+  const token = String(payload?.token || "").trim();
+  const sessionId = String(payload?.session_id || "").trim();
+  if (!token || !sessionId) return;
+  const now = Date.now();
+  playerv2TokenCache.set(playerv2TokenCacheKey(playerv2Url, tokenPath), {
+    expiresAt: now + PLAYERV2_TOKEN_CACHE_TTL_MS,
+    tokenPayload: { token, session_id: sessionId },
+  });
+  trimPlayerv2TokenCache(now);
 }
 
 function isValidHttpUrl(value: string) {
@@ -250,6 +376,12 @@ function toUnderlyingUrl(value: string) {
 function isPlayerv2LikeUrl(value?: string | null) {
   const raw = toUnderlyingUrl(String(value || ""));
   return /\/playerv2\.php(?:\?|$)/i.test(raw) || /[?&]action=generate_token(?:&|$)/i.test(raw);
+}
+
+function isPlayerv2TokenEndpointUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!raw) return false;
+  return /\/playerv2\.php(?:\?|$)/i.test(raw) && /[?&]action=generate_token(?:&|$)/i.test(raw);
 }
 
 function normalizeQualityTag(raw?: string | null) {
@@ -882,12 +1014,14 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
       if (materialized) v = materialized;
     }
     if (!v) return;
+    if (isPlayerv2TokenEndpointUrl(v)) return;
 
     if (v.startsWith("/api/embed-proxy?")) {
       const target = getProxyTargetUrl(v);
       if (!target || !isValidHttpUrl(target)) return;
       const expandedTargets = dedupeUrls([target, ...expandLivehdTvServVariants(target)]);
       for (const candidate of expandedTargets) {
+        if (isPlayerv2TokenEndpointUrl(candidate)) continue;
         if (isClearlyNonStreamUrl(candidate) || isStrongPlayableStreamUrl(candidate) || isLikelyLivePhpEndpointUrl(candidate))
           continue;
         if (!isPlayerLike(candidate)) continue;
@@ -904,6 +1038,7 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
     if (!isValidHttpUrl(v)) return;
     const expanded = dedupeUrls([v, ...expandLivehdTvServVariants(v)]);
     for (const candidate of expanded) {
+      if (isPlayerv2TokenEndpointUrl(candidate)) continue;
       if (isClearlyNonStreamUrl(candidate) || isStrongPlayableStreamUrl(candidate) || isLikelyLivePhpEndpointUrl(candidate))
         continue;
       if (!isPlayerLike(candidate)) continue;
@@ -1216,12 +1351,61 @@ function buildPlayerv2NonceCandidates() {
   return Array.from(new Set([base36(6), pick(6), pick(8)])).filter(Boolean);
 }
 
+function computePlayerv2CanvasFingerprint() {
+  if (typeof window === "undefined" || typeof document === "undefined") return null;
+  try {
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+
+    canvas.width = 200;
+    canvas.height = 50;
+    ctx.textBaseline = "top";
+    ctx.font = '14px "Arial"';
+    ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = "#f60";
+    ctx.fillRect(125, 1, 62, 20);
+    ctx.fillStyle = "#069";
+    ctx.fillText("Browser Fingerprint 🔒", 2, 15);
+    ctx.fillStyle = "rgba(102, 204, 0, 0.7)";
+    ctx.fillText("Canvas Test 123", 4, 17);
+
+    const txt = canvas.toDataURL();
+    let hash = 0;
+    for (let i = 0; i < txt.length; i += 1) {
+      const code = txt.charCodeAt(i);
+      hash = ((hash << 5) - hash) + code;
+      hash |= 0;
+    }
+
+    const gl = (canvas.getContext("webgl") || canvas.getContext("experimental-webgl")) as WebGLRenderingContext | null;
+    if (gl) {
+      const debugInfo = gl.getExtension("WEBGL_debug_renderer_info") as { UNMASKED_RENDERER_WEBGL: number } | null;
+      if (debugInfo) {
+        const renderer = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL);
+        if (typeof renderer === "string") hash ^= renderer.length;
+      }
+    }
+
+    return Math.abs(hash).toString(36);
+  } catch {
+    return null;
+  }
+}
+
 async function requestPlayerv2TokenFromProxy(
   playerv2Url: string,
   tokenPath: string,
   signal?: AbortSignal,
   pushDiag?: (line: string) => void
 ) {
+  const cachedFresh = getCachedPlayerv2Token(playerv2Url, tokenPath, false);
+  if (cachedFresh) {
+    pushDiag?.("playerv2 token cache hit");
+    return cachedFresh;
+  }
+  const cachedStale = getCachedPlayerv2Token(playerv2Url, tokenPath, true);
+
   const endpoint = (() => {
     try {
       return new URL("/playerv2.php?action=generate_token", playerv2Url).toString();
@@ -1242,7 +1426,8 @@ async function requestPlayerv2TokenFromProxy(
       for (let i = 0; i < len; i += 1) out += alpha[Math.floor(Math.random() * alpha.length)];
       return out;
     };
-    return [pick(6), pick(6), "abc123", "null"];
+    const browserFp = computePlayerv2CanvasFingerprint();
+    return Array.from(new Set([browserFp || "", pick(6), "abc123"].filter(Boolean)));
   })();
 
   const payloads = [
@@ -1279,16 +1464,32 @@ async function requestPlayerv2TokenFromProxy(
         typeof data?.session_id === "string" || typeof data?.session_id === "number"
           ? String(data.session_id).trim()
           : "";
-      if (token && sid) return { token, session_id: sid } satisfies Playerv2TokenPayload;
+      if (token && sid) {
+        const payload = { token, session_id: sid } satisfies Playerv2TokenPayload;
+        setCachedPlayerv2Token(playerv2Url, tokenPath, payload);
+        return payload;
+      }
 
-      if (pushDiag && typeof data?.error === "string") {
-        pushDiag(`playerv2 token error: ${String(data.error)}`);
+      const errorText = typeof data?.error === "string" ? String(data.error) : "";
+      if (pushDiag && errorText) pushDiag(`playerv2 token error: ${errorText}`);
+      if (res.status === 403 || /forbidden/i.test(errorText)) {
+        pushDiag?.(`playerv2 token blocked status=${res.status}`);
+        continue;
+      }
+      if (res.status === 429) {
+        pushDiag?.(`playerv2 token ratelimit status=${res.status}`);
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        continue;
       }
     } catch (e: unknown) {
       if (e instanceof Error && e.name === "AbortError") break;
     }
   }
 
+  if (cachedStale) {
+    pushDiag?.("playerv2 token stale fallback");
+    return cachedStale;
+  }
   return null;
 }
 
@@ -1411,6 +1612,26 @@ async function resolveCandidatesForServer(
   const primaryList = extractPlayableCandidatesFromProxyHtml(html, sourceUrl);
   const rollingPrimary = extractRollingHlsCandidatesFromHtml(html, sourceUrl);
   emitBatch([...rollingPrimary, ...primaryList], "fast");
+
+  // For playerv2 sources we keep resolution lightweight to avoid upstream anti-bot/rate-limit bans.
+  // One page fetch + tokenized candidate build is enough; deep crawling creates noisy duplicate calls.
+  if (isPlayerv2LikeUrl(sourceUrl) || PLAYERV2_CONFIG_RE.test(html)) {
+    let tokenized: string[] = [];
+    try {
+      tokenized = await extractPlayerv2TokenizedCandidatesFromHtml(
+        html,
+        sourceUrl,
+        signal,
+        opts?.playerv2Diag
+      );
+    } catch (e: unknown) {
+      if (e instanceof Error && e.name === "AbortError") throw e;
+      tokenized = [];
+    }
+    if (tokenized.length) emitBatch(tokenized, "token");
+    return normalizePlayableBatch([...rollingPrimary, ...primaryList, ...tokenized]);
+  }
+
   const isSameServerVariantPage = (value: string) => {
     const target = value.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(value) || "" : value;
     if (!target || !isValidHttpUrl(target)) return false;
@@ -1554,8 +1775,18 @@ async function resolveCandidatesForServer(
   }
 
   const playerv2List: string[] = [];
+  const playerv2PoolSeen = new Set<string>();
+  const playerv2Pool = playerv2HtmlPool.filter((item) => {
+    const pageUrl = item.pageUrl.startsWith("/api/embed-proxy?")
+      ? getProxyTargetUrl(item.pageUrl) || item.pageUrl
+      : item.pageUrl;
+    const key = canonicalizeUrl(pageUrl) || String(pageUrl || "").trim().toLowerCase();
+    if (!key || playerv2PoolSeen.has(key)) return false;
+    playerv2PoolSeen.add(key);
+    return true;
+  });
   const playerv2Results = await mapWithConcurrency(
-    playerv2HtmlPool.slice(0, maxPlayerv2Pool),
+    playerv2Pool.slice(0, maxPlayerv2Pool),
     Math.min(parallelChildConcurrency, 3),
     async (item): Promise<string[]> => {
       if (signal.aborted) throw new DOMException("aborted", "AbortError");
@@ -2069,21 +2300,25 @@ export default function WatchPage() {
         const proxied = toEmbedProxyUrl(selectedUrl, selectedUrl);
         return proxied ? [proxied] : [];
       })();
-      const disableResolveCache = selectedServer === 3 || isPlayerv2LikeUrl(selectedUrl);
+      const isServer2Playerv2 = selectedServer === 2 && isPlayerv2LikeUrl(selectedUrl);
+      const disableResolveCache = selectedServer === 3;
       const cachedCandidates = disableResolveCache ? [] : getCachedResolveCandidates(selectedUrl);
-      const initialCandidates = dedupeUrls([...cachedCandidates, ...seedCandidates]);
+      const stickyCandidates = isServer2Playerv2 ? getPlayerv2StickyCandidates(selectedUrl) : [];
+      const initialCandidates = dedupeUrls([...stickyCandidates, ...cachedCandidates, ...seedCandidates]);
       let hadPlayable = initialCandidates.length > 0;
       const mergeCandidates = (incoming: string[]) => {
         if (!incoming.length) return;
         hadPlayable = true;
         const merged = dedupeUrls([...candidatesRef.current, ...incoming]);
         applyCandidatesPreservingSelection(merged);
+        if (isServer2Playerv2) setPlayerv2StickyCandidates(selectedUrl, merged);
         if (!disableResolveCache) setCachedResolveCandidates(selectedUrl, merged);
       };
 
       setResolverError(null);
       applyCandidatesPreservingSelection(initialCandidates);
       setResolverLoading(!initialCandidates.length);
+      if (stickyCandidates.length) pushDiag(`resolve sticky hit +${stickyCandidates.length}`);
       if (cachedCandidates.length) pushDiag(`resolve cache hit +${cachedCandidates.length}`);
       if (seedCandidates.length) pushDiag(`resolve seed +${seedCandidates.length}`);
       try {
@@ -2091,9 +2326,9 @@ export default function WatchPage() {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
           allowSamePathServVariants: selectedServer === 3,
-          maxPlayerPages: FAST_PHASE_MAX_PLAYER_PAGES,
-          maxDeepCandidates: FAST_PHASE_MAX_DEEP_CANDIDATES,
-          maxPlayerv2Pool: FAST_PHASE_MAX_PLAYERV2_POOL,
+          maxPlayerPages: isServer2Playerv2 ? 1 : FAST_PHASE_MAX_PLAYER_PAGES,
+          maxDeepCandidates: isServer2Playerv2 ? 2 : FAST_PHASE_MAX_DEEP_CANDIDATES,
+          maxPlayerv2Pool: isServer2Playerv2 ? 1 : FAST_PHASE_MAX_PLAYERV2_POOL,
           fetchTimeoutMs: FAST_PHASE_PROBE_TIMEOUT_MS,
           onBatchCandidates: (batch, phase) => {
             if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
@@ -2106,12 +2341,32 @@ export default function WatchPage() {
         if (fastMerged.length) {
           hadPlayable = true;
           applyCandidatesPreservingSelection(fastMerged);
+          if (isServer2Playerv2) setPlayerv2StickyCandidates(selectedUrl, fastMerged);
           if (!disableResolveCache) setCachedResolveCandidates(selectedUrl, fastMerged);
           setPlayerError(null);
           resetRecoveryState();
           setResolverLoading(false);
         } else {
           setResolverLoading(true);
+        }
+
+        if (isServer2Playerv2) {
+          const stickyFallback = getPlayerv2StickyCandidates(selectedUrl);
+          const lightweight = dedupeUrls([...candidatesRef.current, ...fastMerged, ...stickyFallback]);
+          applyCandidatesPreservingSelection(lightweight);
+          if (lightweight.length) {
+            hadPlayable = true;
+            setPlayerv2StickyCandidates(selectedUrl, lightweight);
+            if (!disableResolveCache) setCachedResolveCandidates(selectedUrl, lightweight);
+            setPlayerError(null);
+            resetRecoveryState();
+            setResolverError(null);
+          } else {
+            setResolverError(NO_STREAM_SELECTED_SERVER_MESSAGE);
+            scheduleResolveRecovery("resolver-empty");
+          }
+          setResolverLoading(false);
+          return;
         }
 
         const finalList = await resolveCandidatesForServer(selectedUrl, controller.signal, {
@@ -2143,12 +2398,16 @@ export default function WatchPage() {
             concurrency: Math.min(3, PROBE_CONCURRENCY),
             pushDiag,
           });
-          const merged = verified.length ? verified : (selectedServer === 3 ? mergedRaw : []);
+          const merged = verified.length ? verified : (selectedServer === 3 || isServer2Playerv2 ? mergedRaw : []);
+          if (!verified.length && isServer2Playerv2 && mergedRaw.length) {
+            pushDiag("probe fallback server2-playerv2 raw");
+          }
           if (mergedRaw.length) pushDiag(`probe ok ${merged.length}/${mergedRaw.length}`);
           applyCandidatesPreservingSelection(merged);
           if (merged.length && !disableResolveCache) setCachedResolveCandidates(selectedUrl, merged);
           if (!merged.length) {
-            clearCachedResolveCandidates(selectedUrl);
+            const keepPlayerv2Cache = selectedServer === 2 && isPlayerv2LikeUrl(selectedUrl);
+            if (!keepPlayerv2Cache) clearCachedResolveCandidates(selectedUrl);
             setResolverError(NO_STREAM_SELECTED_SERVER_MESSAGE);
             if (selectedServer !== 3) scheduleResolveRecovery("resolver-empty");
             else resetRecoveryState();
