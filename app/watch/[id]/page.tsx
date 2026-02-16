@@ -47,6 +47,11 @@ const FAST_PHASE_MAX_PLAYERV2_POOL = 2;
 const RESOLVE_CHILD_CONCURRENCY = 3;
 const EXPAND_VARIANTS_CONCURRENCY = 4;
 const PROBE_CONCURRENCY = 4;
+const LIVEHD77_FETCH_TIMEOUT_FAST_MS = 4200;
+const LIVEHD77_FETCH_TIMEOUT_FINAL_MS = 9500;
+const LIVEHD77_PROBE_TIMEOUT_MS = 9000;
+const LIVEHD77_FETCH_RETRIES = 1;
+const LIVEHD77_FETCH_RETRY_DELAY_MS = 220;
 const RESOLVE_RESULT_CACHE_TTL_MS = 75_000;
 const PLAYERV2_RESOLVE_CACHE_TTL_MS = 45_000;
 const PLAYERV2_STICKY_CACHE_TTL_MS = 8 * 60_000;
@@ -376,6 +381,17 @@ function toUnderlyingUrl(value: string) {
 function isPlayerv2LikeUrl(value?: string | null) {
   const raw = toUnderlyingUrl(String(value || ""));
   return /\/playerv2\.php(?:\?|$)/i.test(raw) || /[?&]action=generate_token(?:&|$)/i.test(raw);
+}
+
+function isLivehd77LikeUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!raw || !isValidHttpUrl(raw)) return false;
+  try {
+    const host = new URL(raw).hostname.toLowerCase();
+    return host === "livehd77.pro" || host.endsWith(".livehd77.pro");
+  } catch {
+    return false;
+  }
 }
 
 function isPlayerv2TokenEndpointUrl(value?: string | null) {
@@ -1553,6 +1569,8 @@ async function resolveCandidatesForServer(
     onBatchCandidates?: (batch: string[], phase: ResolveBatchPhase) => void;
     parallelChildConcurrency?: number;
     fetchTimeoutMs?: number;
+    fetchRetries?: number;
+    fetchRetryDelayMs?: number;
     allowSamePathServVariants?: boolean;
   }
 ) {
@@ -1561,6 +1579,8 @@ async function resolveCandidatesForServer(
   const maxPlayerv2Pool = opts?.maxPlayerv2Pool ?? 6;
   const parallelChildConcurrency = opts?.parallelChildConcurrency ?? RESOLVE_CHILD_CONCURRENCY;
   const fetchTimeoutMs = opts?.fetchTimeoutMs ?? CANDIDATE_PROBE_TIMEOUT_MS;
+  const fetchRetries = Math.max(0, Math.floor(opts?.fetchRetries ?? 0));
+  const fetchRetryDelayMs = Math.max(0, Math.floor(opts?.fetchRetryDelayMs ?? 180));
   const allowSamePathServVariants = opts?.allowSamePathServVariants ?? false;
   const sourceServ = getServFromUrl(sourceUrl);
   const sourcePathKey = normalizePathKey(sourceUrl);
@@ -1575,19 +1595,34 @@ async function resolveCandidatesForServer(
   };
 
   const fetchHtml = async (url: string) => {
-    const res = await fetchWithTimeout(
-      url,
-      {
-        method: "GET",
-        cache: "no-store",
-        credentials: "same-origin",
-        headers: { "x-embed-proxy-probe": "1" },
-      },
-      fetchTimeoutMs,
-      signal
-    );
-    const ct = (res.headers.get("content-type") || "").toLowerCase();
-    return { res, ct };
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt <= fetchRetries; attempt += 1) {
+      try {
+        const res = await fetchWithTimeout(
+          url,
+          {
+            method: "GET",
+            cache: "no-store",
+            credentials: "same-origin",
+            headers: { "x-embed-proxy-probe": "1" },
+          },
+          fetchTimeoutMs,
+          signal
+        );
+        const ct = (res.headers.get("content-type") || "").toLowerCase();
+        return { res, ct };
+      } catch (e: unknown) {
+        if (e instanceof Error && e.name === "AbortError") throw e;
+        lastError = e;
+        if (attempt >= fetchRetries || signal.aborted) throw e;
+        const delay = fetchRetryDelayMs * (attempt + 1);
+        if (delay > 0) {
+          await new Promise<void>((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    }
+    if (lastError instanceof Error) throw lastError;
+    throw new Error("resolve-fetch-failed");
   };
 
   if (isStrongPlayableStreamUrl(sourceUrl) || isLikelyLivePhpEndpointUrl(sourceUrl)) {
@@ -2301,10 +2336,16 @@ export default function WatchPage() {
         return proxied ? [proxied] : [];
       })();
       const isServer2Playerv2 = selectedServer === 2 && isPlayerv2LikeUrl(selectedUrl);
+      const isServer3Livehd = selectedServer === 3 && isLivehd77LikeUrl(selectedUrl);
       const disableResolveCache = selectedServer === 3;
       const cachedCandidates = disableResolveCache ? [] : getCachedResolveCandidates(selectedUrl);
       const stickyCandidates = isServer2Playerv2 ? getPlayerv2StickyCandidates(selectedUrl) : [];
       const initialCandidates = dedupeUrls([...stickyCandidates, ...cachedCandidates, ...seedCandidates]);
+      const resolveFetchTimeoutFast = isServer3Livehd ? LIVEHD77_FETCH_TIMEOUT_FAST_MS : FAST_PHASE_PROBE_TIMEOUT_MS;
+      const resolveFetchTimeoutFinal = isServer3Livehd ? LIVEHD77_FETCH_TIMEOUT_FINAL_MS : CANDIDATE_PROBE_TIMEOUT_MS;
+      const probeTimeoutMs = isServer3Livehd ? LIVEHD77_PROBE_TIMEOUT_MS : CANDIDATE_PROBE_TIMEOUT_MS;
+      const resolveFetchRetries = isServer3Livehd ? LIVEHD77_FETCH_RETRIES : 0;
+      const resolveFetchRetryDelayMs = isServer3Livehd ? LIVEHD77_FETCH_RETRY_DELAY_MS : 0;
       let hadPlayable = initialCandidates.length > 0;
       const mergeCandidates = (incoming: string[]) => {
         if (!incoming.length) return;
@@ -2329,7 +2370,9 @@ export default function WatchPage() {
           maxPlayerPages: isServer2Playerv2 ? 1 : FAST_PHASE_MAX_PLAYER_PAGES,
           maxDeepCandidates: isServer2Playerv2 ? 2 : FAST_PHASE_MAX_DEEP_CANDIDATES,
           maxPlayerv2Pool: isServer2Playerv2 ? 1 : FAST_PHASE_MAX_PLAYERV2_POOL,
-          fetchTimeoutMs: FAST_PHASE_PROBE_TIMEOUT_MS,
+          fetchTimeoutMs: resolveFetchTimeoutFast,
+          fetchRetries: resolveFetchRetries,
+          fetchRetryDelayMs: resolveFetchRetryDelayMs,
           onBatchCandidates: (batch, phase) => {
             if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
             mergeCandidates(batch);
@@ -2373,6 +2416,9 @@ export default function WatchPage() {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
           allowSamePathServVariants: selectedServer === 3,
+          fetchTimeoutMs: resolveFetchTimeoutFinal,
+          fetchRetries: resolveFetchRetries,
+          fetchRetryDelayMs: resolveFetchRetryDelayMs,
           onBatchCandidates: (batch, phase) => {
             if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
             mergeCandidates(batch);
@@ -2382,7 +2428,7 @@ export default function WatchPage() {
         if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
         const playableList = await expandCandidatesWithManifestVariants(finalList, {
           signal: controller.signal,
-          timeoutMs: CANDIDATE_PROBE_TIMEOUT_MS,
+          timeoutMs: probeTimeoutMs,
           maxParents: 8,
           maxVariantsPerParent: 12,
           concurrency: EXPAND_VARIANTS_CONCURRENCY,
@@ -2393,7 +2439,7 @@ export default function WatchPage() {
           const mergedRaw = dedupeUrls([...candidatesRef.current, ...fastMerged, ...finalList, ...playableList]);
           const verified = await filterPlayableCandidates(mergedRaw, {
             signal: controller.signal,
-            timeoutMs: CANDIDATE_PROBE_TIMEOUT_MS,
+            timeoutMs: probeTimeoutMs,
             maxChecks: Math.min(36, mergedRaw.length),
             concurrency: Math.min(3, PROBE_CONCURRENCY),
             pushDiag,
@@ -2409,7 +2455,7 @@ export default function WatchPage() {
             const keepPlayerv2Cache = selectedServer === 2 && isPlayerv2LikeUrl(selectedUrl);
             if (!keepPlayerv2Cache) clearCachedResolveCandidates(selectedUrl);
             setResolverError(NO_STREAM_SELECTED_SERVER_MESSAGE);
-            if (selectedServer !== 3) scheduleResolveRecovery("resolver-empty");
+            if (selectedServer !== 3 || isServer3Livehd) scheduleResolveRecovery("resolver-empty");
             else resetRecoveryState();
           } else {
             hadPlayable = true;
@@ -2420,9 +2466,14 @@ export default function WatchPage() {
       } catch (e: unknown) {
         if (!cancel && !(e instanceof Error && e.name === "AbortError")) {
           if (!hadPlayable) {
-            setResolverError(e instanceof Error ? e.message : "فشل استخراج المصادر.");
-            if (selectedServer !== 3) scheduleResolveRecovery("resolver-error");
-            else resetRecoveryState();
+            const errorMessage = e instanceof Error ? e.message : "فشل استخراج المصادر.";
+            setResolverError(errorMessage);
+            if (selectedServer !== 3 || isServer3Livehd) {
+              const immediate = isServer3Livehd && /probe-timeout/i.test(errorMessage);
+              scheduleResolveRecovery("resolver-error", immediate);
+            } else {
+              resetRecoveryState();
+            }
           } else {
             pushDiag(`resolve background error: ${e instanceof Error ? e.message : String(e)}`);
           }
