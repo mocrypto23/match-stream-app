@@ -323,18 +323,6 @@ function toEmbedProxyUrl(rawUrl?: string | null, ref?: string) {
   return `/api/embed-proxy?${q.toString()}`;
 }
 
-function toEmbedProxyUrlUnstable(rawUrl?: string | null, ref?: string) {
-  const value = String(rawUrl || "").trim();
-  if (!value) return "";
-  if (value.startsWith("/api/embed-proxy?")) return value;
-  if (!isValidHttpUrl(value)) return "";
-  const q = new URLSearchParams();
-  q.set("url", value);
-  q.set("depth", "0");
-  if (ref && isValidHttpUrl(ref)) q.set("ref", ref);
-  return `/api/embed-proxy?${q.toString()}`;
-}
-
 function formatStartTimeAr(iso?: string | null) {
   if (!iso) return null;
   const d = new Date(iso);
@@ -1213,18 +1201,19 @@ function extractPlayerv2ConfigFromHtml(html: string, pageUrl: string) {
 }
 
 function buildPlayerv2NonceCandidates() {
+  // playerv2 nonces observed in the wild are short alnum (often 6 chars), sometimes longer.
   const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  const rnd = () => {
+  const pick = (len: number) => {
     let out = "";
-    for (let i = 0; i < 4; i += 1) out += alphabet[Math.floor(Math.random() * alphabet.length)];
+    for (let i = 0; i < len; i += 1) out += alphabet[Math.floor(Math.random() * alphabet.length)];
     return out;
   };
-  const slot = Math.floor(Date.now() / 1920);
-  return [
-    `${rnd()}${(slot - 3064).toString(36)}`,
-    `${rnd()}${(slot + 3064).toString(36)}`,
-    `${rnd()}${Math.floor(Date.now() / 1000).toString(36)}`,
-  ];
+  const base36 = (len: number) => {
+    let out = "";
+    while (out.length < len) out += Math.random().toString(36).slice(2);
+    return out.slice(0, len);
+  };
+  return Array.from(new Set([base36(6), pick(6), pick(8)])).filter(Boolean);
 }
 
 async function requestPlayerv2TokenFromProxy(
@@ -1270,6 +1259,7 @@ async function requestPlayerv2TokenFromProxy(
         signal,
         headers: {
           "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "x-requested-with": "XMLHttpRequest",
           "x-embed-proxy-probe": "1",
         },
         body: payload,
@@ -1323,9 +1313,7 @@ async function extractPlayerv2TokenizedCandidatesFromHtml(
     if (!tokenPayload) continue;
 
     const basePath = tokenPath.replace(/\.m3u8$/i, "");
-    const pathVariants = Array.from(
-      new Set([basePath, `${basePath}.m3u8`, `${basePath}/index.m3u8`, `${basePath}/mainIndex.m3u8`])
-    );
+    const pathVariants = Array.from(new Set([basePath, `${basePath}.m3u8`]));
 
     for (const domain of cfg.domains.slice(0, 4)) {
       for (const pv of pathVariants) {
@@ -2041,8 +2029,6 @@ export default function WatchPage() {
   const selectedOption = validServers.find((s) => s.n === selectedServer);
   const selectedServerLabel = selectedOption?.label || SERVER_SOURCE_LABELS[selectedServer] || `سيرفر ${selectedServer}`;
   const selectedUrl = selectedOption?.url ?? "";
-  const useIframePlayer = selectedServer === 2 && isPlayerv2LikeUrl(selectedUrl);
-  const iframeSrc = useIframePlayer ? toEmbedProxyUrlUnstable(selectedUrl, selectedUrl) : "";
   const status = (match?.status_key ?? "").toLowerCase();
   const startMs = match?.match_start ? new Date(match.match_start).getTime() : null;
   const prematchMs = PREMATCH_OPEN_WINDOW_MINUTES * 60 * 1000;
@@ -2070,7 +2056,7 @@ export default function WatchPage() {
     activeResolveIdRef.current = resolveId;
     resolveLockRef.current = true;
     (async () => {
-      if (!selectedUrl || shouldBlockStream || useIframePlayer) {
+      if (!selectedUrl || shouldBlockStream) {
         applyCandidatesPreservingSelection([]);
         setResolverError(null);
         setResolverLoading(false);
@@ -2198,7 +2184,6 @@ export default function WatchPage() {
     selectedUrl,
     selectedServer,
     shouldBlockStream,
-    useIframePlayer,
     pushDiag,
     resolveRevision,
     scheduleResolveRecovery,
@@ -2384,12 +2369,20 @@ export default function WatchPage() {
           const delay = Math.min(3500, 500 + fatalRetries * 700);
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
             setPlayerError("انقطاع مؤقت بالشبكة... جاري المحاولة تلقائيًا");
-            queueTimeout(() => hls?.startLoad(), delay);
+            queueTimeout(() => {
+              try { hls?.startLoad(); } catch { }
+              if (video.paused) playWithAutoplayFallback();
+            }, delay);
             return;
           }
           if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
             setPlayerError("خطأ وسائط... جاري الإصلاح تلقائيًا");
-            queueTimeout(() => hls?.recoverMediaError(), delay);
+            queueTimeout(() => {
+              try { hls?.recoverMediaError(); } catch { }
+              queueTimeout(() => {
+                if (video.paused) playWithAutoplayFallback();
+              }, 150);
+            }, delay);
             return;
           }
         }
@@ -2541,16 +2534,6 @@ export default function WatchPage() {
             <div className="flex flex-col gap-2 items-center justify-center h-[55vh] min-h-[320px] text-gray-400 p-6 text-center">
               <div className="text-white font-bold text-xl">{streamStartNotice}</div>
               {prettyStart ? <div className="text-sm text-gray-500">موعد المباراة: <span className="text-gray-300">{prettyStart}</span></div> : null}
-            </div>
-          ) : useIframePlayer && iframeSrc ? (
-            <div className="relative w-full aspect-video min-h-[280px] sm:min-h-[430px] bg-black overflow-hidden">
-              <iframe
-                src={iframeSrc}
-                title={selectedServerLabel}
-                allow="autoplay; fullscreen"
-                allowFullScreen
-                className="absolute inset-0 w-full h-full border-0"
-              />
             </div>
           ) : selectedHlsUrl ? (
             <div onDoubleClick={handleVideoDoubleClick} className="relative w-full aspect-video min-h-[280px] sm:min-h-[430px] bg-black overflow-hidden">
