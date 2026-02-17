@@ -47,6 +47,11 @@ const FAST_PHASE_MAX_PLAYERV2_POOL = 2;
 const RESOLVE_CHILD_CONCURRENCY = 3;
 const EXPAND_VARIANTS_CONCURRENCY = 4;
 const PROBE_CONCURRENCY = 4;
+const SERVER1_FETCH_TIMEOUT_FAST_MS = 4500;
+const SERVER1_FETCH_TIMEOUT_FINAL_MS = 16000;
+const SERVER1_PROBE_TIMEOUT_MS = 12000;
+const SERVER1_FETCH_RETRIES = 1;
+const SERVER1_FETCH_RETRY_DELAY_MS = 250;
 const LIVEHD77_FETCH_TIMEOUT_FAST_MS = 4200;
 const LIVEHD77_FETCH_TIMEOUT_FINAL_MS = 9500;
 const LIVEHD77_PROBE_TIMEOUT_MS = 9000;
@@ -1090,6 +1095,14 @@ function dedupeUrls(values: string[]) {
   return out;
 }
 
+function candidateFailureKey(value: string) {
+  return canonicalizeUrl(value) || String(value || "").trim().toLowerCase();
+}
+
+function isFastFailoverServer(server: number) {
+  return server === 1 || server === 3;
+}
+
 function escapeRegExp(value: string) {
   return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -2044,6 +2057,7 @@ export default function WatchPage() {
   const [diagLogs, setDiagLogs] = useState<string[]>([]);
   const candidatesRef = useRef<string[]>([]);
   const selectedCandidateRef = useRef(0);
+  const selectedServerRef = useRef(1);
   const recoveryTimerRef = useRef<number | null>(null);
   const recoveryAttemptRef = useRef(0);
   const lastResolveKickRef = useRef(0);
@@ -2052,6 +2066,11 @@ export default function WatchPage() {
   const lastProgressRef = useRef(0);
   const lastProgressAtRef = useRef(Date.now());
   const stallTimerRef = useRef<number | null>(null);
+  const badCandidateKeysByServerRef = useRef<Record<number, Set<string>>>({
+    1: new Set<string>(),
+    3: new Set<string>(),
+  });
+  const networkFatalCountByCandidateRef = useRef<Map<string, number>>(new Map());
 
   const diagEnabled = searchParams.get("diag") === "1";
   const pushDiag = useCallback((line: string) => {
@@ -2067,8 +2086,52 @@ export default function WatchPage() {
     selectedCandidateRef.current = selectedCandidate;
   }, [selectedCandidate]);
 
+  useEffect(() => {
+    selectedServerRef.current = selectedServer;
+  }, [selectedServer]);
+
+  const markCandidateAsBad = useCallback((server: number, candidate: string, reason: string) => {
+    if (!isFastFailoverServer(server)) return;
+    const key = candidateFailureKey(candidate);
+    if (!key) return;
+    const store = badCandidateKeysByServerRef.current;
+    const set = store[server] || new Set<string>();
+    const wasKnown = set.has(key);
+    set.add(key);
+    store[server] = set;
+    if (!wasKnown) pushDiag(`bad-candidate-mark server${server} (${reason})`);
+  }, [pushDiag]);
+
+  const clearCandidateFailureMarks = useCallback((server: number, candidate: string) => {
+    const key = candidateFailureKey(candidate);
+    if (!key) return;
+    networkFatalCountByCandidateRef.current.delete(key);
+    if (!isFastFailoverServer(server)) return;
+    const set = badCandidateKeysByServerRef.current[server];
+    if (set?.delete(key)) {
+      pushDiag(`bad-candidate-clear server${server}`);
+    }
+  }, [pushDiag]);
+
+  const filterCandidatesByHealth = useCallback((server: number, input: string[]) => {
+    const base = dedupeUrls(input);
+    if (!isFastFailoverServer(server)) return base;
+    const blocked = badCandidateKeysByServerRef.current[server];
+    if (!blocked || !blocked.size) return base;
+
+    const filtered = base.filter((candidate) => !blocked.has(candidateFailureKey(candidate)));
+    if (!filtered.length && base.length) {
+      pushDiag(`bad-candidate-skip server${server} fallback-all`);
+      return base;
+    }
+    if (filtered.length !== base.length) {
+      pushDiag(`bad-candidate-skip server${server} removed=${base.length - filtered.length}`);
+    }
+    return filtered;
+  }, [pushDiag]);
+
   const applyCandidatesPreservingSelection = useCallback((nextCandidates: string[]) => {
-    const next = dedupeUrls(nextCandidates);
+    const next = filterCandidatesByHealth(selectedServerRef.current, nextCandidates);
     const prev = candidatesRef.current;
     const prevIdx = selectedCandidateRef.current;
     const prevUrl = prev[prevIdx] || "";
@@ -2091,7 +2154,7 @@ export default function WatchPage() {
       setSelectedCandidate(nextIdx);
     }
     setCandidates(next);
-  }, []);
+  }, [filterCandidatesByHealth]);
 
   const clearRecoveryTimer = useCallback(() => {
     if (recoveryTimerRef.current !== null) {
@@ -2306,6 +2369,7 @@ export default function WatchPage() {
     selectedCandidateRef.current = 0;
     setSelectedCandidate(0);
     setPlayerError(null);
+    setResolverError(null);
     resetRecoveryState();
   }, [selectedServer, resetRecoveryState]);
   useEffect(() => {
@@ -2335,23 +2399,41 @@ export default function WatchPage() {
         const proxied = toEmbedProxyUrl(selectedUrl, selectedUrl);
         return proxied ? [proxied] : [];
       })();
+      const isServer1Primary = selectedServer === 1;
       const isServer2Playerv2 = selectedServer === 2 && isPlayerv2LikeUrl(selectedUrl);
       const isServer3Livehd = selectedServer === 3 && isLivehd77LikeUrl(selectedUrl);
       const disableResolveCache = selectedServer === 3;
       const cachedCandidates = disableResolveCache ? [] : getCachedResolveCandidates(selectedUrl);
       const stickyCandidates = isServer2Playerv2 ? getPlayerv2StickyCandidates(selectedUrl) : [];
       const initialCandidates = dedupeUrls([...stickyCandidates, ...cachedCandidates, ...seedCandidates]);
-      const resolveFetchTimeoutFast = isServer3Livehd ? LIVEHD77_FETCH_TIMEOUT_FAST_MS : FAST_PHASE_PROBE_TIMEOUT_MS;
-      const resolveFetchTimeoutFinal = isServer3Livehd ? LIVEHD77_FETCH_TIMEOUT_FINAL_MS : CANDIDATE_PROBE_TIMEOUT_MS;
-      const probeTimeoutMs = isServer3Livehd ? LIVEHD77_PROBE_TIMEOUT_MS : CANDIDATE_PROBE_TIMEOUT_MS;
-      const resolveFetchRetries = isServer3Livehd ? LIVEHD77_FETCH_RETRIES : 0;
-      const resolveFetchRetryDelayMs = isServer3Livehd ? LIVEHD77_FETCH_RETRY_DELAY_MS : 0;
+      const resolveFetchTimeoutFast = isServer3Livehd
+        ? LIVEHD77_FETCH_TIMEOUT_FAST_MS
+        : isServer1Primary
+          ? SERVER1_FETCH_TIMEOUT_FAST_MS
+          : FAST_PHASE_PROBE_TIMEOUT_MS;
+      const resolveFetchTimeoutFinal = isServer3Livehd
+        ? LIVEHD77_FETCH_TIMEOUT_FINAL_MS
+        : isServer1Primary
+          ? SERVER1_FETCH_TIMEOUT_FINAL_MS
+          : CANDIDATE_PROBE_TIMEOUT_MS;
+      const probeTimeoutMs = isServer3Livehd
+        ? LIVEHD77_PROBE_TIMEOUT_MS
+        : isServer1Primary
+          ? SERVER1_PROBE_TIMEOUT_MS
+          : CANDIDATE_PROBE_TIMEOUT_MS;
+      const resolveFetchRetries = isServer3Livehd ? LIVEHD77_FETCH_RETRIES : isServer1Primary ? SERVER1_FETCH_RETRIES : 0;
+      const resolveFetchRetryDelayMs = isServer3Livehd
+        ? LIVEHD77_FETCH_RETRY_DELAY_MS
+        : isServer1Primary
+          ? SERVER1_FETCH_RETRY_DELAY_MS
+          : 0;
       let hadPlayable = initialCandidates.length > 0;
       const mergeCandidates = (incoming: string[]) => {
         if (!incoming.length) return;
         hadPlayable = true;
         const merged = dedupeUrls([...candidatesRef.current, ...incoming]);
         applyCandidatesPreservingSelection(merged);
+        setResolverError(null);
         if (isServer2Playerv2) setPlayerv2StickyCandidates(selectedUrl, merged);
         if (!disableResolveCache) setCachedResolveCandidates(selectedUrl, merged);
       };
@@ -2387,6 +2469,7 @@ export default function WatchPage() {
           if (isServer2Playerv2) setPlayerv2StickyCandidates(selectedUrl, fastMerged);
           if (!disableResolveCache) setCachedResolveCandidates(selectedUrl, fastMerged);
           setPlayerError(null);
+          setResolverError(null);
           resetRecoveryState();
           setResolverLoading(false);
         } else {
@@ -2444,9 +2527,16 @@ export default function WatchPage() {
             concurrency: Math.min(3, PROBE_CONCURRENCY),
             pushDiag,
           });
-          const merged = verified.length ? verified : (selectedServer === 3 || isServer2Playerv2 ? mergedRaw : []);
+          const allowRawFallback = selectedServer === 1 || selectedServer === 3 || isServer2Playerv2;
+          const merged = verified.length ? verified : (allowRawFallback ? mergedRaw : []);
+          if (!verified.length && selectedServer === 1 && mergedRaw.length) {
+            pushDiag("raw-fallback server1");
+          }
           if (!verified.length && isServer2Playerv2 && mergedRaw.length) {
             pushDiag("probe fallback server2-playerv2 raw");
+          }
+          if (!verified.length && selectedServer === 3 && mergedRaw.length) {
+            pushDiag("raw-fallback server3");
           }
           if (mergedRaw.length) pushDiag(`probe ok ${merged.length}/${mergedRaw.length}`);
           applyCandidatesPreservingSelection(merged);
@@ -2460,16 +2550,25 @@ export default function WatchPage() {
           } else {
             hadPlayable = true;
             setPlayerError(null);
+            setResolverError(null);
             resetRecoveryState();
           }
         }
       } catch (e: unknown) {
         if (!cancel && !(e instanceof Error && e.name === "AbortError")) {
           if (!hadPlayable) {
-            const errorMessage = e instanceof Error ? e.message : "فشل استخراج المصادر.";
+            const rawErrorMessage = e instanceof Error ? e.message : "فشل استخراج المصادر.";
+            const isServer1Or3 = selectedServer === 1 || selectedServer === 3;
+            const isProbeTimeout = /probe-timeout/i.test(rawErrorMessage);
+            const errorMessage = isServer1Or3 && isProbeTimeout
+              ? NO_STREAM_SELECTED_SERVER_MESSAGE
+              : rawErrorMessage;
+            if (isServer1Or3 && isProbeTimeout) {
+              pushDiag(`resolver probe-timeout server${selectedServer}`);
+            }
             setResolverError(errorMessage);
             if (selectedServer !== 3 || isServer3Livehd) {
-              const immediate = isServer3Livehd && /probe-timeout/i.test(errorMessage);
+              const immediate = isServer3Livehd && isProbeTimeout;
               scheduleResolveRecovery("resolver-error", immediate);
             } else {
               resetRecoveryState();
@@ -2514,6 +2613,8 @@ export default function WatchPage() {
     let cancel = false;
     let hls: Hls | null = null;
     const current = selectedCandidate;
+    const currentCandidateKey = candidateFailureKey(selectedHlsUrl);
+    const useFastFailover = isFastFailoverServer(selectedServer);
     let freezeTriggered = false;
     let loadingOverlayTimer: number | null = null;
     const timeoutHandles: number[] = [];
@@ -2565,6 +2666,7 @@ export default function WatchPage() {
     };
     const moveNext = (reason: string) => {
       const total = candidatesRef.current.length;
+      setResolverError(null);
       if (current + 1 < total) {
         const nextIndex = current + 1;
         selectedCandidateRef.current = nextIndex;
@@ -2623,6 +2725,8 @@ export default function WatchPage() {
       resetRecoveryState();
       hidePlayerLoading();
       setPlayerError(null);
+      setResolverError(null);
+      if (useFastFailover) clearCandidateFailureMarks(selectedServer, selectedHlsUrl);
     };
     const onTimeUpdate = () => {
       markProgress();
@@ -2669,12 +2773,25 @@ export default function WatchPage() {
         resetRecoveryState();
         hidePlayerLoading();
         setPlayerError(null);
+        setResolverError(null);
+        if (useFastFailover) clearCandidateFailureMarks(selectedServer, selectedHlsUrl);
         playWithAutoplayFallback();
       });
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (cancel || !data.fatal) return;
         fatalRetries += 1;
         pushDiag(`fatal ${data.type} ${String(data.details)} retry=${fatalRetries}`);
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && currentCandidateKey) {
+          const prev = networkFatalCountByCandidateRef.current.get(currentCandidateKey) || 0;
+          const next = prev + 1;
+          networkFatalCountByCandidateRef.current.set(currentCandidateKey, next);
+          if (useFastFailover && next >= 2) {
+            pushDiag(`fast-failover server${selectedServer} network=${next}`);
+            markCandidateAsBad(selectedServer, selectedHlsUrl, "network-fast-failover");
+            moveNext("network-fast-failover");
+            return;
+          }
+        }
         if (fatalRetries <= 6) {
           const delay = Math.min(3500, 500 + fatalRetries * 700);
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
@@ -2695,6 +2812,9 @@ export default function WatchPage() {
             }, delay);
             return;
           }
+        }
+        if (useFastFailover) {
+          markCandidateAsBad(selectedServer, selectedHlsUrl, `fatal-${String(data.type || "unknown")}`);
         }
         moveNext(`${data.type}`);
       });
@@ -2755,6 +2875,8 @@ export default function WatchPage() {
     shouldBlockStream,
     pushDiag,
     applyCandidatesPreservingSelection,
+    markCandidateAsBad,
+    clearCandidateFailureMarks,
     setResolverError,
     scheduleResolveRecovery,
     resetRecoveryState,

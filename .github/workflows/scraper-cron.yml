@@ -15,25 +15,29 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      TZ: Africa/Cairo
 
     steps:
-      - name: Gate (manual always runs, schedule gated)
+      - name: Gate (manual/dispatch always runs, schedule 15m after 2pm Cairo)
         id: gate
         env:
-          TZ: Africa/Cairo
           EVENT_NAME: ${{ github.event_name }}
         run: |
+          echo "event=${EVENT_NAME}"
+          echo "cairo_now=$(date '+%F %T %Z')"
+
           if [ "$EVENT_NAME" = "workflow_dispatch" ] || [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            echo "decision=run (manual/dispatch)"
             echo "should_run=true" >> "$GITHUB_OUTPUT"
-            echo "slot=manual" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           H=$(date +%H)
           M=$(date +%M)
-          D=$(date +%F)
 
           if [ "$H" -lt 14 ]; then
+            echo "decision=skip (before 14:00 Cairo)"
             echo "should_run=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -41,65 +45,39 @@ jobs:
           MM=$((10#$M))
           R=$((MM % 15))
 
-          if [ "$R" -gt 8 ]; then
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          if [ "$R" -le 10 ]; then
+            echo "decision=run (within 15m grace window, minute=$MM, r=$R)"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          SLOT_MIN=$((MM - R))
-          SLOT=$(printf "%s-%02d-%02d" "$D" "$H" "$SLOT_MIN")
-
-          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
-          echo "should_run=true" >> "$GITHUB_OUTPUT"
-
-      - name: Restore slot cache (schedule only)
-        id: slotcache
-        if: steps.gate.outputs.should_run == 'true' && github.event_name == 'schedule'
-        uses: actions/cache/restore@v4
-        with:
-          path: .slot
-          key: scrape-slot-${{ steps.gate.outputs.slot }}
-
-      - name: Stop if slot already executed (schedule only)
-        if: github.event_name == 'schedule' && steps.gate.outputs.should_run == 'true' && steps.slotcache.outputs.cache-hit == 'true'
-        run: exit 0
+          echo "decision=skip (outside window, minute=$MM, r=$R)"
+          echo "should_run=false" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Checkout
-        if: steps.gate.outputs.should_run == 'true' && (github.event_name != 'schedule' || steps.slotcache.outputs.cache-hit != 'true')
+        if: steps.gate.outputs.should_run == 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Setup Node
-        if: steps.gate.outputs.should_run == 'true' && (github.event_name != 'schedule' || steps.slotcache.outputs.cache-hit != 'true')
+        if: steps.gate.outputs.should_run == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: "npm"
 
       - name: Install dependencies
-        if: steps.gate.outputs.should_run == 'true' && (github.event_name != 'schedule' || steps.slotcache.outputs.cache-hit != 'true')
+        if: steps.gate.outputs.should_run == 'true'
         run: npm ci
 
       - name: Install Playwright (Chromium)
-        if: steps.gate.outputs.should_run == 'true' && (github.event_name != 'schedule' || steps.slotcache.outputs.cache-hit != 'true')
+        if: steps.gate.outputs.should_run == 'true'
         run: npx playwright install --with-deps chromium
 
-      - name: Show revision + scraper fingerprint
-        if: steps.gate.outputs.should_run == 'true' && (github.event_name != 'schedule' || steps.slotcache.outputs.cache-hit != 'true')
-        run: |
-          echo "=== REVISION ==="
-          git rev-parse HEAD
-          echo "=== scraper.js info ==="
-          ls -la scraper.js
-          wc -l scraper.js
-          node -e "const fs=require('fs');const crypto=require('crypto');const b=fs.readFileSync('scraper.js');console.log('sha256='+crypto.createHash('sha256').update(b).digest('hex'))"
-          echo "=== node/playwright ==="
-          node -v
-          npx playwright --version
-
       - name: Run scraper (headless)
-        if: steps.gate.outputs.should_run == 'true' && (github.event_name != 'schedule' || steps.slotcache.outputs.cache-hit != 'true')
+        if: steps.gate.outputs.should_run == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -114,11 +92,10 @@ jobs:
           SCRAPE_DAY_SCOPE: today_only
           PRESERVE_FUTURE_ROWS: 0
           CLEANUP_OLD_FINISHED: 1
-          TZ: Africa/Cairo
         run: node scraper.js
 
       - name: Trigger on-demand revalidation
-        if: steps.gate.outputs.should_run == 'true' && (github.event_name != 'schedule' || steps.slotcache.outputs.cache-hit != 'true')
+        if: steps.gate.outputs.should_run == 'true'
         continue-on-error: true
         env:
           SITE_URL: ${{ secrets.SITE_URL }}
@@ -148,59 +125,3 @@ jobs:
             echo "revalidation failed with HTTP ${HTTP_CODE}"
             exit 1
           fi
-
-      - name: Diagnose Supabase rows (today)
-        if: always() && github.event_name == 'workflow_dispatch' && steps.gate.outputs.should_run == 'true'
-        continue-on-error: true
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          TABLE_NAME: match-stream-app
-        run: node scripts/diag-supabase.js
-
-      - name: Probe site rendering (runner)
-        if: always() && github.event_name == 'workflow_dispatch' && steps.gate.outputs.should_run == 'true'
-        continue-on-error: true
-        env:
-          HEADLESS: 1
-          TZ: Africa/Cairo
-          DIAG_GOTO_TIMEOUT_MS: 15000
-          DIAG_GOTO_RETRIES: 1
-        run: node scripts/diag-site.js
-
-      - name: List diagnostics files
-        if: always() && github.event_name == 'workflow_dispatch' && steps.gate.outputs.should_run == 'true'
-        run: |
-          echo "=== diag tree ==="
-          ls -la
-          ls -la diag || true
-          find diag -type f -maxdepth 3 -print || true
-
-      - name: Upload diagnostics
-        if: always() && github.event_name == 'workflow_dispatch' && steps.gate.outputs.should_run == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: diag
-          path: diag
-          if-no-files-found: warn
-
-      - name: Upload debug.png if failed
-        if: failure() && steps.gate.outputs.should_run == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug
-          path: debug.png
-          if-no-files-found: ignore
-
-      - name: Prepare slot marker (schedule only)
-        if: success() && github.event_name == 'schedule' && steps.gate.outputs.should_run == 'true' && steps.slotcache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p .slot
-          echo "${{ steps.gate.outputs.slot }}" > .slot/slot.txt
-
-      - name: Save slot cache (schedule only)
-        if: success() && github.event_name == 'schedule' && steps.gate.outputs.should_run == 'true' && steps.slotcache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: .slot
-          key: scrape-slot-${{ steps.gate.outputs.slot }}
