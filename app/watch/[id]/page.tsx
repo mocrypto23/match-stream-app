@@ -47,7 +47,7 @@ const FAST_PHASE_MAX_PLAYERV2_POOL = 2;
 const RESOLVE_CHILD_CONCURRENCY = 3;
 const EXPAND_VARIANTS_CONCURRENCY = 4;
 const PROBE_CONCURRENCY = 4;
-const SERVER1_FETCH_TIMEOUT_FAST_MS = 4500;
+const SERVER1_FETCH_TIMEOUT_FAST_MS = 7000;
 const SERVER1_FETCH_TIMEOUT_FINAL_MS = 16000;
 const SERVER1_PROBE_TIMEOUT_MS = 12000;
 const SERVER1_FETCH_RETRIES = 1;
@@ -1099,6 +1099,35 @@ function candidateFailureKey(value: string) {
   return canonicalizeUrl(value) || String(value || "").trim().toLowerCase();
 }
 
+function isLikelyExpiredReplayManifestUrl(value: string) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!raw || !isValidHttpUrl(raw)) return false;
+  const lower = raw.toLowerCase();
+  return (
+    lower.includes("video.pscp.tv/") ||
+    lower.includes("periscope-replay-direct") ||
+    lower.includes("dynamic_highlatency.m3u8")
+  );
+}
+
+function scoreServer3Candidate(value: string) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!raw || !isValidHttpUrl(raw)) return 0;
+
+  let score = 0;
+  const lower = raw.toLowerCase();
+  if (lower.includes("pl.gomatch-live.com")) score += 320;
+  if (lower.includes("pandalive.live")) score += 220;
+  if (lower.includes("livehd77.pro")) score += 120;
+  if (lower.includes("/albaplayer/")) score += 90;
+  if (/[?&]serv=1(?:&|$)/i.test(lower)) score += 80;
+  if (/[?&]serv=0(?:&|$)/i.test(lower)) score -= 40;
+  if (lower.includes("cdn3.yalla-online.click/chtv/")) score -= 120;
+  if (isLikelyExpiredReplayManifestUrl(lower)) score -= 500;
+
+  return score;
+}
+
 function isFastFailoverServer(server: number) {
   return server === 1 || server === 3;
 }
@@ -2130,8 +2159,30 @@ export default function WatchPage() {
     return filtered;
   }, [pushDiag]);
 
+  const prioritizeCandidatesByServer = useCallback((server: number, input: string[]) => {
+    let base = dedupeUrls(input);
+    if (server !== 3 || base.length < 2) return base;
+
+    const withoutLikelyExpiredReplay = base.filter((candidate) => !isLikelyExpiredReplayManifestUrl(candidate));
+    if (withoutLikelyExpiredReplay.length && withoutLikelyExpiredReplay.length !== base.length) {
+      pushDiag(`server3 drop-expired-replay=${base.length - withoutLikelyExpiredReplay.length}`);
+      base = withoutLikelyExpiredReplay;
+    } else if (!withoutLikelyExpiredReplay.length && base.length) {
+      pushDiag("server3 drop-expired-replay fallback-all");
+    }
+
+    const scored = base
+      .map((candidate, idx) => ({ candidate, idx, score: scoreServer3Candidate(candidate) }))
+      .sort((a, b) => (b.score === a.score ? a.idx - b.idx : b.score - a.score))
+      .map((item) => item.candidate);
+
+    return scored;
+  }, [pushDiag]);
+
   const applyCandidatesPreservingSelection = useCallback((nextCandidates: string[]) => {
-    const next = filterCandidatesByHealth(selectedServerRef.current, nextCandidates);
+    const server = selectedServerRef.current;
+    const prioritized = prioritizeCandidatesByServer(server, nextCandidates);
+    const next = filterCandidatesByHealth(server, prioritized);
     const prev = candidatesRef.current;
     const prevIdx = selectedCandidateRef.current;
     const prevUrl = prev[prevIdx] || "";
@@ -2154,7 +2205,7 @@ export default function WatchPage() {
       setSelectedCandidate(nextIdx);
     }
     setCandidates(next);
-  }, [filterCandidatesByHealth]);
+  }, [filterCandidatesByHealth, prioritizeCandidatesByServer]);
 
   const clearRecoveryTimer = useCallback(() => {
     if (recoveryTimerRef.current !== null) {
@@ -2560,15 +2611,14 @@ export default function WatchPage() {
             const rawErrorMessage = e instanceof Error ? e.message : "فشل استخراج المصادر.";
             const isServer1Or3 = selectedServer === 1 || selectedServer === 3;
             const isProbeTimeout = /probe-timeout/i.test(rawErrorMessage);
-            const errorMessage = isServer1Or3 && isProbeTimeout
-              ? NO_STREAM_SELECTED_SERVER_MESSAGE
-              : rawErrorMessage;
             if (isServer1Or3 && isProbeTimeout) {
               pushDiag(`resolver probe-timeout server${selectedServer}`);
+              setResolverError(null);
+            } else {
+              setResolverError(rawErrorMessage);
             }
-            setResolverError(errorMessage);
             if (selectedServer !== 3 || isServer3Livehd) {
-              const immediate = isServer3Livehd && isProbeTimeout;
+              const immediate = isProbeTimeout && (selectedServer === 1 || isServer3Livehd);
               scheduleResolveRecovery("resolver-error", immediate);
             } else {
               resetRecoveryState();
@@ -2785,7 +2835,8 @@ export default function WatchPage() {
           const prev = networkFatalCountByCandidateRef.current.get(currentCandidateKey) || 0;
           const next = prev + 1;
           networkFatalCountByCandidateRef.current.set(currentCandidateKey, next);
-          if (useFastFailover && next >= 2) {
+          const fastFailoverThreshold = selectedServer === 3 ? 1 : 2;
+          if (useFastFailover && next >= fastFailoverThreshold) {
             pushDiag(`fast-failover server${selectedServer} network=${next}`);
             markCandidateAsBad(selectedServer, selectedHlsUrl, "network-fast-failover");
             moveNext("network-fast-failover");
