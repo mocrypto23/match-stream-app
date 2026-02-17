@@ -1,11 +1,11 @@
-name: Scrape matches (15m)
+name: Scrape matches (10m)
 
 on:
   workflow_dispatch:
   repository_dispatch:
     types: [run_my_scraper]
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "0 * * * *"
 
 concurrency:
   group: scrape-matches
@@ -19,7 +19,7 @@ jobs:
       TZ: Africa/Cairo
 
     steps:
-      - name: Gate (manual/dispatch always runs, schedule 15m after 2pm Cairo)
+      - name: Gate (dispatch/manual runs, hourly schedule runs)
         id: gate
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -28,30 +28,15 @@ jobs:
           echo "cairo_now=$(date '+%F %T %Z')"
 
           if [ "$EVENT_NAME" = "workflow_dispatch" ] || [ "$EVENT_NAME" = "repository_dispatch" ]; then
-            echo "decision=run (manual/dispatch)"
             echo "should_run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          H=$(date +%H)
-          M=$(date +%M)
-
-          if [ "$H" -lt 14 ]; then
-            echo "decision=skip (before 14:00 Cairo)"
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          MM=$((10#$M))
-          R=$((MM % 15))
-
-          if [ "$R" -le 10 ]; then
-            echo "decision=run (within 15m grace window, minute=$MM, r=$R)"
+          if [ "$EVENT_NAME" = "schedule" ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "decision=skip (outside window, minute=$MM, r=$R)"
           echo "should_run=false" >> "$GITHUB_OUTPUT"
           exit 0
 
