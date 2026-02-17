@@ -4,10 +4,12 @@ on:
   workflow_dispatch:
   repository_dispatch:
     types: [run_my_scraper]
+  schedule:
+    - cron: "*/5 * * * *"
 
 concurrency:
   group: scrape-matches
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   scrape:
@@ -15,24 +17,69 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      - name: Gate (Egypt time + slot)
+        id: gate
+        env:
+          TZ: Africa/Cairo
+        run: |
+          H=$(date +%H)
+          M=$(date +%M)
+          D=$(date +%F)
+
+          if [ "$H" -lt 14 ]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          MM=$((10#$M))
+          R=$((MM % 15))
+
+          if [ "$R" -gt 8 ]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SLOT_MIN=$((MM - R))
+          SLOT=$(printf "%s-%02d-%02d" "$D" "$H" "$SLOT_MIN")
+
+          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Restore slot cache (skip if already ran)
+        id: slotcache
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .slot
+          key: scrape-slot-${{ steps.gate.outputs.slot }}
+
+      - name: Stop if slot already executed
+        if: steps.gate.outputs.should_run == 'true' && steps.slotcache.outputs.cache-hit == 'true'
+        run: exit 0
+
       - name: Checkout
+        if: steps.gate.outputs.should_run == 'true' && steps.slotcache.outputs.cache-hit != 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Setup Node
+        if: steps.gate.outputs.should_run == 'true' && steps.slotcache.outputs.cache-hit != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: "npm"
 
       - name: Install dependencies
+        if: steps.gate.outputs.should_run == 'true' && steps.slotcache.outputs.cache-hit != 'true'
         run: npm ci
 
       - name: Install Playwright (Chromium)
+        if: steps.gate.outputs.should_run == 'true' && steps.slotcache.outputs.cache-hit != 'true'
         run: npx playwright install --with-deps chromium
 
       - name: Show revision + scraper fingerprint
+        if: steps.gate.outputs.should_run == 'true' && steps.slotcache.outputs.cache-hit != 'true'
         run: |
           echo "=== REVISION ==="
           git rev-parse HEAD
@@ -45,6 +92,7 @@ jobs:
           npx playwright --version
 
       - name: Run scraper (headless)
+        if: steps.gate.outputs.should_run == 'true' && steps.slotcache.outputs.cache-hit != 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -63,6 +111,7 @@ jobs:
         run: node scraper.js
 
       - name: Trigger on-demand revalidation
+        if: steps.gate.outputs.should_run == 'true' && steps.slotcache.outputs.cache-hit != 'true'
         continue-on-error: true
         env:
           SITE_URL: ${{ secrets.SITE_URL }}
@@ -135,3 +184,16 @@ jobs:
           name: debug
           path: debug.png
           if-no-files-found: ignore
+
+      - name: Prepare slot marker
+        if: success() && steps.gate.outputs.should_run == 'true' && steps.slotcache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .slot
+          echo "${{ steps.gate.outputs.slot }}" > .slot/slot.txt
+
+      - name: Save slot cache
+        if: success() && steps.gate.outputs.should_run == 'true' && steps.slotcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .slot
+          key: scrape-slot-${{ steps.gate.outputs.slot }}
