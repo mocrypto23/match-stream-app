@@ -1199,6 +1199,22 @@ function mergeScheduleSeedRow(baseRow, patchRow) {
     changed = true;
   }
 
+  // TEAM_NAME_ALIAS_PATCH_START
+  if (ENABLE_TEAM_NAME_ALIAS_PATCH) {
+    const preferredHome = maybePromoteTeamLabel(out.home_team, patchRow.home_team);
+    if (preferredHome && preferredHome !== out.home_team) {
+      out.home_team = preferredHome;
+      changed = true;
+    }
+
+    const preferredAway = maybePromoteTeamLabel(out.away_team, patchRow.away_team);
+    if (preferredAway && preferredAway !== out.away_team) {
+      out.away_team = preferredAway;
+      changed = true;
+    }
+  }
+  // TEAM_NAME_ALIAS_PATCH_END
+
   return { row: out, changed };
 }
 
@@ -2338,6 +2354,68 @@ async function enrichWithDeepLinks(browser, rows) {
 }
 
 // ===================== Merge Guardrails =====================
+const ENABLE_TEAM_NAME_ALIAS_PATCH = true;
+
+// TEAM_NAME_ALIAS_PATCH_START
+const TEAM_NAME_PHRASE_ALIASES = new Map([
+  ["\u0633\u064A\u0631\u0627\u0645\u064A\u0643\u0627\u0643\u0644\u064A\u0648\u0628\u0627\u062A\u0631\u0627", "\u0633\u064A\u0631\u0627\u0645\u064A\u0643\u0627"],
+  ["\u0628\u0648\u0631\u0648\u0633\u064A\u0627\u062F\u0648\u0631\u062A\u0645\u0648\u0646\u062F", "\u062F\u0648\u0631\u062A\u0645\u0648\u0646\u062F"],
+  ["\u0628\u0631\u0648\u0633\u064A\u0627\u062F\u0648\u0631\u062A\u0645\u0648\u0646\u062F", "\u062F\u0648\u0631\u062A\u0645\u0648\u0646\u062F"],
+  ["\u062D\u0633\u064A\u0646\u0627\u0631\u0628\u062F", "\u062D\u0633\u064A\u0646"],
+]);
+
+let aliasPatchMerges = 0;
+
+function resetTeamNameAliasPatchMetrics() {
+  aliasPatchMerges = 0;
+}
+
+function getTeamNameAliasPatchMetrics() {
+  return { alias_patch_merges: aliasPatchMerges };
+}
+
+function applyTeamNamePhraseAlias(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "";
+  if (!ENABLE_TEAM_NAME_ALIAS_PATCH) return normalized;
+  return TEAM_NAME_PHRASE_ALIASES.get(normalized) || normalized;
+}
+
+function countLabelTokens(value) {
+  const label = normalizeSpaces(value || "");
+  if (!label) return 0;
+  return label.split(/\s+/).filter(Boolean).length;
+}
+
+function chooseRicherTeamLabel(currentLabel, incomingLabel) {
+  const current = normalizeSpaces(currentLabel || "");
+  const incoming = normalizeSpaces(incomingLabel || "");
+  if (!current) return incoming;
+  if (!incoming) return current;
+  if (current === incoming) return current;
+
+  const currentCanon = canonTeamName(current);
+  const incomingCanon = canonTeamName(incoming);
+  if (!currentCanon || !incomingCanon || currentCanon !== incomingCanon) return current;
+
+  const currentTokens = countLabelTokens(current);
+  const incomingTokens = countLabelTokens(incoming);
+  if (incomingTokens > currentTokens) return incoming;
+  if (incomingTokens < currentTokens) return current;
+
+  if (incoming.length > current.length) return incoming;
+  return current;
+}
+
+function maybePromoteTeamLabel(currentLabel, incomingLabel) {
+  if (!ENABLE_TEAM_NAME_ALIAS_PATCH) return currentLabel;
+  const current = normalizeSpaces(currentLabel || "");
+  const chosen = chooseRicherTeamLabel(current, incomingLabel);
+  if (chosen && chosen !== current) aliasPatchMerges += 1;
+  return chosen || current;
+}
+// TEAM_NAME_ALIAS_PATCH_END
+
 function canonTeamName(v) {
   let s = normalizeDigits(String(v || "")).trim();
   s = s.replace(/[\u064B-\u0652\u0670\u0640]/g, "");
@@ -2415,7 +2493,9 @@ function canonTeamName(v) {
 
   const joined = tokens.join("");
   if (!joined) return "";
-  return tokenAliases.get(joined) || joined;
+  const canonical = tokenAliases.get(joined) || joined;
+  if (!ENABLE_TEAM_NAME_ALIAS_PATCH) return canonical;
+  return applyTeamNamePhraseAlias(canonical);
 }
 
 function keyOfTeams(matchDay, home, away) {
@@ -2543,6 +2623,16 @@ function mergeDuplicateMatchRows(primary, secondary, { isolationStats = null, ma
   const a = primary || {};
   const b = secondary || {};
   const out = { ...a };
+
+  // TEAM_NAME_ALIAS_PATCH_START
+  if (ENABLE_TEAM_NAME_ALIAS_PATCH) {
+    const preferredHome = maybePromoteTeamLabel(out.home_team, b.home_team);
+    if (preferredHome) out.home_team = preferredHome;
+
+    const preferredAway = maybePromoteTeamLabel(out.away_team, b.away_team);
+    if (preferredAway) out.away_team = preferredAway;
+  }
+  // TEAM_NAME_ALIAS_PATCH_END
 
   if (!out.home_logo && b.home_logo) out.home_logo = b.home_logo;
   if (!out.away_logo && b.away_logo) out.away_logo = b.away_logo;
@@ -3302,9 +3392,38 @@ function mergeWithExisting({
   isolationStats = null,
 }) {
   const nowMs = Date.now();
+  const collapsedExistingDroppedMatchKeys = [];
 
   const existingMap = new Map();
-  for (const r of existingRows) existingMap.set(keyOfRow(r), r);
+  for (const r of existingRows) {
+    const k = keyOfRow(r);
+    if (!k) continue;
+
+    const current = existingMap.get(k);
+    if (!current) {
+      existingMap.set(k, r);
+      continue;
+    }
+
+    const currentQ = rowQualityScore(current);
+    const incomingQ = rowQualityScore(r);
+    const preferIncoming =
+      incomingQ > currentQ ||
+      (incomingQ === currentQ && String(r.match_key || "") < String(current.match_key || ""));
+    const winner = preferIncoming ? r : current;
+    const loser = preferIncoming ? current : r;
+
+    const winnerKey = String(winner?.match_key || "").trim();
+    const loserKey = String(loser?.match_key || "").trim();
+    if (loserKey && loserKey !== winnerKey) collapsedExistingDroppedMatchKeys.push(loserKey);
+
+    const mergedExisting = mergeDuplicateMatchRows(winner, loser, {
+      isolationStats,
+      matchKey: winnerKey || k || null,
+      stage: "merge_existing_collapse",
+    });
+    existingMap.set(k, mergedExisting);
+  }
 
   const mergedMap = new Map();
 
@@ -3482,7 +3601,10 @@ function mergeWithExisting({
     mergedMap.set(k, sanitizedPreserved);
   }
 
-  return { mergedRows: Array.from(mergedMap.values()) };
+  return {
+    mergedRows: Array.from(mergedMap.values()),
+    droppedMatchKeys: collapsedExistingDroppedMatchKeys,
+  };
 }
 
 async function backfillDynamicMatchFields(rows) {
@@ -4714,6 +4836,7 @@ async function startScraping() {
   console.log(`⚙️ day scope: ${SCRAPE_DAY_SCOPE_RAW} => [${ACTIVE_DAY_KEYS.join(", ")}]`);
 
   diagTouch();
+  resetTeamNameAliasPatchMetrics();
 
   const browser = await chromium.launch({
     headless: HEADLESS,
@@ -5173,7 +5296,7 @@ async function startScraping() {
     const primaryServer1Degraded = usedPrimarySiiirFallback || !all.length;
 
     const existing = await fetchExistingForDays(daysToRefresh);
-    const { mergedRows: mergedRowsRaw } = mergeWithExisting({
+    const { mergedRows: mergedRowsRaw, droppedMatchKeys: existingCollapsedDroppedKeys = [] } = mergeWithExisting({
       newRows: finalRows,
       existingRows: existing,
       allowSiiirFallbackRows: usedPrimarySiiirFallback,
@@ -5222,6 +5345,10 @@ async function startScraping() {
     // Conservative: requires same match_day + strong team match, plus kickoff proximity when available.
     const softDeduped = softDedupeMatchRows(mergedRows, { isolationStats, stage: "post_merge_soft_dedupe" });
     const softDedupDroppedKeys = Array.isArray(softDeduped.droppedMatchKeys) ? softDeduped.droppedMatchKeys : [];
+    const aliasPatchStats = getTeamNameAliasPatchMetrics();
+    const existingCollapseDroppedCount = Array.isArray(existingCollapsedDroppedKeys) ? existingCollapsedDroppedKeys.length : 0;
+    console.log(`[merge] existing_collapse_dropped_keys: ${existingCollapseDroppedCount}`);
+    console.log(`[merge] alias_patch_merges: ${aliasPatchStats.alias_patch_merges}`);
     if (softDeduped.dropped > 0) {
       console.log(`[merge] soft-deduped duplicates: ${softDeduped.dropped}`);
     }
@@ -5254,6 +5381,8 @@ async function startScraping() {
             isolation_reject_server3: isolationStats.isolation_reject_server3,
             isolation_reject_server4: isolationStats.isolation_reject_server4,
             isolation_reject_samples: isolationStats.rejection_samples.slice(0, 12),
+            alias_patch_merges: aliasPatchStats.alias_patch_merges,
+            existing_collapse_dropped_keys: existingCollapseDroppedCount,
             livekora_server4_samples: livekoraServer4Samples,
             livekora_outside_server4_samples: livekoraLeaks,
           },
@@ -5276,6 +5405,10 @@ async function startScraping() {
       isolation_reject_server4: isolationStats.isolation_reject_server4,
     });
     console.log("🧪 livekora sample in stream_url_4:", livekoraServer4Samples);
+    console.log("merge patch counters:", {
+      alias_patch_merges: aliasPatchStats.alias_patch_merges,
+      existing_collapse_dropped_keys: existingCollapseDroppedCount,
+    });
     if (livekoraLeaks.length) {
       console.warn("⚠️ livekora URL outside stream_url_4 detected:", livekoraLeaks);
     } else {
@@ -5310,7 +5443,15 @@ async function startScraping() {
 
     // Remove merged-away duplicates from DB so they don't keep showing in the UI.
     // RPC likely upserts by match_key and may not delete old keys, so we cleanup explicitly.
-    const droppedKeysUniq = Array.from(new Set((softDedupDroppedKeys || []).map((k) => String(k || "").trim()))).filter(Boolean);
+    const droppedKeysUniq = Array.from(
+      new Set(
+        [...(softDedupDroppedKeys || []), ...(existingCollapsedDroppedKeys || [])]
+          .map((k) => String(k || "").trim())
+          .filter(Boolean)
+      )
+    );
+    const final_deleted_duplicate_keys = droppedKeysUniq.length;
+    console.log(`[merge] final_deleted_duplicate_keys: ${final_deleted_duplicate_keys}`);
     if (droppedKeysUniq.length) {
       if (droppedKeysUniq.length > 120) {
         console.warn(`[merge] too many dropped keys (${droppedKeysUniq.length}); skipping delete to be safe.`);
