@@ -3630,6 +3630,9 @@ function mergeWithExisting({
 
       const oldHasScore = oldHS !== null && oldAS !== null;
       const newHasScore = newHS !== null && newAS !== null;
+      const oldStatusNorm = normalizeStatusKeyValue(old.status_key);
+      const oldLiveLikelyStale =
+        oldStatusNorm === "live" && isLikelyFinishedByTime(old.match_start || out.match_start, 4 * 60 * 60 * 1000);
 
       if (newHasScore) {
         out.home_score = newHS;
@@ -3639,7 +3642,7 @@ function mergeWithExisting({
         out.away_score = null;
       }
 
-      if (!newHasScore && oldHasScore) {
+      if (!newHasScore && oldHasScore && !oldLiveLikelyStale) {
         out.home_score = oldHS;
         out.away_score = oldAS;
       }
@@ -3654,8 +3657,16 @@ function mergeWithExisting({
       }
     }
 
+    const statusFromText = statusKeyFromText(out.status_text);
+    if (statusFromText === "finished" && normalizeStatusKeyValue(out.status_key) !== "finished") {
+      out.status_key = "finished";
+    }
+
     const finalStatus = normalizeStatusKeyValue(out.status_key);
-    if ((finalStatus === "unknown" || finalStatus === "upcoming") && isLikelyFinishedByTime(out.match_start)) {
+    if (
+      (finalStatus === "unknown" || finalStatus === "upcoming" || finalStatus === "live") &&
+      isLikelyFinishedByTime(out.match_start, 4 * 60 * 60 * 1000)
+    ) {
       out.status_key = "finished";
     }
     if (
@@ -5291,6 +5302,9 @@ async function startScraping() {
           m._day_key === "yesterday" || isLikelyFinishedByTime(match_start)
             ? "finished"
             : "live";
+      }
+      if (statusKey === "live" && isLikelyFinishedByTime(match_start, 4 * 60 * 60 * 1000)) {
+        statusKey = "finished";
       }
 
       const match_time =

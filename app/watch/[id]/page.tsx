@@ -125,6 +125,11 @@ const PLAYERV2_FALLBACK_DOMAINS = [
   "https://1rxolmirvosixpyfy.yallashot.us/",
   "https://jqyjghfms1mu8zc.yallashot.us/",
 ];
+const YALLASHOOT_DIRECT_HLS_FALLBACK_DOMAINS = [
+  "yallashootttv.com",
+  "yallashoot.cv",
+  "yallashoooootlive.online",
+] as const;
 
 type Playerv2TokenPayload = { token: string; session_id: string };
 type AlbaRollingConfig = { ch: string; dm: string[]; iv: number };
@@ -963,6 +968,87 @@ function isKnownEmbeddedLivePhpPlayerUrl(value?: string | null) {
     return /\/(?:splayer\/)?live\d+\.php$/i.test(path) || /\/chtv\/ch\d+\.php$/i.test(path);
   } catch {
     return false;
+  }
+}
+
+function isLikelyYallashootAlbaplayerUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!isValidHttpUrl(raw)) return false;
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    if (!host.includes("yallashoot") && !host.includes("yallashot")) return false;
+    const path = u.pathname.toLowerCase();
+    return path.includes("/albaplayer/") || path.includes("/alba.php");
+  } catch {
+    return false;
+  }
+}
+
+function extractYallashootChannelCode(rawSourceUrl: string) {
+  const raw = toUnderlyingUrl(String(rawSourceUrl || ""));
+  if (!isValidHttpUrl(raw)) return "";
+  try {
+    const u = new URL(raw);
+    const tokens: string[] = [];
+
+    const slug = String(u.pathname.match(/\/albaplayer\/([^/?#]+)/i)?.[1] || "").trim();
+    if (slug) tokens.push(slug);
+
+    for (const key of ["ch", "channel", "stream", "id", "src", "match"]) {
+      const v = String(u.searchParams.get(key) || "").trim();
+      if (v) tokens.push(v);
+    }
+
+    for (const token of tokens) {
+      const t = decodeURIComponent(token).toLowerCase();
+      const hinted =
+        t.match(/(?:^|[-_/])(?:ch(?:annel)?|sports?|sport|bein(?:-?sport)?|ad(?:-?sport)?|on)?[-_]?(\d{1,2})(?:$|[-_/])/i)?.[1] ||
+        t.match(/(\d{1,2})(?!.*\d)/)?.[1] ||
+        "";
+      const n = Number.parseInt(hinted, 10);
+      if (Number.isFinite(n) && n > 0 && n <= 99) return `ch${n}`;
+    }
+  } catch {
+    return "";
+  }
+  return "";
+}
+
+function isDirectAccessDeniedHtml(status: number, html: string) {
+  const text = String(html || "").toLowerCase();
+  if (!text) return false;
+  if (![200, 401, 403, 429].includes(status)) return false;
+  return text.includes("direct access not allowed") || text.includes("access not allowed");
+}
+
+function buildYallashootDirectHlsFallbackCandidates(sourceUrl: string) {
+  const raw = toUnderlyingUrl(String(sourceUrl || ""));
+  if (!isLikelyYallashootAlbaplayerUrl(raw)) return [] as string[];
+
+  const channelCode = extractYallashootChannelCode(raw);
+  if (!channelCode) return [] as string[];
+
+  try {
+    const sourceHost = new URL(raw).hostname.toLowerCase();
+    const sourcePrefix = String(sourceHost.split(".")[0] || "").trim().toLowerCase();
+    const prefixes = Array.from(new Set([sourcePrefix, "abc"])).filter((x) => /^[a-z0-9-]{2,24}$/i.test(x));
+    const domains = Array.from(new Set(YALLASHOOT_DIRECT_HLS_FALLBACK_DOMAINS));
+    const pathVariants = [`/hls/${channelCode}/live/index.m3u8`];
+
+    const out: string[] = [];
+    for (const prefix of prefixes) {
+      for (const domain of domains) {
+        for (const path of pathVariants) {
+          const candidate = `https://${prefix}.${domain}${path}`;
+          const proxied = toEmbedProxyUrl(candidate, raw);
+          if (proxied) out.push(proxied);
+        }
+      }
+    }
+    return dedupeUrls(out);
+  } catch {
+    return [] as string[];
   }
 }
 
@@ -1843,9 +1929,15 @@ async function resolveCandidatesForServer(
   }
 
   const html = await first.res.text();
+  const directAccessBlocked = isDirectAccessDeniedHtml(first.res.status, html);
+  const yallashootFallback = directAccessBlocked ? buildYallashootDirectHlsFallbackCandidates(sourceUrl) : [];
   const primaryList = extractPlayableCandidatesFromProxyHtml(html, sourceUrl);
   const rollingPrimary = extractRollingHlsCandidatesFromHtml(html, sourceUrl);
-  emitBatch([...rollingPrimary, ...primaryList], "fast");
+  const fastPrimary = [...yallashootFallback, ...rollingPrimary, ...primaryList];
+  emitBatch(fastPrimary, "fast");
+  if (directAccessBlocked && yallashootFallback.length) {
+    return normalizePlayableBatch(fastPrimary);
+  }
 
   // For playerv2 sources we keep resolution lightweight to avoid upstream anti-bot/rate-limit bans.
   // One page fetch + tokenized candidate build is enough; deep crawling creates noisy duplicate calls.
