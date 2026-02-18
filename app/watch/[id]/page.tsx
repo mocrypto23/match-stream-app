@@ -697,7 +697,7 @@ function expandLivehdTvServVariants(value: string) {
     const currentServRaw = (u.searchParams.get("serv") || "").trim();
     if (currentServRaw && !/^[01]$/.test(currentServRaw)) return [] as string[];
 
-    const order = currentServRaw === "1" ? ["1", "0"] : ["0", "1"];
+    const order = ["0", "1"];
     const out: string[] = [];
     for (const serv of order) {
       const next = new URL(u.toString());

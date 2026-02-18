@@ -1661,6 +1661,17 @@ async function extractMatchMetaFromDom(page) {
         if (!Number.isFinite(n) || n < 0 || n > 30) return null;
         return n;
       };
+      const parsePairFromText = (raw) => {
+        const s = String(raw || "")
+          .replace(/[٠-٩]/g, (ch) => "٠١٢٣٤٥٦٧٨٩".indexOf(ch))
+          .replace(/[۰-۹]/g, (ch) => "۰۱۲۳۴۵۶۷۸۹".indexOf(ch));
+        const m = s.match(/(\d{1,2})\s*[-:xX]\s*(\d{1,2})/);
+        if (!m) return null;
+        const a = strictParseGoal(m[1]);
+        const b = strictParseGoal(m[2]);
+        if (a === null || b === null) return null;
+        return { home: String(a), away: String(b) };
+      };
 
       let home = null;
       let away = null;
@@ -1721,6 +1732,26 @@ async function extractMatchMetaFromDom(page) {
             if (a !== null && b !== null) {
               home = String(a);
               away = String(b);
+              hasAny = true;
+            }
+          }
+        }
+        if (!hasAny) {
+          let rowResultText = "";
+          const rows = Array.from(document.querySelectorAll("tr"));
+          for (const row of rows) {
+            const rowText = String(row?.textContent || "").trim();
+            if (!rowText) continue;
+            if (/\u0646\u062a\u064a\u062c\u0629\s*\u0627\u0644\u0645\u0628\u0627\u0631\u0627\u0629|match\s*result|result/i.test(rowText)) {
+              rowResultText = rowText;
+              break;
+            }
+          }
+          if (rowResultText) {
+            const parsed = parsePairFromText(rowResultText);
+            if (parsed) {
+              home = parsed.home;
+              away = parsed.away;
               hasAny = true;
             }
           }
@@ -3723,7 +3754,16 @@ function mergeWithExisting({
       preserved.away_score = null;
     }
     const preservedStatus = normalizeStatusKeyValue(preserved.status_key);
-    if ((preservedStatus === "unknown" || preservedStatus === "upcoming") && isLikelyFinishedByTime(preserved.match_start)) {
+    const preservedStatusFromText = statusKeyFromText(preserved.status_text);
+    if (preservedStatusFromText === "finished" && normalizeStatusKeyValue(preserved.status_key) !== "finished") {
+      preserved.status_key = "finished";
+    }
+    const preservedDay = String(preserved.match_day || "").trim();
+    const isPastMatchDay = !!(todayDay && preservedDay && preservedDay < todayDay);
+    if (
+      (preservedStatus === "unknown" || preservedStatus === "upcoming" || preservedStatus === "live") &&
+      (isLikelyFinishedByTime(preserved.match_start, 4 * 60 * 60 * 1000) || (preservedStatus === "live" && isPastMatchDay))
+    ) {
       preserved.status_key = "finished";
     }
     if (
@@ -3983,6 +4023,34 @@ async function scrapeLivehdToday(page) {
         const fallback = (side.textContent || "").trim();
         return fallback || "";
       };
+      const pickLogo = (item, cls) => {
+        const side = item.querySelector(`.${cls}`);
+        if (!side) return "";
+
+        const img = side.querySelector("img");
+        if (!img) return "";
+
+        const srcsetRaw = (img.getAttribute("srcset") || img.getAttribute("data-srcset") || "").trim();
+        if (srcsetRaw) {
+          const first = srcsetRaw
+            .split(",")
+            .map((x) => x.trim())
+            .filter(Boolean)[0] || "";
+          const firstUrl = first.split(/\s+/)[0] || "";
+          if (firstUrl && !/^data:|^javascript:/i.test(firstUrl)) {
+            const abs = toAbs(firstUrl);
+            if (abs) return abs;
+          }
+        }
+
+        const raw =
+          (img.getAttribute("src") || "").trim() ||
+          (img.getAttribute("data-src") || "").trim() ||
+          (img.getAttribute("data-lazy-src") || "").trim() ||
+          (img.getAttribute("data-original") || "").trim();
+        if (!raw || /^data:|^javascript:/i.test(raw)) return "";
+        return toAbs(raw) || "";
+      };
 
       const root = document.querySelector("#today") || document;
       const cards = Array.from(root.querySelectorAll(".MatchITem"));
@@ -3993,6 +4061,8 @@ async function scrapeLivehdToday(page) {
 
         const home = pickTeam(card, "host");
         const away = pickTeam(card, "guest");
+        const homeLogo = pickLogo(card, "host");
+        const awayLogo = pickLogo(card, "guest");
 
         const statusText = (card.querySelector(".match-status-text")?.textContent || "").trim();
         const timeText = (card.querySelector(".match-time-display")?.textContent || "").trim();
@@ -4002,6 +4072,8 @@ async function scrapeLivehdToday(page) {
         out.push({
           home_team: home,
           away_team: away,
+          home_logo: homeLogo || null,
+          away_logo: awayLogo || null,
           match_url: href,
           status_text: statusText || null,
           time_text: timeText || null,
