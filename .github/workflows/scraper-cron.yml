@@ -1,11 +1,9 @@
-name: Scrape matches (10m)
+name: Scrape matches (20m)
 
 on:
   workflow_dispatch:
   repository_dispatch:
     types: [run_my_scraper]
-  schedule:
-    - cron: "0 * * * *"
 
 concurrency:
   group: scrape-matches
@@ -19,7 +17,7 @@ jobs:
       TZ: Africa/Cairo
 
     steps:
-      - name: Gate (dispatch/manual runs, hourly schedule runs)
+      - name: Gate (manual/dispatch runs)
         id: gate
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -28,11 +26,6 @@ jobs:
           echo "cairo_now=$(date '+%F %T %Z')"
 
           if [ "$EVENT_NAME" = "workflow_dispatch" ] || [ "$EVENT_NAME" = "repository_dispatch" ]; then
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [ "$EVENT_NAME" = "schedule" ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
