@@ -143,6 +143,9 @@ const YALLALIVE = {
   siteHosts: ["anewssport.fun", "yallalive.sx"],
   playerHosts: ["zxxxeeplay.fun", "codepcplay.fun", "playerai.site"],
 };
+const YALLALIVE_MATCH_SITEMAP_INDEX_URL = "https://anewssport.fun/wp-sitemap.xml";
+const YALLALIVE_MATCH_SITEMAP_PAGE_LIMIT = intEnv("YALLALIVE_MATCH_SITEMAP_PAGE_LIMIT", 3, 1, 10);
+const YALLALIVE_MATCH_SITEMAP_LINK_LIMIT = intEnv("YALLALIVE_MATCH_SITEMAP_LINK_LIMIT", 48, 6, 200);
 const SERVER5_SNS_DIAG = {
   server5_sns_endpoint_found: 0,
   server5_sns_urls_count: 0,
@@ -4359,6 +4362,18 @@ function isServer5PlayerLikeUrl(url) {
   if (/\/yalla\.php(?:\?|$)/i.test(s)) return true;
   if (/\/watch\//i.test(s)) return true;
   return false;
+}
+
+function isYallaliveMatchPageUrl(url) {
+  const normalized = normalizeUrl(url, url);
+  if (!normalized) return false;
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    return YALLALIVE.siteHosts.some((hint) => host === hint || host.endsWith(`.${hint}`)) && /\/matches\//i.test(parsed.pathname);
+  } catch {
+    return false;
+  }
 }
 
 function statusKeyFromEventCard(statusTextRaw, classRaw = "") {
