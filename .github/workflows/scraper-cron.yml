@@ -24,7 +24,8 @@ jobs:
     timeout-minutes: 30
     env:
       TZ: Africa/Cairo
-      PLAYWRIGHT_BROWSERS_PATH: ~/.cache/ms-playwright
+      # Use absolute path; '~' is not expanded reliably in workflow env.
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
 
     steps:
       - name: Gate (manual/dispatch runs)
@@ -109,7 +110,7 @@ jobs:
         if: steps.gate.outputs.should_run == 'true' && steps.speed.outputs.speedup_enabled == 'true'
         uses: actions/cache@v4
         with:
-          path: ~/.cache/ms-playwright
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
           key: ${{ runner.os }}-playwright-${{ steps.speed.outputs.playwright_cache_key_suffix }}-${{ hashFiles('package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-playwright-${{ steps.speed.outputs.playwright_cache_key_suffix }}-
@@ -118,12 +119,11 @@ jobs:
       - name: Install Playwright (Chromium - fast path)
         if: steps.gate.outputs.should_run == 'true' && steps.speed.outputs.speedup_enabled == 'true'
         run: |
+          mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}"
+          echo "[fast-path] PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH}"
           echo "[fast-path] cache-hit=${{ steps.pw-cache.outputs.cache-hit }}"
-          if [ "${{ steps.pw-cache.outputs.cache-hit }}" = "true" ]; then
-            npx playwright install chromium || npx playwright install --with-deps chromium
-          else
-            npx playwright install --with-deps chromium
-          fi
+          # Try fast install first (no apt). Fallback to --with-deps only if required.
+          npx playwright install chromium || npx playwright install --with-deps chromium
 
       - name: Install Playwright (Chromium - legacy path)
         if: steps.gate.outputs.should_run == 'true' && steps.speed.outputs.speedup_enabled != 'true'
