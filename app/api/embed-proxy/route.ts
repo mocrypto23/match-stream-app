@@ -460,9 +460,40 @@ function rewriteM3u8Manifest(
 ) {
   const nextDepth = Math.min(MAX_PROXY_DEPTH, depth + 1);
   const childReferrer = referrerForChildren || baseUrl;
+  const inheritEasybroadcastAuth = (rawChildAbsoluteUrl: string) => {
+    try {
+      const child = new URL(rawChildAbsoluteUrl);
+      const parent = new URL(baseUrl);
+      const childHost = normalizeHost(child.hostname);
+      if (!(childHost === "cdn.live.easybroadcast.io" || childHost.endsWith(".easybroadcast.io"))) {
+        return rawChildAbsoluteUrl;
+      }
+      if (child.searchParams.get("token")) return rawChildAbsoluteUrl;
+
+      const token = String(parent.searchParams.get("token") || "").trim();
+      const expires = String(parent.searchParams.get("expires") || "").trim();
+      const tokenPath = String(parent.searchParams.get("token_path") || "").trim();
+      if (!token || !expires) return rawChildAbsoluteUrl;
+
+      if (tokenPath) {
+        const decoded = decodeURIComponent(tokenPath).trim().replace(/\/+$/, "");
+        if (decoded && !child.pathname.toLowerCase().startsWith(decoded.toLowerCase())) {
+          return rawChildAbsoluteUrl;
+        }
+      }
+
+      child.searchParams.set("token", token);
+      child.searchParams.set("expires", expires);
+      if (tokenPath) child.searchParams.set("token_path", tokenPath);
+      return child.toString();
+    } catch {
+      return rawChildAbsoluteUrl;
+    }
+  };
 
   const toProxyUri = (raw: string) => {
-    const absolute = toAbsoluteUrl(raw, baseUrl);
+    const absoluteRaw = toAbsoluteUrl(raw, baseUrl);
+    const absolute = absoluteRaw ? inheritEasybroadcastAuth(absoluteRaw) : null;
     if (!absolute) return raw;
     if (isBlockedAbsoluteUrl(absolute)) return raw;
     return buildProxyUrl(absolute, nextDepth, childReferrer);

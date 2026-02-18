@@ -52,11 +52,16 @@ const SERVER1_FETCH_TIMEOUT_FINAL_MS = 16000;
 const SERVER1_PROBE_TIMEOUT_MS = 12000;
 const SERVER1_FETCH_RETRIES = 1;
 const SERVER1_FETCH_RETRY_DELAY_MS = 250;
-const LIVEHD77_FETCH_TIMEOUT_FAST_MS = 4200;
-const LIVEHD77_FETCH_TIMEOUT_FINAL_MS = 9500;
-const LIVEHD77_PROBE_TIMEOUT_MS = 9000;
-const LIVEHD77_FETCH_RETRIES = 1;
+const LIVEHD77_FETCH_TIMEOUT_FAST_MS = 7000;
+const LIVEHD77_FETCH_TIMEOUT_FINAL_MS = 18000;
+const LIVEHD77_PROBE_TIMEOUT_MS = 14000;
+const LIVEHD77_FETCH_RETRIES = 2;
 const LIVEHD77_FETCH_RETRY_DELAY_MS = 220;
+const SERVER4_FETCH_TIMEOUT_FAST_MS = 6500;
+const SERVER4_FETCH_TIMEOUT_FINAL_MS = 16000;
+const SERVER4_PROBE_TIMEOUT_MS = 12000;
+const SERVER4_FETCH_RETRIES = 1;
+const SERVER4_FETCH_RETRY_DELAY_MS = 220;
 const RESOLVE_RESULT_CACHE_TTL_MS = 75_000;
 const PLAYERV2_RESOLVE_CACHE_TTL_MS = 45_000;
 const PLAYERV2_STICKY_CACHE_TTL_MS = 8 * 60_000;
@@ -535,10 +540,39 @@ function toPlayableProxyFromManifestLine(rawLine: string, parentCandidateUrl: st
 
   if (!parentTarget || !isValidHttpUrl(parentTarget)) return null;
   try {
-    const absolute = new URL(line, parentTarget).toString();
+    const absoluteRaw = new URL(line, parentTarget).toString();
+    const absolute = inheritEasybroadcastAuthQuery(absoluteRaw, parentTarget);
     return toEmbedProxyUrl(absolute, parentTarget);
   } catch {
     return null;
+  }
+}
+
+function inheritEasybroadcastAuthQuery(rawChildUrl: string, rawParentUrl: string) {
+  if (!isValidHttpUrl(rawChildUrl) || !isValidHttpUrl(rawParentUrl)) return rawChildUrl;
+  try {
+    const child = new URL(rawChildUrl);
+    const parent = new URL(rawParentUrl);
+    const childHost = child.hostname.toLowerCase();
+    if (!(childHost === "cdn.live.easybroadcast.io" || childHost.endsWith(".easybroadcast.io"))) return rawChildUrl;
+    if (child.searchParams.get("token")) return rawChildUrl;
+
+    const token = String(parent.searchParams.get("token") || "").trim();
+    const expires = String(parent.searchParams.get("expires") || "").trim();
+    const tokenPath = String(parent.searchParams.get("token_path") || "").trim();
+    if (!token || !expires) return rawChildUrl;
+
+    if (tokenPath) {
+      const decoded = decodeURIComponent(tokenPath).trim().replace(/\/+$/, "");
+      if (decoded && !child.pathname.toLowerCase().startsWith(decoded.toLowerCase())) return rawChildUrl;
+    }
+
+    child.searchParams.set("token", token);
+    child.searchParams.set("expires", expires);
+    if (tokenPath) child.searchParams.set("token_path", tokenPath);
+    return child.toString();
+  } catch {
+    return rawChildUrl;
   }
 }
 
@@ -658,7 +692,7 @@ function expandLivehdTvServVariants(value: string) {
     const currentServRaw = (u.searchParams.get("serv") || "").trim();
     if (currentServRaw && !/^[01]$/.test(currentServRaw)) return [] as string[];
 
-    const order = currentServRaw === "0" ? ["0", "1"] : ["1", "0"];
+    const order = currentServRaw === "1" ? ["1", "0"] : ["0", "1"];
     const out: string[] = [];
     for (const serv of order) {
       const next = new URL(u.toString());
@@ -932,6 +966,105 @@ function isKnownEmbeddedLivePhpPlayerUrl(value?: string | null) {
   }
 }
 
+function isEasybroadcastEventPageUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!isValidHttpUrl(raw)) return false;
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase().replace(/\/+$/, "");
+    if (!(host === "player.easybroadcast.io" || host.endsWith(".player.easybroadcast.io"))) return false;
+    return /^\/events\/[^/?#]+$/i.test(path);
+  } catch {
+    return false;
+  }
+}
+
+function getEasybroadcastEventMeta(eventPageUrl: string) {
+  try {
+    const u = new URL(eventPageUrl);
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (parts.length < 2 || parts[0].toLowerCase() !== "events") return null;
+    const slug = String(parts[1] || "").trim();
+    if (!slug) return null;
+    const apiUrl = `${u.origin}/api/events/${encodeURIComponent(slug)}`;
+    return { slug, apiUrl };
+  } catch {
+    return null;
+  }
+}
+
+function parseEasybroadcastTokenQuery(raw: string) {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+
+  const normalizeParams = (params: URLSearchParams) => {
+    const out = new URLSearchParams();
+    const token = String(params.get("token") || "").trim();
+    const tokenPath = String(params.get("token_path") || params.get("tokenPath") || "").trim();
+    const expires = String(params.get("expires") || params.get("expire") || "").trim();
+    if (token) out.set("token", token);
+    if (tokenPath) out.set("token_path", tokenPath);
+    if (expires) out.set("expires", expires);
+    if (!out.toString()) return "";
+    for (const [k, v] of params.entries()) {
+      const key = String(k || "").trim();
+      const val = String(v || "").trim();
+      if (!key || !val || out.has(key)) continue;
+      out.set(key, val);
+    }
+    return out.toString();
+  };
+
+  if (/^[{[]/.test(text)) {
+    try {
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      const params = new URLSearchParams();
+      for (const [k, v] of Object.entries(parsed || {})) {
+        const key = String(k || "").trim();
+        const val = typeof v === "string" || typeof v === "number" ? String(v).trim() : "";
+        if (!key || !val) continue;
+        params.set(key, val);
+      }
+      const fromJson = normalizeParams(params);
+      if (fromJson) return fromJson;
+    } catch {
+      // Ignore JSON parse failure and continue with query parsing.
+    }
+  }
+
+  const trimmed = text.replace(/^[?#&]+/, "");
+  if (!trimmed.includes("=")) return "";
+  return normalizeParams(new URLSearchParams(trimmed));
+}
+
+function appendQueryToUrl(baseUrl: string, rawQuery: string) {
+  const query = String(rawQuery || "").trim().replace(/^[?#&]+/, "");
+  if (!isValidHttpUrl(baseUrl) || !query) return baseUrl;
+  try {
+    const u = new URL(baseUrl);
+    const incoming = new URLSearchParams(query);
+    incoming.forEach((value, key) => {
+      if (!key || !String(value || "").trim()) return;
+      u.searchParams.set(key, value);
+    });
+    return u.toString();
+  } catch {
+    return baseUrl;
+  }
+}
+
+function hasEasybroadcastTokenQuery(value?: string | null) {
+  const raw = String(value || "").trim();
+  if (!isValidHttpUrl(raw)) return false;
+  try {
+    const u = new URL(raw);
+    return !!u.searchParams.get("token") && !!u.searchParams.get("expires");
+  } catch {
+    return false;
+  }
+}
+
 function isLikelyLivePhpEndpointUrl(value?: string | null) {
   const raw = toUnderlyingUrl(String(value || ""));
   if (!isValidHttpUrl(raw) || isClearlyNonStreamUrl(raw)) return false;
@@ -1027,7 +1160,8 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
     PLAYER_PAGE_HINT_RE.test(url) ||
     isLikelyChannelLandingPlayerPageUrl(url) ||
     isKnownRelayPlayerPageUrl(url) ||
-    isKnownEmbeddedLivePhpPlayerUrl(url);
+    isKnownEmbeddedLivePhpPlayerUrl(url) ||
+    isEasybroadcastEventPageUrl(url);
   const add = (raw: string) => {
     let v = String(raw || "").trim().replace(/[),;]+$/g, "");
     if (v.includes("${")) {
@@ -1120,8 +1254,8 @@ function scoreServer3Candidate(value: string) {
   if (lower.includes("pandalive.live")) score += 220;
   if (lower.includes("livehd77.pro")) score += 120;
   if (lower.includes("/albaplayer/")) score += 90;
-  if (/[?&]serv=1(?:&|$)/i.test(lower)) score += 80;
-  if (/[?&]serv=0(?:&|$)/i.test(lower)) score -= 40;
+  if (/[?&]serv=0(?:&|$)/i.test(lower)) score += 70;
+  if (/[?&]serv=1(?:&|$)/i.test(lower)) score += 25;
   if (lower.includes("cdn3.yalla-online.click/chtv/")) score -= 120;
   if (isLikelyExpiredReplayManifestUrl(lower)) score -= 500;
 
@@ -1234,6 +1368,7 @@ function toCandidateGroupKey(value: string) {
     for (const key of [
       "ts",
       "token",
+      "token_path",
       "sid",
       "nonce",
       "nimblesessionid",
@@ -1301,12 +1436,28 @@ function groupCandidates(values: string[]) {
     map.set(key, { key, primaryIndex: idx, members: [idx], label });
   });
 
-  return Array.from(map.values()).sort((a, b) => {
+  const sorted = Array.from(map.values()).sort((a, b) => {
     const aq = qualityRank(a.label);
     const bq = qualityRank(b.label);
     if (aq !== bq) return bq - aq;
     return a.primaryIndex - b.primaryIndex;
   });
+
+  const familyHasQuality = new Set<string>();
+  for (const group of sorted) {
+    if (qualityRank(group.label) < 0) continue;
+    const family = group.key.split("|q=")[0] || group.key;
+    familyHasQuality.add(family);
+  }
+
+  const filtered = sorted.filter((group) => {
+    if (qualityRank(group.label) >= 0) return true;
+    const family = group.key.split("|q=")[0] || group.key;
+    if (!familyHasQuality.has(family)) return true;
+    return !/easybroadcast\.io/i.test(family);
+  });
+
+  return filtered.length ? filtered : sorted;
 }
 
 function normalizeHtmlForScan(html: string) {
@@ -1796,14 +1947,84 @@ async function resolveCandidatesForServer(
 
       const childHtml = await child.res.text();
       const extractionBaseUrl = pageBaseUrl || sourceUrl;
+      const resolveEasybroadcastEventCandidates = async (eventPageUrl: string) => {
+        if (!isEasybroadcastEventPageUrl(eventPageUrl)) return [] as string[];
+        const meta = getEasybroadcastEventMeta(eventPageUrl);
+        if (!meta?.apiUrl) return [] as string[];
+
+        const eventApiProbe = toEmbedProxyUrl(meta.apiUrl, eventPageUrl);
+        if (!eventApiProbe) return [] as string[];
+
+        let eventApiText = "";
+        try {
+          const eventRes = await fetchHtml(eventApiProbe);
+          if (!eventRes?.res?.ok) return [] as string[];
+          eventApiText = await eventRes.res.text();
+        } catch (e: unknown) {
+          if (e instanceof Error && e.name === "AbortError") throw e;
+          return [] as string[];
+        }
+
+        let payload: Record<string, unknown> | null = null;
+        try {
+          const parsed = JSON.parse(eventApiText);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            payload = parsed as Record<string, unknown>;
+          }
+        } catch {
+          return [] as string[];
+        }
+        if (!payload) return [] as string[];
+
+        const baseStreamsAll = dedupeUrls(
+          [String(payload.stream || "").trim(), String(payload.stream_no_timeshift || "").trim()].filter((v) =>
+            isValidHttpUrl(v)
+          )
+        );
+        const preferredStream = baseStreamsAll[0] || "";
+        if (!preferredStream) return [] as string[];
+        const baseStreams = [preferredStream];
+
+        const tokenRequired = Boolean(payload.token_authentication);
+        const out: string[] = [];
+        for (const streamUrl of baseStreams) {
+          let finalStreamUrl = streamUrl;
+          if (tokenRequired && !hasEasybroadcastTokenQuery(finalStreamUrl)) {
+            const tokenEndpoint = `https://token.easybroadcast.io/all?url=${encodeURIComponent(streamUrl)}`;
+            const tokenProbe = toEmbedProxyUrl(tokenEndpoint, eventPageUrl);
+            if (tokenProbe) {
+              try {
+                const tokenRes = await fetchHtml(tokenProbe);
+                if (tokenRes?.res?.ok) {
+                  const tokenBody = await tokenRes.res.text();
+                  const tokenQuery = parseEasybroadcastTokenQuery(tokenBody);
+                  if (tokenQuery) {
+                    finalStreamUrl = appendQueryToUrl(streamUrl, tokenQuery);
+                  }
+                }
+              } catch (e: unknown) {
+                if (e instanceof Error && e.name === "AbortError") throw e;
+              }
+            }
+          }
+
+          if (!isStrongPlayableStreamUrl(finalStreamUrl)) continue;
+          const proxied = toEmbedProxyUrl(finalStreamUrl, eventPageUrl);
+          if (proxied) out.push(proxied);
+        }
+
+        return dedupeUrls(out);
+      };
+
+      const easybroadcastList = await resolveEasybroadcastEventCandidates(extractionBaseUrl);
       const childList = extractPlayableCandidatesFromProxyHtml(childHtml, extractionBaseUrl);
       const childRolling = extractRollingHlsCandidatesFromHtml(childHtml, extractionBaseUrl);
       const nextPlayerPages = extractPlayerPageCandidatesFromProxyHtml(childHtml, extractionBaseUrl);
       return {
-        deep: childList,
+        deep: [...easybroadcastList, ...childList],
         rolling: childRolling,
         playerv2: pageBaseUrl && isValidHttpUrl(pageBaseUrl) ? { pageUrl: pageBaseUrl, html: childHtml } : null,
-        playable: [...childRolling, ...childList],
+        playable: [...easybroadcastList, ...childRolling, ...childList],
         nextPlayerPages,
         baseUrl: pageBaseUrl,
       };
@@ -2453,28 +2674,43 @@ export default function WatchPage() {
       const isServer1Primary = selectedServer === 1;
       const isServer2Playerv2 = selectedServer === 2 && isPlayerv2LikeUrl(selectedUrl);
       const isServer3Livehd = selectedServer === 3 && isLivehd77LikeUrl(selectedUrl);
-      const disableResolveCache = selectedServer === 3;
+      const isServer4Livekora = selectedServer === 4;
+      const disableResolveCache = selectedServer === 3 || selectedServer === 4;
       const cachedCandidates = disableResolveCache ? [] : getCachedResolveCandidates(selectedUrl);
       const stickyCandidates = isServer2Playerv2 ? getPlayerv2StickyCandidates(selectedUrl) : [];
       const initialCandidates = dedupeUrls([...stickyCandidates, ...cachedCandidates, ...seedCandidates]);
       const resolveFetchTimeoutFast = isServer3Livehd
         ? LIVEHD77_FETCH_TIMEOUT_FAST_MS
+        : isServer4Livekora
+          ? SERVER4_FETCH_TIMEOUT_FAST_MS
         : isServer1Primary
           ? SERVER1_FETCH_TIMEOUT_FAST_MS
           : FAST_PHASE_PROBE_TIMEOUT_MS;
       const resolveFetchTimeoutFinal = isServer3Livehd
         ? LIVEHD77_FETCH_TIMEOUT_FINAL_MS
+        : isServer4Livekora
+          ? SERVER4_FETCH_TIMEOUT_FINAL_MS
         : isServer1Primary
           ? SERVER1_FETCH_TIMEOUT_FINAL_MS
           : CANDIDATE_PROBE_TIMEOUT_MS;
       const probeTimeoutMs = isServer3Livehd
         ? LIVEHD77_PROBE_TIMEOUT_MS
+        : isServer4Livekora
+          ? SERVER4_PROBE_TIMEOUT_MS
         : isServer1Primary
           ? SERVER1_PROBE_TIMEOUT_MS
           : CANDIDATE_PROBE_TIMEOUT_MS;
-      const resolveFetchRetries = isServer3Livehd ? LIVEHD77_FETCH_RETRIES : isServer1Primary ? SERVER1_FETCH_RETRIES : 0;
+      const resolveFetchRetries = isServer3Livehd
+        ? LIVEHD77_FETCH_RETRIES
+        : isServer4Livekora
+          ? SERVER4_FETCH_RETRIES
+          : isServer1Primary
+            ? SERVER1_FETCH_RETRIES
+            : 0;
       const resolveFetchRetryDelayMs = isServer3Livehd
         ? LIVEHD77_FETCH_RETRY_DELAY_MS
+        : isServer4Livekora
+          ? SERVER4_FETCH_RETRY_DELAY_MS
         : isServer1Primary
           ? SERVER1_FETCH_RETRY_DELAY_MS
           : 0;
@@ -2499,7 +2735,7 @@ export default function WatchPage() {
         const fastList = await resolveCandidatesForServer(selectedUrl, controller.signal, {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
-          allowSamePathServVariants: selectedServer === 3,
+          allowSamePathServVariants: selectedServer === 3 || selectedServer === 4,
           maxPlayerPages: isServer2Playerv2 ? 1 : FAST_PHASE_MAX_PLAYER_PAGES,
           maxDeepCandidates: isServer2Playerv2 ? 2 : FAST_PHASE_MAX_DEEP_CANDIDATES,
           maxPlayerv2Pool: isServer2Playerv2 ? 1 : FAST_PHASE_MAX_PLAYERV2_POOL,
@@ -2549,7 +2785,7 @@ export default function WatchPage() {
         const finalList = await resolveCandidatesForServer(selectedUrl, controller.signal, {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
-          allowSamePathServVariants: selectedServer === 3,
+          allowSamePathServVariants: selectedServer === 3 || selectedServer === 4,
           fetchTimeoutMs: resolveFetchTimeoutFinal,
           fetchRetries: resolveFetchRetries,
           fetchRetryDelayMs: resolveFetchRetryDelayMs,
@@ -2578,7 +2814,7 @@ export default function WatchPage() {
             concurrency: Math.min(3, PROBE_CONCURRENCY),
             pushDiag,
           });
-          const allowRawFallback = selectedServer === 1 || selectedServer === 3 || isServer2Playerv2;
+          const allowRawFallback = selectedServer === 1 || selectedServer === 3 || selectedServer === 4 || isServer2Playerv2;
           const merged = verified.length ? verified : (allowRawFallback ? mergedRaw : []);
           if (!verified.length && selectedServer === 1 && mergedRaw.length) {
             pushDiag("raw-fallback server1");
@@ -2588,6 +2824,9 @@ export default function WatchPage() {
           }
           if (!verified.length && selectedServer === 3 && mergedRaw.length) {
             pushDiag("raw-fallback server3");
+          }
+          if (!verified.length && selectedServer === 4 && mergedRaw.length) {
+            pushDiag("raw-fallback server4");
           }
           if (mergedRaw.length) pushDiag(`probe ok ${merged.length}/${mergedRaw.length}`);
           applyCandidatesPreservingSelection(merged);
@@ -2609,16 +2848,16 @@ export default function WatchPage() {
         if (!cancel && !(e instanceof Error && e.name === "AbortError")) {
           if (!hadPlayable) {
             const rawErrorMessage = e instanceof Error ? e.message : "فشل استخراج المصادر.";
-            const isServer1Or3 = selectedServer === 1 || selectedServer === 3;
+            const isServer1Or3Or4 = selectedServer === 1 || selectedServer === 3 || selectedServer === 4;
             const isProbeTimeout = /probe-timeout/i.test(rawErrorMessage);
-            if (isServer1Or3 && isProbeTimeout) {
+            if (isServer1Or3Or4 && isProbeTimeout) {
               pushDiag(`resolver probe-timeout server${selectedServer}`);
               setResolverError(null);
             } else {
               setResolverError(rawErrorMessage);
             }
             if (selectedServer !== 3 || isServer3Livehd) {
-              const immediate = isProbeTimeout && (selectedServer === 1 || isServer3Livehd);
+              const immediate = isProbeTimeout && selectedServer === 1;
               scheduleResolveRecovery("resolver-error", immediate);
             } else {
               resetRecoveryState();
