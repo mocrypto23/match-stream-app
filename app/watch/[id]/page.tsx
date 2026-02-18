@@ -665,6 +665,27 @@ function normalizePathKey(value: string) {
   }
 }
 
+function parseLivehdTvMeta(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!isValidHttpUrl(raw)) return null as null | { pathKey: string; serv: number | null };
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    if (!(host === "livehd77.pro" || host.endsWith(".livehd77.pro"))) return null;
+    const path = u.pathname.toLowerCase().replace(/\/+$/, "");
+    if (!/^\/tv\/[^/?#]+$/.test(path)) return null;
+    let serv: number | null = null;
+    const servRaw = String(u.searchParams.get("serv") || "").trim();
+    if (servRaw) {
+      const n = Number.parseInt(servRaw, 10);
+      if (Number.isFinite(n) && n >= 0) serv = n;
+    }
+    return { pathKey: path, serv };
+  } catch {
+    return null;
+  }
+}
+
 // Server 4 sources sometimes come from legacy mirrors (e.g. koooralive.click),
 // but the upstream HLS/CDN allows playback only when the referrer is gomatch-live.com.
 function normalizeServer4SourceUrl(value?: string | null) {
@@ -1263,19 +1284,25 @@ function isLivehdExternalRelayUrl(value?: string | null) {
   const raw = toUnderlyingUrl(String(value || ""));
   if (!isValidHttpUrl(raw)) return false;
   try {
-    const host = new URL(raw).hostname.toLowerCase();
-    return (
-      host.endsWith(".yalla-online.click") ||
-      host === "cdn3.yalla-online.click" ||
-      host === "popcdn.day" ||
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase();
+    const servRaw = String(u.searchParams.get("serv") || "").trim();
+    const serv = Number.parseInt(servRaw, 10);
+    const isKorasimoRelayHost =
+      host.includes("korasimo") ||
       host.endsWith(".popcdn.day") ||
-      host === "lovetier.bz" ||
+      host === "popcdn.day" ||
       host.endsWith(".lovetier.bz") ||
-      host === "doubttooth.net" ||
-      host.endsWith(".doubttooth.net") ||
-      host === "lovecdn.ru" ||
-      host.endsWith(".lovecdn.ru")
-    );
+      host === "lovetier.bz" ||
+      host.endsWith(".lovecdn.ru") ||
+      host.endsWith(".doubttooth.net");
+    const isKorasimoServVariant =
+      (host.includes("alkoora.live") || host.endsWith(".alkoora.live")) &&
+      path.includes("/albaplayer/") &&
+      Number.isFinite(serv) &&
+      serv === 2;
+    return host.endsWith(".yalla-online.click") || host === "cdn3.yalla-online.click" || isKorasimoRelayHost || isKorasimoServVariant;
   } catch {
     return false;
   }
@@ -1911,6 +1938,7 @@ async function resolveCandidatesForServer(
     fetchRetries?: number;
     fetchRetryDelayMs?: number;
     allowSamePathServVariants?: boolean;
+    livehdServPreference?: "prefer0" | "all";
   }
 ) {
   const maxPlayerPages = opts?.maxPlayerPages ?? 6;
@@ -1921,8 +1949,10 @@ async function resolveCandidatesForServer(
   const fetchRetries = Math.max(0, Math.floor(opts?.fetchRetries ?? 0));
   const fetchRetryDelayMs = Math.max(0, Math.floor(opts?.fetchRetryDelayMs ?? 180));
   const allowSamePathServVariants = opts?.allowSamePathServVariants ?? false;
+  const livehdServPreference = opts?.livehdServPreference ?? "all";
   const sourceServ = getServFromUrl(sourceUrl);
   const sourcePathKey = normalizePathKey(sourceUrl);
+  const sourceLivehdTv = parseLivehdTvMeta(sourceUrl);
   const normalizePlayableBatch = (input: string[]) =>
     dedupeUrls(input).filter((url) => {
       const target = url.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(url) || "" : url;
@@ -2017,6 +2047,17 @@ async function resolveCandidatesForServer(
     if (!target || !isValidHttpUrl(target)) return false;
 
     const targetServ = getServFromUrl(target);
+    const targetLivehdTv = parseLivehdTvMeta(target);
+    if (
+      livehdServPreference === "prefer0" &&
+      sourceLivehdTv &&
+      targetLivehdTv &&
+      sourceLivehdTv.pathKey === targetLivehdTv.pathKey &&
+      targetLivehdTv.serv === 1 &&
+      (sourceLivehdTv.serv === null || sourceLivehdTv.serv === 0)
+    ) {
+      return false;
+    }
     if (sourceServ !== null) {
       if (targetServ !== null && targetServ !== sourceServ) return false;
       return true;
@@ -2904,6 +2945,7 @@ export default function WatchPage() {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
           allowSamePathServVariants: selectedServer === 3 || selectedServer === 4,
+          livehdServPreference: "all",
           maxPlayerPages: isServer2Playerv2 ? 1 : FAST_PHASE_MAX_PLAYER_PAGES,
           maxDeepCandidates: isServer2Playerv2 ? 2 : FAST_PHASE_MAX_DEEP_CANDIDATES,
           maxPlayerv2Pool: isServer2Playerv2 ? 1 : FAST_PHASE_MAX_PLAYERV2_POOL,
@@ -2954,6 +2996,7 @@ export default function WatchPage() {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
           allowSamePathServVariants: selectedServer === 3 || selectedServer === 4,
+          livehdServPreference: "all",
           fetchTimeoutMs: resolveFetchTimeoutFinal,
           fetchRetries: resolveFetchRetries,
           fetchRetryDelayMs: resolveFetchRetryDelayMs,
