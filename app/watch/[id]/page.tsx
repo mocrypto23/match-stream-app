@@ -1234,6 +1234,53 @@ function extractBase64DecodedUrlsFromHtml(html: string, sourceUrl: string) {
   return Array.from(out);
 }
 
+function isLikelyLivehdMirrorIframePageUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!isValidHttpUrl(raw)) return false;
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase().replace(/\/+$/, "");
+    if (!(host === "blogspot.com" || host.endsWith(".blogspot.com"))) return false;
+    return /^\/p\/[a-z0-9-]+\.html$/i.test(path);
+  } catch {
+    return false;
+  }
+}
+
+function isLivehdServer3ChainUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!isValidHttpUrl(raw)) return false;
+  try {
+    const host = new URL(raw).hostname.toLowerCase();
+    return host === "livehd77.pro" || host.endsWith(".livehd77.pro") || host.includes("alkoora.live");
+  } catch {
+    return false;
+  }
+}
+
+function isLivehdExternalRelayUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!isValidHttpUrl(raw)) return false;
+  try {
+    const host = new URL(raw).hostname.toLowerCase();
+    return (
+      host.endsWith(".yalla-online.click") ||
+      host === "cdn3.yalla-online.click" ||
+      host === "popcdn.day" ||
+      host.endsWith(".popcdn.day") ||
+      host === "lovetier.bz" ||
+      host.endsWith(".lovetier.bz") ||
+      host === "doubttooth.net" ||
+      host.endsWith(".doubttooth.net") ||
+      host === "lovecdn.ru" ||
+      host.endsWith(".lovecdn.ru")
+    );
+  } catch {
+    return false;
+  }
+}
+
 function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: string) {
   const text = String(html || "")
     .replace(/&amp;/gi, "&")
@@ -1242,11 +1289,13 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
     .replace(/\\\//g, "/");
   const out: string[] = [];
   const seen = new Set<string>();
+  const sourceIsLivehdServer3Chain = isLivehdServer3ChainUrl(sourceUrl);
   const isPlayerLike = (url: string) =>
     PLAYER_PAGE_HINT_RE.test(url) ||
     isLikelyChannelLandingPlayerPageUrl(url) ||
     isKnownRelayPlayerPageUrl(url) ||
     isKnownEmbeddedLivePhpPlayerUrl(url) ||
+    isLikelyLivehdMirrorIframePageUrl(url) ||
     isEasybroadcastEventPageUrl(url);
   const add = (raw: string) => {
     let v = String(raw || "").trim().replace(/[),;]+$/g, "");
@@ -1263,6 +1312,7 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
       const expandedTargets = dedupeUrls([target, ...expandLivehdTvServVariants(target)]);
       for (const candidate of expandedTargets) {
         if (isPlayerv2TokenEndpointUrl(candidate)) continue;
+        if (sourceIsLivehdServer3Chain && isLivehdExternalRelayUrl(candidate)) continue;
         if (isClearlyNonStreamUrl(candidate) || isStrongPlayableStreamUrl(candidate) || isLikelyLivePhpEndpointUrl(candidate))
           continue;
         if (!isPlayerLike(candidate)) continue;
@@ -1280,6 +1330,7 @@ function extractPlayerPageCandidatesFromProxyHtml(html: string, sourceUrl: strin
     const expanded = dedupeUrls([v, ...expandLivehdTvServVariants(v)]);
     for (const candidate of expanded) {
       if (isPlayerv2TokenEndpointUrl(candidate)) continue;
+      if (sourceIsLivehdServer3Chain && isLivehdExternalRelayUrl(candidate)) continue;
       if (isClearlyNonStreamUrl(candidate) || isStrongPlayableStreamUrl(candidate) || isLikelyLivePhpEndpointUrl(candidate))
         continue;
       if (!isPlayerLike(candidate)) continue;
@@ -1340,8 +1391,11 @@ function scoreServer3Candidate(value: string) {
   if (lower.includes("pandalive.live")) score += 220;
   if (lower.includes("livehd77.pro")) score += 120;
   if (lower.includes("/albaplayer/")) score += 90;
+  if (lower.includes("starzplayarabia.com")) score += 260;
+  if (lower.includes("/admn_tv_enc/abudhabi_sports_1/")) score += 120;
   if (/[?&]serv=0(?:&|$)/i.test(lower)) score += 70;
   if (/[?&]serv=1(?:&|$)/i.test(lower)) score += 25;
+  if (SEGMENT_FILE_RE.test(lower)) score -= 900;
   if (lower.includes("cdn3.yalla-online.click/chtv/")) score -= 120;
   if (isLikelyExpiredReplayManifestUrl(lower)) score -= 500;
 
@@ -2481,6 +2535,22 @@ export default function WatchPage() {
   const prioritizeCandidatesByServer = useCallback((server: number, input: string[]) => {
     let base = dedupeUrls(input);
     if (server !== 3 || base.length < 2) return base;
+
+    const withoutExternalRelay = base.filter((candidate) => !isLivehdExternalRelayUrl(candidate));
+    if (withoutExternalRelay.length && withoutExternalRelay.length !== base.length) {
+      pushDiag(`server3 drop-external-relay=${base.length - withoutExternalRelay.length}`);
+      base = withoutExternalRelay;
+    } else if (!withoutExternalRelay.length && base.length) {
+      pushDiag("server3 drop-external-relay fallback-all");
+    }
+
+    const withoutSegments = base.filter((candidate) => !SEGMENT_FILE_RE.test(toUnderlyingUrl(candidate)));
+    if (withoutSegments.length && withoutSegments.length !== base.length) {
+      pushDiag(`server3 drop-segments=${base.length - withoutSegments.length}`);
+      base = withoutSegments;
+    } else if (!withoutSegments.length && base.length) {
+      pushDiag("server3 drop-segments fallback-all");
+    }
 
     const withoutLikelyExpiredReplay = base.filter((candidate) => !isLikelyExpiredReplayManifestUrl(candidate));
     if (withoutLikelyExpiredReplay.length && withoutLikelyExpiredReplay.length !== base.length) {
