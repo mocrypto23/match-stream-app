@@ -650,7 +650,7 @@ function getServFromUrl(value: string) {
     const raw = new URL(value).searchParams.get("serv");
     if (!raw) return null;
     const n = Number.parseInt(raw, 10);
-    return Number.isFinite(n) && n > 0 ? n : null;
+    return Number.isFinite(n) && n >= 0 ? n : null;
   } catch {
     return null;
   }
@@ -1414,14 +1414,17 @@ function scoreServer3Candidate(value: string) {
 
   let score = 0;
   const lower = raw.toLowerCase();
+  const livehdMeta = parseLivehdTvMeta(raw);
   if (lower.includes("pl.gomatch-live.com")) score += 320;
   if (lower.includes("pandalive.live")) score += 220;
   if (lower.includes("livehd77.pro")) score += 120;
   if (lower.includes("/albaplayer/")) score += 90;
   if (lower.includes("starzplayarabia.com")) score += 260;
   if (lower.includes("/admn_tv_enc/abudhabi_sports_1/")) score += 120;
-  if (/[?&]serv=0(?:&|$)/i.test(lower)) score += 70;
-  if (/[?&]serv=1(?:&|$)/i.test(lower)) score += 25;
+  if (/[?&]serv=0(?:&|$)/i.test(lower)) score += 240;
+  if (/[?&]serv=1(?:&|$)/i.test(lower)) score -= 80;
+  if (livehdMeta?.serv === 1) score -= 220;
+  if (livehdMeta?.serv === 0) score += 140;
   if (SEGMENT_FILE_RE.test(lower)) score -= 900;
   if (lower.includes("cdn3.yalla-online.click/chtv/")) score -= 120;
   if (isLikelyExpiredReplayManifestUrl(lower)) score -= 500;
@@ -2052,13 +2055,21 @@ async function resolveCandidatesForServer(
       livehdServPreference === "prefer0" &&
       sourceLivehdTv &&
       targetLivehdTv &&
-      sourceLivehdTv.pathKey === targetLivehdTv.pathKey &&
-      targetLivehdTv.serv === 1 &&
-      (sourceLivehdTv.serv === null || sourceLivehdTv.serv === 0)
+      sourceLivehdTv.pathKey === targetLivehdTv.pathKey
     ) {
-      return false;
+      // Keep sibling serv variants available, but ordering will strongly prefer serv=0.
+      if (targetLivehdTv.serv !== null && targetLivehdTv.serv !== 0 && targetLivehdTv.serv !== 1) return false;
     }
     if (sourceServ !== null) {
+      // LIVEHD TV pages can switch between serv=0/serv=1 for the same channel path.
+      // We allow both variants here, then ranking decides priority.
+      if (
+        sourceLivehdTv &&
+        targetLivehdTv &&
+        sourceLivehdTv.pathKey === targetLivehdTv.pathKey
+      ) {
+        return true;
+      }
       if (targetServ !== null && targetServ !== sourceServ) return false;
       return true;
     }
@@ -2629,6 +2640,15 @@ export default function WatchPage() {
       nextIdx = 0;
     }
 
+    // Server 3 policy: when a serv=0 sibling exists, prefer it as default over serv=1.
+    if (server === 3 && next.length > 1) {
+      const activeMeta = parseLivehdTvMeta(next[nextIdx] || "");
+      const bestMeta = parseLivehdTvMeta(next[0] || "");
+      if (bestMeta?.serv === 0 && activeMeta?.serv === 1) {
+        nextIdx = 0;
+      }
+    }
+
     candidatesRef.current = next;
     if (nextIdx !== prevIdx) {
       selectedCandidateRef.current = nextIdx;
@@ -2945,7 +2965,7 @@ export default function WatchPage() {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
           allowSamePathServVariants: selectedServer === 3 || selectedServer === 4,
-          livehdServPreference: "all",
+          livehdServPreference: isServer3Livehd ? "prefer0" : "all",
           maxPlayerPages: isServer2Playerv2 ? 1 : FAST_PHASE_MAX_PLAYER_PAGES,
           maxDeepCandidates: isServer2Playerv2 ? 2 : FAST_PHASE_MAX_DEEP_CANDIDATES,
           maxPlayerv2Pool: isServer2Playerv2 ? 1 : FAST_PHASE_MAX_PLAYERV2_POOL,
@@ -2996,7 +3016,7 @@ export default function WatchPage() {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
           allowSamePathServVariants: selectedServer === 3 || selectedServer === 4,
-          livehdServPreference: "all",
+          livehdServPreference: isServer3Livehd ? "prefer0" : "all",
           fetchTimeoutMs: resolveFetchTimeoutFinal,
           fetchRetries: resolveFetchRetries,
           fetchRetryDelayMs: resolveFetchRetryDelayMs,
