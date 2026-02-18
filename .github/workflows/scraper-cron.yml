@@ -2,6 +2,15 @@ name: Scrape matches (20m)
 
 on:
   workflow_dispatch:
+    inputs:
+      ci_speedup_enabled:
+        description: "Enable CI speed optimizations (on/off)"
+        required: false
+        default: "on"
+        type: choice
+        options:
+          - on
+          - off
   repository_dispatch:
     types: [run_my_scraper]
 
@@ -15,6 +24,7 @@ jobs:
     timeout-minutes: 30
     env:
       TZ: Africa/Cairo
+      PLAYWRIGHT_BROWSERS_PATH: ~/.cache/ms-playwright
 
     steps:
       - name: Gate (manual/dispatch runs)
@@ -33,8 +43,48 @@ jobs:
           echo "should_run=false" >> "$GITHUB_OUTPUT"
           exit 0
 
-      - name: Checkout
+      - name: Resolve speed toggle
+        id: speed
         if: steps.gate.outputs.should_run == 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_INPUT: ${{ github.event.inputs.ci_speedup_enabled }}
+          PAYLOAD_INPUT: ${{ github.event.client_payload.ci_speedup_enabled }}
+        run: |
+          raw=""
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "${DISPATCH_INPUT}" ]; then
+            raw="${DISPATCH_INPUT}"
+          elif [ -n "${PAYLOAD_INPUT}" ]; then
+            raw="${PAYLOAD_INPUT}"
+          else
+            raw="on"
+          fi
+
+          norm="$(printf '%s' "${raw}" | tr '[:upper:]' '[:lower:]' | xargs)"
+          enabled="false"
+          case "${norm}" in
+            on|true|1|yes) enabled="true" ;;
+            *) enabled="false" ;;
+          esac
+
+          suffix="legacy"
+          if [ "${enabled}" = "true" ]; then
+            suffix="fast"
+          fi
+
+          echo "speedup_enabled=${enabled}" >> "$GITHUB_OUTPUT"
+          echo "playwright_cache_key_suffix=${suffix}" >> "$GITHUB_OUTPUT"
+          echo "CI speedup enabled: ${enabled}"
+          echo "Speed mode: ${suffix}-path"
+
+      - name: Checkout (fast path)
+        if: steps.gate.outputs.should_run == 'true' && steps.speed.outputs.speedup_enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Checkout (legacy path)
+        if: steps.gate.outputs.should_run == 'true' && steps.speed.outputs.speedup_enabled != 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -46,12 +96,37 @@ jobs:
           node-version: 20
           cache: "npm"
 
-      - name: Install dependencies
-        if: steps.gate.outputs.should_run == 'true'
+      - name: Install dependencies (fast path)
+        if: steps.gate.outputs.should_run == 'true' && steps.speed.outputs.speedup_enabled == 'true'
+        run: npm ci --omit=dev --no-audit --no-fund --prefer-offline
+
+      - name: Install dependencies (legacy path)
+        if: steps.gate.outputs.should_run == 'true' && steps.speed.outputs.speedup_enabled != 'true'
         run: npm ci
 
-      - name: Install Playwright (Chromium)
-        if: steps.gate.outputs.should_run == 'true'
+      - name: Cache Playwright browsers (fast path)
+        id: pw-cache
+        if: steps.gate.outputs.should_run == 'true' && steps.speed.outputs.speedup_enabled == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ steps.speed.outputs.playwright_cache_key_suffix }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-${{ steps.speed.outputs.playwright_cache_key_suffix }}-
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright (Chromium - fast path)
+        if: steps.gate.outputs.should_run == 'true' && steps.speed.outputs.speedup_enabled == 'true'
+        run: |
+          echo "[fast-path] cache-hit=${{ steps.pw-cache.outputs.cache-hit }}"
+          if [ "${{ steps.pw-cache.outputs.cache-hit }}" = "true" ]; then
+            npx playwright install chromium || npx playwright install --with-deps chromium
+          else
+            npx playwright install --with-deps chromium
+          fi
+
+      - name: Install Playwright (Chromium - legacy path)
+        if: steps.gate.outputs.should_run == 'true' && steps.speed.outputs.speedup_enabled != 'true'
         run: npx playwright install --with-deps chromium
 
       - name: Run scraper (headless)
