@@ -1444,8 +1444,10 @@ function groupCandidates(values: string[]) {
   });
 
   const familyHasQuality = new Set<string>();
+  let hasAnyQuality = false;
   for (const group of sorted) {
     if (qualityRank(group.label) < 0) continue;
+    hasAnyQuality = true;
     const family = group.key.split("|q=")[0] || group.key;
     familyHasQuality.add(family);
   }
@@ -1453,8 +1455,12 @@ function groupCandidates(values: string[]) {
   const filtered = sorted.filter((group) => {
     if (qualityRank(group.label) >= 0) return true;
     const family = group.key.split("|q=")[0] || group.key;
-    if (!familyHasQuality.has(family)) return true;
-    return !/easybroadcast\.io/i.test(family);
+    const familyLower = family.toLowerCase();
+    const isEasybroadcastFamily = /easybroadcast\.io/i.test(familyLower);
+    const isLandingPlayerFamily = /\/albaplayer\/|\/tv\/|player\.easybroadcast\.io\/events\//i.test(familyLower);
+    if (familyHasQuality.has(family) && isEasybroadcastFamily) return false;
+    if (hasAnyQuality && (isEasybroadcastFamily || isLandingPlayerFamily)) return false;
+    return true;
   });
 
   return filtered.length ? filtered : sorted;
