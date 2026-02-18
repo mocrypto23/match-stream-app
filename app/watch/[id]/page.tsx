@@ -141,6 +141,16 @@ type ProbeHlsOptions = {
 };
 type FilterPlayableOptions = ProbeHlsOptions & { maxChecks?: number; concurrency?: number };
 type ResolveBatchPhase = "fast" | "deep" | "token";
+type Server3RootServ = 0 | 1 | null;
+type Server3CandidateProvenance = {
+  rootPathKey: string;
+  rootServ: Server3RootServ;
+  originStage: ResolveBatchPhase;
+};
+type ResolveCandidatesResult = {
+  candidates: string[];
+  provenanceByKey: Map<string, Server3CandidateProvenance>;
+};
 type ResolveResultCacheEntry = { expiresAt: number; candidates: string[] };
 type Playerv2StickyCacheEntry = { expiresAt: number; candidates: string[] };
 type Playerv2TokenCacheEntry = { expiresAt: number; tokenPayload: Playerv2TokenPayload };
@@ -533,21 +543,29 @@ function toPlayableProxyFromManifestLine(rawLine: string, parentCandidateUrl: st
   if (!line) return null;
   if (line.startsWith("/api/embed-proxy?")) return line;
 
+  const parentProxyRef =
+    parentCandidateUrl.startsWith("/api/embed-proxy?") ? getProxyRefUrlFromCandidate(parentCandidateUrl) : "";
   const parentTarget = parentCandidateUrl.startsWith("/api/embed-proxy?")
     ? getProxyTargetUrl(parentCandidateUrl)
     : isValidHttpUrl(parentCandidateUrl)
       ? parentCandidateUrl
       : null;
+  const parentRef =
+    parentProxyRef && isValidHttpUrl(parentProxyRef)
+      ? parentProxyRef
+      : parentTarget && isValidHttpUrl(parentTarget)
+        ? parentTarget
+        : null;
 
   if (isValidHttpUrl(line)) {
-    return toEmbedProxyUrl(line, parentTarget || line);
+    return toEmbedProxyUrl(line, parentRef || line);
   }
 
   if (!parentTarget || !isValidHttpUrl(parentTarget)) return null;
   try {
     const absoluteRaw = new URL(line, parentTarget).toString();
     const absolute = inheritEasybroadcastAuthQuery(absoluteRaw, parentTarget);
-    return toEmbedProxyUrl(absolute, parentTarget);
+    return toEmbedProxyUrl(absolute, parentRef || parentTarget);
   } catch {
     return null;
   }
@@ -684,6 +702,86 @@ function parseLivehdTvMeta(value?: string | null) {
   } catch {
     return null;
   }
+}
+
+function normalizeServer3RootServ(value: number | null | undefined): Server3RootServ {
+  if (value === 0) return 0;
+  if (value === 1) return 1;
+  return null;
+}
+
+function server3ProvenanceScore(value?: Server3CandidateProvenance | null) {
+  if (!value) return -1;
+  if (value.rootServ === 0) return 3;
+  if (value.rootServ === 1) return 2;
+  if (value.rootPathKey) return 1;
+  return 0;
+}
+
+function pickBetterServer3Provenance(
+  prev: Server3CandidateProvenance | undefined,
+  next: Server3CandidateProvenance
+) {
+  if (!prev) return next;
+  const prevScore = server3ProvenanceScore(prev);
+  const nextScore = server3ProvenanceScore(next);
+  if (nextScore > prevScore) return next;
+  return prev;
+}
+
+function getProxyRefUrlFromCandidate(value: string) {
+  const raw = String(value || "").trim();
+  if (!raw.startsWith("/api/embed-proxy?")) return "";
+  try {
+    const u = new URL(raw, "http://localhost");
+    const refRaw = String(u.searchParams.get("ref") || "").trim();
+    if (!refRaw) return "";
+    const decoded = normalizeURIComponent(refRaw);
+    return isValidHttpUrl(decoded) ? decoded : "";
+  } catch {
+    return "";
+  }
+}
+
+function getServer3RootServFromCandidate(
+  candidate: string,
+  provenanceByKey?: Map<string, Server3CandidateProvenance> | null
+) {
+  const key = canonicalizeUrl(candidate) || String(candidate || "").trim().toLowerCase();
+  const fromMap = key ? provenanceByKey?.get(key)?.rootServ : null;
+  if (fromMap === 0 || fromMap === 1) return fromMap;
+
+  const refUrl = getProxyRefUrlFromCandidate(candidate);
+  if (refUrl) {
+    const refMeta = parseLivehdTvMeta(refUrl);
+    const refServ = normalizeServer3RootServ(refMeta?.serv ?? null);
+    if (refServ === 0 || refServ === 1) return refServ;
+
+    const refKeys: Array<string | null> = [canonicalizeUrl(refUrl), `proxy:${refUrl.toLowerCase()}`];
+    const refProvenance = refKeys
+      .filter((k): k is string => !!k)
+      .map((k) => provenanceByKey?.get(k))
+      .find((v): v is Server3CandidateProvenance => !!v);
+    if (refProvenance?.rootServ === 0 || refProvenance?.rootServ === 1) return refProvenance.rootServ;
+  }
+
+  const livehdMeta = parseLivehdTvMeta(candidate);
+  return normalizeServer3RootServ(livehdMeta?.serv ?? null);
+}
+
+function splitServer3CandidatesByRootServ(
+  input: string[],
+  provenanceByKey?: Map<string, Server3CandidateProvenance> | null
+) {
+  const deduped = dedupeUrls(input || []);
+  const bucket0: string[] = [];
+  const bucket1: string[] = [];
+  for (const candidate of deduped) {
+    const rootServ = getServer3RootServFromCandidate(candidate, provenanceByKey);
+    if (rootServ === 0) bucket0.push(candidate);
+    else bucket1.push(candidate);
+  }
+  return { bucket0, bucket1 };
 }
 
 // Server 4 sources sometimes come from legacy mirrors (e.g. koooralive.click),
@@ -896,6 +994,48 @@ function extractPlayableCandidatesFromProxyHtml(html: string, sourceUrl: string)
   const seen = new Set<string>();
   const isPlayableLike = (value: string) =>
     isStrongPlayableStreamUrl(value) || isLikelyLivePhpEndpointUrl(value);
+  const extractJsConcatPlayableUrls = (rawHtml: string) => {
+    const localText = String(rawHtml || "")
+      .replace(/&amp;/gi, "&")
+      .replace(/\\u0026/gi, "&")
+      .replace(/\\u002f/gi, "/")
+      .replace(/\\\//g, "/");
+    const vars = new Map<string, string[]>();
+    for (const m of localText.matchAll(/\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*\[([^\]]{1,800})\]/g)) {
+      const varName = String(m[1] || "").trim();
+      const arrBody = String(m[2] || "");
+      if (!varName || !arrBody) continue;
+      const values = Array.from(arrBody.matchAll(/['"]([^'"]{1,200})['"]/g))
+        .map((x) => String(x[1] || "").trim())
+        .filter(Boolean);
+      if (values.length) vars.set(varName, values);
+    }
+    for (const m of localText.matchAll(/\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*\[[^\]]+\]/g)) {
+      const targetVar = String(m[1] || "").trim();
+      const sourceVar = String(m[2] || "").trim();
+      if (!targetVar || !sourceVar) continue;
+      const sourceValues = vars.get(sourceVar);
+      if (sourceValues?.length) vars.set(targetVar, sourceValues);
+    }
+
+    const urls: string[] = [];
+    for (const m of localText.matchAll(/(['"]https?:\/\/['"])\s*\+\s*([A-Za-z_$][\w$]*)\s*\+\s*(['"][^'"]{1,600}['"])/g)) {
+      const prefixRaw = String(m[1] || "");
+      const varName = String(m[2] || "").trim();
+      const suffixRaw = String(m[3] || "");
+      const prefix = prefixRaw.slice(1, -1);
+      const suffix = suffixRaw.slice(1, -1);
+      if (!prefix || !suffix || !varName) continue;
+      const values = vars.get(varName) || [];
+      for (const value of values) {
+        const resolved = `${prefix}${value}${suffix}`;
+        if (isStrongPlayableStreamUrl(resolved) || isLikelyLivePhpEndpointUrl(resolved)) {
+          urls.push(resolved);
+        }
+      }
+    }
+    return dedupeUrls(urls);
+  };
   const add = (raw: string) => {
     let v = String(raw || "").trim().replace(/[),;]+$/g, "");
     if (v.includes("${")) {
@@ -923,6 +1063,7 @@ function extractPlayableCandidatesFromProxyHtml(html: string, sourceUrl: string)
   for (const m of text.match(/\/api\/embed-proxy\?[^"'`\s<>()]+/gi) || []) add(m);
   for (const m of text.match(/https?:\/\/[^"'`\s<>()]+\.m3u8[^"'`\s<>()]*/gi) || []) add(m);
   for (const m of text.match(/https?:\/\/[^"'`\s<>()]+/gi) || []) add(m);
+  for (const m of extractJsConcatPlayableUrls(text)) add(m);
   for (const m of extractPlayableUrlsFromPackedEval(text)) add(m);
   for (const m of extractBase64DecodedUrlsFromHtml(text, sourceUrl)) add(m);
   return out;
@@ -1295,14 +1436,13 @@ function isLivehdExternalRelayUrl(value?: string | null) {
       host === "popcdn.day" ||
       host.endsWith(".lovetier.bz") ||
       host === "lovetier.bz" ||
-      host.endsWith(".lovecdn.ru") ||
-      host.endsWith(".doubttooth.net");
+      host.endsWith(".lovecdn.ru");
     const isKorasimoServVariant =
       (host.includes("alkoora.live") || host.endsWith(".alkoora.live")) &&
       path.includes("/albaplayer/") &&
       Number.isFinite(serv) &&
       serv === 2;
-    return host.endsWith(".yalla-online.click") || host === "cdn3.yalla-online.click" || isKorasimoRelayHost || isKorasimoServVariant;
+    return isKorasimoRelayHost || isKorasimoServVariant;
   } catch {
     return false;
   }
@@ -1935,7 +2075,11 @@ async function resolveCandidatesForServer(
     maxDeepCandidates?: number;
     maxPlayerv2Pool?: number;
     playerv2Diag?: (line: string) => void;
-    onBatchCandidates?: (batch: string[], phase: ResolveBatchPhase) => void;
+    onBatchCandidates?: (
+      batch: string[],
+      phase: ResolveBatchPhase,
+      provenance?: Map<string, Server3CandidateProvenance>
+    ) => void;
     parallelChildConcurrency?: number;
     fetchTimeoutMs?: number;
     fetchRetries?: number;
@@ -1943,7 +2087,7 @@ async function resolveCandidatesForServer(
     allowSamePathServVariants?: boolean;
     livehdServPreference?: "prefer0" | "all";
   }
-) {
+): Promise<ResolveCandidatesResult> {
   const maxPlayerPages = opts?.maxPlayerPages ?? 6;
   const maxDeepCandidates = opts?.maxDeepCandidates ?? 8;
   const maxPlayerv2Pool = opts?.maxPlayerv2Pool ?? 6;
@@ -1956,6 +2100,132 @@ async function resolveCandidatesForServer(
   const sourceServ = getServFromUrl(sourceUrl);
   const sourcePathKey = normalizePathKey(sourceUrl);
   const sourceLivehdTv = parseLivehdTvMeta(sourceUrl);
+  const sourceRootPathKey = sourceLivehdTv?.pathKey || "";
+  const sourceRootServ = normalizeServer3RootServ(sourceLivehdTv?.serv ?? null);
+  const provenanceByKey = new Map<string, Server3CandidateProvenance>();
+
+  const keyOfCandidate = (value: string) => canonicalizeUrl(value) || String(value || "").trim().toLowerCase();
+  const getKnownProvenanceFromUrl = (value: string) => {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+
+    const keys: Array<string | null> = [canonicalizeUrl(raw)];
+    if (isValidHttpUrl(raw)) {
+      keys.push(`proxy:${raw.toLowerCase()}`);
+      const proxiedSelf = toEmbedProxyUrl(raw, raw);
+      if (proxiedSelf) keys.push(canonicalizeUrl(proxiedSelf));
+    }
+
+    for (const k of keys) {
+      if (!k) continue;
+      const found = provenanceByKey.get(k);
+      if (found) return found;
+    }
+    return null;
+  };
+
+  const deriveServer3Provenance = (
+    candidate: string,
+    phase: ResolveBatchPhase
+  ): Server3CandidateProvenance | null => {
+    if (!sourceLivehdTv) return null;
+
+    const target = candidate.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(candidate) || "" : candidate;
+    const directMeta = parseLivehdTvMeta(target);
+    if (directMeta) {
+      return {
+        rootPathKey: directMeta.pathKey || sourceRootPathKey,
+        rootServ: normalizeServer3RootServ(directMeta.serv),
+        originStage: phase,
+      };
+    }
+
+    const refUrl = getProxyRefUrlFromCandidate(candidate);
+    if (refUrl) {
+      const refMeta = parseLivehdTvMeta(refUrl);
+      if (refMeta) {
+        return {
+          rootPathKey: refMeta.pathKey || sourceRootPathKey,
+          rootServ: normalizeServer3RootServ(refMeta.serv),
+          originStage: phase,
+        };
+      }
+      const knownRef = getKnownProvenanceFromUrl(refUrl);
+      if (knownRef) {
+        return {
+          rootPathKey: knownRef.rootPathKey || sourceRootPathKey,
+          rootServ: knownRef.rootServ,
+          originStage: phase,
+        };
+      }
+    }
+
+    const knownTarget = getKnownProvenanceFromUrl(target);
+    if (knownTarget) {
+      return {
+        rootPathKey: knownTarget.rootPathKey || sourceRootPathKey,
+        rootServ: knownTarget.rootServ,
+        originStage: phase,
+      };
+    }
+
+    return {
+      rootPathKey: sourceRootPathKey,
+      rootServ: sourceRootServ,
+      originStage: phase,
+    };
+  };
+
+  const storeServer3ProvenanceForUrl = (value: string, next: Server3CandidateProvenance) => {
+    if (!sourceLivehdTv || !next) return;
+    const raw = String(value || "").trim();
+    if (!raw) return;
+    const keys = new Set<string>();
+    const candidateKey = keyOfCandidate(raw);
+    if (candidateKey) keys.add(candidateKey);
+
+    const target = raw.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(raw) || "" : raw;
+    if (target && isValidHttpUrl(target)) {
+      const canonTarget = canonicalizeUrl(target);
+      if (canonTarget) keys.add(canonTarget);
+      keys.add(`proxy:${target.toLowerCase()}`);
+      const proxiedSelf = toEmbedProxyUrl(target, target);
+      const proxiedSelfKey = proxiedSelf ? canonicalizeUrl(proxiedSelf) : null;
+      if (proxiedSelfKey) keys.add(proxiedSelfKey);
+    }
+
+    const refUrl = getProxyRefUrlFromCandidate(raw);
+    if (refUrl && isValidHttpUrl(refUrl)) {
+      const canonRef = canonicalizeUrl(refUrl);
+      if (canonRef) keys.add(canonRef);
+      keys.add(`proxy:${refUrl.toLowerCase()}`);
+      const proxiedRef = toEmbedProxyUrl(refUrl, refUrl);
+      const proxiedRefKey = proxiedRef ? canonicalizeUrl(proxiedRef) : null;
+      if (proxiedRefKey) keys.add(proxiedRefKey);
+    }
+
+    for (const key of keys) {
+      if (!key) continue;
+      const picked = pickBetterServer3Provenance(provenanceByKey.get(key), next);
+      provenanceByKey.set(key, picked);
+    }
+  };
+
+  const annotateBatchProvenance = (batch: string[], phase: ResolveBatchPhase) => {
+    const out = new Map<string, Server3CandidateProvenance>();
+    if (!sourceLivehdTv || !batch.length) return out;
+    for (const candidate of batch) {
+      const key = keyOfCandidate(candidate);
+      if (!key) continue;
+      const next = deriveServer3Provenance(candidate, phase);
+      if (!next) continue;
+      storeServer3ProvenanceForUrl(candidate, next);
+      const picked = pickBetterServer3Provenance(provenanceByKey.get(key), next);
+      out.set(key, picked);
+    }
+    return out;
+  };
+
   const normalizePlayableBatch = (input: string[]) =>
     dedupeUrls(input).filter((url) => {
       const target = url.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(url) || "" : url;
@@ -1963,7 +2233,9 @@ async function resolveCandidatesForServer(
     });
   const emitBatch = (batch: string[], phase: ResolveBatchPhase) => {
     const normalized = normalizePlayableBatch(batch);
-    if (normalized.length) opts?.onBatchCandidates?.(normalized, phase);
+    if (!normalized.length) return;
+    const batchProvenance = annotateBatchProvenance(normalized, phase);
+    opts?.onBatchCandidates?.(normalized, phase, batchProvenance);
   };
 
   const fetchHtml = async (url: string) => {
@@ -2000,19 +2272,20 @@ async function resolveCandidatesForServer(
   if (isStrongPlayableStreamUrl(sourceUrl) || isLikelyLivePhpEndpointUrl(sourceUrl)) {
     const one = toEmbedProxyUrl(sourceUrl, sourceUrl);
     if (one) emitBatch([one], "fast");
-    return one ? [one] : [];
+    return { candidates: one ? [one] : [], provenanceByKey };
   }
 
   const probe = toEmbedProxyUrl(sourceUrl, sourceUrl);
-  if (!probe) return [];
+  if (!probe) return { candidates: [], provenanceByKey };
 
   const first = await fetchHtml(probe);
   if (HLS_CT.some((x) => first.ct.includes(x))) {
-    return [probe];
+    emitBatch([probe], "fast");
+    return { candidates: [probe], provenanceByKey };
   }
 
   if (!first.ct.includes("text/html") && !first.ct.includes("application/xhtml+xml")) {
-    return [];
+    return { candidates: [], provenanceByKey };
   }
 
   const html = await first.res.text();
@@ -2023,7 +2296,7 @@ async function resolveCandidatesForServer(
   const fastPrimary = [...yallashootFallback, ...rollingPrimary, ...primaryList];
   emitBatch(fastPrimary, "fast");
   if (directAccessBlocked && yallashootFallback.length) {
-    return normalizePlayableBatch(fastPrimary);
+    return { candidates: normalizePlayableBatch(fastPrimary), provenanceByKey };
   }
 
   // For playerv2 sources we keep resolution lightweight to avoid upstream anti-bot/rate-limit bans.
@@ -2042,7 +2315,7 @@ async function resolveCandidatesForServer(
       tokenized = [];
     }
     if (tokenized.length) emitBatch(tokenized, "token");
-    return normalizePlayableBatch([...rollingPrimary, ...primaryList, ...tokenized]);
+    return { candidates: normalizePlayableBatch([...rollingPrimary, ...primaryList, ...tokenized]), provenanceByKey };
   }
 
   const isSameServerVariantPage = (value: string) => {
@@ -2113,6 +2386,10 @@ async function resolveCandidatesForServer(
   ) => {
     for (const candidate of candidates) {
       if (!isSameServerVariantPage(candidate)) continue;
+      if (sourceLivehdTv) {
+        const next = deriveServer3Provenance(candidate, "deep");
+        if (next) storeServer3ProvenanceForUrl(candidate, next);
+      }
       const key = canonicalizeUrl(candidate) || String(candidate || "").trim().toLowerCase();
       if (!key || visited.has(key)) continue;
       visited.add(key);
@@ -2128,6 +2405,15 @@ async function resolveCandidatesForServer(
         ? getProxyTargetUrl(item.pageUrl) || ""
         : item.pageUrl;
       const pageBaseUrl = isValidHttpUrl(pageTargetUrl) ? pageTargetUrl : item.parentRef;
+      if (sourceLivehdTv) {
+        const itemProvenance = deriveServer3Provenance(item.pageUrl, "deep");
+        if (itemProvenance) {
+          storeServer3ProvenanceForUrl(item.pageUrl, itemProvenance);
+          if (pageBaseUrl && isValidHttpUrl(pageBaseUrl)) {
+            storeServer3ProvenanceForUrl(pageBaseUrl, itemProvenance);
+          }
+        }
+      }
       const childProbe = item.pageUrl.startsWith("/api/embed-proxy?")
         ? item.pageUrl
         : toEmbedProxyUrl(item.pageUrl, item.parentRef || sourceUrl);
@@ -2314,7 +2600,10 @@ async function resolveCandidatesForServer(
     emitBatch(built, "token");
   }
 
-  return normalizePlayableBatch([...rollingPrimary, ...primaryList, ...rollingDeepList, ...deepList, ...playerv2List]);
+  return {
+    candidates: normalizePlayableBatch([...rollingPrimary, ...primaryList, ...rollingDeepList, ...deepList, ...playerv2List]),
+    provenanceByKey,
+  };
 }
 
 async function probeHlsCandidate(candidateUrl: string, opts?: ProbeHlsOptions) {
@@ -2525,6 +2814,7 @@ export default function WatchPage() {
     3: new Set<string>(),
   });
   const networkFatalCountByCandidateRef = useRef<Map<string, number>>(new Map());
+  const server3ProvenanceRef = useRef<Map<string, Server3CandidateProvenance>>(new Map());
 
   const diagEnabled = searchParams.get("diag") === "1";
   const pushDiag = useCallback((line: string) => {
@@ -2543,6 +2833,15 @@ export default function WatchPage() {
   useEffect(() => {
     selectedServerRef.current = selectedServer;
   }, [selectedServer]);
+
+  const mergeServer3Provenance = useCallback((incoming?: Map<string, Server3CandidateProvenance>) => {
+    if (!incoming || !incoming.size) return;
+    const store = server3ProvenanceRef.current;
+    for (const [key, next] of incoming.entries()) {
+      const picked = pickBetterServer3Provenance(store.get(key), next);
+      store.set(key, picked);
+    }
+  }, []);
 
   const markCandidateAsBad = useCallback((server: number, candidate: string, reason: string) => {
     if (!isFastFailoverServer(server)) return;
@@ -2612,12 +2911,16 @@ export default function WatchPage() {
       pushDiag("server3 drop-expired-replay fallback-all");
     }
 
-    const scored = base
-      .map((candidate, idx) => ({ candidate, idx, score: scoreServer3Candidate(candidate) }))
-      .sort((a, b) => (b.score === a.score ? a.idx - b.idx : b.score - a.score))
-      .map((item) => item.candidate);
+    const sortByScore = (values: string[]) =>
+      values
+        .map((candidate, idx) => ({ candidate, idx, score: scoreServer3Candidate(candidate) }))
+        .sort((a, b) => (b.score === a.score ? a.idx - b.idx : b.score - a.score))
+        .map((item) => item.candidate);
 
-    return scored;
+    const buckets = splitServer3CandidatesByRootServ(base, server3ProvenanceRef.current);
+    const bucket0Sorted = sortByScore(buckets.bucket0);
+    const bucket1Sorted = sortByScore(buckets.bucket1);
+    return [...bucket0Sorted, ...bucket1Sorted];
   }, [pushDiag]);
 
   const applyCandidatesPreservingSelection = useCallback((nextCandidates: string[]) => {
@@ -2642,10 +2945,11 @@ export default function WatchPage() {
 
     // Server 3 policy: when a serv=0 sibling exists, prefer it as default over serv=1.
     if (server === 3 && next.length > 1) {
-      const activeMeta = parseLivehdTvMeta(next[nextIdx] || "");
-      const bestMeta = parseLivehdTvMeta(next[0] || "");
-      if (bestMeta?.serv === 0 && activeMeta?.serv === 1) {
+      const activeServ = getServer3RootServFromCandidate(next[nextIdx] || "", server3ProvenanceRef.current);
+      const bestServ = getServer3RootServFromCandidate(next[0] || "", server3ProvenanceRef.current);
+      if (bestServ === 0 && activeServ !== 0) {
         nextIdx = 0;
+        pushDiag("server3 default->serv0");
       }
     }
 
@@ -2655,7 +2959,7 @@ export default function WatchPage() {
       setSelectedCandidate(nextIdx);
     }
     setCandidates(next);
-  }, [filterCandidatesByHealth, prioritizeCandidatesByServer]);
+  }, [filterCandidatesByHealth, prioritizeCandidatesByServer, pushDiag]);
 
   const clearRecoveryTimer = useCallback(() => {
     if (recoveryTimerRef.current !== null) {
@@ -2872,6 +3176,7 @@ export default function WatchPage() {
     setPlayerError(null);
     setResolverError(null);
     resetRecoveryState();
+    if (selectedServer !== 3) server3ProvenanceRef.current = new Map();
   }, [selectedServer, resetRecoveryState]);
   useEffect(() => {
     if (selectedCandidate >= candidates.length) {
@@ -2944,8 +3249,13 @@ export default function WatchPage() {
           ? SERVER1_FETCH_RETRY_DELAY_MS
           : 0;
       let hadPlayable = initialCandidates.length > 0;
-      const mergeCandidates = (incoming: string[]) => {
+      if (selectedServer === 3) server3ProvenanceRef.current = new Map();
+      const mergeCandidates = (
+        incoming: string[],
+        provenance?: Map<string, Server3CandidateProvenance>
+      ) => {
         if (!incoming.length) return;
+        if (selectedServer === 3) mergeServer3Provenance(provenance);
         hadPlayable = true;
         const merged = dedupeUrls([...candidatesRef.current, ...incoming]);
         applyCandidatesPreservingSelection(merged);
@@ -2961,7 +3271,7 @@ export default function WatchPage() {
       if (cachedCandidates.length) pushDiag(`resolve cache hit +${cachedCandidates.length}`);
       if (seedCandidates.length) pushDiag(`resolve seed +${seedCandidates.length}`);
       try {
-        const fastList = await resolveCandidatesForServer(selectedUrl, controller.signal, {
+        const fastResolved = await resolveCandidatesForServer(selectedUrl, controller.signal, {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
           allowSamePathServVariants: selectedServer === 3 || selectedServer === 4,
@@ -2972,13 +3282,15 @@ export default function WatchPage() {
           fetchTimeoutMs: resolveFetchTimeoutFast,
           fetchRetries: resolveFetchRetries,
           fetchRetryDelayMs: resolveFetchRetryDelayMs,
-          onBatchCandidates: (batch, phase) => {
+          onBatchCandidates: (batch, phase, batchProvenance) => {
             if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
-            mergeCandidates(batch);
+            mergeCandidates(batch, batchProvenance);
             pushDiag(`resolve batch ${phase} +${batch.length} (fast)`);
           },
         });
         if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
+        if (selectedServer === 3) mergeServer3Provenance(fastResolved.provenanceByKey);
+        const fastList = fastResolved.candidates;
         const fastMerged = dedupeUrls([...initialCandidates, ...fastList]);
         if (fastMerged.length) {
           hadPlayable = true;
@@ -3012,7 +3324,7 @@ export default function WatchPage() {
           return;
         }
 
-        const finalList = await resolveCandidatesForServer(selectedUrl, controller.signal, {
+        const finalResolved = await resolveCandidatesForServer(selectedUrl, controller.signal, {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
           allowSamePathServVariants: selectedServer === 3 || selectedServer === 4,
@@ -3020,13 +3332,15 @@ export default function WatchPage() {
           fetchTimeoutMs: resolveFetchTimeoutFinal,
           fetchRetries: resolveFetchRetries,
           fetchRetryDelayMs: resolveFetchRetryDelayMs,
-          onBatchCandidates: (batch, phase) => {
+          onBatchCandidates: (batch, phase, batchProvenance) => {
             if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
-            mergeCandidates(batch);
+            mergeCandidates(batch, batchProvenance);
             pushDiag(`resolve batch ${phase} +${batch.length}`);
           },
         });
         if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
+        if (selectedServer === 3) mergeServer3Provenance(finalResolved.provenanceByKey);
+        const finalList = finalResolved.candidates;
         const playableList = await expandCandidatesWithManifestVariants(finalList, {
           signal: controller.signal,
           timeoutMs: probeTimeoutMs,
@@ -3038,22 +3352,63 @@ export default function WatchPage() {
         if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
         if (!cancel) {
           const mergedRaw = dedupeUrls([...candidatesRef.current, ...fastMerged, ...finalList, ...playableList]);
-          const verified = await filterPlayableCandidates(mergedRaw, {
-            signal: controller.signal,
-            timeoutMs: probeTimeoutMs,
-            maxChecks: Math.min(36, mergedRaw.length),
-            concurrency: Math.min(3, PROBE_CONCURRENCY),
-            pushDiag,
-          });
+          const maxChecks = Math.min(36, mergedRaw.length);
+          let verified: string[] = [];
+          if (selectedServer === 3 && isServer3Livehd) {
+            const rawBuckets = splitServer3CandidatesByRootServ(mergedRaw, server3ProvenanceRef.current);
+            const maxChecks0 = Math.min(maxChecks, rawBuckets.bucket0.length);
+            const verified0 = maxChecks0
+              ? await filterPlayableCandidates(rawBuckets.bucket0, {
+                signal: controller.signal,
+                timeoutMs: probeTimeoutMs,
+                maxChecks: maxChecks0,
+                concurrency: Math.min(3, PROBE_CONCURRENCY),
+                pushDiag,
+              })
+              : [];
+            const remainingChecks = Math.max(0, maxChecks - maxChecks0);
+            const maxChecks1 = Math.min(remainingChecks, rawBuckets.bucket1.length);
+            const verified1 = maxChecks1
+              ? await filterPlayableCandidates(rawBuckets.bucket1, {
+                signal: controller.signal,
+                timeoutMs: probeTimeoutMs,
+                maxChecks: maxChecks1,
+                concurrency: Math.min(3, PROBE_CONCURRENCY),
+                pushDiag,
+              })
+              : [];
+
+            pushDiag(`server3 bucket0 raw=${rawBuckets.bucket0.length} verified=${verified0.length}`);
+            pushDiag(`server3 bucket1 raw=${rawBuckets.bucket1.length} verified=${verified1.length}`);
+            if (verified0.length) pushDiag("server3 default->serv0");
+            else if (rawBuckets.bucket1.length) pushDiag("server3 fallback->serv1");
+
+            verified = dedupeUrls([...verified0, ...verified1]);
+          } else {
+            verified = await filterPlayableCandidates(mergedRaw, {
+              signal: controller.signal,
+              timeoutMs: probeTimeoutMs,
+              maxChecks,
+              concurrency: Math.min(3, PROBE_CONCURRENCY),
+              pushDiag,
+            });
+          }
           const allowRawFallback = selectedServer === 1 || selectedServer === 3 || selectedServer === 4 || isServer2Playerv2;
-          const merged = verified.length ? verified : (allowRawFallback ? mergedRaw : []);
+          const mergedRawByPolicy =
+            selectedServer === 3 && isServer3Livehd
+              ? (() => {
+                const buckets = splitServer3CandidatesByRootServ(mergedRaw, server3ProvenanceRef.current);
+                return dedupeUrls([...buckets.bucket0, ...buckets.bucket1]);
+              })()
+              : mergedRaw;
+          const merged = verified.length ? verified : (allowRawFallback ? mergedRawByPolicy : []);
           if (!verified.length && selectedServer === 1 && mergedRaw.length) {
             pushDiag("raw-fallback server1");
           }
           if (!verified.length && isServer2Playerv2 && mergedRaw.length) {
             pushDiag("probe fallback server2-playerv2 raw");
           }
-          if (!verified.length && selectedServer === 3 && mergedRaw.length) {
+          if (!verified.length && selectedServer === 3 && mergedRawByPolicy.length) {
             pushDiag("raw-fallback server3");
           }
           if (!verified.length && selectedServer === 4 && mergedRaw.length) {

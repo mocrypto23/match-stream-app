@@ -143,6 +143,12 @@ const YALLALIVE = {
   siteHosts: ["anewssport.fun", "yallalive.sx"],
   playerHosts: ["zxxxeeplay.fun", "codepcplay.fun", "playerai.site"],
 };
+const SERVER5_SNS_DIAG = {
+  server5_sns_endpoint_found: 0,
+  server5_sns_urls_count: 0,
+  server5_sns_candidate_selected: 0,
+  server5_sns_fetch_failed: 0,
+};
 // TSKORA source (Server 5 fallback)
 const TSKORA = {
   dayUrl: {
@@ -169,6 +175,8 @@ const SERVER_SLOT_DOMAIN_WHITELIST = Object.freeze({
   5: [
     "tskoralive.com",
     "pyxq.online",
+    "potw.online",
+    "dvalna.ru",
     "anewssport.fun",
     "yallalive.sx",
     "zxxxeeplay.fun",
@@ -718,6 +726,15 @@ function cairoDayFromIso(iso) {
   return ymdInTimeZone(d, TZ);
 }
 
+function isRowAlignedWithDayKey(dataStart, dayKey) {
+  const expectedDay = matchDayFromKey(dayKey);
+  if (!expectedDay) return true;
+  const iso = toIsoFromDataStart(dataStart);
+  const actualDay = cairoDayFromIso(iso);
+  if (!actualDay) return true;
+  return actualDay === expectedDay;
+}
+
 function prettyTimeFromIso(iso) {
   if (!iso) return "—";
   const d = new Date(iso);
@@ -1104,10 +1121,11 @@ async function fetchAyMatchRowsFallback(url, dayKey) {
     const final = rows
       .map((r) => {
         const iso = toIsoFromDataStart(r.data_start);
-        const match_day = matchDayFromKey(dayKey) || cairoDayFromIso(iso);
+        const match_day = cairoDayFromIso(iso) || matchDayFromKey(dayKey);
         return { ...r, match_day };
       })
-      .filter((r) => r.home_team && r.away_team && r.match_url && r.match_day);
+      .filter((r) => r.home_team && r.away_team && r.match_url && r.match_day)
+      .filter((r) => isRowAlignedWithDayKey(r.data_start, dayKey));
 
     if (DIAG) diagWrite(`fallback/ay_${dayKey}_${Date.now()}.json`, JSON.stringify(final, null, 2));
     return final;
@@ -3210,6 +3228,8 @@ function isWeakStreamUrl(u) {
 
   // أقوى شيء لServer2 هو playerv2
   if (s.includes("playerv2.php")) return false;
+  // Server5 modern yallalive endpoint (zxxxeeplay/codepcplay) is a valid player page.
+  if (/\/yalla\.php(?:\?|$)/i.test(s)) return false;
 
   // ممنوع m3u8 عندك
   if (s.includes("m3u8")) return true;
@@ -4320,9 +4340,15 @@ function scoreWithHostPreference(url, preferredHostHints = []) {
 }
 
 function looksLikePlayerUrl(url) {
-  const s = String(url || "").toLowerCase();
-  if (!/^https?:\/\//i.test(s)) return false;
-  return /\/albaplayer\/|\/alba\.php|\/playerv2\.php(\?|$)|\/embed|\/player|\/tv\//i.test(s);
+  const normalized = normalizeUrl(url, url);
+  if (!normalized) return false;
+  try {
+    const u = new URL(normalized);
+    const pathWithQuery = `${u.pathname}${u.search}`.toLowerCase();
+    return /\/albaplayer\/|\/alba\.php|\/playerv2\.php(\?|$)|\/embed(?:\/|$)|\/player(?:\/|$)|\/tv\//i.test(pathWithQuery);
+  } catch {
+    return false;
+  }
 }
 
 function isServer5PlayerLikeUrl(url) {
@@ -4369,6 +4395,7 @@ function extractServer5YallaliveCandidatesFromHtml(html, pageUrl) {
   const text = String(html || "")
     .replace(/&amp;/gi, "&")
     .replace(/\\u0026/gi, "&")
+    .replace(/\\u003d/gi, "=")
     .replace(/\\u002f/gi, "/")
     .replace(/\\\//g, "/");
   if (!text) return [];
@@ -4394,6 +4421,133 @@ function extractServer5YallaliveCandidatesFromHtml(html, pageUrl) {
   return out.sort((a, b) => scoreServer5YallaliveCandidate(b) - scoreServer5YallaliveCandidate(a));
 }
 
+function dedupeServer5Candidates(input) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of input || []) {
+    const normalized = normalizeUrl(raw, raw);
+    if (!normalized || !isServer5PlayerLikeUrl(normalized) || isClearlyNonStreamUrl(normalized)) continue;
+    const key = canonicalUrlForCompare(normalized);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function scoreServer5CandidatePriority(url) {
+  const normalized = normalizeUrl(url, url);
+  if (!normalized) return -99999;
+  const s = normalized.toLowerCase();
+  let score = scoreServer5YallaliveCandidate(normalized);
+  if (/\/yalla\.php(?:\?|$)/i.test(s)) score += 5000;
+  else if (/\/playerv2\.php(?:\?|$)/i.test(s)) score += 4000;
+  else if (/\/albaplayer\/|\/alba\.php/i.test(s)) score += 3000;
+  else if (isServer5PlayerLikeUrl(s)) score += 2000;
+  return score;
+}
+
+function rankServer5Candidates(input) {
+  const deduped = dedupeServer5Candidates(input);
+  return deduped.sort((a, b) => scoreServer5CandidatePriority(b) - scoreServer5CandidatePriority(a));
+}
+
+function extractServer5SnsEndpointCandidatesFromHtml(html, pageUrl) {
+  const text = decodeHtmlEntities(
+    String(html || "")
+      .replace(/\\u0026/gi, "&")
+      .replace(/\\u003d/gi, "=")
+      .replace(/\\u003f/gi, "?")
+      .replace(/\\u002f/gi, "/")
+      .replace(/\\\//g, "/")
+  );
+  if (!text) return [];
+
+  const out = [];
+  const seen = new Set();
+  const add = (raw) => {
+    const normalized = normalizeUrl(raw, pageUrl);
+    if (!normalized) return;
+    let parsed;
+    try {
+      parsed = new URL(normalized);
+    } catch {
+      return;
+    }
+    if (!/\/wp-json\/sns\/v1\/links(?:\/|$)/i.test(parsed.pathname)) return;
+    const idRaw = String(parsed.searchParams.get("id") || "").trim();
+    if (!idRaw) return;
+    const key = canonicalUrlForCompare(parsed.toString());
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(parsed.toString());
+  };
+
+  for (const m of text.match(/https?:\/\/[^"'`\s<>()]+\/wp-json\/sns\/v1\/links(?:\?[^"'`\s<>()]*)?/gi) || []) add(m);
+  for (const m of text.match(/\/wp-json\/sns\/v1\/links(?:\?[^"'`\s<>()]*)?/gi) || []) add(m);
+  return out;
+}
+
+function extractServer5CandidatesFromSnsPayload(payload, pageUrl) {
+  const raw = [];
+  const walk = (value, depth = 0) => {
+    if (depth > 6 || value === null || value === undefined) return;
+    if (typeof value === "string") {
+      const text = decodeHtmlEntities(
+        String(value || "")
+          .replace(/\\u0026/gi, "&")
+          .replace(/\\u003d/gi, "=")
+          .replace(/\\u003f/gi, "?")
+          .replace(/\\u002f/gi, "/")
+          .replace(/\\\//g, "/")
+      );
+      for (const m of text.match(/https?:\/\/[^"'`\s<>()]+/gi) || []) raw.push(m);
+      for (const m of text.match(/\/yalla\.php\?id=[^"'`\s<>()]+/gi) || []) raw.push(m);
+      if (/^https?:\/\//i.test(text) || /^\/yalla\.php\?id=/i.test(text)) raw.push(text);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item, depth + 1);
+      return;
+    }
+    if (typeof value === "object") {
+      for (const nested of Object.values(value)) walk(nested, depth + 1);
+    }
+  };
+
+  walk(payload, 0);
+  return rankServer5Candidates(raw.map((item) => normalizeUrl(item, pageUrl)).filter(Boolean));
+}
+
+async function fetchServer5SnsLinksPayload(endpointUrl, refererUrl) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+  try {
+    const resp = await fetch(endpointUrl, {
+      method: "GET",
+      headers: {
+        ...DEFAULT_HTTP_HEADERS,
+        accept: "application/json,text/plain,*/*",
+        referer: refererUrl || endpointUrl,
+      },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (!resp.ok) return null;
+    const text = await resp.text();
+    if (!text || !text.trim()) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function resolveYallaliveServer5ViaHttp(url) {
   if (!url) return null;
   try {
@@ -4409,8 +4563,33 @@ async function resolveYallaliveServer5ViaHttp(url) {
     if (!resp.ok) return null;
 
     const html = await resp.text();
-    const candidates = extractServer5YallaliveCandidatesFromHtml(html, resp.url || url);
-    return candidates[0] || null;
+    const pageUrl = resp.url || url;
+    const htmlCandidates = extractServer5YallaliveCandidatesFromHtml(html, pageUrl);
+    const snsEndpoints = extractServer5SnsEndpointCandidatesFromHtml(html, pageUrl);
+    if (snsEndpoints.length) SERVER5_SNS_DIAG.server5_sns_endpoint_found += snsEndpoints.length;
+
+    const snsCandidates = [];
+    for (const endpoint of snsEndpoints.slice(0, 4)) {
+      const payload = await fetchServer5SnsLinksPayload(endpoint, pageUrl);
+      if (!payload) {
+        SERVER5_SNS_DIAG.server5_sns_fetch_failed += 1;
+        continue;
+      }
+      const extracted = extractServer5CandidatesFromSnsPayload(payload, endpoint);
+      if (extracted.length) {
+        SERVER5_SNS_DIAG.server5_sns_urls_count += extracted.length;
+        snsCandidates.push(...extracted);
+      }
+    }
+
+    const ranked = rankServer5Candidates([...snsCandidates, ...htmlCandidates]);
+    const selected = ranked[0] || null;
+    if (selected) {
+      const selectedKey = canonicalUrlForCompare(selected);
+      const snsKeys = new Set((snsCandidates || []).map((item) => canonicalUrlForCompare(item)).filter(Boolean));
+      if (selectedKey && snsKeys.has(selectedKey)) SERVER5_SNS_DIAG.server5_sns_candidate_selected += 1;
+    }
+    return selected;
   } catch {
     return null;
   }
@@ -4816,10 +4995,11 @@ async function fetchYallaliveMatchRowsFallback(url, dayKey) {
     const final = rows
       .map((r) => {
         const iso = toIsoFromDataStart(r.data_start);
-        const match_day = matchDayFromKey(dayKey) || cairoDayFromIso(iso);
+        const match_day = cairoDayFromIso(iso) || matchDayFromKey(dayKey);
         return { ...r, match_day };
       })
-      .filter((r) => r.home_team && r.away_team && r.match_url && r.match_day);
+      .filter((r) => r.home_team && r.away_team && r.match_url && r.match_day)
+      .filter((r) => isRowAlignedWithDayKey(r.data_start, dayKey));
 
     if (DIAG) diagWrite(`yallalive/fallback_${dayKey}_${Date.now()}.json`, JSON.stringify(final, null, 2));
     return final;
@@ -4943,7 +5123,8 @@ async function scrapeYallaliveDay(page, dayKey) {
           match_day: cairoDayFromIso(iso) || matchDayFromKey(dayKey),
         };
       })
-      .filter((r) => r.home_team && r.away_team && r.match_url && r.match_day);
+      .filter((r) => r.home_team && r.away_team && r.match_url && r.match_day)
+      .filter((r) => isRowAlignedWithDayKey(r.data_start, dayKey));
 
     if (final.length) {
       console.log(`🟢 YALLALIVE ${dayKey}: ${final.length} items`);
@@ -6112,6 +6293,10 @@ async function startScraping() {
             alias_patch_pair_scoped_merges: aliasPatchStats.alias_patch_pair_scoped_merges,
             alias_patch_pair_scoped_events_sample: aliasPairScopedEvents.slice(0, 60),
             existing_collapse_dropped_keys: existingCollapseDroppedCount,
+            server5_sns_endpoint_found: SERVER5_SNS_DIAG.server5_sns_endpoint_found,
+            server5_sns_urls_count: SERVER5_SNS_DIAG.server5_sns_urls_count,
+            server5_sns_candidate_selected: SERVER5_SNS_DIAG.server5_sns_candidate_selected,
+            server5_sns_fetch_failed: SERVER5_SNS_DIAG.server5_sns_fetch_failed,
             livekora_server4_samples: livekoraServer4Samples,
             livekora_outside_server4_samples: livekoraLeaks,
           },
@@ -6139,6 +6324,10 @@ async function startScraping() {
       alias_patch_global_merges: aliasPatchStats.alias_patch_global_merges,
       alias_patch_pair_scoped_merges: aliasPatchStats.alias_patch_pair_scoped_merges,
       existing_collapse_dropped_keys: existingCollapseDroppedCount,
+      server5_sns_endpoint_found: SERVER5_SNS_DIAG.server5_sns_endpoint_found,
+      server5_sns_urls_count: SERVER5_SNS_DIAG.server5_sns_urls_count,
+      server5_sns_candidate_selected: SERVER5_SNS_DIAG.server5_sns_candidate_selected,
+      server5_sns_fetch_failed: SERVER5_SNS_DIAG.server5_sns_fetch_failed,
     });
     if (livekoraLeaks.length) {
       console.warn("⚠️ livekora URL outside stream_url_4 detected:", livekoraLeaks);
