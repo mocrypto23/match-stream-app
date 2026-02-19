@@ -3217,23 +3217,23 @@ export default function WatchPage() {
         ? LIVEHD77_FETCH_TIMEOUT_FAST_MS
         : isServer4Livekora
           ? SERVER4_FETCH_TIMEOUT_FAST_MS
-        : isServer1Primary
-          ? SERVER1_FETCH_TIMEOUT_FAST_MS
-          : FAST_PHASE_PROBE_TIMEOUT_MS;
+          : isServer1Primary
+            ? SERVER1_FETCH_TIMEOUT_FAST_MS
+            : FAST_PHASE_PROBE_TIMEOUT_MS;
       const resolveFetchTimeoutFinal = isServer3Livehd
         ? LIVEHD77_FETCH_TIMEOUT_FINAL_MS
         : isServer4Livekora
           ? SERVER4_FETCH_TIMEOUT_FINAL_MS
-        : isServer1Primary
-          ? SERVER1_FETCH_TIMEOUT_FINAL_MS
-          : CANDIDATE_PROBE_TIMEOUT_MS;
+          : isServer1Primary
+            ? SERVER1_FETCH_TIMEOUT_FINAL_MS
+            : CANDIDATE_PROBE_TIMEOUT_MS;
       const probeTimeoutMs = isServer3Livehd
         ? LIVEHD77_PROBE_TIMEOUT_MS
         : isServer4Livekora
           ? SERVER4_PROBE_TIMEOUT_MS
-        : isServer1Primary
-          ? SERVER1_PROBE_TIMEOUT_MS
-          : CANDIDATE_PROBE_TIMEOUT_MS;
+          : isServer1Primary
+            ? SERVER1_PROBE_TIMEOUT_MS
+            : CANDIDATE_PROBE_TIMEOUT_MS;
       const resolveFetchRetries = isServer3Livehd
         ? LIVEHD77_FETCH_RETRIES
         : isServer4Livekora
@@ -3245,9 +3245,9 @@ export default function WatchPage() {
         ? LIVEHD77_FETCH_RETRY_DELAY_MS
         : isServer4Livekora
           ? SERVER4_FETCH_RETRY_DELAY_MS
-        : isServer1Primary
-          ? SERVER1_FETCH_RETRY_DELAY_MS
-          : 0;
+          : isServer1Primary
+            ? SERVER1_FETCH_RETRY_DELAY_MS
+            : 0;
       let hadPlayable = initialCandidates.length > 0;
       if (selectedServer === 3) server3ProvenanceRef.current = new Map();
       const mergeCandidates = (
@@ -3774,7 +3774,7 @@ export default function WatchPage() {
     <div className="min-h-screen bg-black text-white p-4">
       <div className="max-w-5xl mx-auto">
         <div className="mb-4 flex flex-wrap items-center gap-3">
-          <button onClick={() => router.replace("/")} className="text-gray-400 hover:text-white">Back Home</button>
+          <Link href="/" className="text-gray-400 hover:text-white">Back Home</Link>
           <Link href="/test" className="text-blue-400 hover:text-blue-300 font-bold text-sm">Test</Link>
         </div>
 
