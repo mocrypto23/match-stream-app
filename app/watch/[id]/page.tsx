@@ -609,6 +609,23 @@ function extractManifestMediaUris(manifest: string, maxItems = 4) {
   return out;
 }
 
+function extractManifestKeyUris(manifest: string, maxItems = 2) {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const lines = String(manifest || "").split(/\r?\n/);
+  for (const raw of lines) {
+    const line = String(raw || "").trim();
+    if (!line || !line.startsWith("#EXT-X-KEY")) continue;
+    const match = line.match(/URI\s*=\s*(?:(["'])([^"']+)\1|([^,\s]+))/i);
+    const uri = String(match?.[2] || match?.[3] || "").trim();
+    if (!uri || seen.has(uri)) continue;
+    seen.add(uri);
+    out.push(uri);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
 function toPlayableProxyFromManifestLine(rawLine: string, parentCandidateUrl: string) {
   const line = String(rawLine || "").trim();
   if (!line) return null;
@@ -1501,6 +1518,33 @@ function extractAnewssportMatchPageUrlsFromHtml(html: string, baseUrl: string) {
   return out.slice(0, SERVER5_MATCH_PAGE_SCAN_LIMIT);
 }
 
+function extractAnewssportMatchSitemapUrlsFromIndexXml(xml: string) {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const text = String(xml || "");
+  for (const m of text.matchAll(/<loc>\s*(https?:\/\/[^<]*wp-sitemap-posts-matches-\d+\.xml)\s*<\/loc>/gi)) {
+    const url = String(m[1] || "").trim();
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+  }
+  if (!out.length) out.push("https://anewssport.fun/wp-sitemap-posts-matches-1.xml");
+  return out;
+}
+
+function extractAnewssportMatchPageUrlsFromSitemapXml(xml: string) {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const text = String(xml || "");
+  for (const m of text.matchAll(/<loc>\s*(https?:\/\/[^<]*\/matches\/[a-z0-9-]+\/?)\s*<\/loc>/gi)) {
+    const url = String(m[1] || "").trim();
+    if (!url || !isAnewssportMatchPageUrl(url) || seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+  }
+  return out;
+}
+
 function extractServer5LandingUrlsFromHtml(html: string, baseUrl: string) {
   const out: string[] = [];
   const seen = new Set<string>();
@@ -2124,6 +2168,37 @@ function scoreServer3Candidate(value: string) {
   if (SEGMENT_FILE_RE.test(lower)) score -= 900;
   if (lower.includes("cdn3.yalla-online.click/chtv/")) score -= 120;
   if (isLikelyExpiredReplayManifestUrl(lower)) score -= 500;
+
+  return score;
+}
+
+function scoreServer5Candidate(value: string) {
+  const raw = String(value || "").trim();
+  if (!raw) return 0;
+
+  let score = 0;
+  try {
+    const proxyUrl = new URL(raw, "http://localhost");
+    const channelKey = sanitizeServer5ChannelKey(String(proxyUrl.searchParams.get("s5_ep_ck") || "")).toLowerCase();
+    if (channelKey.startsWith("yallalive")) score += 500;
+    else if (channelKey.startsWith("premium")) score += 260;
+    else if (channelKey.startsWith("cnpremium")) score -= 140;
+
+    const ref = normalizeURIComponent(String(proxyUrl.searchParams.get("ref") || ""));
+    const refId = extractServer5LandingId(ref).toLowerCase();
+    if (refId.startsWith("yallalive")) score += 130;
+    else if (/^\d{2,8}$/.test(refId)) score += 90;
+    else if (refId.startsWith("premium")) score += 50;
+    else if (refId.startsWith("cnpremium")) score -= 120;
+
+    const slot = Number.parseInt(String(proxyUrl.searchParams.get("s5_slot") || "0"), 10);
+    if (Number.isFinite(slot) && slot > 0) {
+      // Current upstream tends to have the healthiest feed in slot=2.
+      if (slot === 2) score += 420;
+      else if (slot === 1) score += 80;
+      else score += Math.max(0, 60 - slot * 4);
+    }
+  } catch {}
 
   return score;
 }
@@ -2847,6 +2922,60 @@ async function resolveCandidatesForServer(
         out.push(v);
       }
     };
+    const sourceIdNorm = sourceId.toLowerCase().replace(/^cn/, "");
+    const candidateMatchPages: string[] = [];
+    const matchPageSeen = new Set<string>();
+    const addMatchPages = (items: string[]) => {
+      for (const value of items) {
+        const v = String(value || "").trim();
+        if (!v || !isAnewssportMatchPageUrl(v)) continue;
+        const key = canonicalizeUrl(v);
+        if (!key || matchPageSeen.has(key)) continue;
+        matchPageSeen.add(key);
+        candidateMatchPages.push(v);
+      }
+    };
+    const processMatchPage = async (pageUrl: string) => {
+      if (signal.aborted) throw new DOMException("aborted", "AbortError");
+      const pageProbe = toEmbedProxyUrl(pageUrl, pageUrl);
+      if (!pageProbe) return;
+      try {
+        const pageRes = await fetchHtml(pageProbe);
+        if (!pageRes.ct.includes("text/html") && !pageRes.ct.includes("application/xhtml+xml")) return;
+        const pageHtml = await pageRes.res.text();
+        const fromPage = extractServer5LandingUrlsFromHtml(pageHtml, pageUrl);
+
+        const snsEndpoint = extractAnewssportSnsLinksEndpointFromHtml(pageHtml, pageUrl);
+        const fromSns: string[] = [];
+        if (snsEndpoint) {
+          const snsProbe = toEmbedProxyUrl(snsEndpoint, pageUrl);
+          if (snsProbe) {
+            try {
+              const snsRes = await fetchHtml(snsProbe);
+              if (snsRes.res.ok) {
+                const snsText = await snsRes.res.text();
+                fromSns.push(...extractServer5LandingUrlsFromSnsPayload(snsText, pageUrl));
+              }
+            } catch (e: unknown) {
+              if (e instanceof Error && e.name === "AbortError") throw e;
+            }
+          }
+        }
+
+        const mergedPageUrls = dedupeUrls([...fromPage, ...fromSns]);
+        const hasSourceId = mergedPageUrls.some((candidateUrl) => {
+          const candidateId = extractServer5LandingId(candidateUrl).toLowerCase();
+          if (!candidateId) return false;
+          return candidateId.replace(/^cn/, "") === sourceIdNorm;
+        });
+        opts?.playerv2Diag?.(`server5 page merged=${mergedPageUrls.length} source-hit=${hasSourceId ? 1 : 0}`);
+        if (!hasSourceId) return;
+
+        addBatch(mergedPageUrls);
+      } catch (e: unknown) {
+        if (e instanceof Error && e.name === "AbortError") throw e;
+      }
+    };
 
     addBatch([landingUrl]);
     if (landingHtml) addBatch(extractServer5LandingUrlsFromHtml(landingHtml, landingUrl));
@@ -2858,58 +2987,48 @@ async function resolveCandidatesForServer(
         const searchRes = await fetchHtml(searchProbe);
         if (searchRes.ct.includes("text/html") || searchRes.ct.includes("application/xhtml+xml")) {
           const searchHtml = await searchRes.res.text();
-          const pageUrls = extractAnewssportMatchPageUrlsFromHtml(searchHtml, searchUrl);
-          opts?.playerv2Diag?.(`server5 siblings pages=${pageUrls.length}`);
-          for (const pageUrl of pageUrls) {
-            if (signal.aborted) throw new DOMException("aborted", "AbortError");
-            const pageProbe = toEmbedProxyUrl(pageUrl, pageUrl);
-            if (!pageProbe) continue;
-            try {
-              const pageRes = await fetchHtml(pageProbe);
-              if (!pageRes.ct.includes("text/html") && !pageRes.ct.includes("application/xhtml+xml")) continue;
-              const pageHtml = await pageRes.res.text();
-              const fromPage = extractServer5LandingUrlsFromHtml(pageHtml, pageUrl);
-
-              const snsEndpoint = extractAnewssportSnsLinksEndpointFromHtml(pageHtml, pageUrl);
-              const fromSns: string[] = [];
-              if (snsEndpoint) {
-                const snsProbe = toEmbedProxyUrl(snsEndpoint, pageUrl);
-                if (!snsProbe) {
-                  // keep page-derived URLs even when endpoint proxy can't be built
-                } else {
-                try {
-                  const snsRes = await fetchHtml(snsProbe);
-                    if (snsRes.res.ok) {
-                      const snsText = await snsRes.res.text();
-                      fromSns.push(...extractServer5LandingUrlsFromSnsPayload(snsText, pageUrl));
-                    }
-                } catch (e: unknown) {
-                  if (e instanceof Error && e.name === "AbortError") throw e;
-                }
-                }
-              }
-
-              const sourceIdNorm = sourceId.toLowerCase().replace(/^cn/, "");
-              const mergedPageUrls = dedupeUrls([...fromPage, ...fromSns]);
-              const hasSourceId = mergedPageUrls.some((candidateUrl) => {
-                const candidateId = extractServer5LandingId(candidateUrl).toLowerCase();
-                if (!candidateId) return false;
-                return candidateId.replace(/^cn/, "") === sourceIdNorm;
-              });
-              opts?.playerv2Diag?.(`server5 page merged=${mergedPageUrls.length} source-hit=${hasSourceId ? 1 : 0}`);
-              if (!hasSourceId) continue;
-
-              addBatch(mergedPageUrls);
-
-              if (out.length >= SERVER5_LANDING_LIMIT) break;
-            } catch (e: unknown) {
-              if (e instanceof Error && e.name === "AbortError") throw e;
-            }
-          }
+          addMatchPages(extractAnewssportMatchPageUrlsFromHtml(searchHtml, searchUrl));
         }
       } catch (e: unknown) {
         if (e instanceof Error && e.name === "AbortError") throw e;
       }
+    }
+
+    if (!candidateMatchPages.length) {
+      const sitemapIndexUrl = "https://anewssport.fun/wp-sitemap.xml";
+      const sitemapIndexProbe = toEmbedProxyUrl(sitemapIndexUrl, sitemapIndexUrl);
+      if (sitemapIndexProbe) {
+        try {
+          const sitemapIndexRes = await fetchHtml(sitemapIndexProbe);
+          if (sitemapIndexRes.res.ok) {
+            const indexXml = await sitemapIndexRes.res.text();
+            const sitemapUrls = extractAnewssportMatchSitemapUrlsFromIndexXml(indexXml);
+            for (const sitemapUrl of sitemapUrls.slice(0, 3)) {
+              if (signal.aborted) throw new DOMException("aborted", "AbortError");
+              const sitemapProbe = toEmbedProxyUrl(sitemapUrl, sitemapIndexUrl);
+              if (!sitemapProbe) continue;
+              try {
+                const sitemapRes = await fetchHtml(sitemapProbe);
+                if (!sitemapRes.res.ok) continue;
+                const sitemapXml = await sitemapRes.res.text();
+                addMatchPages(extractAnewssportMatchPageUrlsFromSitemapXml(sitemapXml));
+                if (candidateMatchPages.length >= SERVER5_MATCH_PAGE_SCAN_LIMIT) break;
+              } catch (e: unknown) {
+                if (e instanceof Error && e.name === "AbortError") throw e;
+              }
+            }
+          }
+        } catch (e: unknown) {
+          if (e instanceof Error && e.name === "AbortError") throw e;
+        }
+      }
+    }
+
+    opts?.playerv2Diag?.(`server5 siblings pages=${candidateMatchPages.length}`);
+    for (const pageUrl of candidateMatchPages.slice(0, SERVER5_MATCH_PAGE_SCAN_LIMIT)) {
+      if (signal.aborted) throw new DOMException("aborted", "AbortError");
+      await processMatchPage(pageUrl);
+      if (out.length >= SERVER5_LANDING_LIMIT) break;
     }
 
     const finalized = dedupeUrls(out).slice(0, SERVER5_LANDING_LIMIT);
@@ -2954,6 +3073,7 @@ async function resolveCandidatesForServer(
       }
 
       const landingAuthContext = extractServer5AuthContextFromHtml(landingHtml);
+      if (!landingAuthContext) continue;
       const channelKeysBase = extractServer5ChannelKeyCandidates(landingUrl, landingHtml).slice(0, 8);
       const channelKeys = Array.from(
         new Set(
@@ -2986,10 +3106,9 @@ async function resolveCandidatesForServer(
           if (!serverKey) continue;
           const manifests = buildServer5DvalnaManifestUrls(serverKey, channelKey);
           const authForChannel =
-            landingAuthContext && landingAuthContext.channelKey.toLowerCase() === channelKey.toLowerCase()
-              ? landingAuthContext
-              : null;
+            landingAuthContext.channelKey.toLowerCase() === channelKey.toLowerCase() ? landingAuthContext : null;
           for (const manifest of manifests) {
+            if (!authForChannel) continue;
             let finalManifest = manifest;
             if (landingSlot) {
               try {
@@ -3414,6 +3533,33 @@ async function probeHlsCandidate(candidateUrl: string, opts?: ProbeHlsOptions) {
   const pushDiag = opts?.pushDiag;
   const signal = opts?.signal;
   const server5AuthHeaders = buildServer5ProxyAuthHeadersFromCandidate(candidateUrl);
+  const isServer5Candidate = Object.keys(server5AuthHeaders).length > 0;
+  const verifyServer5ManifestKeys = async (manifestText: string, parentCandidateUrl: string) => {
+    if (!isServer5Candidate) return true;
+    const keyUris = extractManifestKeyUris(manifestText, 2);
+    if (!keyUris.length) return true;
+
+    for (const keyUri of keyUris) {
+      if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+      const keyProxy = toPlayableProxyFromManifestLine(keyUri, parentCandidateUrl);
+      if (!keyProxy) return false;
+      const keyRes = await fetchWithTimeout(
+        keyProxy,
+        {
+          method: "GET",
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "x-embed-proxy-probe": "1", ...server5AuthHeaders },
+        },
+        timeoutMs,
+        signal
+      );
+      if (!keyRes.ok) return false;
+      const keyBytes = await keyRes.arrayBuffer();
+      if (keyBytes.byteLength !== 16) return false;
+    }
+    return true;
+  };
 
   try {
     const manifestRes = await fetchWithTimeout(
@@ -3441,6 +3587,11 @@ async function probeHlsCandidate(candidateUrl: string, opts?: ProbeHlsOptions) {
       return false;
     }
 
+    if (!(await verifyServer5ManifestKeys(manifestText, candidateUrl))) {
+      pushDiag?.("probe server5 key-check failed");
+      return false;
+    }
+
     const childLines = extractManifestMediaUris(manifestText, maxChildChecks);
     if (!childLines.length) return true;
 
@@ -3448,6 +3599,8 @@ async function probeHlsCandidate(candidateUrl: string, opts?: ProbeHlsOptions) {
       if (signal?.aborted) throw new DOMException("aborted", "AbortError");
       const childProxy = toPlayableProxyFromManifestLine(childLine, candidateUrl);
       if (!childProxy) continue;
+      const childLooksLikeManifest =
+        /\.m3u8(?:$|[?#])/i.test(childLine) || /(?:^|\/)(?:index|master|playlist)\b/i.test(childLine.toLowerCase());
 
       try {
         const headRes = await fetchWithTimeout(
@@ -3461,9 +3614,32 @@ async function probeHlsCandidate(candidateUrl: string, opts?: ProbeHlsOptions) {
           timeoutMs,
           signal
         );
-        if (headRes.ok) return true;
+        if (headRes.ok && (!isServer5Candidate || !childLooksLikeManifest)) return true;
       } catch (e: unknown) {
         if (e instanceof Error && e.name === "AbortError") throw e;
+      }
+
+      if (isServer5Candidate && childLooksLikeManifest) {
+        try {
+          const childManifestRes = await fetchWithTimeout(
+            childProxy,
+            {
+              method: "GET",
+              cache: "no-store",
+              credentials: "same-origin",
+              headers: { "x-embed-proxy-probe": "1", ...server5AuthHeaders },
+            },
+            timeoutMs,
+            signal
+          );
+          if (childManifestRes.ok) {
+            const childText = await childManifestRes.text();
+            const childHasExtM3u = /^\s*#EXTM3U/m.test(childText);
+            if (childHasExtM3u && (await verifyServer5ManifestKeys(childText, childProxy))) return true;
+          }
+        } catch (e: unknown) {
+          if (e instanceof Error && e.name === "AbortError") throw e;
+        }
       }
 
       try {
@@ -3690,6 +3866,12 @@ export default function WatchPage() {
 
   const prioritizeCandidatesByServer = useCallback((server: number, input: string[]) => {
     let base = dedupeUrls(input);
+    if (server === 5 && base.length > 1) {
+      base = base
+        .map((candidate, idx) => ({ candidate, idx, score: scoreServer5Candidate(candidate) }))
+        .sort((a, b) => (b.score === a.score ? a.idx - b.idx : b.score - a.score))
+        .map((item) => item.candidate);
+    }
     if (server !== 3 || base.length < 2) return base;
 
     const withoutExternalRelay = base.filter((candidate) => !isLivehdExternalRelayUrl(candidate));
@@ -4274,7 +4456,7 @@ export default function WatchPage() {
             });
           }
           const allowRawFallback =
-            selectedServer === 1 || selectedServer === 3 || selectedServer === 4 || selectedServer === 5 || isServer2Playerv2;
+            selectedServer === 1 || selectedServer === 3 || selectedServer === 4 || isServer2Playerv2;
           const mergedRawByPolicy =
             selectedServer === 3 && isServer3Livehd
               ? (() => {

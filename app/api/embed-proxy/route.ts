@@ -288,6 +288,17 @@ function pickServer5ProxyPassQueryParams(source?: URLSearchParams | null) {
   return out;
 }
 
+function buildServer5PassQueryCacheKey(source?: URLSearchParams | null) {
+  if (!source) return "";
+  const parts: string[] = [];
+  for (const key of SERVER5_PROXY_PASS_QUERY_KEYS) {
+    const value = String(source.get(key) || "").trim();
+    if (!value) continue;
+    parts.push(`${key}=${value}`);
+  }
+  return parts.join("&");
+}
+
 function buildProxyUrl(absUrl: string, nextDepth: number, refUrl?: string | null, passQuery?: URLSearchParams | null) {
   const q = new URLSearchParams();
   q.set("url", absUrl);
@@ -432,6 +443,13 @@ function isLikelyM3u8(target: URL, contentType: string) {
   );
 }
 
+function isServer5MonoCssLikeManifestUrl(target: URL) {
+  const host = normalizeHost(target.hostname);
+  const path = String(target.pathname || "").toLowerCase();
+  if (!(host === "dvalna.ru" || host.endsWith(".dvalna.ru"))) return false;
+  return /\/mono\.css(?:$|[/?#])/i.test(path);
+}
+
 type UpstreamFetchPolicyName = "html_page" | "hls_manifest" | "hls_segment_or_chunk";
 type UpstreamFetchPolicy = {
   name: UpstreamFetchPolicyName;
@@ -573,9 +591,12 @@ function rewriteM3u8Manifest(
       // Handle tags like: #EXT-X-KEY:METHOD=AES-128,URI="key.key"
       if (line.includes("URI=")) {
         outLines.push(
-          line.replace(/URI=(["'])([^"']+)\1/gi, (_full, quote, rawUri) => {
+          line.replace(/URI\s*=\s*(?:(["'])([^"']+)\1|([^,\s]+))/gi, (_full, quote: string, quotedUri: string, bareUri: string) => {
+            const rawUri = String(quotedUri || bareUri || "").trim();
+            if (!rawUri) return _full;
             const rewritten = toProxyUri(rawUri);
-            return `URI=${quote}${rewritten}${quote}`;
+            if (quote) return `URI=${quote}${rewritten}${quote}`;
+            return `URI=${rewritten}`;
           })
         );
       } else {
@@ -605,8 +626,13 @@ function shouldUseManifestCacheForTarget(target: URL) {
   return value.includes(".m3u8");
 }
 
-function buildManifestCacheKey(target: URL, depth: number, safeReferrer?: string | null) {
-  return `${target.toString()}|d=${depth}|r=${safeReferrer || ""}`;
+function buildManifestCacheKey(
+  target: URL,
+  depth: number,
+  safeReferrer?: string | null,
+  server5PassQueryCacheKey?: string | null
+) {
+  return `${target.toString()}|d=${depth}|r=${safeReferrer || ""}|s5=${server5PassQueryCacheKey || ""}`;
 }
 
 function trimManifestCache(now = Date.now()) {
@@ -2362,7 +2388,7 @@ async function handleProxyRequest(req: Request) {
     const body = hasBody ? await req.arrayBuffer() : undefined;
     const manifestCacheKey =
       method === "GET" && M3U8_CACHE_TTL_MS > 0 && shouldUseManifestCacheForTarget(target)
-        ? buildManifestCacheKey(target, depth, safeReferrer)
+        ? buildManifestCacheKey(target, depth, safeReferrer, buildServer5PassQueryCacheKey(server5PassQuery))
         : null;
 
     if (manifestCacheKey) {
@@ -2405,41 +2431,57 @@ async function handleProxyRequest(req: Request) {
     }
 
     if (!isHtml) {
-      if (isLikelyM3u8(target, contentType)) {
-        const rawManifest = await upstream.text();
-        const rewrittenManifest = rewriteM3u8Manifest(
-          rawManifest,
-          target.toString(),
-          depth,
-          // Preserve original embed referrer for child segments; some upstreams
-          // (e.g. server4 CDNs) enforce strict Referer checks on both manifest and segments.
-          safeReferrer || target.toString(),
-          server5PassQuery
-        );
-        const headers = withProxyMetaHeaders(filterResponseHeaders(upstream.headers, { html: false }));
-        headers.set("content-type", "application/vnd.apple.mpegurl; charset=utf-8");
-        headers.set("x-embed-proxy-cache", manifestCacheKey ? "miss" : "bypass");
+      let prefetchedNonHtmlText: string | null = null;
+      const targetLooksLikeM3u8 = isLikelyM3u8(target, contentType);
+      const targetLooksLikeServer5Mono = isServer5MonoCssLikeManifestUrl(target);
+      if (targetLooksLikeM3u8 || targetLooksLikeServer5Mono) {
+        const rawMaybeManifest = await upstream.text();
+        prefetchedNonHtmlText = rawMaybeManifest;
+        const hasExtM3u = /^\s*#EXTM3U/m.test(rawMaybeManifest);
+        if (targetLooksLikeM3u8 || hasExtM3u) {
+          const rewrittenManifest = rewriteM3u8Manifest(
+            rawMaybeManifest,
+            target.toString(),
+            depth,
+            // Preserve original embed referrer for child segments; some upstreams
+            // (e.g. server4 CDNs) enforce strict Referer checks on both manifest and segments.
+            safeReferrer || target.toString(),
+            server5PassQuery
+          );
+          const headers = withProxyMetaHeaders(filterResponseHeaders(upstream.headers, { html: false }));
+          headers.set("content-type", "application/vnd.apple.mpegurl; charset=utf-8");
+          headers.set("x-embed-proxy-cache", manifestCacheKey ? "miss" : "bypass");
 
-        if (manifestCacheKey && upstream.ok) {
-          manifestCache.set(manifestCacheKey, {
-            body: rewrittenManifest,
-            expiresAt: Date.now() + M3U8_CACHE_TTL_MS,
-            headers: Array.from(headers.entries()),
+          if (manifestCacheKey && upstream.ok) {
+            manifestCache.set(manifestCacheKey, {
+              body: rewrittenManifest,
+              expiresAt: Date.now() + M3U8_CACHE_TTL_MS,
+              headers: Array.from(headers.entries()),
+              status: upstream.status,
+              statusText: upstream.statusText,
+            });
+            trimManifestCache();
+          }
+
+          return new Response(rewrittenManifest, {
             status: upstream.status,
             statusText: upstream.statusText,
+            headers,
           });
-          trimManifestCache();
         }
 
-        return new Response(rewrittenManifest, {
-          status: upstream.status,
-          statusText: upstream.statusText,
-          headers,
-        });
+        if (!isCss) {
+          const headers = withProxyMetaHeaders(filterResponseHeaders(upstream.headers, { html: false }));
+          return new Response(rawMaybeManifest, {
+            status: upstream.status,
+            statusText: upstream.statusText,
+            headers,
+          });
+        }
       }
 
       if (isCss) {
-        const rawCss = await upstream.text();
+        const rawCss = prefetchedNonHtmlText ?? (await upstream.text());
         const rewrittenCss = rewriteCssUrls(rawCss, target.toString(), depth);
         const headers = withProxyMetaHeaders(filterResponseHeaders(upstream.headers, { html: false }));
         headers.set("content-type", "text/css; charset=utf-8");
