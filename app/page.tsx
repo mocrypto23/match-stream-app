@@ -195,11 +195,7 @@ export default function Home() {
       return "upcoming" as const;
     };
 
-    let arr = [...matches];
-
-    if (day === "today") {
-      arr = arr.filter((m) => getStatus(m) !== "finished");
-    }
+    const arr = [...matches];
 
     const rank = (s: string) => (s === "live" ? 0 : s === "upcoming" ? 1 : 2);
 

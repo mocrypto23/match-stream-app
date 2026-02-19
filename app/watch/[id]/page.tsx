@@ -49,6 +49,8 @@ const FAST_PHASE_PROBE_TIMEOUT_MS = 2200;
 const FAST_PHASE_MAX_PLAYER_PAGES = 5;
 const FAST_PHASE_MAX_DEEP_CANDIDATES = 6;
 const FAST_PHASE_MAX_PLAYERV2_POOL = 2;
+const SERVER5_STAGE1_MAX_CHECKS = 8;
+const SERVER5_STAGE1_TIMEOUT_MS = 3400;
 const RESOLVE_CHILD_CONCURRENCY = 3;
 const EXPAND_VARIANTS_CONCURRENCY = 4;
 const PROBE_CONCURRENCY = 4;
@@ -78,6 +80,14 @@ const RESOLVE_RESULT_CACHE_MAX = 250;
 const SERVER5_SIBLING_CACHE_MAX = 80;
 const SERVER5_MATCH_PAGE_SCAN_LIMIT = 10;
 const SERVER5_LANDING_LIMIT = 8;
+const SERVER5_HLS_BACK_BUFFER_LENGTH = 70;
+const SERVER5_HLS_MAX_BUFFER_LENGTH = 48;
+const SERVER5_HLS_MAX_MAX_BUFFER_LENGTH = 100;
+const SERVER5_HLS_LIVE_SYNC_COUNT = 4;
+const SERVER5_HLS_LIVE_MAX_LATENCY_COUNT = 12;
+const SERVER5_HLS_MANIFEST_RETRIES = 8;
+const SERVER5_HLS_LEVEL_RETRIES = 8;
+const SERVER5_HLS_FRAG_RETRIES = 10;
 const NO_STREAM_SELECTED_SERVER_MESSAGE = "لا يوجد بث في هذا السيرفر لهذه المباراة";
 const HLS_CT = ["application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl"];
 const MEDIA_RE = /\.(?:m3u8|mp4|m4v|mov|webm|mpd|ts)(?:[?#]|$)/i;
@@ -4446,6 +4456,42 @@ export default function WatchPage() {
             else if (rawBuckets.bucket1.length) pushDiag("server3 fallback->serv1");
 
             verified = dedupeUrls([...verified0, ...verified1]);
+          } else if (selectedServer === 5) {
+            const stage1Checks = Math.min(maxChecks, SERVER5_STAGE1_MAX_CHECKS);
+            let stage1Verified: string[] = [];
+            if (stage1Checks > 0) {
+              stage1Verified = await filterPlayableCandidates(mergedRaw, {
+                signal: controller.signal,
+                timeoutMs: Math.min(probeTimeoutMs, SERVER5_STAGE1_TIMEOUT_MS),
+                maxChecks: stage1Checks,
+                concurrency: Math.min(3, PROBE_CONCURRENCY),
+                pushDiag,
+              });
+              pushDiag(`server5 stage1 verified=${stage1Verified.length}/${stage1Checks}`);
+              if (
+                stage1Verified.length &&
+                !cancel &&
+                !controller.signal.aborted &&
+                activeResolveIdRef.current === resolveId
+              ) {
+                hadPlayable = true;
+                applyCandidatesPreservingSelection(stage1Verified);
+                setPlayerError(null);
+                setResolverError(null);
+                resetRecoveryState();
+                setResolverLoading(false);
+              }
+            }
+
+            const stage2Verified = await filterPlayableCandidates(mergedRaw, {
+              signal: controller.signal,
+              timeoutMs: probeTimeoutMs,
+              maxChecks,
+              concurrency: Math.min(3, PROBE_CONCURRENCY),
+              pushDiag,
+            });
+            pushDiag(`server5 stage2 verified=${stage2Verified.length}/${maxChecks}`);
+            verified = dedupeUrls([...stage1Verified, ...stage2Verified]);
           } else {
             verified = await filterPlayableCandidates(mergedRaw, {
               signal: controller.signal,
@@ -4699,6 +4745,7 @@ export default function WatchPage() {
       video.load();
       playWithAutoplayFallback();
     } else if (Hls.isSupported()) {
+      const isServer5Playback = selectedServer === 5;
       hls = new Hls({
         enableWorker: true,
         xhrSetup: (xhr, requestUrl) => {
@@ -4706,17 +4753,17 @@ export default function WatchPage() {
         },
         lowLatencyMode: false,
         capLevelToPlayerSize: true,
-        backBufferLength: 90,
-        maxBufferLength: 60,
-        maxMaxBufferLength: 120,
-        liveSyncDurationCount: 5,
-        liveMaxLatencyDurationCount: 15,
+        backBufferLength: isServer5Playback ? SERVER5_HLS_BACK_BUFFER_LENGTH : 90,
+        maxBufferLength: isServer5Playback ? SERVER5_HLS_MAX_BUFFER_LENGTH : 60,
+        maxMaxBufferLength: isServer5Playback ? SERVER5_HLS_MAX_MAX_BUFFER_LENGTH : 120,
+        liveSyncDurationCount: isServer5Playback ? SERVER5_HLS_LIVE_SYNC_COUNT : 5,
+        liveMaxLatencyDurationCount: isServer5Playback ? SERVER5_HLS_LIVE_MAX_LATENCY_COUNT : 15,
         startFragPrefetch: true,
         maxBufferHole: 1.2,
         highBufferWatchdogPeriod: 2,
-        manifestLoadingMaxRetry: 6,
-        levelLoadingMaxRetry: 6,
-        fragLoadingMaxRetry: 8,
+        manifestLoadingMaxRetry: isServer5Playback ? SERVER5_HLS_MANIFEST_RETRIES : 6,
+        levelLoadingMaxRetry: isServer5Playback ? SERVER5_HLS_LEVEL_RETRIES : 6,
+        fragLoadingMaxRetry: isServer5Playback ? SERVER5_HLS_FRAG_RETRIES : 8,
         abrBandWidthFactor: 0.85,
         abrBandWidthUpFactor: 0.7,
       });
@@ -4745,7 +4792,7 @@ export default function WatchPage() {
           const prev = networkFatalCountByCandidateRef.current.get(currentCandidateKey) || 0;
           const next = prev + 1;
           networkFatalCountByCandidateRef.current.set(currentCandidateKey, next);
-          const fastFailoverThreshold = selectedServer === 3 || selectedServer === 5 ? 1 : 2;
+          const fastFailoverThreshold = selectedServer === 3 ? 1 : 2;
           if (useFastFailover && next >= fastFailoverThreshold) {
             pushDiag(`fast-failover server${selectedServer} network=${next}`);
             markCandidateAsBad(selectedServer, selectedHlsUrl, "network-fast-failover");

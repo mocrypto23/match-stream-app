@@ -177,6 +177,22 @@ const UPSTREAM_FETCH_RETRY_DELAY_STREAM_MS = Math.max(
   100,
   Number.parseInt(process.env.EMBED_PROXY_FETCH_RETRY_DELAY_STREAM_MS || "250", 10) || 250
 );
+const DVALNA_FETCH_TIMEOUT_MANIFEST_MS = Math.max(
+  UPSTREAM_FETCH_TIMEOUT_MANIFEST_MS,
+  Number.parseInt(process.env.EMBED_PROXY_DVALNA_FETCH_TIMEOUT_MANIFEST_MS || "7000", 10) || 7000
+);
+const DVALNA_FETCH_TIMEOUT_SEGMENT_MS = Math.max(
+  UPSTREAM_FETCH_TIMEOUT_SEGMENT_MS,
+  Number.parseInt(process.env.EMBED_PROXY_DVALNA_FETCH_TIMEOUT_SEGMENT_MS || "5200", 10) || 5200
+);
+const DVALNA_FETCH_RETRIES_STREAM = Math.max(
+  UPSTREAM_FETCH_RETRIES_STREAM,
+  Number.parseInt(process.env.EMBED_PROXY_DVALNA_FETCH_RETRIES_STREAM || "2", 10) || 2
+);
+const DVALNA_FETCH_RETRY_DELAY_STREAM_MS = Math.max(
+  UPSTREAM_FETCH_RETRY_DELAY_STREAM_MS,
+  Number.parseInt(process.env.EMBED_PROXY_DVALNA_FETCH_RETRY_DELAY_STREAM_MS || "320", 10) || 320
+);
 
 type ManifestCacheEntry = {
   body: string;
@@ -443,10 +459,14 @@ function isLikelyM3u8(target: URL, contentType: string) {
   );
 }
 
+function isDvalnaHost(hostname: string) {
+  const host = normalizeHost(hostname);
+  return host === "dvalna.ru" || host.endsWith(".dvalna.ru");
+}
+
 function isServer5MonoCssLikeManifestUrl(target: URL) {
-  const host = normalizeHost(target.hostname);
   const path = String(target.pathname || "").toLowerCase();
-  if (!(host === "dvalna.ru" || host.endsWith(".dvalna.ru"))) return false;
+  if (!isDvalnaHost(target.hostname)) return false;
   return /\/mono\.css(?:$|[/?#])/i.test(path);
 }
 
@@ -480,8 +500,19 @@ function getUpstreamFetchPolicy(target: URL, method: string): UpstreamFetchPolic
     };
   }
 
-  const kind = classifyProxyTarget(target);
+  const kind: UpstreamFetchPolicyName = isServer5MonoCssLikeManifestUrl(target)
+    ? "hls_manifest"
+    : classifyProxyTarget(target);
+  const dvalnaTarget = isDvalnaHost(target.hostname);
   if (kind === "hls_manifest") {
+    if (dvalnaTarget) {
+      return {
+        name: kind,
+        timeoutMs: DVALNA_FETCH_TIMEOUT_MANIFEST_MS,
+        retries: DVALNA_FETCH_RETRIES_STREAM,
+        retryDelayMs: DVALNA_FETCH_RETRY_DELAY_STREAM_MS,
+      };
+    }
     return {
       name: kind,
       timeoutMs: UPSTREAM_FETCH_TIMEOUT_MANIFEST_MS,
@@ -490,6 +521,14 @@ function getUpstreamFetchPolicy(target: URL, method: string): UpstreamFetchPolic
     };
   }
   if (kind === "hls_segment_or_chunk") {
+    if (dvalnaTarget) {
+      return {
+        name: kind,
+        timeoutMs: DVALNA_FETCH_TIMEOUT_SEGMENT_MS,
+        retries: DVALNA_FETCH_RETRIES_STREAM,
+        retryDelayMs: DVALNA_FETCH_RETRY_DELAY_STREAM_MS,
+      };
+    }
     return {
       name: kind,
       timeoutMs: UPSTREAM_FETCH_TIMEOUT_SEGMENT_MS,
@@ -2120,8 +2159,7 @@ function computeDvalnaPowNonce(channel: string, keyId: string, timestampSec: num
 }
 
 function applyServer5DvalnaAuthHeaders(out: Headers, incoming: Headers, target: URL, query?: URLSearchParams | null) {
-  const host = normalizeHost(target.hostname);
-  if (!(host === "dvalna.ru" || host.endsWith(".dvalna.ru"))) return;
+  if (!isDvalnaHost(target.hostname)) return;
 
   const authToken = String(incoming.get("x-s5-auth-token") || query?.get("s5_ep_auth") || "").trim();
   const channelKey = String(incoming.get("x-s5-channel-key") || query?.get("s5_ep_ck") || "").trim();
