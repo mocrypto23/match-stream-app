@@ -937,6 +937,24 @@ function stripHtmlToText(input) {
   return normalizeSpaces(decodeHtmlEntities(s));
 }
 
+function sanitizeDisplayTimeText(raw) {
+  const decoded = normalizeSpaces(decodeHtmlEntities(String(raw || "")));
+  if (!decoded) return null;
+
+  const fixed = normalizeSpaces(
+    decoded
+      .replace(/â€”|â€“|â€"|â€|â€˜|â€™/g, "—")
+      .replace(/[‐‑‒–—―]+/g, "—")
+  );
+  if (!fixed) return null;
+
+  const compact = fixed.replace(/\s+/g, "");
+  if (!compact) return null;
+  if (/^[-—]+$/.test(compact)) return null;
+
+  return fixed;
+}
+
 function extractAyMatchRowsFromHtml(html, pageUrl) {
   const text = String(html || "");
   if (!text) return [];
@@ -2904,8 +2922,12 @@ function mergeDuplicateMatchRows(primary, secondary, { isolationStats = null, ma
   if ((!out.match_start || parseMs(out.match_start) === null) && b.match_start && parseMs(b.match_start) !== null) {
     out.match_start = b.match_start;
   }
-  if (!String(out.match_time || "").trim() && String(b.match_time || "").trim()) {
-    out.match_time = b.match_time;
+  const outMatchTime = sanitizeDisplayTimeText(out.match_time);
+  const bMatchTime = sanitizeDisplayTimeText(b.match_time);
+  if (!outMatchTime && bMatchTime) {
+    out.match_time = bMatchTime;
+  } else {
+    out.match_time = outMatchTime;
   }
 
   const aHasScore = typeof out.home_score === "number" && typeof out.away_score === "number";
@@ -3817,7 +3839,7 @@ function mergeWithExisting({
       if (!(oldLooksNowish && newIsFarFuture)) {
         if ((!out.match_start || !parseMs(out.match_start)) && old.match_start) {
           out.match_start = old.match_start;
-          out.match_time = old.match_time || out.match_time;
+          out.match_time = sanitizeDisplayTimeText(old.match_time) || sanitizeDisplayTimeText(out.match_time);
         }
       }
 
@@ -6359,10 +6381,11 @@ async function startScraping() {
         statusKey = "finished";
       }
 
-      const match_time =
+      const matchTimeRaw =
         statusKey === "upcoming"
           ? m.time_text || prettyTimeFromIso(match_start) || "-"
           : prettyTimeFromIso(match_start) || m.time_text || "-";
+      const match_time = sanitizeDisplayTimeText(matchTimeRaw);
 
       const finalStreamUrl = m.match_url || m.deep_stream_url;
       const match_key = keyOfTeams(match_day, m.home_team, m.away_team);

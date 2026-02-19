@@ -122,6 +122,21 @@ function normalizeStatusKey(sk: any): "live" | "finished" | "upcoming" | "unknow
   return "unknown";
 }
 
+function sanitizeDisplayMatchTime(raw: unknown) {
+  const value = typeof raw === "string" ? raw.trim() : "";
+  if (!value) return null as string | null;
+
+  const normalized = value
+    .replace(/â€”|â€“|â€"|â€|â€˜|â€™/g, "—")
+    .replace(/[‐‑‒–—―]+/g, "—")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return null;
+
+  if (/^[-—]+$/.test(normalized.replace(/\s+/g, ""))) return null;
+  return normalized;
+}
+
 export default function Home() {
   const [day, setDay] = useState<DayKey>("today");
   const [matches, setMatches] = useState<MatchRow[]>([]);
@@ -277,13 +292,16 @@ export default function Home() {
                         : "upcoming";
 
             const centerText =
-              status === "upcoming"
-                ? match.match_time || "—"
-                : scores
-                  ? `${match.home_score} - ${match.away_score}`
-                  : status === "finished"
-                    ? "— - —"
-                    : match.match_time || "—";
+              (() => {
+                const safeMatchTime = sanitizeDisplayMatchTime(match.match_time);
+                return status === "upcoming"
+                  ? safeMatchTime || "—"
+                  : scores
+                    ? `${match.home_score} - ${match.away_score}`
+                    : status === "finished"
+                      ? "— - —"
+                      : safeMatchTime || "—";
+              })();
 
             const canNavigate = day !== "yesterday" && Boolean(match?.id);
             const watchHref = `/watch/${match.id}`;

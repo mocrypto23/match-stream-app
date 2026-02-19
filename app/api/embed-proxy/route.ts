@@ -193,6 +193,18 @@ const DVALNA_FETCH_RETRY_DELAY_STREAM_MS = Math.max(
   UPSTREAM_FETCH_RETRY_DELAY_STREAM_MS,
   Number.parseInt(process.env.EMBED_PROXY_DVALNA_FETCH_RETRY_DELAY_STREAM_MS || "320", 10) || 320
 );
+const DVALNA_FETCH_TIMEOUT_LOOKUP_MS = Math.max(
+  1200,
+  Number.parseInt(process.env.EMBED_PROXY_DVALNA_FETCH_TIMEOUT_LOOKUP_MS || "2600", 10) || 2600
+);
+const DVALNA_FETCH_RETRIES_LOOKUP = Math.max(
+  0,
+  Number.parseInt(process.env.EMBED_PROXY_DVALNA_FETCH_RETRIES_LOOKUP || "1", 10) || 1
+);
+const DVALNA_FETCH_RETRY_DELAY_LOOKUP_MS = Math.max(
+  50,
+  Number.parseInt(process.env.EMBED_PROXY_DVALNA_FETCH_RETRY_DELAY_LOOKUP_MS || "180", 10) || 180
+);
 
 type ManifestCacheEntry = {
   body: string;
@@ -470,7 +482,7 @@ function isServer5MonoCssLikeManifestUrl(target: URL) {
   return /\/mono\.css(?:$|[/?#])/i.test(path);
 }
 
-type UpstreamFetchPolicyName = "html_page" | "hls_manifest" | "hls_segment_or_chunk";
+type UpstreamFetchPolicyName = "html_page" | "hls_manifest" | "hls_segment_or_chunk" | "dvalna_server_lookup";
 type UpstreamFetchPolicy = {
   name: UpstreamFetchPolicyName;
   timeoutMs: number;
@@ -504,6 +516,15 @@ function getUpstreamFetchPolicy(target: URL, method: string): UpstreamFetchPolic
     ? "hls_manifest"
     : classifyProxyTarget(target);
   const dvalnaTarget = isDvalnaHost(target.hostname);
+  const dvalnaLookupTarget = dvalnaTarget && /\/server_lookup(?:$|\/)/i.test(String(target.pathname || ""));
+  if (dvalnaLookupTarget) {
+    return {
+      name: "dvalna_server_lookup",
+      timeoutMs: DVALNA_FETCH_TIMEOUT_LOOKUP_MS,
+      retries: DVALNA_FETCH_RETRIES_LOOKUP,
+      retryDelayMs: DVALNA_FETCH_RETRY_DELAY_LOOKUP_MS,
+    };
+  }
   if (kind === "hls_manifest") {
     if (dvalnaTarget) {
       return {
@@ -2303,6 +2324,19 @@ function isRetryableFetchError(error: unknown) {
   );
 }
 
+function parseRetryAfterMs(value: string | null) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  if (/^\d+$/.test(raw)) {
+    const secs = Number.parseInt(raw, 10);
+    if (!Number.isFinite(secs)) return null;
+    return Math.max(0, secs * 1000);
+  }
+  const at = Date.parse(raw);
+  if (!Number.isFinite(at)) return null;
+  return Math.max(0, at - Date.now());
+}
+
 type UpstreamResult = {
   upstream: Response;
   attempts: number;
@@ -2334,10 +2368,15 @@ async function fetchUpstreamWithRetry(params: {
       });
 
       if (attempt < retries && isRetryableStatus(upstream.status)) {
+        let delayMs = params.policy.retryDelayMs * (attempt + 1);
+        if (upstream.status === 429) {
+          const retryAfterMs = parseRetryAfterMs(upstream.headers.get("retry-after"));
+          if (retryAfterMs !== null) delayMs = Math.max(delayMs, retryAfterMs);
+        }
         try {
           await upstream.body?.cancel();
         } catch {}
-        await sleep(params.policy.retryDelayMs * (attempt + 1));
+        await sleep(delayMs);
         continue;
       }
 

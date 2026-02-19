@@ -29,7 +29,7 @@ type ServerOption = {
   url: string | null;
   sticky?: boolean;
 };
-type ServerHealthState = "ok" | "down";
+type ServerHealthState = "ok" | "down" | "pending";
 
 const SERVER_SOURCE_LABELS: Record<number, string> = {
   1: "سيرفر 1 ",
@@ -88,6 +88,14 @@ const SERVER5_HLS_LIVE_MAX_LATENCY_COUNT = 12;
 const SERVER5_HLS_MANIFEST_RETRIES = 8;
 const SERVER5_HLS_LEVEL_RETRIES = 8;
 const SERVER5_HLS_FRAG_RETRIES = 10;
+const SERVER3_DERIVE_CACHE_TTL_MS = 120_000;
+const SERVER5_FAST_LANDING_LIMIT = 3;
+const SERVER5_FINAL_LANDING_LIMIT = 6;
+const SERVER5_FAST_CHANNEL_KEY_LIMIT = 2;
+const SERVER5_FINAL_CHANNEL_KEY_LIMIT = 3;
+const SERVER5_FAST_FAILOVER_COOLDOWN_MS = 4_000;
+const SERVER5_LOOKUP_SUCCESS_CACHE_TTL_MS = 5 * 60_000;
+const SERVER5_LOOKUP_MISS_CACHE_TTL_MS = 90_000;
 const NO_STREAM_SELECTED_SERVER_MESSAGE = "لا يوجد بث في هذا السيرفر لهذه المباراة";
 const HLS_CT = ["application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl"];
 const MEDIA_RE = /\.(?:m3u8|mp4|m4v|mov|webm|mpd|ts)(?:[?#]|$)/i;
@@ -166,6 +174,7 @@ type Server3CandidateProvenance = {
   rootServ: Server3RootServ;
   originStage: ResolveBatchPhase;
 };
+type Server3DeriveState = "idle" | "loading" | "ready" | "empty" | "error";
 type ResolveCandidatesResult = {
   candidates: string[];
   provenanceByKey: Map<string, Server3CandidateProvenance>;
@@ -174,6 +183,12 @@ type ResolveResultCacheEntry = { expiresAt: number; candidates: string[] };
 type Playerv2StickyCacheEntry = { expiresAt: number; candidates: string[] };
 type Playerv2TokenCacheEntry = { expiresAt: number; tokenPayload: Playerv2TokenPayload };
 type Server5SiblingDiscoveryCacheEntry = { expiresAt: number; urls: string[] };
+type Server3DeriveCacheEntry = {
+  expiresAt: number;
+  url: string | null;
+  state: Exclude<Server3DeriveState, "idle" | "loading">;
+};
+type Server5LookupCacheEntry = { expiresAt: number; serverKey: string | null };
 type Server5AuthContext = { authToken: string; channelKey: string; channelSalt: string };
 type CandidateGroup = { key: string; primaryIndex: number; members: number[]; label: string };
 
@@ -181,6 +196,9 @@ const resolveResultCache = new Map<string, ResolveResultCacheEntry>();
 const playerv2StickyCache = new Map<string, Playerv2StickyCacheEntry>();
 const playerv2TokenCache = new Map<string, Playerv2TokenCacheEntry>();
 const server5SiblingDiscoveryCache = new Map<string, Server5SiblingDiscoveryCacheEntry>();
+const server3DeriveCache = new Map<string, Server3DeriveCacheEntry>();
+const server5LookupCache = new Map<string, Server5LookupCacheEntry>();
+const server5LookupInFlight = new Map<string, Promise<string | null>>();
 
 function resolveResultCacheKey(sourceUrl: string) {
   return canonicalizeUrl(sourceUrl) || String(sourceUrl || "").trim().toLowerCase();
@@ -224,6 +242,91 @@ function setCachedResolveCandidates(sourceUrl: string, candidates: string[]) {
 
 function clearCachedResolveCandidates(sourceUrl: string) {
   resolveResultCache.delete(resolveResultCacheKey(sourceUrl));
+}
+
+function buildServer3DeriveCacheKey(homeTeam?: string | null, awayTeam?: string | null) {
+  const home = normalizeTeamNameForMatchCompare(homeTeam);
+  const away = normalizeTeamNameForMatchCompare(awayTeam);
+  if (!home && !away) return "";
+  return `${home}|${away}`;
+}
+
+function getServer3DeriveCacheEntry(cacheKey: string) {
+  const key = String(cacheKey || "").trim();
+  if (!key) return null as Server3DeriveCacheEntry | null;
+  const now = Date.now();
+  const cached = server3DeriveCache.get(key);
+  if (!cached || cached.expiresAt <= now) {
+    if (cached) server3DeriveCache.delete(key);
+    return null;
+  }
+  return cached;
+}
+
+function setServer3DeriveCacheEntry(
+  cacheKey: string,
+  value: { url: string | null; state: Exclude<Server3DeriveState, "idle" | "loading"> }
+) {
+  const key = String(cacheKey || "").trim();
+  if (!key) return;
+  const now = Date.now();
+  server3DeriveCache.set(key, {
+    expiresAt: now + SERVER3_DERIVE_CACHE_TTL_MS,
+    url: value.url,
+    state: value.state,
+  });
+  if (server3DeriveCache.size > 300) {
+    for (const [cacheEntryKey, cacheEntryValue] of server3DeriveCache.entries()) {
+      if (cacheEntryValue.expiresAt <= now) server3DeriveCache.delete(cacheEntryKey);
+    }
+    while (server3DeriveCache.size > 220) {
+      const firstKey = server3DeriveCache.keys().next().value as string | undefined;
+      if (!firstKey) break;
+      server3DeriveCache.delete(firstKey);
+    }
+  }
+}
+
+function trimServer5LookupCache(now = Date.now()) {
+  for (const [key, value] of server5LookupCache.entries()) {
+    if (value.expiresAt <= now) server5LookupCache.delete(key);
+  }
+  if (server5LookupCache.size <= 600) return;
+  while (server5LookupCache.size > 450) {
+    const firstKey = server5LookupCache.keys().next().value as string | undefined;
+    if (!firstKey) break;
+    server5LookupCache.delete(firstKey);
+  }
+}
+
+function getServer5LookupCacheEntry(cacheKey: string) {
+  const key = String(cacheKey || "").trim().toLowerCase();
+  if (!key) return undefined as string | null | undefined;
+  const now = Date.now();
+  const cached = server5LookupCache.get(key);
+  if (!cached || cached.expiresAt <= now) {
+    if (cached) server5LookupCache.delete(key);
+    return undefined;
+  }
+  return cached.serverKey;
+}
+
+function setServer5LookupCacheEntry(cacheKey: string, serverKey: string | null, ttlMs: number) {
+  const key = String(cacheKey || "").trim().toLowerCase();
+  if (!key) return;
+  const now = Date.now();
+  server5LookupCache.set(key, {
+    expiresAt: now + Math.max(1000, ttlMs),
+    serverKey: serverKey || null,
+  });
+  trimServer5LookupCache(now);
+}
+
+function buildServer5LookupCacheKey(landingId: string, channelKey: string) {
+  const landing = sanitizeServer5ChannelKey(landingId).toLowerCase();
+  const channel = sanitizeServer5ChannelKey(channelKey).toLowerCase();
+  if (!channel) return "";
+  return `${landing || "none"}|${channel}`;
 }
 
 function trimServer5SiblingDiscoveryCache(now = Date.now()) {
@@ -2727,6 +2830,10 @@ async function resolveCandidatesForServer(
     fetchRetryDelayMs?: number;
     allowSamePathServVariants?: boolean;
     livehdServPreference?: "prefer0" | "all";
+    server5Mode?: "fast" | "final";
+    server5LandingLimit?: number;
+    server5ChannelKeyLimit?: number;
+    server5AllowSitemap?: boolean;
   }
 ): Promise<ResolveCandidatesResult> {
   const maxPlayerPages = opts?.maxPlayerPages ?? 6;
@@ -2738,6 +2845,16 @@ async function resolveCandidatesForServer(
   const fetchRetryDelayMs = Math.max(0, Math.floor(opts?.fetchRetryDelayMs ?? 180));
   const allowSamePathServVariants = opts?.allowSamePathServVariants ?? false;
   const livehdServPreference = opts?.livehdServPreference ?? "all";
+  const server5Mode = opts?.server5Mode ?? "final";
+  const server5LandingLimit = Math.max(
+    1,
+    Math.min(SERVER5_LANDING_LIMIT, Math.floor(opts?.server5LandingLimit ?? SERVER5_LANDING_LIMIT))
+  );
+  const server5ChannelKeyLimit = Math.max(
+    1,
+    Math.min(8, Math.floor(opts?.server5ChannelKeyLimit ?? 4))
+  );
+  const server5AllowSitemap = opts?.server5AllowSitemap ?? true;
   const sourceServ = getServFromUrl(sourceUrl);
   const sourcePathKey = normalizePathKey(sourceUrl);
   const sourceLivehdTv = parseLivehdTvMeta(sourceUrl);
@@ -2917,10 +3034,16 @@ async function resolveCandidatesForServer(
     const cacheKey = `v2:${sourceId.toLowerCase()}`;
     const now = Date.now();
     const cached = server5SiblingDiscoveryCache.get(cacheKey);
-    if (cached && cached.expiresAt > now && cached.urls.length > 1) return [...cached.urls];
+    if (cached && cached.expiresAt > now && cached.urls.length > 1) {
+      return cached.urls.slice(0, server5LandingLimit);
+    }
     if (cached) server5SiblingDiscoveryCache.delete(cacheKey);
 
     const out: string[] = [];
+    const maxMatchPageScan =
+      server5Mode === "fast"
+        ? Math.min(3, SERVER5_MATCH_PAGE_SCAN_LIMIT)
+        : Math.min(6, SERVER5_MATCH_PAGE_SCAN_LIMIT);
     const seen = new Set<string>();
     const addBatch = (items: string[]) => {
       for (const value of items) {
@@ -2930,6 +3053,7 @@ async function resolveCandidatesForServer(
         if (!key || seen.has(key)) continue;
         seen.add(key);
         out.push(v);
+        if (out.length >= server5LandingLimit) break;
       }
     };
     const sourceIdNorm = sourceId.toLowerCase().replace(/^cn/, "");
@@ -2943,6 +3067,7 @@ async function resolveCandidatesForServer(
         if (!key || matchPageSeen.has(key)) continue;
         matchPageSeen.add(key);
         candidateMatchPages.push(v);
+        if (candidateMatchPages.length >= maxMatchPageScan) break;
       }
     };
     const processMatchPage = async (pageUrl: string) => {
@@ -2989,6 +3114,9 @@ async function resolveCandidatesForServer(
 
     addBatch([landingUrl]);
     if (landingHtml) addBatch(extractServer5LandingUrlsFromHtml(landingHtml, landingUrl));
+    if (out.length >= server5LandingLimit) {
+      return dedupeUrls(out).slice(0, server5LandingLimit);
+    }
 
     const searchUrl = `https://anewssport.fun/?s=${encodeURIComponent(sourceId)}`;
     const searchProbe = toEmbedProxyUrl(searchUrl, searchUrl);
@@ -3004,7 +3132,7 @@ async function resolveCandidatesForServer(
       }
     }
 
-    if (!candidateMatchPages.length) {
+    if (!candidateMatchPages.length && server5AllowSitemap) {
       const sitemapIndexUrl = "https://anewssport.fun/wp-sitemap.xml";
       const sitemapIndexProbe = toEmbedProxyUrl(sitemapIndexUrl, sitemapIndexUrl);
       if (sitemapIndexProbe) {
@@ -3013,7 +3141,7 @@ async function resolveCandidatesForServer(
           if (sitemapIndexRes.res.ok) {
             const indexXml = await sitemapIndexRes.res.text();
             const sitemapUrls = extractAnewssportMatchSitemapUrlsFromIndexXml(indexXml);
-            for (const sitemapUrl of sitemapUrls.slice(0, 3)) {
+            for (const sitemapUrl of sitemapUrls.slice(0, server5Mode === "fast" ? 0 : 3)) {
               if (signal.aborted) throw new DOMException("aborted", "AbortError");
               const sitemapProbe = toEmbedProxyUrl(sitemapUrl, sitemapIndexUrl);
               if (!sitemapProbe) continue;
@@ -3022,7 +3150,7 @@ async function resolveCandidatesForServer(
                 if (!sitemapRes.res.ok) continue;
                 const sitemapXml = await sitemapRes.res.text();
                 addMatchPages(extractAnewssportMatchPageUrlsFromSitemapXml(sitemapXml));
-                if (candidateMatchPages.length >= SERVER5_MATCH_PAGE_SCAN_LIMIT) break;
+                if (candidateMatchPages.length >= maxMatchPageScan) break;
               } catch (e: unknown) {
                 if (e instanceof Error && e.name === "AbortError") throw e;
               }
@@ -3035,13 +3163,13 @@ async function resolveCandidatesForServer(
     }
 
     opts?.playerv2Diag?.(`server5 siblings pages=${candidateMatchPages.length}`);
-    for (const pageUrl of candidateMatchPages.slice(0, SERVER5_MATCH_PAGE_SCAN_LIMIT)) {
+    for (const pageUrl of candidateMatchPages.slice(0, maxMatchPageScan)) {
       if (signal.aborted) throw new DOMException("aborted", "AbortError");
       await processMatchPage(pageUrl);
-      if (out.length >= SERVER5_LANDING_LIMIT) break;
+      if (out.length >= server5LandingLimit) break;
     }
 
-    const finalized = dedupeUrls(out).slice(0, SERVER5_LANDING_LIMIT);
+    const finalized = dedupeUrls(out).slice(0, server5LandingLimit);
     if (finalized.length > 1) {
       server5SiblingDiscoveryCache.set(cacheKey, { expiresAt: now + SERVER5_SIBLING_DISCOVERY_TTL_MS, urls: finalized });
       trimServer5SiblingDiscoveryCache(now);
@@ -3058,11 +3186,16 @@ async function resolveCandidatesForServer(
     const landingUrls = isServer5Landing
       ? await resolveServer5SiblingLandingUrls(pageUrl, pageHtml)
       : [pageUrl];
-    const timeoutMs = Math.max(2400, Math.min(fetchTimeoutMs, 9000));
+    const timeoutMs =
+      server5Mode === "fast"
+        ? Math.max(1700, Math.min(fetchTimeoutMs, 4500))
+        : Math.max(2400, Math.min(fetchTimeoutMs, 9000));
     const out: string[] = [];
+    let fastStop = false;
 
-    for (const landingUrl of dedupeUrls(landingUrls).slice(0, SERVER5_LANDING_LIMIT)) {
+    for (const landingUrl of dedupeUrls(landingUrls).slice(0, server5LandingLimit)) {
       if (signal.aborted) throw new DOMException("aborted", "AbortError");
+      if (server5Mode === "fast" && fastStop) break;
       let landingHtml = landingUrl === pageUrl ? String(pageHtml || "") : "";
       let landingSlot = "";
       try {
@@ -3084,58 +3217,108 @@ async function resolveCandidatesForServer(
 
       const landingAuthContext = extractServer5AuthContextFromHtml(landingHtml);
       if (!landingAuthContext) continue;
-      const channelKeysBase = extractServer5ChannelKeyCandidates(landingUrl, landingHtml).slice(0, 8);
+      const landingId = extractServer5LandingId(landingUrl);
+      const explicitChannelKeys = extractServer5ChannelKeyCandidates(landingUrl, landingHtml)
+        .map((value) => sanitizeServer5ChannelKey(value))
+        .filter(Boolean);
+      const explicitChannelKeysSet = new Set(explicitChannelKeys.map((value) => value.toLowerCase()));
+      const derivedChannelFromLandingId = (() => {
+        const id = sanitizeServer5ChannelKey(landingId);
+        if (!id) return "";
+        if (/^cn[a-z0-9_-]{3,64}$/i.test(id)) return sanitizeServer5ChannelKey(id.slice(2));
+        if (/^\d{2,8}$/.test(id)) return sanitizeServer5ChannelKey(`yallalive${id}`);
+        return id;
+      })();
       const channelKeys = Array.from(
         new Set(
-          [landingAuthContext?.channelKey || "", ...channelKeysBase]
+          [landingAuthContext.channelKey || "", derivedChannelFromLandingId, ...explicitChannelKeys]
             .map((value) => sanitizeServer5ChannelKey(value))
             .filter(Boolean)
         )
-      );
+      )
+        .filter((value) => {
+          const lower = value.toLowerCase();
+          if (!lower.startsWith("cnpremium")) return true;
+          return lower === landingAuthContext.channelKey.toLowerCase() || explicitChannelKeysSet.has(lower);
+        })
+        .slice(0, server5ChannelKeyLimit);
       if (!channelKeys.length) continue;
       for (const channelKey of channelKeys) {
         if (signal.aborted) throw new DOMException("aborted", "AbortError");
-        const lookupUrl = `https://chevy.dvalna.ru/server_lookup?channel_id=${encodeURIComponent(channelKey)}`;
-        const probe = toEmbedProxyUrl(lookupUrl, landingUrl);
-        if (!probe) continue;
-        try {
-          const lookupRes = await fetchWithTimeout(
-            probe,
-            {
-              method: "GET",
-              cache: "no-store",
-              credentials: "same-origin",
-              headers: { "x-embed-proxy-probe": "1" },
-            },
-            timeoutMs,
-            signal
-          );
-          if (!lookupRes.ok) continue;
-          const lookupText = await lookupRes.text();
-          const serverKey = extractServer5LookupServerKey(lookupText);
-          if (!serverKey) continue;
-          const manifests = buildServer5DvalnaManifestUrls(serverKey, channelKey);
-          const authForChannel =
-            landingAuthContext.channelKey.toLowerCase() === channelKey.toLowerCase() ? landingAuthContext : null;
-          for (const manifest of manifests) {
-            if (!authForChannel) continue;
-            let finalManifest = manifest;
-            if (landingSlot) {
+        const lookupCacheKey = buildServer5LookupCacheKey(landingId, channelKey);
+        let serverKey = getServer5LookupCacheEntry(lookupCacheKey);
+        if (serverKey === undefined) {
+          const lookupUrl = `https://chevy.dvalna.ru/server_lookup?channel_id=${encodeURIComponent(channelKey)}`;
+          const probe = toEmbedProxyUrl(lookupUrl, landingUrl);
+          if (!probe) continue;
+          let lookupPromise = server5LookupInFlight.get(lookupCacheKey);
+          if (!lookupPromise) {
+            lookupPromise = (async () => {
               try {
-                const tagged = new URL(finalManifest);
-                tagged.searchParams.set("s5_slot", landingSlot);
-                finalManifest = tagged.toString();
-              } catch { }
-            }
-            let proxied = toEmbedProxyUrl(finalManifest, landingUrl);
-            if (!proxied) continue;
-            proxied = attachServer5AuthContextToProxyUrl(proxied, authForChannel);
-            out.push(proxied);
+                const lookupRes = await fetchWithTimeout(
+                  probe,
+                  {
+                    method: "GET",
+                    cache: "no-store",
+                    credentials: "same-origin",
+                    headers: { "x-embed-proxy-probe": "1" },
+                  },
+                  timeoutMs
+                );
+                if (!lookupRes.ok) {
+                  setServer5LookupCacheEntry(lookupCacheKey, null, SERVER5_LOOKUP_MISS_CACHE_TTL_MS);
+                  return null;
+                }
+                const lookupText = await lookupRes.text();
+                const extractedServerKey = extractServer5LookupServerKey(lookupText);
+                if (!extractedServerKey) {
+                  setServer5LookupCacheEntry(lookupCacheKey, null, SERVER5_LOOKUP_MISS_CACHE_TTL_MS);
+                  return null;
+                }
+                setServer5LookupCacheEntry(lookupCacheKey, extractedServerKey, SERVER5_LOOKUP_SUCCESS_CACHE_TTL_MS);
+                return extractedServerKey;
+              } catch {
+                setServer5LookupCacheEntry(lookupCacheKey, null, SERVER5_LOOKUP_MISS_CACHE_TTL_MS);
+                return null;
+              } finally {
+                server5LookupInFlight.delete(lookupCacheKey);
+              }
+            })();
+            server5LookupInFlight.set(lookupCacheKey, lookupPromise);
           }
-        } catch (e: unknown) {
-          if (e instanceof Error && e.name === "AbortError") throw e;
+          if (!lookupPromise) continue;
+          serverKey = await lookupPromise;
         }
+        if (signal.aborted) throw new DOMException("aborted", "AbortError");
+        if (!serverKey) continue;
+
+        const manifests = buildServer5DvalnaManifestUrls(serverKey, channelKey);
+        const authForChannel =
+          landingAuthContext.channelKey.toLowerCase() === channelKey.toLowerCase() ? landingAuthContext : null;
+        for (const manifest of manifests) {
+          if (!authForChannel) continue;
+          let finalManifest = manifest;
+          if (landingSlot) {
+            try {
+              const tagged = new URL(finalManifest);
+              tagged.searchParams.set("s5_slot", landingSlot);
+              finalManifest = tagged.toString();
+            } catch { }
+          }
+          let proxied = toEmbedProxyUrl(finalManifest, landingUrl);
+          if (!proxied) continue;
+          proxied = attachServer5AuthContextToProxyUrl(proxied, authForChannel);
+          out.push(proxied);
+          if (server5Mode === "fast") {
+            if (landingSlot === "2" || out.length >= 2) {
+              fastStop = true;
+              break;
+            }
+          }
+        }
+        if (server5Mode === "fast" && fastStop) break;
       }
+      if (server5Mode === "fast" && fastStop) break;
     }
 
     return dedupeUrls(out);
@@ -3772,6 +3955,7 @@ export default function WatchPage() {
 
   const [match, setMatch] = useState<MatchRow | null>(null);
   const [derivedServer3Url, setDerivedServer3Url] = useState<string | null>(null);
+  const [server3DeriveState, setServer3DeriveState] = useState<Server3DeriveState>("idle");
   const [, setDerivedServerVariants] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [errMsg, setErrMsg] = useState<string | null>(null);
@@ -3806,6 +3990,7 @@ export default function WatchPage() {
   });
   const networkFatalCountByCandidateRef = useRef<Map<string, number>>(new Map());
   const server3ProvenanceRef = useRef<Map<string, Server3CandidateProvenance>>(new Map());
+  const lastFastFailoverAtByServerRef = useRef<Record<number, number>>({ 1: 0, 3: 0, 5: 0 });
 
   const diagEnabled = searchParams.get("diag") === "1";
   const pushDiag = useCallback((line: string) => {
@@ -4062,6 +4247,7 @@ export default function WatchPage() {
       const explicitServer3 = String(match?.stream_url_3 || "").trim();
       if (explicitServer3 && isValidHttpUrl(explicitServer3)) {
         setDerivedServer3Url(null);
+        setServer3DeriveState("idle");
         return;
       }
 
@@ -4069,13 +4255,29 @@ export default function WatchPage() {
       const away = String(match?.away_team || "").trim();
       if (!home && !away) {
         setDerivedServer3Url(null);
+        setServer3DeriveState("empty");
         return;
       }
+
+      const cacheKey = buildServer3DeriveCacheKey(home, away);
+      if (cacheKey) {
+        const cached = getServer3DeriveCacheEntry(cacheKey);
+        if (cached) {
+          setDerivedServer3Url(cached.url);
+          setServer3DeriveState(cached.state);
+          pushDiag(`server3 derive cache hit (${cached.state})`);
+          return;
+        }
+      }
+
+      setServer3DeriveState("loading");
 
       const livehdScheduleUrl = "https://livehd77.pro/matches-today/";
       const probeUrl = toEmbedProxyUrl(livehdScheduleUrl, livehdScheduleUrl);
       if (!probeUrl) {
         setDerivedServer3Url(null);
+        setServer3DeriveState("error");
+        if (cacheKey) setServer3DeriveCacheEntry(cacheKey, { url: null, state: "error" });
         return;
       }
 
@@ -4093,7 +4295,11 @@ export default function WatchPage() {
         );
         const ct = (res.headers.get("content-type") || "").toLowerCase();
         if (!res.ok || (!ct.includes("text/html") && !ct.includes("application/xhtml+xml"))) {
-          if (!cancel) setDerivedServer3Url(null);
+          if (!cancel) {
+            setDerivedServer3Url(null);
+            setServer3DeriveState("empty");
+          }
+          if (cacheKey) setServer3DeriveCacheEntry(cacheKey, { url: null, state: "empty" });
           return;
         }
 
@@ -4102,15 +4308,21 @@ export default function WatchPage() {
         const picked = pickServer3LivehdFallbackPageUrl(html, home, away);
         if (picked && isValidHttpUrl(picked)) {
           setDerivedServer3Url(picked);
+          setServer3DeriveState("ready");
+          if (cacheKey) setServer3DeriveCacheEntry(cacheKey, { url: picked, state: "ready" });
           pushDiag(`server3 derived livehd=${picked}`);
         } else {
           setDerivedServer3Url(null);
+          setServer3DeriveState("empty");
+          if (cacheKey) setServer3DeriveCacheEntry(cacheKey, { url: null, state: "empty" });
           pushDiag("server3 derived livehd=none");
         }
       } catch (e: unknown) {
         if (cancel) return;
         if (e instanceof Error && e.name === "AbortError") return;
         setDerivedServer3Url(null);
+        setServer3DeriveState("error");
+        if (cacheKey) setServer3DeriveCacheEntry(cacheKey, { url: null, state: "error" });
         pushDiag(`server3 derive failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     })();
@@ -4214,11 +4426,19 @@ export default function WatchPage() {
     setServerHealth(() => {
       const next: Record<number, ServerHealthState> = {};
       for (const s of serverOptions) {
-        next[s.n] = s.url && isValidHttpUrl(s.url) ? "ok" : "down";
+        if (s.url && isValidHttpUrl(s.url)) {
+          next[s.n] = "ok";
+          continue;
+        }
+        if (s.n === 3 && server3DeriveState === "loading") {
+          next[s.n] = "pending";
+          continue;
+        }
+        next[s.n] = "down";
       }
       return next;
     });
-  }, [serverOptions]);
+  }, [serverOptions, server3DeriveState]);
 
   const handleVideoDoubleClick = useCallback(() => {
     const video = videoRef.current;
@@ -4348,6 +4568,10 @@ export default function WatchPage() {
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
           allowSamePathServVariants: selectedServer === 3 || selectedServer === 4,
           livehdServPreference: isServer3Livehd ? "prefer0" : "all",
+          server5Mode: selectedServer === 5 ? "fast" : undefined,
+          server5LandingLimit: selectedServer === 5 ? SERVER5_FAST_LANDING_LIMIT : undefined,
+          server5ChannelKeyLimit: selectedServer === 5 ? SERVER5_FAST_CHANNEL_KEY_LIMIT : undefined,
+          server5AllowSitemap: selectedServer === 5 ? false : undefined,
           maxPlayerPages: isServer2Playerv2 ? 1 : FAST_PHASE_MAX_PLAYER_PAGES,
           maxDeepCandidates: isServer2Playerv2 ? 2 : FAST_PHASE_MAX_DEEP_CANDIDATES,
           maxPlayerv2Pool: isServer2Playerv2 ? 1 : FAST_PHASE_MAX_PLAYERV2_POOL,
@@ -4401,6 +4625,10 @@ export default function WatchPage() {
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
           allowSamePathServVariants: selectedServer === 3 || selectedServer === 4,
           livehdServPreference: isServer3Livehd ? "prefer0" : "all",
+          server5Mode: selectedServer === 5 ? "final" : undefined,
+          server5LandingLimit: selectedServer === 5 ? SERVER5_FINAL_LANDING_LIMIT : undefined,
+          server5ChannelKeyLimit: selectedServer === 5 ? SERVER5_FINAL_CHANNEL_KEY_LIMIT : undefined,
+          server5AllowSitemap: selectedServer === 5 ? true : undefined,
           fetchTimeoutMs: resolveFetchTimeoutFinal,
           fetchRetries: resolveFetchRetries,
           fetchRetryDelayMs: resolveFetchRetryDelayMs,
@@ -4792,8 +5020,17 @@ export default function WatchPage() {
           const prev = networkFatalCountByCandidateRef.current.get(currentCandidateKey) || 0;
           const next = prev + 1;
           networkFatalCountByCandidateRef.current.set(currentCandidateKey, next);
-          const fastFailoverThreshold = selectedServer === 3 ? 1 : 2;
+          const fastFailoverThreshold = selectedServer === 3 ? 1 : selectedServer === 5 ? 3 : 2;
           if (useFastFailover && next >= fastFailoverThreshold) {
+            if (selectedServer === 5) {
+              const now = Date.now();
+              const lastFastFailoverAt = lastFastFailoverAtByServerRef.current[5] || 0;
+              if (now - lastFastFailoverAt < SERVER5_FAST_FAILOVER_COOLDOWN_MS) {
+                pushDiag("fast-failover server5 cooldown");
+                return;
+              }
+              lastFastFailoverAtByServerRef.current[5] = now;
+            }
             pushDiag(`fast-failover server${selectedServer} network=${next}`);
             markCandidateAsBad(selectedServer, selectedHlsUrl, "network-fast-failover");
             moveNext("network-fast-failover");
@@ -4921,9 +5158,12 @@ export default function WatchPage() {
         <div className="mb-3 flex flex-wrap gap-2">
           {serverOptions.map((s) => {
             const hasUrl = !!s.url && isValidHttpUrl(s.url);
-            const health: ServerHealthState = hasUrl ? serverHealth[s.n] ?? "ok" : "down";
+            const health: ServerHealthState = serverHealth[s.n] ?? (hasUrl ? "ok" : "down");
             const ok = hasUrl;
-            const subtitle = !ok || health === "down" ? "لا يوجد بث" : null;
+            const subtitle =
+              s.n === 3 && health === "pending"
+                ? "جاري التحضير"
+                : (!ok || health === "down" ? "لا يوجد بث" : null);
             return (
               <button
                 key={s.n}

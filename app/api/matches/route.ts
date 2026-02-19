@@ -39,6 +39,21 @@ function asNonEmptyString(raw: unknown) {
   return typeof raw === "string" ? raw.trim() : "";
 }
 
+function sanitizeMatchTimeForClient(raw: unknown) {
+  const value = asNonEmptyString(raw);
+  if (!value) return null as string | null;
+
+  const normalized = value
+    .replace(/â€”|â€“|â€"|â€|â€˜|â€™/g, "—")
+    .replace(/[‐‑‒–—―]+/g, "—")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return null;
+
+  if (/^[-—]+$/.test(normalized.replace(/\s+/g, ""))) return "—";
+  return normalized;
+}
+
 async function hydrateMissingLogos(rows: MatchApiRow[]) {
   if (!rows.length) return rows;
 
@@ -118,7 +133,11 @@ export async function GET(req: Request) {
   }
 
   const hydrated = await hydrateMissingLogos((data ?? []) as MatchApiRow[]);
-  const res = NextResponse.json(hydrated);
+  const normalized = hydrated.map((row) => ({
+    ...row,
+    match_time: sanitizeMatchTimeForClient(row.match_time),
+  }));
+  const res = NextResponse.json(normalized);
   res.headers.set("Cache-Control", "public, s-maxage=10, stale-while-revalidate=60");
   res.headers.set("Vary", "Accept-Encoding");
   return res;
