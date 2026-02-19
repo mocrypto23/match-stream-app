@@ -333,9 +333,25 @@ function isValidHttpUrl(value: string) {
   }
 }
 
+function isKnownServer5MonoCssManifestUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!raw || !isValidHttpUrl(raw)) return false;
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase();
+    const isDvalna = host === "dvalna.ru" || host.endsWith(".dvalna.ru");
+    if (!isDvalna) return false;
+    return /\/[a-z0-9/_-]+\/[a-z0-9_-]+\/mono\.css$/i.test(path);
+  } catch {
+    return false;
+  }
+}
+
 function isClearlyNonStreamUrl(value?: string | null) {
   const v = String(value || "").trim();
   if (!v || !isValidHttpUrl(v)) return true;
+  if (isKnownServer5MonoCssManifestUrl(v)) return false;
   try {
     const u = new URL(v);
     const host = u.hostname.toLowerCase();
@@ -352,6 +368,7 @@ function isClearlyNonStreamUrl(value?: string | null) {
 function isStrongPlayableStreamUrl(value?: string | null) {
   const v = String(value || "").trim();
   if (!v || !isValidHttpUrl(v)) return false;
+  if (isKnownServer5MonoCssManifestUrl(v)) return true;
   if (isClearlyNonStreamUrl(v)) return false;
   try {
     const u = new URL(v);
@@ -1377,6 +1394,214 @@ function isLikelyLivePhpEndpointUrl(value?: string | null) {
   }
 }
 
+function isLikelyServer5LookupLandingUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!isValidHttpUrl(raw)) return false;
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase();
+    const knownHost =
+      host === "zxxxeeplay.fun" ||
+      host.endsWith(".zxxxeeplay.fun") ||
+      host === "codepcplay.fun" ||
+      host.endsWith(".codepcplay.fun") ||
+      host === "playerai.site" ||
+      host.endsWith(".playerai.site");
+    if (!knownHost) return false;
+    return /\/(?:yalla|watch)\.php(?:[/?#]|$)/i.test(path);
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeServer5ChannelKey(raw: string) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  if (!/^[a-z0-9_-]{3,64}$/i.test(value)) return "";
+  return value;
+}
+
+function extractServer5ChannelKeyCandidates(sourceUrl: string, html: string) {
+  const out: string[] = [];
+  const push = (raw: string) => {
+    const v = sanitizeServer5ChannelKey(raw);
+    if (!v) return;
+    out.push(v);
+  };
+
+  const text = String(html || "");
+  const lookupVarName = text.match(/server_lookup\?channel_id='\s*\+\s*encodeURIComponent\(\s*([A-Za-z_$][\w$]*)\s*\)/i)?.[1] || "";
+  if (lookupVarName) {
+    const re = new RegExp(`(?:const|let|var)\\s+${escapeRegExp(lookupVarName)}\\s*=\\s*["']([^"']+)["']`, "i");
+    const m = text.match(re);
+    if (m?.[1]) push(m[1]);
+  }
+
+  for (const m of text.matchAll(/channelKey\s*:\s*['"]([^'"]+)['"]/gi)) push(m[1] || "");
+  for (const m of text.matchAll(/authToken\s*:\s*['"]([^'"]+)['"]/gi)) {
+    const tokenRaw = String(m[1] || "").trim();
+    if (!tokenRaw) continue;
+    const tokenParts = tokenRaw.split("|").map((x) => String(x || "").trim()).filter(Boolean);
+    if (tokenParts.length) push(tokenParts[0]);
+  }
+
+  try {
+    const source = new URL(sourceUrl);
+    const idRaw = String(source.searchParams.get("id") || "").trim();
+    if (idRaw) {
+      push(idRaw);
+      if (/^cn[a-z0-9_-]{3,64}$/i.test(idRaw)) push(idRaw.slice(2));
+    }
+  } catch { }
+
+  const ordered = Array.from(new Set(out.map((x) => x.trim()).filter(Boolean)));
+  return ordered.slice(0, 6);
+}
+
+function extractServer5LookupServerKey(rawLookupText: string) {
+  const text = String(rawLookupText || "").trim();
+  if (!text) return "";
+  try {
+    const parsed = JSON.parse(text) as { server_key?: unknown } | null;
+    const key = String(parsed?.server_key || "").trim();
+    if (/^[a-z0-9/_-]{2,40}$/i.test(key)) return key;
+  } catch { }
+  const regexMatch = text.match(/["']server_key["']\s*:\s*["']([a-z0-9/_-]{2,40})["']/i)?.[1] || "";
+  if (/^[a-z0-9/_-]{2,40}$/i.test(regexMatch)) return regexMatch;
+  return "";
+}
+
+function buildServer5DvalnaManifestUrls(serverKeyRaw: string, channelKeyRaw: string) {
+  const serverKey = String(serverKeyRaw || "").trim().toLowerCase();
+  const channelKey = sanitizeServer5ChannelKey(channelKeyRaw);
+  if (!serverKey || !channelKey) return [] as string[];
+
+  if (serverKey === "top1/cdn") {
+    return [`https://top1.dvalna.ru/top1/cdn/${channelKey}/mono.css`];
+  }
+
+  if (!/^[a-z0-9_-]{2,24}(?:\/[a-z0-9_-]{2,24}){0,2}$/i.test(serverKey)) return [] as string[];
+  return [`https://${serverKey}new.dvalna.ru/${serverKey}/${channelKey}/mono.css`];
+}
+
+function normalizeTeamNameForMatchCompare(value?: string | null) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[\u064b-\u065f\u0670\u0610-\u061a]/g, "")
+    .replace(/[أإآ]/g, "ا")
+    .replace(/ى/g, "ي")
+    .replace(/ؤ/g, "و")
+    .replace(/ئ/g, "ي")
+    .replace(/ة/g, "ه")
+    .replace(/[^a-z0-9\u0600-\u06ff]+/g, "");
+}
+
+function buildStringBigrams(value: string) {
+  const input = String(value || "").trim();
+  if (!input) return new Set<string>();
+  if (input.length < 2) return new Set<string>([input]);
+  const out = new Set<string>();
+  for (let i = 0; i < input.length - 1; i += 1) out.add(input.slice(i, i + 2));
+  return out;
+}
+
+function looseStringSimilarity(a: string, b: string) {
+  const left = normalizeTeamNameForMatchCompare(a);
+  const right = normalizeTeamNameForMatchCompare(b);
+  if (!left || !right) return 0;
+  if (left === right) return 1;
+  if (left.includes(right) || right.includes(left)) return 0.92;
+
+  const aGram = buildStringBigrams(left);
+  const bGram = buildStringBigrams(right);
+  if (!aGram.size || !bGram.size) return 0;
+
+  let overlap = 0;
+  for (const token of aGram) {
+    if (bGram.has(token)) overlap += 1;
+  }
+  const denom = Math.max(aGram.size, bGram.size);
+  return denom > 0 ? overlap / denom : 0;
+}
+
+function isLikelyLivehdScheduleMatchPageUrl(value?: string | null) {
+  const raw = String(value || "").trim();
+  if (!isValidHttpUrl(raw)) return false;
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase();
+    if (!(host === "livehd77.pro" || host.endsWith(".livehd77.pro"))) return false;
+    if (path === "/" || /\/(?:matches-today|matches-yesterday|matches-tomorrow|liive)\/?$/i.test(path)) return false;
+    if (path.includes("/category/") || path.includes("/tag/") || path.includes("/author/")) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function pickServer3LivehdFallbackPageUrl(html: string, homeTeam?: string | null, awayTeam?: string | null) {
+  const page = String(html || "");
+  if (!page) return "";
+  const homeNorm = normalizeTeamNameForMatchCompare(homeTeam);
+  const awayNorm = normalizeTeamNameForMatchCompare(awayTeam);
+  if (!homeNorm && !awayNorm) return "";
+
+  try {
+    const doc = new DOMParser().parseFromString(page, "text/html");
+    const anchors = Array.from(
+      doc.querySelectorAll<HTMLAnchorElement>(
+        ".MatchITem a[href], .match-item a[href], .matchItem a[href], .live-match a[href], a[href*='livehd77.pro/']"
+      )
+    );
+    let bestUrl = "";
+    let bestScore = 0;
+
+    for (const anchor of anchors) {
+      const href = String(anchor.getAttribute("href") || "").trim();
+      if (!href) continue;
+      let absHref = "";
+      try {
+        absHref = new URL(href, "https://livehd77.pro/matches-today/").toString();
+      } catch {
+        absHref = "";
+      }
+      if (!absHref) continue;
+      try {
+        const maybeProxy = new URL(absHref);
+        if (/\/api\/embed-proxy$/i.test(maybeProxy.pathname)) {
+          const rawTarget = normalizeURIComponent(maybeProxy.searchParams.get("url") || "");
+          if (rawTarget && isValidHttpUrl(rawTarget)) absHref = rawTarget;
+        }
+      } catch { }
+      if (!isLikelyLivehdScheduleMatchPageUrl(absHref)) continue;
+
+      const hostText = normalizeTeamNameForMatchCompare(
+        anchor.querySelector(".host span, .team-home span, .home span, .home-team span")?.textContent || ""
+      );
+      const guestText = normalizeTeamNameForMatchCompare(
+        anchor.querySelector(".guest span, .team-away span, .away span, .away-team span")?.textContent || ""
+      );
+      const allText = normalizeTeamNameForMatchCompare(anchor.textContent || "");
+
+      const directScore = looseStringSimilarity(homeNorm, hostText) + looseStringSimilarity(awayNorm, guestText);
+      const swapScore = looseStringSimilarity(homeNorm, guestText) + looseStringSimilarity(awayNorm, hostText);
+      const textScore = looseStringSimilarity(homeNorm, allText) + looseStringSimilarity(awayNorm, allText);
+      const score = Math.max(directScore, swapScore, textScore * 0.9);
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestUrl = absHref;
+      }
+    }
+
+    return bestScore >= 0.7 ? bestUrl : "";
+  } catch {
+    return "";
+  }
+}
+
 function decodeBase64Literal(raw: string) {
   let value = String(raw || "").trim();
   if (!value) return "";
@@ -2319,6 +2544,49 @@ async function resolveCandidatesForServer(
     throw new Error("resolve-fetch-failed");
   };
 
+  const resolveServer5LookupCandidates = async (pageUrl: string, pageHtml: string) => {
+    if (!isLikelyServer5LookupLandingUrl(pageUrl) && !/server_lookup\?channel_id/i.test(String(pageHtml || ""))) {
+      return [] as string[];
+    }
+
+    const channelKeys = extractServer5ChannelKeyCandidates(pageUrl, pageHtml);
+    if (!channelKeys.length) return [] as string[];
+
+    const timeoutMs = Math.max(2400, Math.min(fetchTimeoutMs, 9000));
+    const out: string[] = [];
+    for (const channelKey of channelKeys.slice(0, 4)) {
+      if (signal.aborted) throw new DOMException("aborted", "AbortError");
+      const lookupUrl = `https://chevy.dvalna.ru/server_lookup?channel_id=${encodeURIComponent(channelKey)}`;
+      const probe = toEmbedProxyUrl(lookupUrl, pageUrl);
+      if (!probe) continue;
+      try {
+        const lookupRes = await fetchWithTimeout(
+          probe,
+          {
+            method: "GET",
+            cache: "no-store",
+            credentials: "same-origin",
+            headers: { "x-embed-proxy-probe": "1" },
+          },
+          timeoutMs,
+          signal
+        );
+        if (!lookupRes.ok) continue;
+        const lookupText = await lookupRes.text();
+        const serverKey = extractServer5LookupServerKey(lookupText);
+        if (!serverKey) continue;
+        const manifests = buildServer5DvalnaManifestUrls(serverKey, channelKey);
+        for (const manifest of manifests) {
+          const proxied = toEmbedProxyUrl(manifest, pageUrl);
+          if (proxied) out.push(proxied);
+        }
+      } catch (e: unknown) {
+        if (e instanceof Error && e.name === "AbortError") throw e;
+      }
+    }
+    return dedupeUrls(out);
+  };
+
   if (isStrongPlayableStreamUrl(sourceUrl) || isLikelyLivePhpEndpointUrl(sourceUrl)) {
     const one = toEmbedProxyUrl(sourceUrl, sourceUrl);
     if (one) emitBatch([one], "fast");
@@ -2335,6 +2603,11 @@ async function resolveCandidatesForServer(
   }
 
   if (!first.ct.includes("text/html") && !first.ct.includes("application/xhtml+xml")) {
+    const server5LookupFromNonHtml = await resolveServer5LookupCandidates(sourceUrl, "");
+    if (server5LookupFromNonHtml.length) {
+      emitBatch(server5LookupFromNonHtml, "fast");
+      return { candidates: normalizePlayableBatch(server5LookupFromNonHtml), provenanceByKey };
+    }
     return { candidates: [], provenanceByKey };
   }
 
@@ -2343,7 +2616,8 @@ async function resolveCandidatesForServer(
   const yallashootFallback = directAccessBlocked ? buildYallashootDirectHlsFallbackCandidates(sourceUrl) : [];
   const primaryList = extractPlayableCandidatesFromProxyHtml(html, sourceUrl);
   const rollingPrimary = extractRollingHlsCandidatesFromHtml(html, sourceUrl);
-  const fastPrimary = [...yallashootFallback, ...rollingPrimary, ...primaryList];
+  const server5LookupPrimary = await resolveServer5LookupCandidates(sourceUrl, html);
+  const fastPrimary = [...yallashootFallback, ...rollingPrimary, ...primaryList, ...server5LookupPrimary];
   emitBatch(fastPrimary, "fast");
   if (directAccessBlocked && yallashootFallback.length) {
     return { candidates: normalizePlayableBatch(fastPrimary), provenanceByKey };
@@ -2356,7 +2630,7 @@ async function resolveCandidatesForServer(
   // 3. Simultaneously fetch the HTML page (slow path).
   // If speculation hits, we get the stream in <1s. If it misses, we fall back to the HTML parse.
   if (isPlayerv2LikeUrl(sourceUrl) || PLAYERV2_CONFIG_RE.test(html)) {
-    let tokenized: string[] = [];
+    const tokenized: string[] = [];
 
     // SPECULATION: Try to guess the token path and fetch it parallel to parsing
     const speculativePath = guessPlayerv2TokenPath(sourceUrl);
@@ -2414,7 +2688,10 @@ async function resolveCandidatesForServer(
       }
     }
 
-    return { candidates: normalizePlayableBatch([...rollingPrimary, ...primaryList, ...tokenized]), provenanceByKey };
+    return {
+      candidates: normalizePlayableBatch([...rollingPrimary, ...primaryList, ...server5LookupPrimary, ...tokenized]),
+      provenanceByKey,
+    };
   }
 
   const isSameServerVariantPage = (value: string) => {
@@ -2606,14 +2883,15 @@ async function resolveCandidatesForServer(
       };
 
       const easybroadcastList = await resolveEasybroadcastEventCandidates(extractionBaseUrl);
+      const server5LookupList = await resolveServer5LookupCandidates(extractionBaseUrl, childHtml);
       const childList = extractPlayableCandidatesFromProxyHtml(childHtml, extractionBaseUrl);
       const childRolling = extractRollingHlsCandidatesFromHtml(childHtml, extractionBaseUrl);
       const nextPlayerPages = extractPlayerPageCandidatesFromProxyHtml(childHtml, extractionBaseUrl);
       return {
-        deep: [...easybroadcastList, ...childList],
+        deep: [...easybroadcastList, ...server5LookupList, ...childList],
         rolling: childRolling,
         playerv2: pageBaseUrl && isValidHttpUrl(pageBaseUrl) ? { pageUrl: pageBaseUrl, html: childHtml } : null,
-        playable: [...easybroadcastList, ...childRolling, ...childList],
+        playable: [...easybroadcastList, ...server5LookupList, ...childRolling, ...childList],
         nextPlayerPages,
         baseUrl: pageBaseUrl,
       };
@@ -2881,7 +3159,8 @@ export default function WatchPage() {
   }, [rawId]);
 
   const [match, setMatch] = useState<MatchRow | null>(null);
-  const [derivedServerVariants, setDerivedServerVariants] = useState<string[]>([]);
+  const [derivedServer3Url, setDerivedServer3Url] = useState<string | null>(null);
+  const [, setDerivedServerVariants] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [errMsg, setErrMsg] = useState<string | null>(null);
   const [hlsInstance, setHlsInstance] = useState<Hls | null>(null);
@@ -3161,6 +3440,71 @@ export default function WatchPage() {
     let cancel = false;
     const controller = new AbortController();
     (async () => {
+      const explicitServer3 = String(match?.stream_url_3 || "").trim();
+      if (explicitServer3 && isValidHttpUrl(explicitServer3)) {
+        setDerivedServer3Url(null);
+        return;
+      }
+
+      const home = String(match?.home_team || "").trim();
+      const away = String(match?.away_team || "").trim();
+      if (!home && !away) {
+        setDerivedServer3Url(null);
+        return;
+      }
+
+      const livehdScheduleUrl = "https://livehd77.pro/matches-today/";
+      const probeUrl = toEmbedProxyUrl(livehdScheduleUrl, livehdScheduleUrl);
+      if (!probeUrl) {
+        setDerivedServer3Url(null);
+        return;
+      }
+
+      try {
+        const res = await fetchWithTimeout(
+          probeUrl,
+          {
+            method: "GET",
+            cache: "no-store",
+            credentials: "same-origin",
+            headers: { "x-embed-proxy-probe": "1" },
+          },
+          CANDIDATE_PROBE_TIMEOUT_MS,
+          controller.signal
+        );
+        const ct = (res.headers.get("content-type") || "").toLowerCase();
+        if (!res.ok || (!ct.includes("text/html") && !ct.includes("application/xhtml+xml"))) {
+          if (!cancel) setDerivedServer3Url(null);
+          return;
+        }
+
+        const html = await res.text();
+        if (cancel) return;
+        const picked = pickServer3LivehdFallbackPageUrl(html, home, away);
+        if (picked && isValidHttpUrl(picked)) {
+          setDerivedServer3Url(picked);
+          pushDiag(`server3 derived livehd=${picked}`);
+        } else {
+          setDerivedServer3Url(null);
+          pushDiag("server3 derived livehd=none");
+        }
+      } catch (e: unknown) {
+        if (cancel) return;
+        if (e instanceof Error && e.name === "AbortError") return;
+        setDerivedServer3Url(null);
+        pushDiag(`server3 derive failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    })();
+    return () => {
+      cancel = true;
+      controller.abort();
+    };
+  }, [match?.stream_url_3, match?.home_team, match?.away_team, pushDiag]);
+
+  useEffect(() => {
+    let cancel = false;
+    const controller = new AbortController();
+    (async () => {
       const primary = String(match?.stream_url || "").trim();
       if (!primary || !isValidHttpUrl(primary)) {
         setDerivedServerVariants([]);
@@ -3212,10 +3556,17 @@ export default function WatchPage() {
 
   const serverOptions = useMemo<ServerOption[]>(() => {
     // Strict isolation: each server only uses its own dedicated URL
+    const server3Source = (() => {
+      const explicitServer3 = String(match?.stream_url_3 || "").trim();
+      if (explicitServer3 && isValidHttpUrl(explicitServer3)) return explicitServer3;
+      const derivedServer3 = String(derivedServer3Url || "").trim();
+      if (derivedServer3 && isValidHttpUrl(derivedServer3)) return derivedServer3;
+      return null;
+    })();
     const explicit: Array<string | null> = [
       match?.stream_url ?? null,
       match?.stream_url_2 ?? null,
-      match?.stream_url_3 ?? null,
+      server3Source,
       normalizeServer4SourceUrl(match?.stream_url_4 ?? null) || null,
       match?.stream_url_5 ?? null,
       match?.stream_url_6 ?? null,
@@ -3233,7 +3584,7 @@ export default function WatchPage() {
       out.push({ n, label, url, sticky });
     }
     return out;
-  }, [match]);
+  }, [match, derivedServer3Url]);
 
   const validServers = useMemo(() => serverOptions.filter((s) => s.url && isValidHttpUrl(s.url)), [serverOptions]);
   useEffect(() => {
@@ -3495,7 +3846,8 @@ export default function WatchPage() {
               pushDiag,
             });
           }
-          const allowRawFallback = selectedServer === 1 || selectedServer === 3 || selectedServer === 4 || isServer2Playerv2;
+          const allowRawFallback =
+            selectedServer === 1 || selectedServer === 3 || selectedServer === 4 || selectedServer === 5 || isServer2Playerv2;
           const mergedRawByPolicy =
             selectedServer === 3 && isServer3Livehd
               ? (() => {
@@ -3575,6 +3927,7 @@ export default function WatchPage() {
     scheduleResolveRecovery,
     resetRecoveryState,
     applyCandidatesPreservingSelection,
+    mergeServer3Provenance,
   ]);
 
   const selectedHlsUrl = candidates[selectedCandidate] || "";
@@ -3990,4 +4343,3 @@ export default function WatchPage() {
     </div>
   );
 }
-
