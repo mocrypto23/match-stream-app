@@ -143,6 +143,7 @@ const YALLALIVE = {
   siteHosts: ["anewssport.fun", "yallalive.sx"],
   playerHosts: ["zxxxeeplay.fun", "codepcplay.fun", "playerai.site"],
 };
+const YALLALIVE_TRUSTED_DOMAINS = ["zxxxeeplay.fun", "wikinew.dvalna.ru", "zekonew.dvalna.ru", "dvalna.ru"];
 const YALLALIVE_MATCH_SITEMAP_INDEX_URL = "https://anewssport.fun/wp-sitemap.xml";
 const YALLALIVE_MATCH_SITEMAP_PAGE_LIMIT = intEnv("YALLALIVE_MATCH_SITEMAP_PAGE_LIMIT", 3, 1, 10);
 const YALLALIVE_MATCH_SITEMAP_LINK_LIMIT = intEnv("YALLALIVE_MATCH_SITEMAP_LINK_LIMIT", 48, 6, 200);
@@ -435,6 +436,10 @@ async function resolveFinalUrlViaBrowser(context, startUrl, { timeoutMs = 20000 
 function isJunkCandidateUrl(url) {
   if (!url) return true;
   const u = String(url).toLowerCase();
+
+  // FIX: Allow mono.css from dvalna.ru
+  if (u.includes("dvalna.ru") && u.endsWith("mono.css")) return false;
+
   return (
     /\.(css|js|png|jpg|jpeg|gif|svg|webp|avif|woff|woff2|ttf|eot|ico|json|map|m3u8|ts|m4s|mp4|mpd|webm)(\?.*)?$/.test(u) ||
     u.includes("cloudflareinsights.com") ||
@@ -459,6 +464,10 @@ function isAdHost(url) {
 function isAdultUrl(url) {
   if (!url) return false;
   const s = String(url).toLowerCase();
+
+  // FIX: Bypass for trusted domains (Server 5)
+  if (YALLALIVE_TRUSTED_DOMAINS.some(d => s.includes(d))) return false;
+
   return ADULT_HINTS.some((hint) => s.includes(hint));
 }
 
@@ -1456,34 +1465,34 @@ async function scrapeOneDay(page, dayKey, url) {
         .replace(/[٠-٩]/g, (ch) => "٠١٢٣٤٥٦٧٨٩".indexOf(ch))
         .replace(/[۰-۹]/g, (ch) => "۰۱۲۳۴۵۶۷۸۹".indexOf(ch));
       const m1 = scoreText.match(/(\d{1,2})\s*[-:]\s*(\d{1,2})/);
-        if (m1) {
-          const a = strictParseGoal(m1[1]);
-          const b = strictParseGoal(m1[2]);
-          if (a !== null && b !== null) return { home: String(a), away: String(b), hasAny: true };
-        }
+      if (m1) {
+        const a = strictParseGoal(m1[1]);
+        const b = strictParseGoal(m1[2]);
+        if (a !== null && b !== null) return { home: String(a), away: String(b), hasAny: true };
+      }
 
-        const sideA = strictParseGoal(
-          pickText(match, [".score-1", ".score1", ".host_goals", ".home_score", "[class*='score-1']"])
-        );
-        const sideB = strictParseGoal(
-          pickText(match, [".score-2", ".score2", ".guest_goals", ".away_score", "[class*='score-2']"])
-        );
-        if (sideA !== null && sideB !== null) {
-          return { home: String(sideA), away: String(sideB), hasAny: true };
-        }
+      const sideA = strictParseGoal(
+        pickText(match, [".score-1", ".score1", ".host_goals", ".home_score", "[class*='score-1']"])
+      );
+      const sideB = strictParseGoal(
+        pickText(match, [".score-2", ".score2", ".guest_goals", ".away_score", "[class*='score-2']"])
+      );
+      if (sideA !== null && sideB !== null) {
+        return { home: String(sideA), away: String(sideB), hasAny: true };
+      }
 
-        const resultText = String(pickText(match, [".MT_Result", ".ay_abe0d7ce", ".result", ".match-result"]))
-          .replace(/[٠-٩]/g, (ch) => "٠١٢٣٤٥٦٧٨٩".indexOf(ch))
-          .replace(/[۰-۹]/g, (ch) => "۰۱۲۳۴۵۶۷۸۹".indexOf(ch));
-        const m2 = resultText.match(/(\d{1,2})\s*[-:xX]\s*(\d{1,2})/);
-        if (m2) {
-          const a = strictParseGoal(m2[1]);
-          const b = strictParseGoal(m2[2]);
-          if (a !== null && b !== null) return { home: String(a), away: String(b), hasAny: true };
-        }
+      const resultText = String(pickText(match, [".MT_Result", ".ay_abe0d7ce", ".result", ".match-result"]))
+        .replace(/[٠-٩]/g, (ch) => "٠١٢٣٤٥٦٧٨٩".indexOf(ch))
+        .replace(/[۰-۹]/g, (ch) => "۰۱۲۳۴۵۶۷۸۹".indexOf(ch));
+      const m2 = resultText.match(/(\d{1,2})\s*[-:xX]\s*(\d{1,2})/);
+      if (m2) {
+        const a = strictParseGoal(m2[1]);
+        const b = strictParseGoal(m2[2]);
+        if (a !== null && b !== null) return { home: String(a), away: String(b), hasAny: true };
+      }
 
-        return { home: null, away: null, hasAny: false };
-      };
+      return { home: null, away: null, hasAny: false };
+    };
 
     const cleanText = (value) => String(value || "").replace(/\s+/g, " ").trim();
 
@@ -4361,6 +4370,8 @@ function isServer5PlayerLikeUrl(url) {
   if (looksLikePlayerUrl(s)) return true;
   if (/\/yalla\.php(?:\?|$)/i.test(s)) return true;
   if (/\/watch\//i.test(s)) return true;
+  // FIX: Allow dvalna.ru mono.css
+  if (s.includes("dvalna.ru") && s.endsWith("mono.css")) return true;
   return false;
 }
 
@@ -4400,6 +4411,8 @@ function scoreServer5YallaliveCandidate(url) {
   if (/\/albaplayer\/|\/alba\.php/i.test(s)) score += 900;
   if (YALLALIVE.playerHosts.some((host) => s.includes(host))) score += 220;
   if (s.includes("cnpremium")) score += 40;
+  // Boost score for our fixed dvalna CSS links to ensure they are picked
+  if (s.includes("dvalna.ru") && s.endsWith("mono.css")) score += 3000;
   if (s.includes("/matches/")) score -= 900;
   if (s.includes("/feed") || s.includes("/category/") || s.includes("/tag/") || s.includes("/author/")) score -= 500;
 
