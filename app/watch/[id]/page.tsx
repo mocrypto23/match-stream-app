@@ -41,8 +41,8 @@ const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const RESOLVE_COOLDOWN_MS = 1500;
 const CANDIDATE_PROBE_TIMEOUT_MS = 6500;
 const FAST_PHASE_PROBE_TIMEOUT_MS = 2200;
-const FAST_PHASE_MAX_PLAYER_PAGES = 2;
-const FAST_PHASE_MAX_DEEP_CANDIDATES = 4;
+const FAST_PHASE_MAX_PLAYER_PAGES = 5;
+const FAST_PHASE_MAX_DEEP_CANDIDATES = 6;
 const FAST_PHASE_MAX_PLAYERV2_POOL = 2;
 const RESOLVE_CHILD_CONCURRENCY = 3;
 const EXPAND_VARIANTS_CONCURRENCY = 4;
@@ -52,9 +52,9 @@ const SERVER1_FETCH_TIMEOUT_FINAL_MS = 16000;
 const SERVER1_PROBE_TIMEOUT_MS = 12000;
 const SERVER1_FETCH_RETRIES = 1;
 const SERVER1_FETCH_RETRY_DELAY_MS = 250;
-const LIVEHD77_FETCH_TIMEOUT_FAST_MS = 7000;
-const LIVEHD77_FETCH_TIMEOUT_FINAL_MS = 18000;
-const LIVEHD77_PROBE_TIMEOUT_MS = 14000;
+const LIVEHD77_FETCH_TIMEOUT_FAST_MS = 4500; // Balanced: Fast enough for good net, allows some lag
+const LIVEHD77_FETCH_TIMEOUT_FINAL_MS = 25000; // Increased for max reliability on slow net
+const LIVEHD77_PROBE_TIMEOUT_MS = 15000; // Deep scraping needs time
 const LIVEHD77_FETCH_RETRIES = 2;
 const LIVEHD77_FETCH_RETRY_DELAY_MS = 220;
 const SERVER4_FETCH_TIMEOUT_FAST_MS = 6500;
@@ -826,6 +826,19 @@ function expandLivehdTvServVariants(value: string) {
     return dedupeUrls(out);
   } catch {
     return [] as string[];
+  }
+}
+
+function guessPlayerv2TokenPath(url: string) {
+  try {
+    const u = new URL(url);
+    const id = u.searchParams.get("id");
+    if (id && /^[a-z0-9_-]+$/i.test(id)) return `${id}.m3u8`;
+    const ch = u.searchParams.get("ch");
+    if (ch && /^[a-z0-9_-]+$/i.test(ch)) return `${ch}.m3u8`;
+    return "";
+  } catch {
+    return "";
   }
 }
 
@@ -2300,21 +2313,70 @@ async function resolveCandidatesForServer(
   }
 
   // For playerv2 sources we keep resolution lightweight to avoid upstream anti-bot/rate-limit bans.
-  // One page fetch + tokenized candidate build is enough; deep crawling creates noisy duplicate calls.
+  // We employ a "Speculative Race" strategy:
+  // 1. Guess the token path from the URL params (e.g. ?id=ch1 -> ch1.m3u8).
+  // 2. Fire off a token request IMMEDIATELY (speculation).
+  // 3. Simultaneously fetch the HTML page (slow path).
+  // If speculation hits, we get the stream in <1s. If it misses, we fall back to the HTML parse.
   if (isPlayerv2LikeUrl(sourceUrl) || PLAYERV2_CONFIG_RE.test(html)) {
     let tokenized: string[] = [];
-    try {
-      tokenized = await extractPlayerv2TokenizedCandidatesFromHtml(
-        html,
-        sourceUrl,
-        signal,
-        opts?.playerv2Diag
-      );
-    } catch (e: unknown) {
-      if (e instanceof Error && e.name === "AbortError") throw e;
-      tokenized = [];
+
+    // SPECULATION: Try to guess the token path and fetch it parallel to parsing
+    const speculativePath = guessPlayerv2TokenPath(sourceUrl);
+    if (speculativePath) {
+      opts?.playerv2Diag?.(`playerv2 speculating path: ${speculativePath}`);
+      try {
+        // We do this blindly without waiting for HTML. If it fails, no harm done.
+        const specToken = await requestPlayerv2TokenFromProxy(sourceUrl, speculativePath, signal, opts?.playerv2Diag);
+        if (specToken) {
+          const ts = String(Math.floor(Date.now() / 1000));
+          const nonces = buildPlayerv2NonceCandidates();
+          // Construct candidate immediately
+          // We assume standard live-hd domain structure or use the origin
+          const origin = new URL(sourceUrl).origin;
+          const variants = [speculativePath, speculativePath.replace(".m3u8", "")];
+          for (const v of variants) {
+            for (const nonce of nonces) {
+              const q = new URLSearchParams({ ts, nonce, token: specToken.token, sid: specToken.session_id });
+              // Try both relative to origin and relative to /hls/
+              const candidate1 = toEmbedProxyUrl(`${origin}/${v}?${q}`, sourceUrl);
+              if (candidate1) tokenized.push(candidate1);
+              const candidate2 = toEmbedProxyUrl(`${origin}/hls/${v}?${q}`, sourceUrl);
+              if (candidate2) tokenized.push(candidate2);
+            }
+          }
+          if (tokenized.length) {
+            opts?.playerv2Diag?.(`playerv2 speculation HIT +${tokenized.length}`);
+            // We can return early if we are confident, or let the HTML parse happen as backup.
+            // For speed, we emit immediately.
+            emitBatch(tokenized, "token");
+          }
+        }
+      } catch (e) {
+        opts?.playerv2Diag?.(`playerv2 speculation failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
-    if (tokenized.length) emitBatch(tokenized, "token");
+
+    // SLOW PATH: Parse HTML (Safety Net)
+    // Only run this if speculation didn't produce enough candidates, or run it anyway for robustness?
+    // Running it anyway ensures we don't miss obscure configurations.
+    if (tokenized.length < 1) {
+      try {
+        const fromHtml = await extractPlayerv2TokenizedCandidatesFromHtml(
+          html,
+          sourceUrl,
+          signal,
+          opts?.playerv2Diag
+        );
+        if (fromHtml.length) {
+          tokenized.push(...fromHtml);
+          emitBatch(fromHtml, "token");
+        }
+      } catch (e: unknown) {
+        if (e instanceof Error && e.name === "AbortError") throw e;
+      }
+    }
+
     return { candidates: normalizePlayableBatch([...rollingPrimary, ...primaryList, ...tokenized]), provenanceByKey };
   }
 
@@ -3434,16 +3496,16 @@ export default function WatchPage() {
         if (!cancel && !(e instanceof Error && e.name === "AbortError")) {
           if (!hadPlayable) {
             const rawErrorMessage = e instanceof Error ? e.message : "فشل استخراج المصادر.";
-            const isServer1Or3Or4 = selectedServer === 1 || selectedServer === 3 || selectedServer === 4;
             const isProbeTimeout = /probe-timeout/i.test(rawErrorMessage);
-            if (isServer1Or3Or4 && isProbeTimeout) {
+            // Always suppress probe timeouts for retry, regardless of server
+            if (isProbeTimeout) {
               pushDiag(`resolver probe-timeout server${selectedServer}`);
               setResolverError(null);
             } else {
               setResolverError(rawErrorMessage);
             }
             if (selectedServer !== 3 || isServer3Livehd) {
-              const immediate = isProbeTimeout && selectedServer === 1;
+              const immediate = isProbeTimeout; // Retry immediately heavily favored for timeouts
               scheduleResolveRecovery("resolver-error", immediate);
             } else {
               resetRecoveryState();
