@@ -1,4 +1,3 @@
-// app/page.tsx
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
@@ -176,9 +175,7 @@ export default function Home() {
   }, [day]);
 
   const sortedMatches = useMemo(() => {
-    const arr = [...matches];
-
-    const computedStatus = (m: MatchRow) => {
+    const getStatus = (m: MatchRow) => {
       if (day === "yesterday") return "finished" as const;
 
       const sk = normalizeStatusKey(m.status_key);
@@ -198,11 +195,17 @@ export default function Home() {
       return "upcoming" as const;
     };
 
+    let arr = [...matches];
+
+    if (day === "today") {
+      arr = arr.filter((m) => getStatus(m) !== "finished");
+    }
+
     const rank = (s: string) => (s === "live" ? 0 : s === "upcoming" ? 1 : 2);
 
     arr.sort((a, b) => {
-      const sa = computedStatus(a);
-      const sb = computedStatus(b);
+      const sa = getStatus(a);
+      const sb = getStatus(b);
       const ra = rank(sa);
       const rb = rank(sb);
       if (ra !== rb) return ra - rb;
