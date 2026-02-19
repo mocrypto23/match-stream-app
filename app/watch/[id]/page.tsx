@@ -23,7 +23,12 @@ type MatchRow = {
   status_key?: string | null;
 };
 
-type ServerOption = { n: number; label: string; url: string | null };
+type ServerOption = {
+  n: number;
+  label: string;
+  url: string | null;
+  sticky?: boolean;
+};
 type ServerHealthState = "ok" | "down";
 
 const SERVER_SOURCE_LABELS: Record<number, string> = {
@@ -401,6 +406,36 @@ function toUnderlyingUrl(value: string) {
   if (!v) return "";
   if (!v.startsWith("/api/embed-proxy?")) return v;
   return getProxyTargetUrl(v) || v;
+}
+
+function isSafeToCacheUrl(value?: string | null) {
+  const v = String(value || "").trim();
+  if (!v || !isValidHttpUrl(v)) return false;
+
+  // 1. Length Check: Huge URLs are often tokenized blobs
+  if (v.length > 450) return false;
+
+  // 2. Token Keyword Check: Common params for expiration/auth
+  const lower = v.toLowerCase();
+  if (
+    lower.includes("token=") ||
+    lower.includes("?st=") ||
+    lower.includes("&st=") ||
+    lower.includes("?e=") ||
+    lower.includes("&e=") ||
+    lower.includes("expires=") ||
+    lower.includes("signature=") ||
+    lower.includes("?t=") || // Often timestamp
+    lower.includes("&t=")
+  ) {
+    return false;
+  }
+
+  // 3. Pattern Check: Looks like a segmented session path?
+  // e.g. /session/12345/index.m3u8
+  if (/\/session\/|\/auth\//i.test(lower)) return false;
+
+  return true;
 }
 
 function isPlayerv2LikeUrl(value?: string | null) {
@@ -1408,6 +1443,8 @@ function extractBase64DecodedUrlsFromHtml(html: string, sourceUrl: string) {
 
   return Array.from(out);
 }
+
+
 
 function isLikelyLivehdMirrorIframePageUrl(value?: string | null) {
   const raw = toUnderlyingUrl(String(value || ""));
@@ -3190,7 +3227,10 @@ export default function WatchPage() {
       const raw = String(explicit[i] || "").trim();
       const url = raw && isValidHttpUrl(raw) ? raw : null;
       const label = SERVER_SOURCE_LABELS[n] || `سيرفر ${n}`;
-      out.push({ n, label, url });
+      // Smart Guard: Only allow sticky if config says so AND the URL looks safe (no tokens)
+      const stickyConfig = n === 2 || n === 4;
+      const sticky = stickyConfig && isSafeToCacheUrl(url);
+      out.push({ n, label, url, sticky });
     }
     return out;
   }, [match]);
