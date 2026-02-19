@@ -1,5 +1,6 @@
 ﻿import { NextResponse } from "next/server";
 
+import { createHash, createHmac } from "crypto";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -94,6 +95,9 @@ const STREAM_HOST_ALLOW_SUFFIXES = [
   "dynamicsafari.net",
   "lovecdn.ru",
   "pandalive.live",
+  "zxxxeeplay.fun",
+  "codepcplay.fun",
+  "playerai.site",
 ];
 
 const DEFAULT_DIRECT_HOST_SUFFIXES = [
@@ -263,9 +267,40 @@ function toAbsoluteUrl(raw: string, baseUrl: string) {
   }
 }
 
-function buildProxyUrl(absUrl: string, nextDepth: number, refUrl?: string | null) {
-  const refPart = refUrl ? `&ref=${encodeURIComponent(refUrl)}` : "";
-  return `/api/embed-proxy?url=${encodeURIComponent(absUrl)}&depth=${nextDepth}${refPart}`;
+const SERVER5_PROXY_PASS_QUERY_KEYS = [
+  "s5_ep_auth",
+  "s5_ep_ck",
+  "s5_ep_cs",
+  "s5_fp",
+  "s5_fp_sc",
+  "s5_fp_tz",
+  "s5_fp_lg",
+] as const;
+
+function pickServer5ProxyPassQueryParams(source?: URLSearchParams | null) {
+  const out = new URLSearchParams();
+  if (!source) return out;
+  for (const key of SERVER5_PROXY_PASS_QUERY_KEYS) {
+    const value = String(source.get(key) || "").trim();
+    if (!value) continue;
+    out.set(key, value);
+  }
+  return out;
+}
+
+function buildProxyUrl(absUrl: string, nextDepth: number, refUrl?: string | null, passQuery?: URLSearchParams | null) {
+  const q = new URLSearchParams();
+  q.set("url", absUrl);
+  q.set("depth", String(nextDepth));
+  if (refUrl) q.set("ref", refUrl);
+  if (passQuery) {
+    for (const key of SERVER5_PROXY_PASS_QUERY_KEYS) {
+      const value = String(passQuery.get(key) || "").trim();
+      if (!value) continue;
+      q.set(key, value);
+    }
+  }
+  return `/api/embed-proxy?${q.toString()}`;
 }
 
 function rewriteAttributeUrls(html: string, baseUrl: string, depth: number) {
@@ -456,7 +491,8 @@ function rewriteM3u8Manifest(
   manifest: string,
   baseUrl: string,
   depth: number,
-  referrerForChildren?: string | null
+  referrerForChildren?: string | null,
+  passQuery?: URLSearchParams | null
 ) {
   const nextDepth = Math.min(MAX_PROXY_DEPTH, depth + 1);
   const childReferrer = referrerForChildren || baseUrl;
@@ -496,7 +532,7 @@ function rewriteM3u8Manifest(
     const absolute = absoluteRaw ? inheritEasybroadcastAuth(absoluteRaw) : null;
     if (!absolute) return raw;
     if (isBlockedAbsoluteUrl(absolute)) return raw;
-    return buildProxyUrl(absolute, nextDepth, childReferrer);
+    return buildProxyUrl(absolute, nextDepth, childReferrer, passQuery);
   };
 
   const lines = String(manifest || "").split(/\r?\n/);
@@ -1992,9 +2028,115 @@ function parseSafeReferrer(value: string | null) {
   }
 }
 
+type DvalnaPowNonceCacheEntry = { expiresAt: number; nonce: number };
+const dvalnaPowNonceCache = new Map<string, DvalnaPowNonceCacheEntry>();
+
+function hmacSha256Hex(value: string, key: string) {
+  return createHmac("sha256", key).update(value).digest("hex");
+}
+
+function md5Hex(value: string) {
+  return createHash("md5").update(value).digest("hex");
+}
+
+function computeServer5FingerprintFromHeaders(incoming: Headers, query?: URLSearchParams | null) {
+  const direct = String(incoming.get("x-s5-fingerprint") || query?.get("s5_fp") || "")
+    .trim()
+    .toLowerCase();
+  if (/^[a-f0-9]{16}$/.test(direct)) return direct;
+
+  const ua = String(incoming.get("user-agent") || DEFAULT_USER_AGENT).trim() || DEFAULT_USER_AGENT;
+  const screenRaw = String(incoming.get("x-s5-screen") || query?.get("s5_fp_sc") || "").trim();
+  const timezoneRaw = String(incoming.get("x-s5-timezone") || query?.get("s5_fp_tz") || "").trim();
+  const languageRaw = String(incoming.get("x-s5-language") || query?.get("s5_fp_lg") || "").trim();
+
+  const screen = /^\d{1,5}x\d{1,5}$/i.test(screenRaw) ? screenRaw : "0x0";
+  const timezone = /^[a-z0-9_./+-]{1,80}$/i.test(timezoneRaw) ? timezoneRaw : "UTC";
+  const language = /^[a-z0-9-]{1,32}$/i.test(languageRaw) ? languageRaw : "en";
+
+  return createHash("sha256").update(`${ua}${screen}${timezone}${language}`).digest("hex").slice(0, 16);
+}
+
+function computeDvalnaPowNonce(channel: string, keyId: string, timestampSec: number, channelSalt: string) {
+  const now = Date.now();
+  const cacheKey = `${channel}|${keyId}|${timestampSec}|${channelSalt}`;
+  const cached = dvalnaPowNonceCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) return cached.nonce;
+  if (cached) dvalnaPowNonceCache.delete(cacheKey);
+
+  const seed = hmacSha256Hex(channel, channelSalt);
+  const threshold = 0x1000;
+  const maxIter = 100_000;
+  let nonce = maxIter - 1;
+
+  for (let i = 0; i < maxIter; i += 1) {
+    const digest = md5Hex(`${seed}${channel}${keyId}${timestampSec}${i}`);
+    const score = Number.parseInt(digest.slice(0, 4), 16);
+    if (score < threshold) {
+      nonce = i;
+      break;
+    }
+  }
+
+  dvalnaPowNonceCache.set(cacheKey, { expiresAt: now + 12_000, nonce });
+  if (dvalnaPowNonceCache.size > 400) {
+    for (const [key, value] of dvalnaPowNonceCache.entries()) {
+      if (value.expiresAt <= now) dvalnaPowNonceCache.delete(key);
+    }
+    while (dvalnaPowNonceCache.size > 300) {
+      const first = dvalnaPowNonceCache.keys().next().value as string | undefined;
+      if (!first) break;
+      dvalnaPowNonceCache.delete(first);
+    }
+  }
+
+  return nonce;
+}
+
+function applyServer5DvalnaAuthHeaders(out: Headers, incoming: Headers, target: URL, query?: URLSearchParams | null) {
+  const host = normalizeHost(target.hostname);
+  if (!(host === "dvalna.ru" || host.endsWith(".dvalna.ru"))) return;
+
+  const authToken = String(incoming.get("x-s5-auth-token") || query?.get("s5_ep_auth") || "").trim();
+  const channelKey = String(incoming.get("x-s5-channel-key") || query?.get("s5_ep_ck") || "").trim();
+  const channelSalt = String(incoming.get("x-s5-channel-salt") || query?.get("s5_ep_cs") || "").trim();
+  if (!authToken || !channelKey || !channelSalt) return;
+
+  const path = target.pathname.toLowerCase();
+  const fingerprint = computeServer5FingerprintFromHeaders(incoming, query);
+
+  const keyMatch = target.pathname.match(/\/key\/([^/]+)\/(\d+)/i);
+  if (keyMatch?.[1] && keyMatch?.[2]) {
+    const channelFromPath = String(keyMatch[1] || "").trim();
+    const keyId = String(keyMatch[2] || "").trim();
+    if (!channelFromPath || !keyId) return;
+
+    const ts = Math.floor(Date.now() / 1000);
+    const nonce = computeDvalnaPowNonce(channelFromPath, keyId, ts, channelSalt);
+    const keyPath = hmacSha256Hex(`${channelFromPath}|${keyId}|${ts}|${fingerprint}`, channelSalt).slice(0, 16);
+
+    out.set("authorization", `Bearer ${authToken}`);
+    out.set("x-key-timestamp", String(ts));
+    out.set("x-key-nonce", String(nonce));
+    out.set("x-key-path", keyPath);
+    out.set("x-fingerprint", fingerprint);
+    return;
+  }
+
+  if (path.includes(".m3u8") || path.includes(".ts") || path.includes("/redirect/")) {
+    out.set("authorization", `Bearer ${authToken}`);
+    out.set("x-channel-key", channelKey);
+    out.set("x-user-agent", incoming.get("user-agent") || DEFAULT_USER_AGENT);
+  }
+}
+
 function buildUpstreamRequestHeaders(req: Request, target: URL, referrerUrl?: string | null) {
   const out = new Headers();
   const incoming = new Headers(req.headers);
+  let query: URLSearchParams | null = null;
+  try {
+    query = new URL(req.url).searchParams;
+  } catch {}
   const fallbackReferrer = `${target.protocol}//${target.host}/`;
   const referer = referrerUrl || fallbackReferrer;
   let origin = `${target.protocol}//${target.host}`;
@@ -2023,6 +2165,8 @@ function buildUpstreamRequestHeaders(req: Request, target: URL, referrerUrl?: st
 
   const cookie = incoming.get("cookie");
   if (cookie) out.set("cookie", cookie);
+
+  applyServer5DvalnaAuthHeaders(out, incoming, target, query);
 
   return out;
 }
@@ -2157,6 +2301,7 @@ async function handleProxyRequest(req: Request) {
     const depth = parseDepth(requestUrl.searchParams.get("depth"));
     const safeReferrer = parseSafeReferrer(requestUrl.searchParams.get("ref"));
     const stableMode = requestUrl.searchParams.get("stable") === "1";
+    const server5PassQuery = pickServer5ProxyPassQueryParams(requestUrl.searchParams);
 
     if (!rawUrl) {
       return NextResponse.json({ error: "Missing query parameter: url" }, { status: 400 });
@@ -2268,7 +2413,8 @@ async function handleProxyRequest(req: Request) {
           depth,
           // Preserve original embed referrer for child segments; some upstreams
           // (e.g. server4 CDNs) enforce strict Referer checks on both manifest and segments.
-          safeReferrer || target.toString()
+          safeReferrer || target.toString(),
+          server5PassQuery
         );
         const headers = withProxyMetaHeaders(filterResponseHeaders(upstream.headers, { html: false }));
         headers.set("content-type", "application/vnd.apple.mpegurl; charset=utf-8");
