@@ -140,6 +140,8 @@ const STREAM_HOST_DIRECT_FROM_ENV = String(process.env.EMBED_PROXY_DIRECT_HOSTS 
 const STREAM_HOST_DIRECT_SUFFIXES = Array.from(
   new Set([...DEFAULT_DIRECT_HOST_SUFFIXES, ...STREAM_HOST_DIRECT_FROM_ENV])
 );
+const LIGHTWEIGHT_MODE = String(process.env.EMBED_PROXY_LIGHTWEIGHT_MODE || "1").trim() !== "0";
+const KEEP_KEY_PROXY = String(process.env.EMBED_PROXY_KEEP_KEY_PROXY || "1").trim() !== "0";
 
 const M3U8_CACHE_TTL_MS = Math.max(
   0,
@@ -471,6 +473,11 @@ function isLikelyM3u8(target: URL, contentType: string) {
   );
 }
 
+function isLikelyHlsKeyTarget(target: URL) {
+  const value = `${String(target.pathname || "").toLowerCase()}${String(target.search || "").toLowerCase()}`;
+  return /(?:^|\/)[^/]+\.key(?:$|[/?#])/.test(value) || /\/key\/[^/?#]+/i.test(value);
+}
+
 function isDvalnaHost(hostname: string) {
   const host = normalizeHost(hostname);
   return host === "dvalna.ru" || host.endsWith(".dvalna.ru");
@@ -605,12 +612,24 @@ function rewriteM3u8Manifest(
     }
   };
 
-  const toProxyUri = (raw: string) => {
+  const toAbsoluteUri = (raw: string) => {
     const absoluteRaw = toAbsoluteUrl(raw, baseUrl);
     const absolute = absoluteRaw ? inheritEasybroadcastAuth(absoluteRaw) : null;
     if (!absolute) return raw;
     if (isBlockedAbsoluteUrl(absolute)) return raw;
-    return buildProxyUrl(absolute, nextDepth, childReferrer, passQuery);
+    return absolute;
+  };
+
+  const toManifestUri = (raw: string, { keyUri = false }: { keyUri?: boolean } = {}) => {
+    const direct = toAbsoluteUri(raw);
+    if (!keyUri || !KEEP_KEY_PROXY) return direct;
+    try {
+      const parsed = new URL(direct);
+      if (!/^https?:$/i.test(parsed.protocol)) return direct;
+    } catch {
+      return direct;
+    }
+    return buildProxyUrl(direct, nextDepth, childReferrer, passQuery);
   };
 
   const lines = String(manifest || "").split(/\r?\n/);
@@ -650,11 +669,12 @@ function rewriteM3u8Manifest(
 
       // Handle tags like: #EXT-X-KEY:METHOD=AES-128,URI="key.key"
       if (line.includes("URI=")) {
+        const keyTag = /^#EXT-X-KEY(?::|$)/i.test(line);
         outLines.push(
           line.replace(/URI\s*=\s*(?:(["'])([^"']+)\1|([^,\s]+))/gi, (_full, quote: string, quotedUri: string, bareUri: string) => {
             const rawUri = String(quotedUri || bareUri || "").trim();
             if (!rawUri) return _full;
-            const rewritten = toProxyUri(rawUri);
+            const rewritten = toManifestUri(rawUri, { keyUri: keyTag });
             if (quote) return `URI=${quote}${rewritten}${quote}`;
             return `URI=${rewritten}`;
           })
@@ -674,7 +694,7 @@ function rewriteM3u8Manifest(
       continue;
     }
 
-    outLines.push(toProxyUri(line));
+    outLines.push(toManifestUri(line));
   }
 
   return outLines.join("\n");
@@ -2460,6 +2480,23 @@ async function handleProxyRequest(req: Request) {
       headers.set("x-embed-proxy-retries", String(fetchPolicy.retries));
       return headers;
     };
+
+    if (
+      LIGHTWEIGHT_MODE &&
+      fetchPolicy.name === "hls_segment_or_chunk" &&
+      !(KEEP_KEY_PROXY && isLikelyHlsKeyTarget(target))
+    ) {
+      const isProbeRequest = String(req.headers.get("x-embed-proxy-probe") || "").trim() === "1";
+      const headers = withProxyMetaHeaders(new Headers());
+      headers.set("cache-control", "no-store, no-cache, must-revalidate, max-age=0");
+      headers.set("pragma", "no-cache");
+      headers.set("x-embed-proxy-cache", "bypass");
+      if (isProbeRequest) {
+        return new Response(null, { status: 204, headers });
+      }
+      headers.set("location", target.toString());
+      return new Response(null, { status: 302, headers });
+    }
 
     const hasBody = method !== "GET" && method !== "HEAD";
     const body = hasBody ? await req.arrayBuffer() : undefined;
