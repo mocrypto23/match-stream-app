@@ -363,12 +363,12 @@ function rewriteAttributeUrls(html: string, baseUrl: string, depth: number) {
 
       // VAST/VMAP blocking
       if (
-        absolute.includes("vast.xml") || 
-        absolute.includes("vmap.xml") || 
+        absolute.includes("vast.xml") ||
+        absolute.includes("vmap.xml") ||
         absolute.includes("ad_tag") ||
         absolute.includes("ima3.js")
       ) {
-         return `${prefix}about:blank${suffix}`;
+        return `${prefix}about:blank${suffix}`;
       }
 
       let rewritten = absolute;
@@ -379,7 +379,7 @@ function rewriteAttributeUrls(html: string, baseUrl: string, depth: number) {
         if (!keepDirect && maybeProxy.pathname !== "/api/embed-proxy" && depth < MAX_PROXY_DEPTH) {
           rewritten = buildProxyUrl(absolute, nextDepth, baseUrl);
         }
-      } catch {}
+      } catch { }
 
       return `${prefix}${rewritten}${suffix}`;
     });
@@ -409,7 +409,7 @@ function rewriteSrcsetUrls(html: string, baseUrl: string, depth: number) {
           if (!shouldKeepDirectHost(host) && depth < MAX_PROXY_DEPTH) {
             finalUrl = buildProxyUrl(absolute, nextDepth, baseUrl);
           }
-        } catch {}
+        } catch { }
         return descriptor ? `${finalUrl} ${descriptor}` : finalUrl;
       })
       .filter(Boolean);
@@ -434,7 +434,7 @@ function rewriteCssUrls(css: string, baseUrl: string, depth: number) {
       if (!shouldKeepDirectHost(host) && depth < MAX_PROXY_DEPTH) {
         rewritten = buildProxyUrl(absolute, nextDepth, baseUrl);
       }
-    } catch {}
+    } catch { }
 
     return `url("${rewritten}")`;
   });
@@ -452,7 +452,7 @@ function rewriteCssUrls(css: string, baseUrl: string, depth: number) {
         if (!shouldKeepDirectHost(host) && depth < MAX_PROXY_DEPTH) {
           rewritten = buildProxyUrl(absolute, nextDepth, baseUrl);
         }
-      } catch {}
+      } catch { }
 
       return `@import url("${rewritten}")`;
     }
@@ -620,8 +620,11 @@ function rewriteM3u8Manifest(
     return absolute;
   };
 
-  const toManifestUri = (raw: string, { keyUri = false }: { keyUri?: boolean } = {}) => {
+  const toManifestUri = (raw: string, { keyUri = false, isSegment = false }: { keyUri?: boolean; isSegment?: boolean } = {}) => {
     const direct = toAbsoluteUri(raw);
+    if (!keyUri && isSegment) {
+      return direct;
+    }
     if (!keyUri || !KEEP_KEY_PROXY) return direct;
     try {
       const parsed = new URL(direct);
@@ -694,7 +697,7 @@ function rewriteM3u8Manifest(
       continue;
     }
 
-    outLines.push(toManifestUri(line));
+    outLines.push(toManifestUri(line, { isSegment: true }));
   }
 
   return outLines.join("\n");
@@ -872,6 +875,10 @@ function buildInjection(depth: number, currentTargetUrl: string, stableMode: boo
       if (abs.pathname === proxyPath && abs.origin === location.origin) return abs.toString();
       if (hostDirect(abs.hostname)) return abs.toString();
       if (isBlocked(abs.toString())) return null;
+
+      const isSegment = /\\.(?:ts|m4s|m4f|cmf|mp4|aac|ac3|ec3|mp3|vtt|webm)(?:[?#]|$)/i.test(abs.pathname + abs.search);
+      if (isSegment) return abs.toString();
+
       if (nextDepth > maxDepth) return abs.toString();
       return (
         proxyPath +
@@ -2115,7 +2122,7 @@ function sanitizeMalformedTargetUrl(rawValue: string, referrerUrl?: string | nul
   if (/^\//.test(out) && referrerUrl) {
     try {
       out = new URL(out, referrerUrl).toString();
-    } catch {}
+    } catch { }
   }
 
   return out;
@@ -2241,13 +2248,13 @@ function buildUpstreamRequestHeaders(req: Request, target: URL, referrerUrl?: st
   let query: URLSearchParams | null = null;
   try {
     query = new URL(req.url).searchParams;
-  } catch {}
+  } catch { }
   const fallbackReferrer = `${target.protocol}//${target.host}/`;
   const referer = referrerUrl || fallbackReferrer;
   let origin = `${target.protocol}//${target.host}`;
   try {
     origin = new URL(referer).origin;
-  } catch {}
+  } catch { }
 
   out.set("user-agent", incoming.get("user-agent") || DEFAULT_USER_AGENT);
   out.set("accept", incoming.get("accept") || "*/*");
@@ -2395,7 +2402,7 @@ async function fetchUpstreamWithRetry(params: {
         }
         try {
           await upstream.body?.cancel();
-        } catch {}
+        } catch { }
         await sleep(delayMs);
         continue;
       }
