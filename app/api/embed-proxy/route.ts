@@ -140,8 +140,6 @@ const STREAM_HOST_DIRECT_FROM_ENV = String(process.env.EMBED_PROXY_DIRECT_HOSTS 
 const STREAM_HOST_DIRECT_SUFFIXES = Array.from(
   new Set([...DEFAULT_DIRECT_HOST_SUFFIXES, ...STREAM_HOST_DIRECT_FROM_ENV])
 );
-const LIGHTWEIGHT_MODE = String(process.env.EMBED_PROXY_LIGHTWEIGHT_MODE || "1").trim() !== "0";
-const KEEP_KEY_PROXY = String(process.env.EMBED_PROXY_KEEP_KEY_PROXY || "1").trim() !== "0";
 
 const M3U8_CACHE_TTL_MS = Math.max(
   0,
@@ -363,12 +361,12 @@ function rewriteAttributeUrls(html: string, baseUrl: string, depth: number) {
 
       // VAST/VMAP blocking
       if (
-        absolute.includes("vast.xml") ||
-        absolute.includes("vmap.xml") ||
+        absolute.includes("vast.xml") || 
+        absolute.includes("vmap.xml") || 
         absolute.includes("ad_tag") ||
         absolute.includes("ima3.js")
       ) {
-        return `${prefix}about:blank${suffix}`;
+         return `${prefix}about:blank${suffix}`;
       }
 
       let rewritten = absolute;
@@ -379,7 +377,7 @@ function rewriteAttributeUrls(html: string, baseUrl: string, depth: number) {
         if (!keepDirect && maybeProxy.pathname !== "/api/embed-proxy" && depth < MAX_PROXY_DEPTH) {
           rewritten = buildProxyUrl(absolute, nextDepth, baseUrl);
         }
-      } catch { }
+      } catch {}
 
       return `${prefix}${rewritten}${suffix}`;
     });
@@ -409,7 +407,7 @@ function rewriteSrcsetUrls(html: string, baseUrl: string, depth: number) {
           if (!shouldKeepDirectHost(host) && depth < MAX_PROXY_DEPTH) {
             finalUrl = buildProxyUrl(absolute, nextDepth, baseUrl);
           }
-        } catch { }
+        } catch {}
         return descriptor ? `${finalUrl} ${descriptor}` : finalUrl;
       })
       .filter(Boolean);
@@ -434,7 +432,7 @@ function rewriteCssUrls(css: string, baseUrl: string, depth: number) {
       if (!shouldKeepDirectHost(host) && depth < MAX_PROXY_DEPTH) {
         rewritten = buildProxyUrl(absolute, nextDepth, baseUrl);
       }
-    } catch { }
+    } catch {}
 
     return `url("${rewritten}")`;
   });
@@ -452,7 +450,7 @@ function rewriteCssUrls(css: string, baseUrl: string, depth: number) {
         if (!shouldKeepDirectHost(host) && depth < MAX_PROXY_DEPTH) {
           rewritten = buildProxyUrl(absolute, nextDepth, baseUrl);
         }
-      } catch { }
+      } catch {}
 
       return `@import url("${rewritten}")`;
     }
@@ -471,11 +469,6 @@ function isLikelyM3u8(target: URL, contentType: string) {
     ct.includes("audio/mpegurl") ||
     ct.includes("audio/x-mpegurl")
   );
-}
-
-function isLikelyHlsKeyTarget(target: URL) {
-  const value = `${String(target.pathname || "").toLowerCase()}${String(target.search || "").toLowerCase()}`;
-  return /(?:^|\/)[^/]+\.key(?:$|[/?#])/.test(value) || /\/key\/[^/?#]+/i.test(value);
 }
 
 function isDvalnaHost(hostname: string) {
@@ -612,27 +605,12 @@ function rewriteM3u8Manifest(
     }
   };
 
-  const toAbsoluteUri = (raw: string) => {
+  const toProxyUri = (raw: string) => {
     const absoluteRaw = toAbsoluteUrl(raw, baseUrl);
     const absolute = absoluteRaw ? inheritEasybroadcastAuth(absoluteRaw) : null;
     if (!absolute) return raw;
     if (isBlockedAbsoluteUrl(absolute)) return raw;
-    return absolute;
-  };
-
-  const toManifestUri = (raw: string, { keyUri = false, isSegment = false }: { keyUri?: boolean; isSegment?: boolean } = {}) => {
-    const direct = toAbsoluteUri(raw);
-    if (!keyUri && isSegment) {
-      return direct;
-    }
-    if (!keyUri || !KEEP_KEY_PROXY) return direct;
-    try {
-      const parsed = new URL(direct);
-      if (!/^https?:$/i.test(parsed.protocol)) return direct;
-    } catch {
-      return direct;
-    }
-    return buildProxyUrl(direct, nextDepth, childReferrer, passQuery);
+    return buildProxyUrl(absolute, nextDepth, childReferrer, passQuery);
   };
 
   const lines = String(manifest || "").split(/\r?\n/);
@@ -672,12 +650,11 @@ function rewriteM3u8Manifest(
 
       // Handle tags like: #EXT-X-KEY:METHOD=AES-128,URI="key.key"
       if (line.includes("URI=")) {
-        const keyTag = /^#EXT-X-KEY(?::|$)/i.test(line);
         outLines.push(
           line.replace(/URI\s*=\s*(?:(["'])([^"']+)\1|([^,\s]+))/gi, (_full, quote: string, quotedUri: string, bareUri: string) => {
             const rawUri = String(quotedUri || bareUri || "").trim();
             if (!rawUri) return _full;
-            const rewritten = toManifestUri(rawUri, { keyUri: keyTag });
+            const rewritten = toProxyUri(rawUri);
             if (quote) return `URI=${quote}${rewritten}${quote}`;
             return `URI=${rewritten}`;
           })
@@ -697,7 +674,7 @@ function rewriteM3u8Manifest(
       continue;
     }
 
-    outLines.push(toManifestUri(line, { isSegment: true }));
+    outLines.push(toProxyUri(line));
   }
 
   return outLines.join("\n");
@@ -875,10 +852,6 @@ function buildInjection(depth: number, currentTargetUrl: string, stableMode: boo
       if (abs.pathname === proxyPath && abs.origin === location.origin) return abs.toString();
       if (hostDirect(abs.hostname)) return abs.toString();
       if (isBlocked(abs.toString())) return null;
-
-      const isSegment = /\\.(?:ts|m4s|m4f|cmf|mp4|aac|ac3|ec3|mp3|vtt|webm)(?:[?#]|$)/i.test(abs.pathname + abs.search);
-      if (isSegment) return abs.toString();
-
       if (nextDepth > maxDepth) return abs.toString();
       return (
         proxyPath +
@@ -2122,7 +2095,7 @@ function sanitizeMalformedTargetUrl(rawValue: string, referrerUrl?: string | nul
   if (/^\//.test(out) && referrerUrl) {
     try {
       out = new URL(out, referrerUrl).toString();
-    } catch { }
+    } catch {}
   }
 
   return out;
@@ -2248,13 +2221,13 @@ function buildUpstreamRequestHeaders(req: Request, target: URL, referrerUrl?: st
   let query: URLSearchParams | null = null;
   try {
     query = new URL(req.url).searchParams;
-  } catch { }
+  } catch {}
   const fallbackReferrer = `${target.protocol}//${target.host}/`;
   const referer = referrerUrl || fallbackReferrer;
   let origin = `${target.protocol}//${target.host}`;
   try {
     origin = new URL(referer).origin;
-  } catch { }
+  } catch {}
 
   out.set("user-agent", incoming.get("user-agent") || DEFAULT_USER_AGENT);
   out.set("accept", incoming.get("accept") || "*/*");
@@ -2402,7 +2375,7 @@ async function fetchUpstreamWithRetry(params: {
         }
         try {
           await upstream.body?.cancel();
-        } catch { }
+        } catch {}
         await sleep(delayMs);
         continue;
       }
@@ -2487,23 +2460,6 @@ async function handleProxyRequest(req: Request) {
       headers.set("x-embed-proxy-retries", String(fetchPolicy.retries));
       return headers;
     };
-
-    if (
-      LIGHTWEIGHT_MODE &&
-      fetchPolicy.name === "hls_segment_or_chunk" &&
-      !(KEEP_KEY_PROXY && isLikelyHlsKeyTarget(target))
-    ) {
-      const isProbeRequest = String(req.headers.get("x-embed-proxy-probe") || "").trim() === "1";
-      const headers = withProxyMetaHeaders(new Headers());
-      headers.set("cache-control", "no-store, no-cache, must-revalidate, max-age=0");
-      headers.set("pragma", "no-cache");
-      headers.set("x-embed-proxy-cache", "bypass");
-      if (isProbeRequest) {
-        return new Response(null, { status: 204, headers });
-      }
-      headers.set("location", target.toString());
-      return new Response(null, { status: 302, headers });
-    }
 
     const hasBody = method !== "GET" && method !== "HEAD";
     const body = hasBody ? await req.arrayBuffer() : undefined;

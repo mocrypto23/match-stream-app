@@ -97,7 +97,6 @@ const SERVER5_FAST_FAILOVER_COOLDOWN_MS = 4_000;
 const SERVER5_LOOKUP_SUCCESS_CACHE_TTL_MS = 5 * 60_000;
 const SERVER5_LOOKUP_MISS_CACHE_TTL_MS = 90_000;
 const NO_STREAM_SELECTED_SERVER_MESSAGE = "لا يوجد بث في هذا السيرفر لهذه المباراة";
-const STREAM_LIGHTWEIGHT_MODE = String(process.env.NEXT_PUBLIC_STREAM_LIGHTWEIGHT_MODE || "1").trim() !== "0";
 const HLS_CT = ["application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl"];
 const MEDIA_RE = /\.(?:m3u8|mp4|m4v|mov|webm|mpd|ts)(?:[?#]|$)/i;
 const SEGMENT_FILE_RE = /\.(?:ts|m4s|m4f|cmf|mp4|aac|ac3|ec3|mp3|vtt|webm|key)(?:[?#]|$)/i;
@@ -1850,49 +1849,6 @@ function buildServer5ProxyAuthHeadersFromCandidate(candidateUrl: string) {
     "x-s5-timezone": fp.tz,
     "x-s5-language": fp.lang,
   };
-}
-
-function hostMatchesSuffix(hostname: string, suffix: string) {
-  const host = String(hostname || "").trim().toLowerCase().replace(/\.$/, "");
-  const needle = String(suffix || "").trim().toLowerCase().replace(/^\./, "");
-  if (!host || !needle) return false;
-  return host === needle || host.endsWith(`.${needle}`);
-}
-
-function buildServer5DirectHeadersForRequestUrl(requestUrl: string, authHeaders: Record<string, string>) {
-  if (!STREAM_LIGHTWEIGHT_MODE) return {} as Record<string, string>;
-  if (!authHeaders || !Object.keys(authHeaders).length) return {} as Record<string, string>;
-  let hostname = "";
-  try {
-    hostname = new URL(String(requestUrl || ""), "http://localhost").hostname;
-  } catch {
-    return {} as Record<string, string>;
-  }
-  const directHeaderRules: Array<{ hostSuffix: string; build: () => Record<string, string> }> = [
-    {
-      hostSuffix: "dvalna.ru",
-      build: () => {
-        const authToken = String(authHeaders["x-s5-auth-token"] || "").trim();
-        const channelKey = String(authHeaders["x-s5-channel-key"] || "").trim();
-        if (!authToken || !channelKey) return {} as Record<string, string>;
-        return {
-          authorization: `Bearer ${authToken}`,
-          "x-channel-key": channelKey,
-          // Extensible hook for future direct-stream hosts with explicit header needs.
-          "x-user-agent":
-            typeof navigator !== "undefined" && navigator.userAgent
-              ? String(navigator.userAgent)
-              : "Mozilla/5.0",
-        };
-      },
-    },
-  ];
-
-  for (const rule of directHeaderRules) {
-    if (!hostMatchesSuffix(hostname, rule.hostSuffix)) continue;
-    return rule.build();
-  }
-  return {} as Record<string, string>;
 }
 
 function sanitizeServer5ChannelKey(raw: string) {
@@ -3829,11 +3785,6 @@ async function probeHlsCandidate(candidateUrl: string, opts?: ProbeHlsOptions) {
       return false;
     }
 
-    if (STREAM_LIGHTWEIGHT_MODE) {
-      pushDiag?.("probe lightweight manifest-only");
-      return true;
-    }
-
     const childLines = extractManifestMediaUris(manifestText, maxChildChecks);
     if (!childLines.length) return true;
 
@@ -4930,12 +4881,9 @@ export default function WatchPage() {
     };
     const applyServer5ProxyAuthToXhr = (xhr: XMLHttpRequest, requestUrl: string) => {
       if (!server5PlayerAuthHeaders || !Object.keys(server5PlayerAuthHeaders).length) return;
-      const raw = String(requestUrl || "").trim();
-      if (!raw) return;
-      const headerMap = raw.includes("/api/embed-proxy?")
-        ? server5PlayerAuthHeaders
-        : buildServer5DirectHeadersForRequestUrl(raw, server5PlayerAuthHeaders);
-      for (const [key, value] of Object.entries(headerMap)) {
+      const raw = String(requestUrl || "");
+      if (!raw.includes("/api/embed-proxy?")) return;
+      for (const [key, value] of Object.entries(server5PlayerAuthHeaders)) {
         if (!value) continue;
         try {
           xhr.setRequestHeader(key, value);
