@@ -476,6 +476,13 @@ function isDvalnaHost(hostname: string) {
   return host === "dvalna.ru" || host.endsWith(".dvalna.ru");
 }
 
+const SERVER5_AUTH_HOST_SUFFIXES = ["dvalna.ru", "soyspace.cyou", "coopnnn.fun", "keylocking.ru"] as const;
+
+function isServer5AuthHost(hostname: string) {
+  const host = normalizeHost(hostname);
+  return SERVER5_AUTH_HOST_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
+}
+
 function isServer5MonoCssLikeManifestUrl(target: URL) {
   const path = String(target.pathname || "").toLowerCase();
   if (!isDvalnaHost(target.hostname)) return false;
@@ -2181,8 +2188,8 @@ function computeDvalnaPowNonce(channel: string, keyId: string, timestampSec: num
   return nonce;
 }
 
-function applyServer5DvalnaAuthHeaders(out: Headers, incoming: Headers, target: URL, query?: URLSearchParams | null) {
-  if (!isDvalnaHost(target.hostname)) return;
+function applyServer5AuthHeaders(out: Headers, incoming: Headers, target: URL, query?: URLSearchParams | null) {
+  if (!isServer5AuthHost(target.hostname)) return;
 
   const authToken = String(incoming.get("x-s5-auth-token") || query?.get("s5_ep_auth") || "").trim();
   const channelKey = String(incoming.get("x-s5-channel-key") || query?.get("s5_ep_ck") || "").trim();
@@ -2211,6 +2218,13 @@ function applyServer5DvalnaAuthHeaders(out: Headers, incoming: Headers, target: 
   }
 
   if (path.includes(".m3u8") || path.includes(".ts") || path.includes("/redirect/")) {
+    out.set("authorization", `Bearer ${authToken}`);
+    out.set("x-channel-key", channelKey);
+    out.set("x-user-agent", incoming.get("user-agent") || DEFAULT_USER_AGENT);
+    return;
+  }
+
+  if (path.includes("/v/") || path.includes("/proxy/") || path.includes("/chunks/") || path.includes("/live/")) {
     out.set("authorization", `Bearer ${authToken}`);
     out.set("x-channel-key", channelKey);
     out.set("x-user-agent", incoming.get("user-agent") || DEFAULT_USER_AGENT);
@@ -2253,7 +2267,7 @@ function buildUpstreamRequestHeaders(req: Request, target: URL, referrerUrl?: st
   const cookie = incoming.get("cookie");
   if (cookie) out.set("cookie", cookie);
 
-  applyServer5DvalnaAuthHeaders(out, incoming, target, query);
+  applyServer5AuthHeaders(out, incoming, target, query);
 
   return out;
 }

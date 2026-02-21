@@ -167,6 +167,10 @@ const SERVER5_STACK_HOST_HINTS = [
   "soyspace.cyou",
   "coopnnn.fun",
 ] as const;
+const SERVER5_LOOKUP_ENDPOINT_FALLBACKS = [
+  "https://chevy.soyspace.cyou/server_lookup",
+  "https://chevy.dvalna.ru/server_lookup",
+] as const;
 const SERVER5_STARTUP_NO_FRAME_TIMEOUT_MS = 10_000;
 const SERVER5_STARTUP_NO_FRAME_RECHECK_MS = 2_400;
 
@@ -508,6 +512,20 @@ function isKnownServer5MonoCssManifestUrl(value?: string | null) {
   }
 }
 
+function isKnownServer5ProxyManifestUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!raw || !isValidHttpUrl(raw)) return false;
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase();
+    if (!isServer5StackHost(host)) return false;
+    return /\/proxy\/[a-z0-9/_-]+\/[a-z0-9_-]+\/mono\.(?:m3u8|css)$/i.test(path);
+  } catch {
+    return false;
+  }
+}
+
 function isServer5StackHost(hostname?: string | null) {
   const host = String(hostname || "").trim().toLowerCase();
   if (!host) return false;
@@ -531,13 +549,74 @@ function isServer5AuthReadyCandidate(value?: string | null) {
   const raw = String(value || "").trim();
   if (!raw || !raw.startsWith("/api/embed-proxy?")) return false;
   if (!isServer5StackCandidate(raw)) return false;
-  return !!extractServer5AuthContextFromProxyCandidate(raw);
+  if (extractServer5AuthContextFromProxyCandidate(raw)) return true;
+  return isKnownServer5ProxyManifestUrl(raw);
+}
+
+function getServer5CandidateIdentity(value?: string | null) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const target = raw.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(raw) || "" : toUnderlyingUrl(raw);
+  if (!target || !isValidHttpUrl(target)) return "";
+  try {
+    const u = new URL(target);
+    const host = u.hostname.toLowerCase();
+    if (!isServer5StackHost(host)) return "";
+    const path = u.pathname.toLowerCase();
+    const proxyMono = path.match(/\/proxy\/([a-z0-9/_-]+)\/([a-z0-9_-]+)\/mono\.(?:m3u8|css)$/i);
+    if (proxyMono) {
+      return `${host}|proxy|${String(proxyMono[1] || "").toLowerCase()}|${String(proxyMono[2] || "").toLowerCase()}`;
+    }
+    const legacyMono = path.match(/\/([a-z0-9/_-]+)\/([a-z0-9_-]+)\/mono\.css$/i);
+    if (legacyMono) {
+      return `${host}|legacy|${String(legacyMono[1] || "").toLowerCase()}|${String(legacyMono[2] || "").toLowerCase()}`;
+    }
+    return canonicalizeUrl(target) || target.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function scoreServer5CandidatePreference(value?: string | null) {
+  const raw = String(value || "").trim();
+  if (!raw) return 0;
+  const target = raw.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(raw) || "" : toUnderlyingUrl(raw);
+  if (!target || !isValidHttpUrl(target)) return 0;
+  try {
+    const u = new URL(target);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase();
+    let score = 0;
+    if (/\/mono\.m3u8(?:[?#]|$)/i.test(path)) score += 4;
+    else if (/\/mono\.css(?:[?#]|$)/i.test(path)) score += 2;
+    if (host === "soyspace.cyou" || host.endsWith(".soyspace.cyou")) score += 2;
+    if (host === "dvalna.ru" || host.endsWith(".dvalna.ru")) score += 1;
+    return score;
+  } catch {
+    return 0;
+  }
+}
+
+function collapseServer5EquivalentCandidates(values: string[]) {
+  const out = new Map<string, string>();
+  for (const value of dedupeUrls(values)) {
+    const id = getServer5CandidateIdentity(value) || (canonicalizeUrl(value) || value.toLowerCase());
+    const existing = out.get(id);
+    if (!existing) {
+      out.set(id, value);
+      continue;
+    }
+    if (scoreServer5CandidatePreference(value) > scoreServer5CandidatePreference(existing)) {
+      out.set(id, value);
+    }
+  }
+  return Array.from(out.values());
 }
 
 function isClearlyNonStreamUrl(value?: string | null) {
   const v = String(value || "").trim();
   if (!v || !isValidHttpUrl(v)) return true;
-  if (isKnownServer5MonoCssManifestUrl(v)) return false;
+  if (isKnownServer5MonoCssManifestUrl(v) || isKnownServer5ProxyManifestUrl(v)) return false;
   try {
     const u = new URL(v);
     const host = u.hostname.toLowerCase();
@@ -554,7 +633,7 @@ function isClearlyNonStreamUrl(value?: string | null) {
 function isStrongPlayableStreamUrl(value?: string | null) {
   const v = String(value || "").trim();
   if (!v || !isValidHttpUrl(v)) return false;
-  if (isKnownServer5MonoCssManifestUrl(v)) return true;
+  if (isKnownServer5MonoCssManifestUrl(v) || isKnownServer5ProxyManifestUrl(v)) return true;
   if (isClearlyNonStreamUrl(v)) return false;
   try {
     const u = new URL(v);
@@ -1587,9 +1666,10 @@ function isLikelyServer5LookupLandingUrl(value?: string | null) {
     const u = new URL(raw);
     const host = u.hostname.toLowerCase();
     const path = u.pathname.toLowerCase();
-    const landingPath = /\/(?:yalla|watch)\.php(?:[/?#]|$)/i.test(path);
-    if (!landingPath) return false;
-    if (!sanitizeServer5ChannelKey(String(u.searchParams.get("id") || ""))) return false;
+    const isYallaLike = /\/(?:yalla|watch)\.php(?:[/?#]|$)/i.test(path);
+    const isLivePhpLike = /\/(?:player\/)?live\d+\.php(?:[/?#]|$)/i.test(path);
+    if (!isYallaLike && !isLivePhpLike) return false;
+    if (isYallaLike && !sanitizeServer5ChannelKey(String(u.searchParams.get("id") || ""))) return false;
     const knownHost =
       host === "zxxxeeplay.fun" ||
       host.endsWith(".zxxxeeplay.fun") ||
@@ -1598,7 +1678,13 @@ function isLikelyServer5LookupLandingUrl(value?: string | null) {
       host === "anewssport.fun" ||
       host.endsWith(".anewssport.fun") ||
       host === "playerai.site" ||
-      host.endsWith(".playerai.site");
+      host.endsWith(".playerai.site") ||
+      host === "ksohls.ru" ||
+      host.endsWith(".ksohls.ru") ||
+      host === "s-high.fun" ||
+      host.endsWith(".s-high.fun") ||
+      host === "scoder.fun" ||
+      host.endsWith(".scoder.fun");
     if (knownHost) return true;
     if (!/^[a-z0-9.-]{4,253}$/i.test(host)) return false;
     if (NON_STREAM_HOST_HINTS.some((hint) => host.includes(hint))) return false;
@@ -1613,7 +1699,13 @@ function extractServer5LandingId(value?: string | null) {
   if (!isLikelyServer5LookupLandingUrl(raw)) return "";
   try {
     const u = new URL(raw);
-    return sanitizeServer5ChannelKey(String(u.searchParams.get("id") || ""));
+    const fromId = sanitizeServer5ChannelKey(String(u.searchParams.get("id") || ""));
+    if (fromId) return fromId;
+    const fromStream = sanitizeServer5ChannelKey(String(u.searchParams.get("stream") || ""));
+    if (fromStream) return fromStream;
+    const fromPlay = sanitizeServer5ChannelKey(String(u.searchParams.get("play") || ""));
+    if (fromPlay) return fromPlay;
+    return "";
   } catch {
     return "";
   }
@@ -1733,7 +1825,9 @@ function extractServer5LandingUrlsFromHtml(html: string, baseUrl: string) {
   try {
     const doc = new DOMParser().parseFromString(text, "text/html");
     const anchors = Array.from(
-      doc.querySelectorAll<HTMLAnchorElement>("a[href*='yalla.php?id='], a[href*='watch.php?id='], .MW-Servers a[href]")
+      doc.querySelectorAll<HTMLAnchorElement>(
+        "a[href*='yalla.php?id='], a[href*='watch.php?id='], a[href*='live'][href*='.php'], .MW-Servers a[href]"
+      )
     );
     for (const anchor of anchors) push(String(anchor.getAttribute("href") || ""));
   } catch { }
@@ -1741,6 +1835,8 @@ function extractServer5LandingUrlsFromHtml(html: string, baseUrl: string) {
   const normalized = text.replace(/\\\//g, "/").replace(/&amp;/gi, "&");
   for (const m of normalized.match(/https?:\/\/[^"'`\s<>()]+\/(?:yalla|watch)\.php\?[^"'`\s<>()]*/gi) || []) push(m);
   for (const m of normalized.match(/\/(?:yalla|watch)\.php\?[^"'`\s<>()]*/gi) || []) push(m);
+  for (const m of normalized.match(/https?:\/\/[^"'`\s<>()]+\/(?:player\/)?live\d+\.php(?:\?[^"'`\s<>()]*)?/gi) || []) push(m);
+  for (const m of normalized.match(/\/(?:player\/)?live\d+\.php(?:\?[^"'`\s<>()]*)?/gi) || []) push(m);
   return out.slice(0, SERVER5_LANDING_LIMIT);
 }
 
@@ -1993,6 +2089,38 @@ function extractServer5LookupEndpointUrlFromHtml(html: string, baseUrl: string) 
   if (normalizedRelative) return normalizedRelative;
 
   return "";
+}
+
+function buildServer5LookupEndpointCandidates(html: string, landingUrl: string) {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw: string) => {
+    const value = String(raw || "").trim();
+    if (!value) return;
+    let normalized = "";
+    try {
+      const endpoint = new URL(value, landingUrl);
+      endpoint.search = "";
+      endpoint.hash = "";
+      if (!/\/server_lookup(?:\.php)?$/i.test(endpoint.pathname)) return;
+      normalized = endpoint.toString();
+    } catch {
+      return;
+    }
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(normalized);
+  };
+
+  push(extractServer5LookupEndpointUrlFromHtml(html, landingUrl));
+  try {
+    const landing = new URL(landingUrl);
+    push(`${landing.origin}/server_lookup`);
+    push(`${landing.origin}/server_lookup.php`);
+  } catch { }
+  for (const endpoint of SERVER5_LOOKUP_ENDPOINT_FALLBACKS) push(endpoint);
+  return out.slice(0, 5);
 }
 
 function buildServer5ManifestUrls(serverKeyRaw: string, channelKeyRaw: string, lookupEndpointUrl?: string | null) {
@@ -3343,13 +3471,19 @@ async function resolveCandidatesForServer(
 
   const resolveServer5LookupCandidates = async (pageUrl: string, pageHtml: string) => {
     const isServer5Landing = isLikelyServer5LookupLandingUrl(pageUrl);
-    if (!isServer5Landing && !/server_lookup\?channel_id/i.test(String(pageHtml || ""))) {
+    if (
+      !isServer5Landing &&
+      !/server_lookup\?channel_id|\/(?:yalla|watch)\.php\?id=|\/(?:player\/)?live\d+\.php/i.test(String(pageHtml || ""))
+    ) {
       return [] as string[];
     }
 
     const landingUrls = isServer5Landing
       ? await resolveServer5SiblingLandingUrls(pageUrl, pageHtml)
-      : [pageUrl];
+      : (() => {
+          const fromHtml = extractServer5LandingUrlsFromHtml(pageHtml, pageUrl);
+          return fromHtml.length ? fromHtml : [pageUrl];
+        })();
     const timeoutMs =
       server5Mode === "fast"
         ? Math.max(1700, Math.min(fetchTimeoutMs, 4500))
@@ -3380,9 +3514,8 @@ async function resolveCandidatesForServer(
       }
 
       const landingAuthContext = extractServer5AuthContextFromHtml(landingHtml);
-      if (!landingAuthContext) continue;
       const landingId = extractServer5LandingId(landingUrl);
-      const lookupEndpointUrl = extractServer5LookupEndpointUrlFromHtml(landingHtml, landingUrl) || "https://chevy.dvalna.ru/server_lookup";
+      const lookupEndpointCandidates = buildServer5LookupEndpointCandidates(landingHtml, landingUrl);
       const explicitChannelKeys = extractServer5ChannelKeyCandidates(landingUrl, landingHtml)
         .map((value) => sanitizeServer5ChannelKey(value))
         .filter(Boolean);
@@ -3396,12 +3529,13 @@ async function resolveCandidatesForServer(
       })();
       const channelKeys = Array.from(
         new Set(
-          [landingAuthContext.channelKey || "", derivedChannelFromLandingId, ...explicitChannelKeys]
+          [landingAuthContext?.channelKey || "", derivedChannelFromLandingId, ...explicitChannelKeys]
             .map((value) => sanitizeServer5ChannelKey(value))
             .filter(Boolean)
         )
       )
         .filter((value) => {
+          if (!landingAuthContext) return true;
           const lower = value.toLowerCase();
           if (!lower.startsWith("cnpremium")) return true;
           return lower === landingAuthContext.channelKey.toLowerCase() || explicitChannelKeysSet.has(lower);
@@ -3410,76 +3544,83 @@ async function resolveCandidatesForServer(
       if (!channelKeys.length) continue;
       for (const channelKey of channelKeys) {
         if (signal.aborted) throw new DOMException("aborted", "AbortError");
-        const lookupCacheKey = buildServer5LookupCacheKey(landingId, channelKey, lookupEndpointUrl);
-        let serverKey = getServer5LookupCacheEntry(lookupCacheKey);
-        if (serverKey === undefined) {
-          const lookupUrl = `${lookupEndpointUrl}?channel_id=${encodeURIComponent(channelKey)}`;
-          const probe = toEmbedProxyUrl(lookupUrl, landingUrl);
-          if (!probe) continue;
-          let lookupPromise = server5LookupInFlight.get(lookupCacheKey);
-          if (!lookupPromise) {
-            lookupPromise = (async () => {
-              try {
-                const lookupRes = await fetchWithTimeout(
-                  probe,
-                  {
-                    method: "GET",
-                    cache: "no-store",
-                    credentials: "same-origin",
-                    headers: { "x-embed-proxy-probe": "1" },
-                  },
-                  timeoutMs
-                );
-                if (!lookupRes.ok) {
+        for (const lookupEndpointUrl of lookupEndpointCandidates) {
+          if (signal.aborted) throw new DOMException("aborted", "AbortError");
+          const lookupCacheKey = buildServer5LookupCacheKey(landingId, channelKey, lookupEndpointUrl);
+          let serverKey = getServer5LookupCacheEntry(lookupCacheKey);
+          if (serverKey === undefined) {
+            const lookupUrl = `${lookupEndpointUrl}?channel_id=${encodeURIComponent(channelKey)}`;
+            const probe = toEmbedProxyUrl(lookupUrl, landingUrl);
+            if (!probe) continue;
+            let lookupPromise = server5LookupInFlight.get(lookupCacheKey);
+            if (!lookupPromise) {
+              lookupPromise = (async () => {
+                try {
+                  const lookupRes = await fetchWithTimeout(
+                    probe,
+                    {
+                      method: "GET",
+                      cache: "no-store",
+                      credentials: "same-origin",
+                      headers: { "x-embed-proxy-probe": "1" },
+                    },
+                    timeoutMs
+                  );
+                  if (!lookupRes.ok) {
+                    setServer5LookupCacheEntry(lookupCacheKey, null, SERVER5_LOOKUP_MISS_CACHE_TTL_MS);
+                    return null;
+                  }
+                  const lookupText = await lookupRes.text();
+                  const extractedServerKey = extractServer5LookupServerKey(lookupText);
+                  if (!extractedServerKey) {
+                    setServer5LookupCacheEntry(lookupCacheKey, null, SERVER5_LOOKUP_MISS_CACHE_TTL_MS);
+                    return null;
+                  }
+                  setServer5LookupCacheEntry(lookupCacheKey, extractedServerKey, SERVER5_LOOKUP_SUCCESS_CACHE_TTL_MS);
+                  return extractedServerKey;
+                } catch {
                   setServer5LookupCacheEntry(lookupCacheKey, null, SERVER5_LOOKUP_MISS_CACHE_TTL_MS);
                   return null;
+                } finally {
+                  server5LookupInFlight.delete(lookupCacheKey);
                 }
-                const lookupText = await lookupRes.text();
-                const extractedServerKey = extractServer5LookupServerKey(lookupText);
-                if (!extractedServerKey) {
-                  setServer5LookupCacheEntry(lookupCacheKey, null, SERVER5_LOOKUP_MISS_CACHE_TTL_MS);
-                  return null;
-                }
-                setServer5LookupCacheEntry(lookupCacheKey, extractedServerKey, SERVER5_LOOKUP_SUCCESS_CACHE_TTL_MS);
-                return extractedServerKey;
-              } catch {
-                setServer5LookupCacheEntry(lookupCacheKey, null, SERVER5_LOOKUP_MISS_CACHE_TTL_MS);
-                return null;
-              } finally {
-                server5LookupInFlight.delete(lookupCacheKey);
-              }
-            })();
-            server5LookupInFlight.set(lookupCacheKey, lookupPromise);
+              })();
+              server5LookupInFlight.set(lookupCacheKey, lookupPromise);
+            }
+            if (!lookupPromise) continue;
+            serverKey = await lookupPromise;
           }
-          if (!lookupPromise) continue;
-          serverKey = await lookupPromise;
-        }
-        if (signal.aborted) throw new DOMException("aborted", "AbortError");
-        if (!serverKey) continue;
+          if (signal.aborted) throw new DOMException("aborted", "AbortError");
+          if (!serverKey) continue;
 
-        const manifests = buildServer5ManifestUrls(serverKey, channelKey, lookupEndpointUrl);
-        const authForChannel =
-          landingAuthContext.channelKey.toLowerCase() === channelKey.toLowerCase() ? landingAuthContext : null;
-        for (const manifest of manifests) {
-          if (!authForChannel) continue;
-          let finalManifest = manifest;
-          if (landingSlot) {
-            try {
-              const tagged = new URL(finalManifest);
-              tagged.searchParams.set("s5_slot", landingSlot);
-              finalManifest = tagged.toString();
-            } catch { }
-          }
-          let proxied = toEmbedProxyUrl(finalManifest, landingUrl);
-          if (!proxied) continue;
-          proxied = attachServer5AuthContextToProxyUrl(proxied, authForChannel);
-          out.push(proxied);
-          if (server5Mode === "fast") {
-            if (landingSlot === "2" || out.length >= 2) {
-              fastStop = true;
-              break;
+          const manifests = buildServer5ManifestUrls(serverKey, channelKey, lookupEndpointUrl);
+          const authForChannel =
+            landingAuthContext && landingAuthContext.channelKey.toLowerCase() === channelKey.toLowerCase()
+              ? landingAuthContext
+              : null;
+          for (const manifest of manifests) {
+            let finalManifest = manifest;
+            if (landingSlot) {
+              try {
+                const tagged = new URL(finalManifest);
+                tagged.searchParams.set("s5_slot", landingSlot);
+                finalManifest = tagged.toString();
+              } catch { }
+            }
+            let proxied = toEmbedProxyUrl(finalManifest, landingUrl);
+            if (!proxied) continue;
+            if (authForChannel) {
+              proxied = attachServer5AuthContextToProxyUrl(proxied, authForChannel);
+            }
+            out.push(proxied);
+            if (server5Mode === "fast") {
+              if (landingSlot === "2" || out.length >= 2) {
+                fastStop = true;
+                break;
+              }
             }
           }
+          if (server5Mode === "fast" && fastStop) break;
         }
         if (server5Mode === "fast" && fastStop) break;
       }
@@ -3897,7 +4038,7 @@ async function probeHlsCandidate(candidateUrl: string, opts?: ProbeHlsOptions) {
   const pushDiag = opts?.pushDiag;
   const signal = opts?.signal;
   const server5AuthHeaders = buildServer5ProxyAuthHeadersFromCandidate(candidateUrl);
-  const isServer5Candidate = Object.keys(server5AuthHeaders).length > 0;
+  const isServer5Candidate = isServer5StackCandidate(candidateUrl);
   const looksLikeServer5PlayableSegment = async (response: Response) => {
     if (!response.ok) return false;
     const contentType = (response.headers.get("content-type") || "").toLowerCase();
@@ -4956,6 +5097,7 @@ export default function WatchPage() {
                 concurrency: Math.min(3, PROBE_CONCURRENCY),
                 pushDiag,
               });
+              stage1Verified = collapseServer5EquivalentCandidates(stage1Verified);
               pushDiag(`server5 stage1 verified=${stage1Verified.length}/${stage1Checks}`);
               if (
                 stage1Verified.length &&
@@ -4979,8 +5121,9 @@ export default function WatchPage() {
               concurrency: Math.min(3, PROBE_CONCURRENCY),
               pushDiag,
             });
-            pushDiag(`server5 stage2 verified=${stage2Verified.length}/${maxChecks}`);
-            verified = dedupeUrls([...stage1Verified, ...stage2Verified]);
+            const collapsedStage2 = collapseServer5EquivalentCandidates(stage2Verified);
+            pushDiag(`server5 stage2 verified=${collapsedStage2.length}/${maxChecks}`);
+            verified = collapseServer5EquivalentCandidates([...stage1Verified, ...collapsedStage2]);
           } else {
             verified = await filterPlayableCandidates(mergedRaw, {
               signal: controller.signal,
