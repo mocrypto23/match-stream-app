@@ -51,6 +51,8 @@ const FAST_PHASE_MAX_DEEP_CANDIDATES = 6;
 const FAST_PHASE_MAX_PLAYERV2_POOL = 2;
 const SERVER5_STAGE1_MAX_CHECKS = 8;
 const SERVER5_STAGE1_TIMEOUT_MS = 3400;
+const SERVER5_FAST_STAGE0_MAX_CHECKS = 10;
+const SERVER5_FAST_STAGE0_TIMEOUT_MS = 2600;
 const RESOLVE_CHILD_CONCURRENCY = 3;
 const EXPAND_VARIANTS_CONCURRENCY = 4;
 const PROBE_CONCURRENCY = 4;
@@ -89,13 +91,22 @@ const SERVER5_HLS_MANIFEST_RETRIES = 8;
 const SERVER5_HLS_LEVEL_RETRIES = 8;
 const SERVER5_HLS_FRAG_RETRIES = 10;
 const SERVER3_DERIVE_CACHE_TTL_MS = 120_000;
-const SERVER5_FAST_LANDING_LIMIT = 3;
+const SERVER5_FAST_LANDING_LIMIT = 6;
 const SERVER5_FINAL_LANDING_LIMIT = 6;
-const SERVER5_FAST_CHANNEL_KEY_LIMIT = 2;
+const SERVER5_FAST_CHANNEL_KEY_LIMIT = 3;
 const SERVER5_FINAL_CHANNEL_KEY_LIMIT = 3;
+const SERVER5_FAST_LOOKUP_ENDPOINT_LIMIT = 2;
+const SERVER5_FINAL_LOOKUP_ENDPOINT_LIMIT = 3;
+const SERVER5_FAST_MIN_RESOLVED_CANDIDATES = 3;
 const SERVER5_FAST_FAILOVER_COOLDOWN_MS = 4_000;
 const SERVER5_LOOKUP_SUCCESS_CACHE_TTL_MS = 5 * 60_000;
 const SERVER5_LOOKUP_MISS_CACHE_TTL_MS = 90_000;
+const SERVER5_HTML_FETCH_CACHE_TTL_MS = 150_000;
+const SERVER5_HTML_FETCH_MISS_TTL_MS = 90_000;
+const SERVER5_HTML_FETCH_CACHE_MAX = 260;
+const SERVER5_PREWARM_CACHE_TTL_MS = 90_000;
+const SERVER5_REFRESH_RUNTIME_CACHE_TTL_MS = 90_000;
+const SERVER5_FINAL_ERROR_MIN_MS = 20_000;
 const NO_STREAM_SELECTED_SERVER_MESSAGE = "لا يوجد بث في هذا السيرفر لهذه المباراة";
 const HLS_CT = ["application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl"];
 const MEDIA_RE = /\.(?:m3u8|mp4|m4v|mov|webm|mpd|ts)(?:[?#]|$)/i;
@@ -171,8 +182,8 @@ const SERVER5_LOOKUP_ENDPOINT_FALLBACKS = [
   "https://chevy.soyspace.cyou/server_lookup",
   "https://chevy.dvalna.ru/server_lookup",
 ] as const;
-const SERVER5_STARTUP_NO_FRAME_TIMEOUT_MS = 10_000;
-const SERVER5_STARTUP_NO_FRAME_RECHECK_MS = 2_400;
+const SERVER5_STARTUP_NO_FRAME_TIMEOUT_MS = 5_500;
+const SERVER5_STARTUP_NO_FRAME_RECHECK_MS = 1_500;
 
 type Playerv2TokenPayload = { token: string; session_id: string };
 type AlbaRollingConfig = { ch: string; dm: string[]; iv: number };
@@ -205,6 +216,9 @@ type Server3DeriveCacheEntry = {
   state: Exclude<Server3DeriveState, "idle" | "loading">;
 };
 type Server5LookupCacheEntry = { expiresAt: number; serverKey: string | null };
+type Server5HtmlFetchCacheEntry = { expiresAt: number; ok: boolean; ct: string; html: string };
+type Server5PrewarmCacheEntry = { expiresAt: number; candidates: string[] };
+type Server5RuntimeRefreshCacheEntry = { expiresAt: number; url: string | null; status: "hit" | "miss" | "skip" };
 type Server5AuthContext = { authToken: string; channelKey: string; channelSalt: string };
 type CandidateGroup = { key: string; primaryIndex: number; members: number[]; label: string };
 
@@ -215,6 +229,9 @@ const server5SiblingDiscoveryCache = new Map<string, Server5SiblingDiscoveryCach
 const server3DeriveCache = new Map<string, Server3DeriveCacheEntry>();
 const server5LookupCache = new Map<string, Server5LookupCacheEntry>();
 const server5LookupInFlight = new Map<string, Promise<string | null>>();
+const server5HtmlFetchCache = new Map<string, Server5HtmlFetchCacheEntry>();
+const server5PrewarmCache = new Map<string, Server5PrewarmCacheEntry>();
+const server5RuntimeRefreshCache = new Map<string, Server5RuntimeRefreshCacheEntry>();
 
 function resolveResultCacheKey(sourceUrl: string) {
   return canonicalizeUrl(sourceUrl) || String(sourceUrl || "").trim().toLowerCase();
@@ -353,6 +370,127 @@ function buildServer5LookupCacheKey(landingId: string, channelKey: string, looku
     }
   }
   return `${endpointKey}|${landing || "none"}|${channel}`;
+}
+
+function trimServer5HtmlFetchCache(now = Date.now()) {
+  for (const [key, value] of server5HtmlFetchCache.entries()) {
+    if (value.expiresAt <= now) server5HtmlFetchCache.delete(key);
+  }
+  if (server5HtmlFetchCache.size <= SERVER5_HTML_FETCH_CACHE_MAX) return;
+  while (server5HtmlFetchCache.size > Math.max(120, SERVER5_HTML_FETCH_CACHE_MAX - 80)) {
+    const firstKey = server5HtmlFetchCache.keys().next().value as string | undefined;
+    if (!firstKey) break;
+    server5HtmlFetchCache.delete(firstKey);
+  }
+}
+
+function getServer5HtmlFetchCacheEntry(cacheKey: string) {
+  const key = String(cacheKey || "").trim().toLowerCase();
+  if (!key) return undefined as Server5HtmlFetchCacheEntry | undefined;
+  const now = Date.now();
+  const cached = server5HtmlFetchCache.get(key);
+  if (!cached || cached.expiresAt <= now) {
+    if (cached) server5HtmlFetchCache.delete(key);
+    return undefined;
+  }
+  return cached;
+}
+
+function setServer5HtmlFetchCacheEntry(cacheKey: string, value: { ok: boolean; ct: string; html: string }) {
+  const key = String(cacheKey || "").trim().toLowerCase();
+  if (!key) return;
+  const ttl = value.ok ? SERVER5_HTML_FETCH_CACHE_TTL_MS : SERVER5_HTML_FETCH_MISS_TTL_MS;
+  const now = Date.now();
+  server5HtmlFetchCache.set(key, {
+    expiresAt: now + ttl,
+    ok: !!value.ok,
+    ct: String(value.ct || ""),
+    html: String(value.html || ""),
+  });
+  trimServer5HtmlFetchCache(now);
+}
+
+function trimServer5PrewarmCache(now = Date.now()) {
+  for (const [key, value] of server5PrewarmCache.entries()) {
+    if (value.expiresAt <= now || !value.candidates.length) server5PrewarmCache.delete(key);
+  }
+  if (server5PrewarmCache.size <= 180) return;
+  while (server5PrewarmCache.size > 120) {
+    const firstKey = server5PrewarmCache.keys().next().value as string | undefined;
+    if (!firstKey) break;
+    server5PrewarmCache.delete(firstKey);
+  }
+}
+
+function getServer5PrewarmCandidates(sourceUrl: string) {
+  const key = canonicalizeUrl(sourceUrl) || String(sourceUrl || "").trim().toLowerCase();
+  if (!key) return [] as string[];
+  const now = Date.now();
+  const cached = server5PrewarmCache.get(key);
+  if (!cached || cached.expiresAt <= now || !cached.candidates.length) {
+    if (cached) server5PrewarmCache.delete(key);
+    return [] as string[];
+  }
+  return [...cached.candidates];
+}
+
+function setServer5PrewarmCandidates(sourceUrl: string, candidates: string[]) {
+  const key = canonicalizeUrl(sourceUrl) || String(sourceUrl || "").trim().toLowerCase();
+  if (!key) return;
+  const cleaned = prioritizeServer5Candidates(
+    dedupeUrls(candidates || []).filter((candidate) => isServer5AuthReadyCandidate(candidate))
+  ).slice(0, 16);
+  if (!cleaned.length) return;
+  const now = Date.now();
+  server5PrewarmCache.set(key, {
+    expiresAt: now + SERVER5_PREWARM_CACHE_TTL_MS,
+    candidates: cleaned,
+  });
+  trimServer5PrewarmCache(now);
+}
+
+function server5RuntimeRefreshCacheKey(matchId: number | null, sourceUrl?: string | null) {
+  const idPart = Number.isFinite(matchId || NaN) && (matchId || 0) > 0 ? String(matchId) : "0";
+  const urlPart = canonicalizeUrl(String(sourceUrl || "").trim()) || "";
+  return `${idPart}|${urlPart}`;
+}
+
+function trimServer5RuntimeRefreshCache(now = Date.now()) {
+  for (const [key, value] of server5RuntimeRefreshCache.entries()) {
+    if (value.expiresAt <= now) server5RuntimeRefreshCache.delete(key);
+  }
+  if (server5RuntimeRefreshCache.size <= 300) return;
+  while (server5RuntimeRefreshCache.size > 220) {
+    const firstKey = server5RuntimeRefreshCache.keys().next().value as string | undefined;
+    if (!firstKey) break;
+    server5RuntimeRefreshCache.delete(firstKey);
+  }
+}
+
+function getServer5RuntimeRefreshCached(matchId: number | null, sourceUrl?: string | null) {
+  const key = server5RuntimeRefreshCacheKey(matchId, sourceUrl);
+  const now = Date.now();
+  const cached = server5RuntimeRefreshCache.get(key);
+  if (!cached || cached.expiresAt <= now) {
+    if (cached) server5RuntimeRefreshCache.delete(key);
+    return null as Server5RuntimeRefreshCacheEntry | null;
+  }
+  return cached;
+}
+
+function setServer5RuntimeRefreshCached(
+  matchId: number | null,
+  sourceUrl: string | null | undefined,
+  value: { url: string | null; status: "hit" | "miss" | "skip" }
+) {
+  const key = server5RuntimeRefreshCacheKey(matchId, sourceUrl);
+  const now = Date.now();
+  server5RuntimeRefreshCache.set(key, {
+    expiresAt: now + SERVER5_REFRESH_RUNTIME_CACHE_TTL_MS,
+    url: value.url && isValidHttpUrl(value.url) ? value.url : null,
+    status: value.status,
+  });
+  trimServer5RuntimeRefreshCache(now);
 }
 
 function trimServer5SiblingDiscoveryCache(now = Date.now()) {
@@ -583,14 +721,32 @@ function scoreServer5CandidatePreference(value?: string | null) {
   const target = raw.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(raw) || "" : toUnderlyingUrl(raw);
   if (!target || !isValidHttpUrl(target)) return 0;
   try {
+    let slot = "";
+    if (raw.startsWith("/api/embed-proxy?")) {
+      try {
+        slot = String(new URL(raw, "http://localhost").searchParams.get("s5_slot") || "").trim();
+      } catch { }
+    }
     const u = new URL(target);
+    if (!slot) slot = String(u.searchParams.get("s5_slot") || "").trim();
     const host = u.hostname.toLowerCase();
     const path = u.pathname.toLowerCase();
     let score = 0;
+    if (slot === "2") score += 10;
+    else if (slot === "1") score += 7;
+    else if (slot === "3") score += 5;
+    else if (slot === "4") score += 4;
     if (/\/mono\.m3u8(?:[?#]|$)/i.test(path)) score += 4;
     else if (/\/mono\.css(?:[?#]|$)/i.test(path)) score += 2;
     if (host === "soyspace.cyou" || host.endsWith(".soyspace.cyou")) score += 2;
     if (host === "dvalna.ru" || host.endsWith(".dvalna.ru")) score += 1;
+    const auth = extractServer5AuthContextFromProxyCandidate(raw);
+    if (auth) {
+      score += 16;
+      if (auth.channelKey.toLowerCase().startsWith("yallalive")) score += 8;
+    } else if (raw.startsWith("/api/embed-proxy?")) {
+      score -= 5;
+    }
     return score;
   } catch {
     return 0;
@@ -611,6 +767,18 @@ function collapseServer5EquivalentCandidates(values: string[]) {
     }
   }
   return Array.from(out.values());
+}
+
+function prioritizeServer5Candidates(values: string[]) {
+  const collapsed = collapseServer5EquivalentCandidates(values);
+  return collapsed
+    .map((candidate, index) => ({
+      candidate,
+      index,
+      score: scoreServer5CandidatePreference(candidate),
+    }))
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .map((item) => item.candidate);
 }
 
 function isClearlyNonStreamUrl(value?: string | null) {
@@ -1853,6 +2021,55 @@ function extractAnewssportSnsLinksEndpointFromHtml(html: string, baseUrl: string
   }
 }
 
+function extractAnewssportEventTeamNamesFromHtml(html: string) {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw: string) => {
+    const text = String(raw || "")
+      .replace(/&nbsp;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (text.length < 2) return;
+    const key = normalizeTeamNameForMatchCompare(text);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(text);
+  };
+
+  const text = String(html || "");
+  try {
+    const doc = new DOMParser().parseFromString(text, "text/html");
+    const nodes = Array.from(doc.querySelectorAll(".EventTeamName"));
+    for (const node of nodes) push(node.textContent || "");
+  } catch {}
+
+  if (!out.length) {
+    for (const m of text.matchAll(/class=["'][^"']*EventTeamName[^"']*["'][^>]*>([^<]+)/gi)) {
+      push(String(m[1] || ""));
+      if (out.length >= 4) break;
+    }
+  }
+
+  return out.slice(0, 4);
+}
+
+function isServer5PageTeamsMatchSearchTerms(pageHtml: string, searchTerms: string[]) {
+  const terms = (searchTerms || [])
+    .map((value) => normalizeTeamNameForMatchCompare(value))
+    .filter((value) => value.length >= 2);
+  if (terms.length < 2) return false;
+
+  const pageTeams = extractAnewssportEventTeamNamesFromHtml(pageHtml)
+    .map((value) => normalizeTeamNameForMatchCompare(value))
+    .filter((value) => value.length >= 2);
+  if (pageTeams.length < 2) return false;
+
+  return terms.every((term) =>
+    pageTeams.some((team) => team === term || team.includes(term) || term.includes(team) || looseStringSimilarity(team, term) >= 0.66)
+  );
+}
+
 function extractServer5LandingUrlsFromSnsPayload(rawText: string, baseUrl: string) {
   const out: string[] = [];
   const duplicateCountByKey = new Map<string, number>();
@@ -2121,6 +2338,55 @@ function buildServer5LookupEndpointCandidates(html: string, landingUrl: string) 
   } catch { }
   for (const endpoint of SERVER5_LOOKUP_ENDPOINT_FALLBACKS) push(endpoint);
   return out.slice(0, 5);
+}
+
+function prioritizeServer5LookupEndpointCandidates(
+  endpoints: string[],
+  landingUrl: string,
+  mode: "fast" | "final"
+) {
+  const unique = dedupeUrls(endpoints);
+  if (!unique.length) return [] as string[];
+
+  let landingHost = "";
+  try {
+    landingHost = new URL(landingUrl).hostname.toLowerCase();
+  } catch {}
+
+  const ranked = unique
+    .map((url, index) => {
+      let host = "";
+      let score = index === 0 ? 80 : 0;
+      try {
+        host = new URL(url).hostname.toLowerCase();
+      } catch {}
+
+      if (host) {
+        if (isServer5StackHost(host)) score += 40;
+        if (host === "chevy.soyspace.cyou" || host.endsWith(".soyspace.cyou")) score += 60;
+        if (host === "chevy.dvalna.ru" || host.endsWith(".dvalna.ru")) score += mode === "fast" ? -10 : 5;
+        if (landingHost && host === landingHost) score += isServer5StackHost(host) ? 20 : -25;
+      }
+
+      return { url, host, score, index };
+    })
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+
+  const out: string[] = [];
+  const limit = mode === "fast" ? SERVER5_FAST_LOOKUP_ENDPOINT_LIMIT : SERVER5_FINAL_LOOKUP_ENDPOINT_LIMIT;
+  const firstOriginal = unique[0] || "";
+  for (const entry of ranked) {
+    if (mode === "fast") {
+      const isFirstOriginal = entry.url === firstOriginal;
+      const isStack = !!entry.host && isServer5StackHost(entry.host);
+      if (!isFirstOriginal && !isStack) continue;
+    }
+    out.push(entry.url);
+    if (out.length >= limit) break;
+  }
+
+  if (!out.length && firstOriginal) return [firstOriginal];
+  return out;
 }
 
 function buildServer5ManifestUrls(serverKeyRaw: string, channelKeyRaw: string, lookupEndpointUrl?: string | null) {
@@ -2546,6 +2812,13 @@ function scoreServer5Candidate(value: string) {
   if (!raw) return 0;
 
   let score = 0;
+  const auth = extractServer5AuthContextFromProxyCandidate(raw);
+  if (auth) {
+    score += 380;
+    if (auth.channelKey.toLowerCase().startsWith("yallalive")) score += 140;
+  } else if (raw.startsWith("/api/embed-proxy?")) {
+    score -= 120;
+  }
   try {
     const proxyUrl = new URL(raw, "http://localhost");
     const channelKey = sanitizeServer5ChannelKey(String(proxyUrl.searchParams.get("s5_ep_ck") || "")).toLowerCase();
@@ -3286,6 +3559,34 @@ async function resolveCandidatesForServer(
     throw new Error("resolve-fetch-failed");
   };
 
+  const fetchServer5HtmlPage = async (pageUrl: string, refUrl: string) => {
+    const cacheKey = canonicalizeUrl(pageUrl) || String(pageUrl || "").trim().toLowerCase();
+    if (!cacheKey) return null as { ok: boolean; ct: string; html: string } | null;
+    const cached = getServer5HtmlFetchCacheEntry(cacheKey);
+    if (cached) return { ok: cached.ok, ct: cached.ct, html: cached.html };
+
+    const probe = toEmbedProxyUrl(pageUrl, refUrl || pageUrl);
+    if (!probe) {
+      setServer5HtmlFetchCacheEntry(cacheKey, { ok: false, ct: "", html: "" });
+      return null;
+    }
+
+    try {
+      const pageRes = await fetchHtml(probe);
+      const isHtml = pageRes.ct.includes("text/html") || pageRes.ct.includes("application/xhtml+xml");
+      let html = "";
+      if (isHtml) html = await pageRes.res.text();
+      const hasUsefulSignals = /server_lookup\?channel_id|\/(?:yalla|watch)\.php\?id=|\/wp-json\/sns\/v1\/links/i.test(html);
+      const ok = isHtml && (!!html.trim() && (pageRes.res.ok || hasUsefulSignals));
+      setServer5HtmlFetchCacheEntry(cacheKey, { ok, ct: pageRes.ct, html });
+      return { ok, ct: pageRes.ct, html };
+    } catch (e: unknown) {
+      if (e instanceof Error && e.name === "AbortError") throw e;
+      setServer5HtmlFetchCacheEntry(cacheKey, { ok: false, ct: "", html: "" });
+      return null;
+    }
+  };
+
   const resolveServer5SiblingLandingUrls = async (landingUrl: string, landingHtml: string) => {
     const sourceId = extractServer5LandingId(landingUrl);
     if (!sourceId) return [landingUrl] as string[];
@@ -3340,12 +3641,10 @@ async function resolveCandidatesForServer(
     };
     const processMatchPage = async (pageUrl: string, requireSourceId: boolean) => {
       if (signal.aborted) throw new DOMException("aborted", "AbortError");
-      const pageProbe = toEmbedProxyUrl(pageUrl, pageUrl);
-      if (!pageProbe) return;
       try {
-        const pageRes = await fetchHtml(pageProbe);
-        if (!pageRes.ct.includes("text/html") && !pageRes.ct.includes("application/xhtml+xml")) return;
-        const pageHtml = await pageRes.res.text();
+        const pageRes = await fetchServer5HtmlPage(pageUrl, pageUrl);
+        if (!pageRes?.ok) return;
+        const pageHtml = pageRes.html;
         const fromPage = extractServer5LandingUrlsFromHtml(pageHtml, pageUrl);
 
         const snsEndpoint = extractAnewssportSnsLinksEndpointFromHtml(pageHtml, pageUrl);
@@ -3371,8 +3670,11 @@ async function resolveCandidatesForServer(
           if (!candidateId) return false;
           return candidateId.replace(/^cn/, "") === sourceIdNorm;
         });
-        opts?.playerv2Diag?.(`server5 page merged=${mergedPageUrls.length} source-hit=${hasSourceId ? 1 : 0}`);
-        if (requireSourceId && !hasSourceId) return;
+        const hasTeamHit = isServer5PageTeamsMatchSearchTerms(pageHtml, server5SearchTerms);
+        opts?.playerv2Diag?.(
+          `server5 page merged=${mergedPageUrls.length} source-hit=${hasSourceId ? 1 : 0} team-hit=${hasTeamHit ? 1 : 0}`
+        );
+        if (requireSourceId && !hasSourceId && !hasTeamHit) return;
 
         addBatch(mergedPageUrls);
       } catch (e: unknown) {
@@ -3401,7 +3703,8 @@ async function resolveCandidatesForServer(
     }
 
     if ((candidateMatchPages.size < maxMatchPageScan || out.length < Math.min(2, server5LandingLimit)) && server5SearchTerms.length) {
-      for (const searchTerm of server5SearchTerms) {
+      const teamSearchTerms = server5Mode === "fast" ? server5SearchTerms.slice(0, 1) : server5SearchTerms;
+      for (const searchTerm of teamSearchTerms) {
         if (signal.aborted) throw new DOMException("aborted", "AbortError");
         const searchByTeamUrl = `https://anewssport.fun/?s=${encodeURIComponent(searchTerm)}`;
         const searchByTeamProbe = toEmbedProxyUrl(searchByTeamUrl, searchByTeamUrl);
@@ -3411,7 +3714,7 @@ async function resolveCandidatesForServer(
           if (searchByTeamRes.ct.includes("text/html") || searchByTeamRes.ct.includes("application/xhtml+xml")) {
             const searchByTeamHtml = await searchByTeamRes.res.text();
             addMatchPages(extractAnewssportMatchPageUrlsFromHtml(searchByTeamHtml, searchByTeamUrl), false);
-            if (candidateMatchPages.size >= maxMatchPageScan) break;
+            if (candidateMatchPages.size >= maxMatchPageScan || (server5Mode === "fast" && candidateMatchPages.size >= 2)) break;
           }
         } catch (e: unknown) {
           if (e instanceof Error && e.name === "AbortError") throw e;
@@ -3455,10 +3758,14 @@ async function resolveCandidatesForServer(
     });
     const strictCount = orderedMatchPages.filter((entry) => entry.requireSourceId).length;
     opts?.playerv2Diag?.(`server5 siblings pages=${orderedMatchPages.length} strict=${strictCount}`);
-    for (const entry of orderedMatchPages.slice(0, maxMatchPageScan)) {
-      if (signal.aborted) throw new DOMException("aborted", "AbortError");
-      await processMatchPage(entry.url, entry.requireSourceId);
-      if (out.length >= server5LandingLimit) break;
+    const pagesToScan = orderedMatchPages.slice(0, maxMatchPageScan);
+    const scanConcurrency = server5Mode === "fast" ? Math.min(3, pagesToScan.length || 1) : Math.min(2, pagesToScan.length || 1);
+    if (pagesToScan.length) {
+      await mapWithConcurrency(pagesToScan, scanConcurrency, async (entry) => {
+        if (signal.aborted) throw new DOMException("aborted", "AbortError");
+        if (out.length >= server5LandingLimit) return;
+        await processMatchPage(entry.url, entry.requireSourceId);
+      });
     }
 
     const finalized = dedupeUrls(out).slice(0, server5LandingLimit);
@@ -3486,7 +3793,7 @@ async function resolveCandidatesForServer(
         })();
     const timeoutMs =
       server5Mode === "fast"
-        ? Math.max(1700, Math.min(fetchTimeoutMs, 4500))
+        ? Math.max(1400, Math.min(fetchTimeoutMs, 2600))
         : Math.max(2400, Math.min(fetchTimeoutMs, 9000));
     const out: string[] = [];
     let fastStop = false;
@@ -3500,22 +3807,22 @@ async function resolveCandidatesForServer(
         landingSlot = String(new URL(toUnderlyingUrl(landingUrl)).searchParams.get("s5_slot") || "").trim();
       } catch { }
       if (!landingHtml && isLikelyServer5LookupLandingUrl(landingUrl)) {
-        const landingProbe = toEmbedProxyUrl(landingUrl, landingUrl);
-        if (landingProbe) {
-          try {
-            const landingRes = await fetchHtml(landingProbe);
-            if (landingRes.ct.includes("text/html") || landingRes.ct.includes("application/xhtml+xml")) {
-              landingHtml = await landingRes.res.text();
-            }
-          } catch (e: unknown) {
-            if (e instanceof Error && e.name === "AbortError") throw e;
-          }
+        try {
+          const landingRes = await fetchServer5HtmlPage(landingUrl, landingUrl);
+          if (landingRes?.ok) landingHtml = landingRes.html;
+        } catch (e: unknown) {
+          if (e instanceof Error && e.name === "AbortError") throw e;
         }
       }
 
       const landingAuthContext = extractServer5AuthContextFromHtml(landingHtml);
       const landingId = extractServer5LandingId(landingUrl);
-      const lookupEndpointCandidates = buildServer5LookupEndpointCandidates(landingHtml, landingUrl);
+      const lookupEndpointCandidates = prioritizeServer5LookupEndpointCandidates(
+        buildServer5LookupEndpointCandidates(landingHtml, landingUrl),
+        landingUrl,
+        server5Mode
+      );
+      if (!lookupEndpointCandidates.length) continue;
       const explicitChannelKeys = extractServer5ChannelKeyCandidates(landingUrl, landingHtml)
         .map((value) => sanitizeServer5ChannelKey(value))
         .filter(Boolean);
@@ -3527,6 +3834,9 @@ async function resolveCandidatesForServer(
         if (/^\d{2,8}$/.test(id)) return sanitizeServer5ChannelKey(`yallalive${id}`);
         return id;
       })();
+      const derivedLower = derivedChannelFromLandingId.toLowerCase();
+      const authLower = landingAuthContext?.channelKey.toLowerCase() || "";
+      const channelKeyLimit = server5Mode === "fast" ? Math.min(2, server5ChannelKeyLimit) : server5ChannelKeyLimit;
       const channelKeys = Array.from(
         new Set(
           [landingAuthContext?.channelKey || "", derivedChannelFromLandingId, ...explicitChannelKeys]
@@ -3540,10 +3850,25 @@ async function resolveCandidatesForServer(
           if (!lower.startsWith("cnpremium")) return true;
           return lower === landingAuthContext.channelKey.toLowerCase() || explicitChannelKeysSet.has(lower);
         })
-        .slice(0, server5ChannelKeyLimit);
+        .sort((a, b) => {
+          const score = (value: string) => {
+            const lower = value.toLowerCase();
+            let total = 0;
+            if (authLower && lower === authLower) total += 120;
+            if (derivedLower && lower === derivedLower) total += 80;
+            if (lower.startsWith("yallalive")) total += 70;
+            else if (lower.startsWith("premium")) total += 45;
+            else if (lower.startsWith("cnpremium")) total -= 20;
+            if (/^\d{2,8}$/.test(lower)) total -= 25;
+            return total;
+          };
+          return score(b) - score(a);
+        })
+        .slice(0, channelKeyLimit);
       if (!channelKeys.length) continue;
       for (const channelKey of channelKeys) {
         if (signal.aborted) throw new DOMException("aborted", "AbortError");
+        let channelProduced = false;
         for (const lookupEndpointUrl of lookupEndpointCandidates) {
           if (signal.aborted) throw new DOMException("aborted", "AbortError");
           const lookupCacheKey = buildServer5LookupCacheKey(landingId, channelKey, lookupEndpointUrl);
@@ -3613,13 +3938,16 @@ async function resolveCandidatesForServer(
               proxied = attachServer5AuthContextToProxyUrl(proxied, authForChannel);
             }
             out.push(proxied);
+            channelProduced = true;
             if (server5Mode === "fast") {
-              if (landingSlot === "2" || out.length >= 2) {
+              const minFastCandidates = landingSlot === "2" ? SERVER5_FAST_MIN_RESOLVED_CANDIDATES : 2;
+              if (out.length >= minFastCandidates) {
                 fastStop = true;
                 break;
               }
             }
           }
+          if (server5Mode === "fast" && channelProduced) break;
           if (server5Mode === "fast" && fastStop) break;
         }
         if (server5Mode === "fast" && fastStop) break;
@@ -4042,6 +4370,7 @@ async function probeHlsCandidate(candidateUrl: string, opts?: ProbeHlsOptions) {
   const looksLikeServer5PlayableSegment = async (response: Response) => {
     if (!response.ok) return false;
     const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    const contentLength = Number.parseInt(String(response.headers.get("content-length") || "0"), 10);
     if (
       contentType.includes("text/html") ||
       contentType.includes("application/json") ||
@@ -4051,8 +4380,9 @@ async function probeHlsCandidate(candidateUrl: string, opts?: ProbeHlsOptions) {
     ) {
       return false;
     }
+    if (Number.isFinite(contentLength) && contentLength > 0 && contentLength < 8192) return false;
     const bytes = await response.arrayBuffer();
-    if (!bytes.byteLength) return false;
+    if (!bytes.byteLength || bytes.byteLength < 8192) return false;
     const probeText = new TextDecoder("utf-8").decode(bytes.slice(0, Math.min(120, bytes.byteLength))).trim().toLowerCase();
     if (!probeText) return true;
     if (probeText.startsWith("#extm3u")) return false;
@@ -4347,6 +4677,7 @@ export default function WatchPage() {
   const [hlsInstance, setHlsInstance] = useState<Hls | null>(null);
 
   const [selectedServer, setSelectedServer] = useState(1);
+  const [runtimeServer5Url, setRuntimeServer5Url] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [resolverLoading, setResolverLoading] = useState(false);
   const [resolverError, setResolverError] = useState<string | null>(null);
@@ -4376,6 +4707,7 @@ export default function WatchPage() {
   const networkFatalCountByCandidateRef = useRef<Map<string, number>>(new Map());
   const server3ProvenanceRef = useRef<Map<string, Server3CandidateProvenance>>(new Map());
   const lastFastFailoverAtByServerRef = useRef<Record<number, number>>({ 1: 0, 3: 0, 5: 0 });
+  const server5RefreshInFlightRef = useRef<Promise<string | null> | null>(null);
 
   const diagEnabled = searchParams.get("diag") === "1";
   const pushDiag = useCallback((line: string) => {
@@ -4779,12 +5111,17 @@ export default function WatchPage() {
       if (derivedServer3 && isValidHttpUrl(derivedServer3)) return derivedServer3;
       return null;
     })();
+    const server5Source = (() => {
+      const refreshed = String(runtimeServer5Url || "").trim();
+      if (refreshed && isValidHttpUrl(refreshed)) return refreshed;
+      return match?.stream_url_5 ?? null;
+    })();
     const explicit: Array<string | null> = [
       match?.stream_url ?? null,
       match?.stream_url_2 ?? null,
       server3Source,
       match?.stream_url_4 ?? null,
-      match?.stream_url_5 ?? null,
+      server5Source,
       match?.stream_url_6 ?? null,
     ];
 
@@ -4800,7 +5137,7 @@ export default function WatchPage() {
       out.push({ n, label, url, sticky });
     }
     return out;
-  }, [match, derivedServer3Url]);
+  }, [match, derivedServer3Url, runtimeServer5Url]);
 
   const validServers = useMemo(() => serverOptions.filter((s) => s.url && isValidHttpUrl(s.url)), [serverOptions]);
   useEffect(() => {
@@ -4840,12 +5177,102 @@ export default function WatchPage() {
   const selectedOption = validServers.find((s) => s.n === selectedServer);
   const selectedServerLabel = selectedOption?.label || SERVER_SOURCE_LABELS[selectedServer] || `سيرفر ${selectedServer}`;
   const selectedUrl = selectedOption?.url ?? "";
+  const server5OptionUrl = serverOptions.find((s) => s.n === 5)?.url ?? "";
+  const server5DbUrl = String(match?.stream_url_5 || "").trim();
   const status = (match?.status_key ?? "").toLowerCase();
   const startMs = match?.match_start ? new Date(match.match_start).getTime() : null;
   const prematchMs = PREMATCH_OPEN_WINDOW_MINUTES * 60 * 1000;
   const streamOpenMs = startMs !== null && Number.isFinite(startMs) ? startMs - prematchMs : null;
   const hasStartedByTime = startMs !== null && Number.isFinite(startMs) ? nowMs >= startMs - prematchMs : false;
   const shouldBlockStream = !(status === "live" || status === "finished") && !hasStartedByTime && status === "upcoming";
+
+  useEffect(() => {
+    if (!idNum) {
+      setRuntimeServer5Url(null);
+      return;
+    }
+    const cached = getServer5RuntimeRefreshCached(idNum, server5DbUrl);
+    if (cached?.url && isValidHttpUrl(cached.url)) setRuntimeServer5Url(cached.url);
+    else setRuntimeServer5Url(null);
+  }, [idNum, server5DbUrl]);
+
+  const requestServer5Refresh = useCallback(
+    async (reason: "bg" | "click") => {
+      if (!idNum) return null as string | null;
+      const sourceUrl = String(server5DbUrl || "").trim();
+      if (!sourceUrl || !isValidHttpUrl(sourceUrl) || shouldBlockStream) return null;
+
+      const cached = getServer5RuntimeRefreshCached(idNum, sourceUrl);
+      if (cached) {
+        if (cached.url && isValidHttpUrl(cached.url)) {
+          setRuntimeServer5Url(cached.url);
+          const proxied = toEmbedProxyUrl(cached.url, cached.url);
+          if (proxied) setServer5PrewarmCandidates(cached.url, [proxied]);
+        }
+        pushDiag(`server5 refresh ${reason} cache=${cached.status}`);
+        return cached.url || null;
+      }
+
+      if (server5RefreshInFlightRef.current) return server5RefreshInFlightRef.current;
+
+      const query = new URLSearchParams();
+      query.set("s5", "refresh");
+      const matchKey = String(match?.match_key || "").trim();
+      if (matchKey) query.set("k", matchKey);
+      const requestUrl = `/api/match/${idNum}?${query.toString()}`;
+
+      let localPromise: Promise<string | null> | null = null;
+      localPromise = (async () => {
+        try {
+          const response = await fetch(requestUrl, { cache: "no-store" });
+          const refreshStatus = String(response.headers.get("x-server5-refresh") || "skip").trim().toLowerCase();
+          const refreshMs = String(response.headers.get("x-server5-refresh-ms") || "0").trim();
+          let refreshedUrl: string | null = null;
+          if (response.ok) {
+            const payload = (await response.json()) as MatchRow;
+            const maybe = String(payload?.stream_url_5 || "").trim();
+            if (maybe && isValidHttpUrl(maybe)) refreshedUrl = maybe;
+          }
+          setServer5RuntimeRefreshCached(idNum, sourceUrl, {
+            status: (refreshStatus === "hit" || refreshStatus === "miss" ? refreshStatus : "skip"),
+            url: refreshedUrl,
+          });
+          if (refreshedUrl) {
+            setRuntimeServer5Url(refreshedUrl);
+            const proxied = toEmbedProxyUrl(refreshedUrl, refreshedUrl);
+            if (proxied) setServer5PrewarmCandidates(refreshedUrl, [proxied]);
+          }
+          pushDiag(`server5 refresh ${reason} ${refreshStatus} ${refreshMs}ms`);
+          return refreshedUrl;
+        } catch (e: unknown) {
+          setServer5RuntimeRefreshCached(idNum, sourceUrl, { status: "miss", url: null });
+          pushDiag(`server5 refresh ${reason} fail: ${e instanceof Error ? e.message : String(e)}`);
+          return null;
+        } finally {
+          if (server5RefreshInFlightRef.current === localPromise) {
+            server5RefreshInFlightRef.current = null;
+          }
+        }
+      })();
+      server5RefreshInFlightRef.current = localPromise;
+      return localPromise;
+    },
+    [idNum, match?.match_key, pushDiag, server5DbUrl, shouldBlockStream]
+  );
+
+  useEffect(() => {
+    if (selectedServer === 5) return;
+    if (!server5OptionUrl || !isValidHttpUrl(server5OptionUrl)) return;
+    if (shouldBlockStream) return;
+    void requestServer5Refresh("bg");
+  }, [requestServer5Refresh, selectedServer, server5OptionUrl, shouldBlockStream]);
+
+  useEffect(() => {
+    if (selectedServer !== 5) return;
+    if (!server5OptionUrl || !isValidHttpUrl(server5OptionUrl)) return;
+    if (shouldBlockStream) return;
+    void requestServer5Refresh("click");
+  }, [requestServer5Refresh, selectedServer, server5OptionUrl, shouldBlockStream]);
 
   useEffect(() => {
     selectedCandidateRef.current = 0;
@@ -4878,9 +5305,24 @@ export default function WatchPage() {
         return;
       }
       const seedCandidates = (() => {
-        if (!isStrongPlayableStreamUrl(selectedUrl) && !isLikelyLivePhpEndpointUrl(selectedUrl)) return [] as string[];
-        const proxied = toEmbedProxyUrl(selectedUrl, selectedUrl);
-        return proxied ? [proxied] : [];
+        const seedUrls: string[] = [];
+        if (selectedServer === 5) {
+          const refreshed = String(runtimeServer5Url || "").trim();
+          const original = String(match?.stream_url_5 || "").trim();
+          if (refreshed && isValidHttpUrl(refreshed)) seedUrls.push(refreshed);
+          if (original && isValidHttpUrl(original) && canonicalizeUrl(original) !== canonicalizeUrl(refreshed)) {
+            seedUrls.push(original);
+          }
+        } else {
+          seedUrls.push(selectedUrl);
+        }
+        const out: string[] = [];
+        for (const seedUrl of dedupeUrls(seedUrls)) {
+          if (!isStrongPlayableStreamUrl(seedUrl) && !isLikelyLivePhpEndpointUrl(seedUrl)) continue;
+          const proxied = toEmbedProxyUrl(seedUrl, seedUrl);
+          if (proxied) out.push(proxied);
+        }
+        return out;
       })();
       const isServer1Primary = selectedServer === 1;
       const isServer2Playerv2 = selectedServer === 2 && isPlayerv2LikeUrl(selectedUrl);
@@ -4889,8 +5331,9 @@ export default function WatchPage() {
       const disableResolveCache = selectedServer === 3 || selectedServer === 4 || selectedServer === 5;
       const cachedCandidates = disableResolveCache ? [] : getCachedResolveCandidates(selectedUrl);
       const stickyCandidates = isServer2Playerv2 ? getPlayerv2StickyCandidates(selectedUrl) : [];
+      const prewarmedServer5Candidates = selectedServer === 5 ? getServer5PrewarmCandidates(selectedUrl) : [];
       const initialCandidates = dedupeUrls(
-        [...stickyCandidates, ...cachedCandidates, ...seedCandidates].filter((candidate) =>
+        [...prewarmedServer5Candidates, ...stickyCandidates, ...cachedCandidates, ...seedCandidates].filter((candidate) =>
           selectedServer === 5 ? isServer5AuthReadyCandidate(candidate) : true
         )
       );
@@ -4954,6 +5397,7 @@ export default function WatchPage() {
       setResolverLoading(!initialCandidates.length);
       if (stickyCandidates.length) pushDiag(`resolve sticky hit +${stickyCandidates.length}`);
       if (cachedCandidates.length) pushDiag(`resolve cache hit +${cachedCandidates.length}`);
+      if (prewarmedServer5Candidates.length) pushDiag(`server5 prewarm hit +${prewarmedServer5Candidates.length}`);
       if (seedCandidates.length) pushDiag(`resolve seed +${seedCandidates.length}`);
       try {
         const fastResolved = await resolveCandidatesForServer(selectedUrl, controller.signal, {
@@ -4983,7 +5427,49 @@ export default function WatchPage() {
         const fastList = fastResolved.candidates;
         const fastMerged = dedupeUrls([...initialCandidates, ...fastList]);
         if (selectedServer === 5) {
-          setResolverLoading(true);
+          const fastScopedRaw = prioritizeServer5Candidates(
+            fastMerged.filter((candidate) => isServer5AuthReadyCandidate(candidate))
+          );
+          const refreshedSelected =
+            !!runtimeServer5Url &&
+            isValidHttpUrl(runtimeServer5Url) &&
+            (canonicalizeUrl(selectedUrl) || selectedUrl) === (canonicalizeUrl(runtimeServer5Url) || runtimeServer5Url);
+          const fastChecksLimit = refreshedSelected ? 2 : SERVER5_FAST_STAGE0_MAX_CHECKS;
+          const fastChecks = Math.min(fastScopedRaw.length, fastChecksLimit);
+          let fastVerifiedNow: string[] = [];
+          if (fastChecks > 0) {
+            fastVerifiedNow = prioritizeServer5Candidates(
+              await filterPlayableCandidates(fastScopedRaw, {
+                signal: controller.signal,
+                timeoutMs: Math.min(probeTimeoutMs, refreshedSelected ? 1800 : SERVER5_FAST_STAGE0_TIMEOUT_MS),
+                maxChildChecks: refreshedSelected ? 1 : 1,
+                maxChecks: fastChecks,
+                concurrency: Math.min(3, PROBE_CONCURRENCY),
+                pushDiag,
+              })
+            );
+            pushDiag(`server5 fast verified=${fastVerifiedNow.length}/${fastChecks}`);
+          } else {
+            pushDiag("server5 fast verified=0/0");
+          }
+          const fastVerifiedWithAuth = fastVerifiedNow.filter((candidate) => !!extractServer5AuthContextFromProxyCandidate(candidate));
+          const fastReadyNow =
+            fastVerifiedWithAuth.length
+              ? fastVerifiedWithAuth
+              : fastVerifiedNow.length >= 2
+                ? fastVerifiedNow.slice(0, 2)
+                : [];
+          if (fastReadyNow.length) {
+            hadPlayable = true;
+            applyCandidatesPreservingSelection(fastReadyNow);
+            setPlayerError(null);
+            setResolverError(null);
+            resetRecoveryState();
+            setResolverLoading(false);
+          } else {
+            if (fastVerifiedNow.length) pushDiag("server5 fast defer-untrusted");
+            setResolverLoading(true);
+          }
         } else if (fastMerged.length) {
           hadPlayable = true;
           applyCandidatesPreservingSelection(fastMerged);
@@ -5050,7 +5536,9 @@ export default function WatchPage() {
         if (!cancel) {
           const mergedRawPrePolicy = dedupeUrls([...candidatesRef.current, ...fastMerged, ...finalList, ...playableList]);
           const mergedRaw =
-            selectedServer === 5 ? mergedRawPrePolicy.filter((candidate) => isServer5AuthReadyCandidate(candidate)) : mergedRawPrePolicy;
+            selectedServer === 5
+              ? prioritizeServer5Candidates(mergedRawPrePolicy.filter((candidate) => isServer5AuthReadyCandidate(candidate)))
+              : mergedRawPrePolicy;
           if (selectedServer === 5 && mergedRawPrePolicy.length !== mergedRaw.length) {
             pushDiag(`server5 scoped raw=${mergedRaw.length}/${mergedRawPrePolicy.length}`);
           }
@@ -5093,11 +5581,12 @@ export default function WatchPage() {
               stage1Verified = await filterPlayableCandidates(mergedRaw, {
                 signal: controller.signal,
                 timeoutMs: Math.min(probeTimeoutMs, SERVER5_STAGE1_TIMEOUT_MS),
+                maxChildChecks: 2,
                 maxChecks: stage1Checks,
                 concurrency: Math.min(3, PROBE_CONCURRENCY),
                 pushDiag,
               });
-              stage1Verified = collapseServer5EquivalentCandidates(stage1Verified);
+              stage1Verified = prioritizeServer5Candidates(stage1Verified);
               pushDiag(`server5 stage1 verified=${stage1Verified.length}/${stage1Checks}`);
               if (
                 stage1Verified.length &&
@@ -5121,9 +5610,9 @@ export default function WatchPage() {
               concurrency: Math.min(3, PROBE_CONCURRENCY),
               pushDiag,
             });
-            const collapsedStage2 = collapseServer5EquivalentCandidates(stage2Verified);
+            const collapsedStage2 = prioritizeServer5Candidates(stage2Verified);
             pushDiag(`server5 stage2 verified=${collapsedStage2.length}/${maxChecks}`);
-            verified = collapseServer5EquivalentCandidates([...stage1Verified, ...collapsedStage2]);
+            verified = prioritizeServer5Candidates([...stage1Verified, ...collapsedStage2]);
           } else {
             verified = await filterPlayableCandidates(mergedRaw, {
               signal: controller.signal,
@@ -5211,6 +5700,8 @@ export default function WatchPage() {
     resetRecoveryState,
     applyCandidatesPreservingSelection,
     mergeServer3Provenance,
+    runtimeServer5Url,
+    match?.stream_url_5,
     match?.home_team,
     match?.away_team,
   ]);
@@ -5234,6 +5725,8 @@ export default function WatchPage() {
       selectedServer === 5 ? buildServer5ProxyAuthHeadersFromCandidate(selectedHlsUrl) : ({} as Record<string, string>);
     let freezeTriggered = false;
     let server5VisualStarted = false;
+    let server5StartupGraceUsed = false;
+    const playbackAttemptStartedAt = Date.now();
     let loadingOverlayTimer: number | null = null;
     let startupNoFrameTimer: number | null = null;
     const timeoutHandles: number[] = [];
@@ -5278,10 +5771,28 @@ export default function WatchPage() {
             markServer5VisualStart();
             return;
           }
-          pushDiag("server5 startup no-frame");
-          if (useFastFailover) {
-            markCandidateAsBad(selectedServer, selectedHlsUrl, "startup-no-frame");
+          const hasBuffered = (() => {
+            try {
+              return video.buffered.length > 0 && video.buffered.end(video.buffered.length - 1) > 0;
+            } catch {
+              return false;
+            }
+          })();
+          if (!server5StartupGraceUsed && selectedServer === 5 && (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA || hasBuffered)) {
+            server5StartupGraceUsed = true;
+            pushDiag("server5 startup grace");
+            queueTimeout(() => {
+              if (cancel || server5VisualStarted) return;
+              if (hasServer5VisualStart()) {
+                markServer5VisualStart();
+                return;
+              }
+              pushDiag("server5 startup no-frame");
+              moveNext("startup-no-frame");
+            }, Math.max(1200, SERVER5_STARTUP_NO_FRAME_RECHECK_MS));
+            return;
           }
+          pushDiag("server5 startup no-frame");
           moveNext("startup-no-frame");
         }, SERVER5_STARTUP_NO_FRAME_RECHECK_MS);
       }, SERVER5_STARTUP_NO_FRAME_TIMEOUT_MS);
@@ -5344,12 +5855,24 @@ export default function WatchPage() {
         setSelectedCandidate(nextIndex);
         setPlayerError(`تعثر المصدر الحالي (${reason})، جاري التحويل تلقائيًا للمصدر التالي.`);
       } else {
-        setPlayerError("فشل تشغيل كل مصادر HLS الداخلية.");
-        if (selectedServer === 3) {
+        if (selectedServer === 5) {
+          const elapsedMs = Date.now() - playbackAttemptStartedAt;
+          const hasVisual = server5VisualStarted || hasServer5VisualStart();
+          const canFinalize = elapsedMs >= SERVER5_FINAL_ERROR_MIN_MS && !hasVisual;
+          if (canFinalize) {
+            setPlayerError("فشل تشغيل كل مصادر HLS الداخلية.");
+            pushDiag("server5 final exhausted");
+          } else {
+            setPlayerError("جاري التحضير...");
+          }
+          scheduleResolveRecovery(`player-exhausted:${reason}`, true);
+        } else if (selectedServer === 3) {
+          setPlayerError("فشل تشغيل كل مصادر HLS الداخلية.");
           applyCandidatesPreservingSelection([]);
           setResolverError(NO_STREAM_SELECTED_SERVER_MESSAGE);
           resetRecoveryState();
         } else {
+          setPlayerError("فشل تشغيل كل مصادر HLS الداخلية.");
           scheduleResolveRecovery(`player-exhausted:${reason}`, true);
         }
       }
@@ -5518,6 +6041,7 @@ export default function WatchPage() {
       hidePlayerLoading();
     }
 
+    const stallFreezeMs = selectedServer === 5 ? 4_500 : STALL_FREEZE_MS;
     stallTimerRef.current = window.setInterval(() => {
       if (cancel) return;
       if (video.paused || video.seeking) {
@@ -5536,7 +6060,7 @@ export default function WatchPage() {
         video.readyState <= 2 ||
         video.networkState === HTMLMediaElement.NETWORK_LOADING ||
         video.networkState === HTMLMediaElement.NETWORK_IDLE;
-      if (!waitingState || stalledFor < STALL_FREEZE_MS || freezeTriggered) return;
+      if (!waitingState || stalledFor < stallFreezeMs || freezeTriggered) return;
       freezeTriggered = true;
       const total = candidatesRef.current.length;
       pushDiag(`stall-freeze ${stalledFor}ms source=${current + 1}/${Math.max(1, total)}`);
