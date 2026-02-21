@@ -493,9 +493,11 @@ type UpstreamFetchPolicy = {
 const SEGMENT_PATH_RE = /\.(?:ts|m4s|m4f|cmf|mp4|aac|ac3|ec3|mp3|vtt|webm|key)(?:[?#]|$)/i;
 const MANIFEST_HINT_RE = /\.(?:m3u8)(?:[?#]|$)|\/(?:hls|live|chunks?|playlist|manifest)\b/i;
 const HTML_PAGE_RE = /\.(?:html?|php|asp|aspx|jsp)(?:[?#]|$)/i;
+const STREAM_CSS_CHUNK_RE = /\.css(?:[?#]|$)/i;
 
 function classifyProxyTarget(target: URL): UpstreamFetchPolicyName {
   const value = `${target.pathname}${target.search}`.toLowerCase();
+  if (STREAM_CSS_CHUNK_RE.test(value) && /\/(?:live|hls|chunks?)\//i.test(value)) return "hls_segment_or_chunk";
   if (SEGMENT_PATH_RE.test(value)) return "hls_segment_or_chunk";
   if (!HTML_PAGE_RE.test(value) && MANIFEST_HINT_RE.test(value)) return "hls_manifest";
   return "html_page";
@@ -2555,6 +2557,15 @@ async function handleProxyRequest(req: Request) {
             headers,
           });
         }
+      }
+
+      if (fetchPolicy.name === "hls_segment_or_chunk") {
+        const headers = withProxyMetaHeaders(filterResponseHeaders(upstream.headers, { html: false }));
+        return new Response(upstream.body, {
+          status: upstream.status,
+          statusText: upstream.statusText,
+          headers,
+        });
       }
 
       if (isCss) {

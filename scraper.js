@@ -141,9 +141,16 @@ const YALLALIVE = {
     tomorrow: "https://anewssport.fun/tomorrow-matches/",
   },
   siteHosts: ["anewssport.fun", "yallalive.sx"],
-  playerHosts: ["zxxxeeplay.fun", "codepcplay.fun", "playerai.site"],
+  playerHosts: ["zxxxeeplay.fun", "codepcplay.fun", "playerai.site", "soyspace.cyou", "coopnnn.fun"],
 };
-const YALLALIVE_TRUSTED_DOMAINS = ["zxxxeeplay.fun", "wikinew.dvalna.ru", "zekonew.dvalna.ru", "dvalna.ru"];
+const YALLALIVE_TRUSTED_DOMAINS = [
+  "zxxxeeplay.fun",
+  "wikinew.dvalna.ru",
+  "zekonew.dvalna.ru",
+  "dvalna.ru",
+  "soyspace.cyou",
+  "coopnnn.fun",
+];
 const YALLALIVE_MATCH_SITEMAP_INDEX_URL = "https://anewssport.fun/wp-sitemap.xml";
 const YALLALIVE_MATCH_SITEMAP_PAGE_LIMIT = intEnv("YALLALIVE_MATCH_SITEMAP_PAGE_LIMIT", 3, 1, 10);
 const YALLALIVE_MATCH_SITEMAP_LINK_LIMIT = intEnv("YALLALIVE_MATCH_SITEMAP_LINK_LIMIT", 48, 6, 200);
@@ -184,6 +191,8 @@ const SERVER_SLOT_DOMAIN_WHITELIST = Object.freeze({
     "zxxxeeplay.fun",
     "codepcplay.fun",
     "playerai.site",
+    "soyspace.cyou",
+    "coopnnn.fun",
   ],
   6: ["1kora.com", "ahlamontada.com"],
 });
@@ -435,8 +444,8 @@ function isJunkCandidateUrl(url) {
   if (!url) return true;
   const u = String(url).toLowerCase();
 
-  // FIX: Allow mono.css from dvalna.ru
-  if (u.includes("dvalna.ru") && u.endsWith("mono.css")) return false;
+  // Server 5 stack can expose HLS manifests/chunks behind .css aliases.
+  if (/(?:dvalna\.ru|soyspace\.cyou|coopnnn\.fun)/i.test(u) && /mono\.(?:css|m3u8)(?:[?#]|$)/i.test(u)) return false;
 
   return (
     /\.(css|js|png|jpg|jpeg|gif|svg|webp|avif|woff|woff2|ttf|eot|ico|json|map|m3u8|ts|m4s|mp4|mpd|webm)(\?.*)?$/.test(u) ||
@@ -3664,6 +3673,11 @@ function preferExistingUrl(slot, newUrl, oldUrl, options = {}) {
     reason: options.reasonOld || `prefer_slot${slot}_old_invalid`,
   });
 
+  // Server 5 policy: never keep stale/legacy URL when latest scrape has no valid URL.
+  if (slot === 5) {
+    return newCandidate || null;
+  }
+
   if (!newCandidate && oldCandidate) return oldCandidate;
   if (newCandidate && !oldCandidate) return newCandidate;
   if (!newCandidate && !oldCandidate) return null;
@@ -4482,8 +4496,7 @@ function isServer5PlayerLikeUrl(url) {
   if (looksLikePlayerUrl(s)) return true;
   if (/\/yalla\.php(?:\?|$)/i.test(s)) return true;
   if (/\/watch\//i.test(s)) return true;
-  // FIX: Allow dvalna.ru mono.css
-  if (s.includes("dvalna.ru") && s.endsWith("mono.css")) return true;
+  if (/(?:dvalna\.ru|soyspace\.cyou|coopnnn\.fun)/i.test(s) && /mono\.(?:css|m3u8)(?:[?#]|$)/i.test(s)) return true;
   return false;
 }
 
@@ -4523,8 +4536,7 @@ function scoreServer5YallaliveCandidate(url) {
   if (/\/albaplayer\/|\/alba\.php/i.test(s)) score += 900;
   if (YALLALIVE.playerHosts.some((host) => s.includes(host))) score += 220;
   if (s.includes("cnpremium")) score += 40;
-  // Boost score for our fixed dvalna CSS links to ensure they are picked
-  if (s.includes("dvalna.ru") && s.endsWith("mono.css")) score += 3000;
+  if (/(?:dvalna\.ru|soyspace\.cyou|coopnnn\.fun)/i.test(s) && /mono\.(?:css|m3u8)(?:[?#]|$)/i.test(s)) score += 3000;
   if (s.includes("/matches/")) score -= 900;
   if (s.includes("/feed") || s.includes("/category/") || s.includes("/tag/") || s.includes("/author/")) score -= 500;
 
