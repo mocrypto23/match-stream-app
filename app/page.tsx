@@ -1,9 +1,10 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useMemo, useState } from "react";
 
 type DayKey = "yesterday" | "today" | "tomorrow";
 const TZ = "Africa/Cairo";
+const MATCH_NOTICE_ENABLED = true; // Switch ON/OFF the top matches notice
 
 type MatchRow = {
   id: number;
@@ -252,6 +253,34 @@ export default function Home() {
         </div>
       </header>
 
+      {MATCH_NOTICE_ENABLED ? (
+        <section className="max-w-2xl mx-auto mb-6 px-1">
+          <div className="rounded-xl border-r-4 border-[#2ecc71] bg-[linear-gradient(135deg,#ffffff_0%,#f1f8e9_100%)] p-3 sm:p-4 text-right shadow-[0_10px_25px_rgba(0,0,0,0.05)] relative overflow-hidden">
+            <div className="flex items-center mb-2">
+              <div className="bg-[#2ecc71] text-white w-6 h-6 rounded-full flex items-center justify-center ml-2 font-bold text-sm">
+                !
+              </div>
+              <h3 className="m-0 text-[#1a5d1a] text-base font-bold">ملاحظة تهمك</h3>
+            </div>
+
+            <p className="m-0 text-[#34495e] text-sm sm:text-[15px] leading-6">
+              موقعنا <span className="text-[#27ae60] font-bold">مجاني تماماً</span> وبدون إعلانات مزعجة{" "}
+              <span className="text-red-600 font-bold">أثناء البث</span>.. استمرارنا يعتمد على دعمك بتصفح{" "}
+              <span className="bg-[#e8f5e9] px-2 py-[2px] rounded text-[#2e7d32] font-bold border border-[#c8e6c9]">
+                الإعلان الوحيد
+              </span>{" "}
+              (إذا كنت مهتماً به) ويحفزنا على التطوير لضمان أفضل جودة لك.
+            </p>
+
+            <div className="absolute -left-5 -bottom-5 opacity-5" aria-hidden="true">
+              <svg width="100" height="100" viewBox="0 0 24 24" fill="#2ecc71">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z" />
+              </svg>
+            </div>
+          </div>
+        </section>
+      ) : null}
+
       <div className="max-w-4xl mx-auto flex gap-2 mb-8">
         {tabs.map((t) => (
           <button
@@ -361,3 +390,4 @@ export default function Home() {
     </div>
   );
 }
+
