@@ -183,7 +183,7 @@ const SERVER_SLOT_DOMAIN_WHITELIST = Object.freeze({
   1: ["bein-live.com"],
   2: ["siiir.tv", "yallashot.us", "aleynoxitram.sbs"],
   3: ["livehd77.pro", "alkoora.live"],
-  4: ["livekora.vip", "koooralive.click", "gomatch-live.com", "kooraxx.com", "sia-bth.net"],
+  4: ["livekora.vip", "koooralive.click", "gomatch-live.com", "kooraxx.com", "sia-bth.net", "baranewssumsel.online"],
   5: [
     "dvalna.ru",
     "anewssport.fun",
@@ -1895,6 +1895,8 @@ async function getDeepMatchDetails(page, matchUrl) {
   try {
     await page.goto(matchUrl, { waitUntil: "domcontentloaded", timeout: DEEP_TIMEOUT_MS });
     await page.waitForTimeout(1400);
+    const redirectedTopUrl = getTrackedRedirectUrl(page, matchUrl, isServer1SourceLikeUrl);
+    if (redirectedTopUrl) candidates.add(redirectedTopUrl);
 
     let meta = await extractMatchMetaFromDom(page);
 
@@ -1907,6 +1909,8 @@ async function getDeepMatchDetails(page, matchUrl) {
         else {
           await first.click({ timeout: 3000, noWaitAfter: true });
           await page.waitForTimeout(900);
+          const redirectedAfterClick = getTrackedRedirectUrl(page, matchUrl, isServer1SourceLikeUrl);
+          if (redirectedAfterClick) candidates.add(redirectedAfterClick);
         }
       }
     } catch { }
@@ -2258,6 +2262,16 @@ async function resolveSiiirPlayerIframeSrc(page, matchPageUrl) {
     }
 
     await page.goto(matchPageUrl, { waitUntil: "domcontentloaded", timeout: DEEP_TIMEOUT_MS });
+    const redirectedPlayerv2 = getTrackedRedirectUrl(
+      page,
+      matchPageUrl,
+      (u) => /\/playerv2\.php(\?|$)/i.test(String(u || ""))
+    );
+    if (redirectedPlayerv2) {
+      candidates.add(redirectedPlayerv2);
+      dbg("🟣 SIIIR redirect playerv2:", redirectedPlayerv2);
+      return redirectedPlayerv2;
+    }
 
     // ====== Phase 1: محاولات سريعة لاستخراج playerv2 ======
     const maxWaitMs = 8000; // مهم: hard أحيانًا يبني المتغيرات متأخر
@@ -2265,6 +2279,17 @@ async function resolveSiiirPlayerIframeSrc(page, matchPageUrl) {
     const start = Date.now();
 
     while (Date.now() - start < maxWaitMs) {
+      const loopRedirectPlayerv2 = getTrackedRedirectUrl(
+        page,
+        matchPageUrl,
+        (u) => /\/playerv2\.php(\?|$)/i.test(String(u || ""))
+      );
+      if (loopRedirectPlayerv2) {
+        candidates.add(loopRedirectPlayerv2);
+        dbg("🟣 SIIIR loop-redirect playerv2:", loopRedirectPlayerv2);
+        return loopRedirectPlayerv2;
+      }
+
       // 1) frames URLs
       try {
         for (const fr of page.frames()) {
@@ -3449,8 +3474,8 @@ function validateServerUrlBySlot(slot, url, { stats = null, reason = "", matchKe
 
     switch (slot) {
       case 1: {
-        allowed = hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[1]) && /\/matches\//i.test(path);
-        if (!allowed) rejectReason = reason || "server1_requires_bein_match_page";
+        allowed = isServer1SourceLikeUrl(normalized);
+        if (!allowed) rejectReason = reason || "server1_requires_match_or_player";
         break;
       }
       case 2: {
@@ -3470,10 +3495,7 @@ function validateServerUrlBySlot(slot, url, { stats = null, reason = "", matchKe
         break;
       }
       case 4: {
-        allowed =
-          looksLikePlayerUrl(normalized) &&
-          !isClearlyNonStreamUrl(normalized) &&
-          hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[4]);
+        allowed = isServer4PlayerLikeUrl(normalized);
         if (!allowed) rejectReason = reason || "server4_requires_livekora_domain";
         break;
       }
@@ -4317,6 +4339,7 @@ async function resolveLivehdFromTvPage(page, tvUrl) {
 async function resolveLivehdStreamViaHttp(matchUrl) {
   if (!matchUrl) return null;
   try {
+    const sourceNormalized = normalizeUrl(matchUrl, matchUrl);
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
     const resp = await fetch(matchUrl, {
@@ -4330,6 +4353,10 @@ async function resolveLivehdStreamViaHttp(matchUrl) {
 
     const html = await resp.text();
     const candidates = [];
+    const redirected = normalizeUrl(resp.url || "", sourceNormalized || matchUrl);
+    if (redirected && (!sourceNormalized || redirected !== sourceNormalized)) {
+      candidates.push(redirected);
+    }
 
     // Extract iframes/links
     // Simple regex for src="..."
@@ -4376,6 +4403,19 @@ async function resolveLivehdStream(page, matchUrl) {
     await page.goto(matchUrl, { waitUntil: "domcontentloaded", timeout: DEEP_TIMEOUT_MS, referer: LIVEHD.listUrl });
     await page.waitForSelector("iframe, a[href], body", { timeout: 12000 }).catch(() => { });
     await page.waitForTimeout(800);
+    const redirected = getTrackedRedirectUrl(page, matchUrl, (u) => scoreLivehdCandidate(u) > -900);
+    if (redirected) {
+      const redirectedLower = String(redirected).toLowerCase();
+      if (redirectedLower.includes("livehd77.pro/tv/")) {
+        const deepFromRedirect = await resolveLivehdFromTvPage(page, redirected);
+        if (deepFromRedirect && scoreLivehdCandidate(deepFromRedirect) >= scoreLivehdCandidate(redirected)) {
+          return normalizeLivehdServer3Url(deepFromRedirect);
+        }
+      }
+      if (looksLikePlayerUrl(redirected) || redirectedLower.includes("/tv/")) {
+        return normalizeLivehdServer3Url(redirected);
+      }
+    }
 
     const candidates = await collectLivehdCandidateUrlsFromPage(page, matchUrl);
     const best = pickBestLivehdUrl(candidates, { baseUrl: matchUrl });
@@ -4487,6 +4527,83 @@ function looksLikePlayerUrl(url) {
   } catch {
     return false;
   }
+}
+
+function isLikelyLivePhpPlayerUrl(url) {
+  const normalized = normalizeUrl(url, url);
+  if (!normalized) return false;
+  try {
+    const u = new URL(normalized);
+    const path = u.pathname.toLowerCase();
+    if (/\/(?:splayer\/)?live\d+\.php$/i.test(path) || /\/chtv\/ch\d+\.php$/i.test(path)) return true;
+    if (/\/(?:stream|live)\.php$/i.test(path)) {
+      return !!(u.searchParams.get("play") || u.searchParams.get("stream"));
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function isServer1SourceLikeUrl(url) {
+  const normalized = normalizeUrl(url, url);
+  if (!normalized || isClearlyNonStreamUrl(normalized)) return false;
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname.toLowerCase();
+    if (hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[1]) && /\/matches\//i.test(path)) return true;
+    if (looksLikePlayerUrl(normalized)) return true;
+    if (isLikelyLivePhpPlayerUrl(normalized)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function getTrackedRedirectUrl(page, sourceUrl, validator = null) {
+  const base = normalizeUrl(sourceUrl, sourceUrl);
+  let current = "";
+  try {
+    current = normalizeUrl(page.url(), base || sourceUrl) || "";
+  } catch {
+    current = "";
+  }
+  if (!current) return null;
+  if (base && current === base) return null;
+  if (isClearlyNonStreamUrl(current)) return null;
+  if (typeof validator === "function" && !validator(current)) return null;
+  return current;
+}
+
+function isLikelyServer4ChannelSlug(pathname) {
+  const raw = String(pathname || "").toLowerCase().trim();
+  const leaf = raw.replace(/^\/+|\/+$/g, "");
+  if (!leaf) return false;
+  if (!/^[a-z0-9-]{2,80}$/.test(leaf)) return false;
+  if (/^(?:today|yesterday|tomorrow|matches?|match|category|tag|author|feed|home|index|wp-.*)$/i.test(leaf)) {
+    return false;
+  }
+  if (/(?:bein|sport|ssc|ad|on-?time|premium|star|kass|abu|thmanya|ch\d+|\d+$)/i.test(leaf)) return true;
+  return false;
+}
+
+function isServer4PlayerLikeUrl(url) {
+  const normalized = normalizeUrl(url, url);
+  if (!normalized) return false;
+  if (!looksLikePlayerUrl(normalized)) return false;
+  if (isClearlyNonStreamUrl(normalized)) return false;
+  try {
+    const u = new URL(normalized);
+    const host = u.hostname.toLowerCase();
+    const pathWithQuery = `${u.pathname}${u.search}`.toLowerCase();
+    if (hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[4])) return true;
+    if (/\/albaplayer\/|\/alba\.php|\/playerv2\.php(\?|$)/i.test(pathWithQuery)) return true;
+    if (/\/(?:splayer\/)?live\d+\.php(\?|$)|\/chtv\/ch\d+\.php(\?|$)/i.test(pathWithQuery)) {
+      return /(?:kora|koora|live|sport|baranews|baranewssumsel|on-?time)/i.test(`${host}${pathWithQuery}`);
+    }
+  } catch {}
+  return false;
 }
 
 function isServer5PlayerLikeUrl(url) {
@@ -4915,6 +5032,15 @@ async function resolveStreamFromPage(page, pageUrl, { preferredHostHints = [] } 
     await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: DEEP_TIMEOUT_MS });
     await page.waitForSelector("iframe, a[href], body", { timeout: 12000 }).catch(() => { });
     await page.waitForTimeout(900);
+    const finalPageUrl = normalizeUrl(page.url(), pageUrl);
+    if (
+      finalPageUrl &&
+      finalPageUrl !== pageUrl &&
+      looksLikePlayerUrl(finalPageUrl) &&
+      !isClearlyNonStreamUrl(finalPageUrl)
+    ) {
+      return finalPageUrl;
+    }
 
     const domUrls = await page
       .evaluate(() => {
@@ -4955,7 +5081,7 @@ async function resolveStreamFromPage(page, pageUrl, { preferredHostHints = [] } 
       })
       .catch(() => []);
 
-    const candidates = Array.from(new Set(domUrls))
+    const candidates = Array.from(new Set([finalPageUrl, ...domUrls]))
       .map((u) => normalizeUrl(u, pageUrl))
       .filter(Boolean)
       .filter((u) => u !== pageUrl && !isClearlyNonStreamUrl(u));
@@ -5028,6 +5154,16 @@ function deriveYalaFallbackPlayerUrl(rawUrl) {
     if (host === "pl.koooralive.click" || host.endsWith(".koooralive.click")) {
       if (path.includes("/albaplayer/") && looksLikePlayerUrl(normalized)) return normalized;
       if (path) return `${u.protocol}//${u.host}/albaplayer/${path.replace(/^\/+|\/+$/g, "")}/`;
+    }
+
+    // LIVEKORA source now rotates domains frequently, but channel slugs are stable.
+    // Example: /on-time-sport-1/ => /albaplayer/on-time-sport-1/
+    if (!path.includes("/albaplayer/")) {
+      const leaf = path.replace(/^\/+|\/+$/g, "");
+      if (isLikelyServer4ChannelSlug(leaf)) {
+        const derived = `${u.protocol}//${u.host}/albaplayer/${leaf}/`;
+        if (looksLikePlayerUrl(derived) && !isClearlyNonStreamUrl(derived)) return derived;
+      }
     }
   } catch { }
 
@@ -5608,6 +5744,7 @@ async function enrichYalaWithStreams(browser, rows) {
         if (!finalUrl) {
           finalUrl = await resolveStreamFromPage(page, raw, {
             preferredHostHints: [
+              "baranewssumsel.online",
               "koooralive.click",
               "livekora.vip",
               "kooraxx.com",
@@ -6399,7 +6536,12 @@ async function startScraping() {
           : prettyTimeFromIso(match_start) || m.time_text || "-";
       const match_time = sanitizeDisplayTimeText(matchTimeRaw);
 
-      const finalStreamUrl = m.match_url || m.deep_stream_url;
+      const finalStreamUrl =
+        [m.deep_stream_url, m.match_url]
+          .map((u) => normalizeUrl(u, m.match_url || m.deep_stream_url || ""))
+          .find((u) => u && isServer1SourceLikeUrl(u)) ||
+        m.match_url ||
+        m.deep_stream_url;
       const match_key = keyOfTeams(match_day, m.home_team, m.away_team);
       const primaryServer1 = validateServerUrlBySlot(1, finalStreamUrl, {
         stats: isolationStats,
