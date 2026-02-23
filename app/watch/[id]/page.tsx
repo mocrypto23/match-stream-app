@@ -49,10 +49,10 @@ const FAST_PHASE_PROBE_TIMEOUT_MS = 2200;
 const FAST_PHASE_MAX_PLAYER_PAGES = 5;
 const FAST_PHASE_MAX_DEEP_CANDIDATES = 6;
 const FAST_PHASE_MAX_PLAYERV2_POOL = 2;
-const SERVER5_STAGE1_MAX_CHECKS = 8;
-const SERVER5_STAGE1_TIMEOUT_MS = 3400;
-const SERVER5_FAST_STAGE0_MAX_CHECKS = 10;
-const SERVER5_FAST_STAGE0_TIMEOUT_MS = 2600;
+const SERVER5_STAGE1_MAX_CHECKS = 6;
+const SERVER5_STAGE1_TIMEOUT_MS = 2800;
+const SERVER5_FAST_STAGE0_MAX_CHECKS = 6;
+const SERVER5_FAST_STAGE0_TIMEOUT_MS = 2100;
 const RESOLVE_CHILD_CONCURRENCY = 3;
 const EXPAND_VARIANTS_CONCURRENCY = 4;
 const PROBE_CONCURRENCY = 4;
@@ -106,6 +106,12 @@ const SERVER5_HTML_FETCH_MISS_TTL_MS = 90_000;
 const SERVER5_HTML_FETCH_CACHE_MAX = 260;
 const SERVER5_PREWARM_CACHE_TTL_MS = 90_000;
 const SERVER5_REFRESH_RUNTIME_CACHE_TTL_MS = 90_000;
+const SERVER5_PROBE_SUCCESS_CACHE_TTL_MS = 75_000;
+const SERVER5_PROBE_MISS_CACHE_TTL_MS = 20_000;
+const SERVER5_PROBE_CACHE_MAX = 800;
+const SERVER5_PREWARM_WARM_TIMEOUT_MS = 3_000;
+const SERVER5_PREWARM_WARM_PROBE_TIMEOUT_MS = 1_700;
+const SERVER5_PREWARM_WARM_MAX_CHECKS = 2;
 const SERVER5_FINAL_ERROR_MIN_MS = 20_000;
 const NO_STREAM_SELECTED_SERVER_MESSAGE = "لا يوجد بث في هذا السيرفر لهذه المباراة";
 const HLS_CT = ["application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl"];
@@ -219,6 +225,7 @@ type Server5LookupCacheEntry = { expiresAt: number; serverKey: string | null };
 type Server5HtmlFetchCacheEntry = { expiresAt: number; ok: boolean; ct: string; html: string };
 type Server5PrewarmCacheEntry = { expiresAt: number; candidates: string[] };
 type Server5RuntimeRefreshCacheEntry = { expiresAt: number; url: string | null; status: "hit" | "miss" | "skip" };
+type Server5ProbeCacheEntry = { expiresAt: number; ok: boolean };
 type Server5AuthContext = { authToken: string; channelKey: string; channelSalt: string };
 type CandidateGroup = { key: string; primaryIndex: number; members: number[]; label: string };
 
@@ -232,6 +239,8 @@ const server5LookupInFlight = new Map<string, Promise<string | null>>();
 const server5HtmlFetchCache = new Map<string, Server5HtmlFetchCacheEntry>();
 const server5PrewarmCache = new Map<string, Server5PrewarmCacheEntry>();
 const server5RuntimeRefreshCache = new Map<string, Server5RuntimeRefreshCacheEntry>();
+const server5ProbeCache = new Map<string, Server5ProbeCacheEntry>();
+const server5ProbeInFlight = new Map<string, Promise<boolean>>();
 
 function resolveResultCacheKey(sourceUrl: string) {
   return canonicalizeUrl(sourceUrl) || String(sourceUrl || "").trim().toLowerCase();
@@ -491,6 +500,64 @@ function setServer5RuntimeRefreshCached(
     status: value.status,
   });
   trimServer5RuntimeRefreshCache(now);
+}
+
+function normalizeServer5ProbeTarget(candidateUrl: string) {
+  const target = toUnderlyingUrl(String(candidateUrl || "").trim());
+  if (!target || !isValidHttpUrl(target)) return "";
+  try {
+    const u = new URL(target);
+    u.hash = "";
+    const volatileKeys = ["ts", "t", "_", "cb", "cache", "v", "r", "rnd", "s5_fp_ts"];
+    for (const key of volatileKeys) u.searchParams.delete(key);
+    return u.toString().toLowerCase();
+  } catch {
+    return canonicalizeUrl(target) || target.toLowerCase();
+  }
+}
+
+function buildServer5ProbeCacheKey(candidateUrl: string) {
+  const canonical = normalizeServer5ProbeTarget(candidateUrl) || canonicalizeUrl(candidateUrl) || String(candidateUrl || "").trim().toLowerCase();
+  if (!canonical) return "";
+  const auth = extractServer5AuthContextFromProxyCandidate(candidateUrl);
+  if (!auth) return canonical;
+  return `${canonical}|${auth.channelKey.toLowerCase()}|${auth.channelSalt.toLowerCase()}`;
+}
+
+function trimServer5ProbeCache(now = Date.now()) {
+  for (const [key, value] of server5ProbeCache.entries()) {
+    if (value.expiresAt <= now) server5ProbeCache.delete(key);
+  }
+  if (server5ProbeCache.size <= SERVER5_PROBE_CACHE_MAX) return;
+  while (server5ProbeCache.size > Math.max(620, SERVER5_PROBE_CACHE_MAX - 120)) {
+    const firstKey = server5ProbeCache.keys().next().value as string | undefined;
+    if (!firstKey) break;
+    server5ProbeCache.delete(firstKey);
+  }
+}
+
+function getServer5ProbeCached(cacheKey: string) {
+  const key = String(cacheKey || "").trim();
+  if (!key) return null as boolean | null;
+  const now = Date.now();
+  const cached = server5ProbeCache.get(key);
+  if (!cached || cached.expiresAt <= now) {
+    if (cached) server5ProbeCache.delete(key);
+    return null;
+  }
+  return !!cached.ok;
+}
+
+function setServer5ProbeCached(cacheKey: string, ok: boolean) {
+  const key = String(cacheKey || "").trim();
+  if (!key) return;
+  const now = Date.now();
+  const ttl = ok ? SERVER5_PROBE_SUCCESS_CACHE_TTL_MS : SERVER5_PROBE_MISS_CACHE_TTL_MS;
+  server5ProbeCache.set(key, {
+    expiresAt: now + ttl,
+    ok: !!ok,
+  });
+  trimServer5ProbeCache(now);
 }
 
 function trimServer5SiblingDiscoveryCache(now = Date.now()) {
@@ -4360,7 +4427,7 @@ async function resolveCandidatesForServer(
   };
 }
 
-async function probeHlsCandidate(candidateUrl: string, opts?: ProbeHlsOptions) {
+async function probeHlsCandidateInternal(candidateUrl: string, opts?: ProbeHlsOptions) {
   const timeoutMs = opts?.timeoutMs ?? CANDIDATE_PROBE_TIMEOUT_MS;
   const maxChildChecks = opts?.maxChildChecks ?? 3;
   const pushDiag = opts?.pushDiag;
@@ -4577,6 +4644,43 @@ async function probeHlsCandidate(candidateUrl: string, opts?: ProbeHlsOptions) {
   }
 }
 
+async function probeHlsCandidate(candidateUrl: string, opts?: ProbeHlsOptions) {
+  const isServer5Candidate = isServer5StackCandidate(candidateUrl);
+  if (!isServer5Candidate) {
+    return probeHlsCandidateInternal(candidateUrl, opts);
+  }
+  const cacheKey = buildServer5ProbeCacheKey(candidateUrl);
+  if (!cacheKey) {
+    return probeHlsCandidateInternal(candidateUrl, opts);
+  }
+  const cached = getServer5ProbeCached(cacheKey);
+  if (cached !== null) {
+    opts?.pushDiag?.(`probe cache ${cached ? "hit" : "miss"}`);
+    return cached;
+  }
+  const inFlight = server5ProbeInFlight.get(cacheKey);
+  if (inFlight) return inFlight;
+
+  let localPromise: Promise<boolean> | null = null;
+  localPromise = (async () => {
+    try {
+      const ok = await probeHlsCandidateInternal(candidateUrl, opts);
+      setServer5ProbeCached(cacheKey, ok);
+      return ok;
+    } catch (e: unknown) {
+      if (e instanceof Error && e.name === "AbortError") throw e;
+      setServer5ProbeCached(cacheKey, false);
+      return false;
+    } finally {
+      if (server5ProbeInFlight.get(cacheKey) === localPromise) {
+        server5ProbeInFlight.delete(cacheKey);
+      }
+    }
+  })();
+  server5ProbeInFlight.set(cacheKey, localPromise);
+  return localPromise;
+}
+
 async function filterPlayableCandidates(input: string[], opts?: FilterPlayableOptions) {
   const limit = opts?.maxChecks && opts.maxChecks > 0 ? opts.maxChecks : input.length;
   const scoped = input.slice(0, limit);
@@ -4708,6 +4812,7 @@ export default function WatchPage() {
   const server3ProvenanceRef = useRef<Map<string, Server3CandidateProvenance>>(new Map());
   const lastFastFailoverAtByServerRef = useRef<Record<number, number>>({ 1: 0, 3: 0, 5: 0 });
   const server5RefreshInFlightRef = useRef<Promise<string | null> | null>(null);
+  const server5PrewarmResolveInFlightRef = useRef<Map<string, Promise<string[]>>>(new Map());
 
   const diagEnabled = searchParams.get("diag") === "1";
   const pushDiag = useCallback((line: string) => {
@@ -5196,6 +5301,82 @@ export default function WatchPage() {
     else setRuntimeServer5Url(null);
   }, [idNum, server5DbUrl]);
 
+  const warmServer5PrewarmCandidates = useCallback(
+    async (sourceUrl: string, reason: "bg" | "click" | "resolve") => {
+      const source = String(sourceUrl || "").trim();
+      if (!source || !isValidHttpUrl(source) || shouldBlockStream) return [] as string[];
+      const cached = getServer5PrewarmCandidates(source);
+      if (cached.length) return cached;
+      const key = canonicalizeUrl(source) || source.toLowerCase();
+      if (!key) return [] as string[];
+
+      const inFlight = server5PrewarmResolveInFlightRef.current.get(key);
+      if (inFlight) return inFlight;
+
+      let localPromise: Promise<string[]> | null = null;
+      localPromise = (async () => {
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), SERVER5_PREWARM_WARM_TIMEOUT_MS);
+        try {
+          const resolved = await resolveCandidatesForServer(source, controller.signal, {
+            playerv2Diag: pushDiag,
+            parallelChildConcurrency: 2,
+            allowSamePathServVariants: false,
+            server5Mode: "fast",
+            server5LandingLimit: Math.min(3, SERVER5_FAST_LANDING_LIMIT),
+            server5ChannelKeyLimit: Math.min(2, SERVER5_FAST_CHANNEL_KEY_LIMIT),
+            server5AllowSitemap: false,
+            server5SearchTerms: [match?.home_team ?? "", match?.away_team ?? ""],
+            maxPlayerPages: 2,
+            maxDeepCandidates: 2,
+            maxPlayerv2Pool: 0,
+            fetchTimeoutMs: Math.min(1800, FAST_PHASE_PROBE_TIMEOUT_MS),
+            fetchRetries: 0,
+            fetchRetryDelayMs: 0,
+          });
+          const scoped = prioritizeServer5Candidates(
+            resolved.candidates.filter((candidate) => isServer5AuthReadyCandidate(candidate))
+          );
+          const maxChecks = Math.min(SERVER5_PREWARM_WARM_MAX_CHECKS, scoped.length);
+          if (maxChecks <= 0) {
+            pushDiag(`server5 prewarm ${reason} raw=0`);
+            return [] as string[];
+          }
+          const verified = prioritizeServer5Candidates(
+            await filterPlayableCandidates(scoped, {
+              signal: controller.signal,
+              timeoutMs: SERVER5_PREWARM_WARM_PROBE_TIMEOUT_MS,
+              maxChildChecks: 1,
+              maxChecks,
+              concurrency: Math.min(2, PROBE_CONCURRENCY),
+              pushDiag,
+            })
+          );
+          if (verified.length) {
+            setServer5PrewarmCandidates(source, verified);
+            pushDiag(`server5 prewarm ${reason} verified=${verified.length}/${maxChecks}`);
+          } else {
+            pushDiag(`server5 prewarm ${reason} verified=0/${maxChecks}`);
+          }
+          return verified;
+        } catch (e: unknown) {
+          if (!(e instanceof Error && e.name === "AbortError")) {
+            pushDiag(`server5 prewarm ${reason} fail: ${e instanceof Error ? e.message : String(e)}`);
+          }
+          return [] as string[];
+        } finally {
+          window.clearTimeout(timeoutId);
+          if (server5PrewarmResolveInFlightRef.current.get(key) === localPromise) {
+            server5PrewarmResolveInFlightRef.current.delete(key);
+          }
+        }
+      })();
+      server5PrewarmResolveInFlightRef.current.set(key, localPromise);
+      return localPromise;
+    },
+    [match?.away_team, match?.home_team, pushDiag, shouldBlockStream]
+  );
+
   const requestServer5Refresh = useCallback(
     async (reason: "bg" | "click") => {
       if (!idNum) return null as string | null;
@@ -5206,8 +5387,7 @@ export default function WatchPage() {
       if (cached) {
         if (cached.url && isValidHttpUrl(cached.url)) {
           setRuntimeServer5Url(cached.url);
-          const proxied = toEmbedProxyUrl(cached.url, cached.url);
-          if (proxied) setServer5PrewarmCandidates(cached.url, [proxied]);
+          void warmServer5PrewarmCandidates(cached.url, reason);
         }
         pushDiag(`server5 refresh ${reason} cache=${cached.status}`);
         return cached.url || null;
@@ -5239,8 +5419,7 @@ export default function WatchPage() {
           });
           if (refreshedUrl) {
             setRuntimeServer5Url(refreshedUrl);
-            const proxied = toEmbedProxyUrl(refreshedUrl, refreshedUrl);
-            if (proxied) setServer5PrewarmCandidates(refreshedUrl, [proxied]);
+            void warmServer5PrewarmCandidates(refreshedUrl, reason);
           }
           pushDiag(`server5 refresh ${reason} ${refreshStatus} ${refreshMs}ms`);
           return refreshedUrl;
@@ -5257,7 +5436,7 @@ export default function WatchPage() {
       server5RefreshInFlightRef.current = localPromise;
       return localPromise;
     },
-    [idNum, match?.match_key, pushDiag, server5DbUrl, shouldBlockStream]
+    [idNum, match?.match_key, pushDiag, server5DbUrl, shouldBlockStream, warmServer5PrewarmCandidates]
   );
 
   useEffect(() => {
@@ -5331,7 +5510,10 @@ export default function WatchPage() {
       const disableResolveCache = selectedServer === 3 || selectedServer === 4 || selectedServer === 5;
       const cachedCandidates = disableResolveCache ? [] : getCachedResolveCandidates(selectedUrl);
       const stickyCandidates = isServer2Playerv2 ? getPlayerv2StickyCandidates(selectedUrl) : [];
-      const prewarmedServer5Candidates = selectedServer === 5 ? getServer5PrewarmCandidates(selectedUrl) : [];
+      let prewarmedServer5Candidates = selectedServer === 5 ? getServer5PrewarmCandidates(selectedUrl) : [];
+      if (selectedServer === 5 && !prewarmedServer5Candidates.length) {
+        prewarmedServer5Candidates = await warmServer5PrewarmCandidates(selectedUrl, "resolve");
+      }
       const initialCandidates = dedupeUrls(
         [...prewarmedServer5Candidates, ...stickyCandidates, ...cachedCandidates, ...seedCandidates].filter((candidate) =>
           selectedServer === 5 ? isServer5AuthReadyCandidate(candidate) : true
@@ -5462,6 +5644,7 @@ export default function WatchPage() {
           if (fastReadyNow.length) {
             hadPlayable = true;
             applyCandidatesPreservingSelection(fastReadyNow);
+            setServer5PrewarmCandidates(selectedUrl, fastReadyNow);
             setPlayerError(null);
             setResolverError(null);
             resetRecoveryState();
@@ -5596,6 +5779,7 @@ export default function WatchPage() {
               ) {
                 hadPlayable = true;
                 applyCandidatesPreservingSelection(stage1Verified);
+                setServer5PrewarmCandidates(selectedUrl, stage1Verified);
                 setPlayerError(null);
                 setResolverError(null);
                 resetRecoveryState();
@@ -5642,6 +5826,9 @@ export default function WatchPage() {
           }
           if (mergedRaw.length) pushDiag(`probe ok ${merged.length}/${mergedRaw.length}`);
           applyCandidatesPreservingSelection(merged);
+          if (selectedServer === 5 && merged.length) {
+            setServer5PrewarmCandidates(selectedUrl, merged);
+          }
           if (merged.length && !disableResolveCache) setCachedResolveCandidates(selectedUrl, merged);
           if (!merged.length) {
             const keepPlayerv2Cache = selectedServer === 2 && isPlayerv2LikeUrl(selectedUrl);
@@ -5701,6 +5888,7 @@ export default function WatchPage() {
     applyCandidatesPreservingSelection,
     mergeServer3Provenance,
     runtimeServer5Url,
+    warmServer5PrewarmCandidates,
     match?.stream_url_5,
     match?.home_team,
     match?.away_team,
@@ -5920,6 +6108,10 @@ export default function WatchPage() {
       freezeTriggered = false;
       markProgress();
       if (hasServer5VisualStart()) markServer5VisualStart();
+      if (selectedServer === 5 && selectedUrl && isValidHttpUrl(selectedUrl) && selectedHlsUrl) {
+        const existing = getServer5PrewarmCandidates(selectedUrl);
+        setServer5PrewarmCandidates(selectedUrl, [selectedHlsUrl, ...existing]);
+      }
       resetRecoveryState();
       hidePlayerLoading();
       setPlayerError(null);
@@ -6092,6 +6284,7 @@ export default function WatchPage() {
     selectedHlsUrl,
     selectedCandidate,
     selectedServer,
+    selectedUrl,
     shouldBlockStream,
     pushDiag,
     applyCandidatesPreservingSelection,

@@ -2694,6 +2694,31 @@ function normalizeTeamPairForDedupe(homeCanon, awayCanon, { trackMetric = false 
     return normalized;
   }
 
+  // Pair-scoped mapping:
+  // "\u0636\u0645\u0643 vs \u0627\u0644\u0623\u0647\u0644\u064A \u0627\u0644\u0633\u0639\u0648\u062F\u064A" should absorb "\u0636\u0645\u0643 vs \u0627\u0644\u0623\u0647\u0644\u064A".
+  // This is intentionally narrow to avoid touching "\u0627\u0644\u0623\u0647\u0644\u064A" in other competitions.
+  const isDamakFamily = (v) => v === "\u0636\u0645\u0643";
+  const damakAhliDirect = isDamakFamily(home) && isAhliSaudiFamily(away);
+  const damakAhliSwapped = isAhliSaudiFamily(home) && isDamakFamily(away);
+  if (damakAhliDirect || damakAhliSwapped) {
+    const normalized = damakAhliDirect
+      ? { home: "\u0636\u0645\u0643", away: "\u0627\u0647\u0644\u064A\u0633\u0639\u0648\u062F\u064A" }
+      : { home: "\u0627\u0647\u0644\u064A\u0633\u0639\u0648\u062F\u064A", away: "\u0636\u0645\u0643" };
+
+    if (trackMetric && (normalized.home !== home || normalized.away !== away)) {
+      aliasPatchPairScopedMerges += 1;
+      if (aliasPatchPairScopedEvents.length < 240) {
+        aliasPatchPairScopedEvents.push({
+          home_before: home || null,
+          away_before: away || null,
+          home_after: normalized.home,
+          away_after: normalized.away,
+        });
+      }
+    }
+    return normalized;
+  }
+
   return { home, away };
 }
 // TEAM_NAME_ALIAS_PATCH_END
