@@ -20,7 +20,7 @@
  *  - CONCURRENCY (default: 2)
  *  - SCRAPE_DAY_SCOPE (default: "today_only") -> "today_only" | "all" | comma list ("today,yesterday")
  *  - PRESERVE_FUTURE_ROWS (default: 0 when today_only, else 1)
- *  - CLEANUP_OLD_FINISHED (default: 1)
+ *  - CLEANUP_OLD_FINISHED (default: 0)
  */
 
 const { chromium } = require("playwright");
@@ -105,7 +105,7 @@ const ACTIVE_DAY_KEYS = (() => {
 const ACTIVE_DAYS = DAYS.filter((d) => ACTIVE_DAY_KEYS.includes(d.key));
 const PRESERVE_FUTURE_ROWS =
   String(process.env.PRESERVE_FUTURE_ROWS ?? (ACTIVE_DAY_KEYS.includes("tomorrow") ? "1" : "0")) !== "0";
-const CLEANUP_OLD_FINISHED = String(process.env.CLEANUP_OLD_FINISHED ?? "1") !== "0";
+const CLEANUP_OLD_FINISHED = String(process.env.CLEANUP_OLD_FINISHED ?? "0") !== "0";
 
 // SIIIR source (Server 2)
 const SIIIR = {

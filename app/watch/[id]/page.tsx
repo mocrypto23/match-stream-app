@@ -94,7 +94,7 @@ const SERVER3_DERIVE_CACHE_TTL_MS = 120_000;
 const SERVER5_FAST_LANDING_LIMIT = 6;
 const SERVER5_FINAL_LANDING_LIMIT = 6;
 const SERVER5_FAST_CHANNEL_KEY_LIMIT = 3;
-const SERVER5_FINAL_CHANNEL_KEY_LIMIT = 3;
+const SERVER5_FINAL_CHANNEL_KEY_LIMIT = 4;
 const SERVER5_FAST_LOOKUP_ENDPOINT_LIMIT = 2;
 const SERVER5_FINAL_LOOKUP_ENDPOINT_LIMIT = 3;
 const SERVER5_FAST_MIN_RESOLVED_CANDIDATES = 3;
@@ -764,19 +764,27 @@ function getServer5CandidateIdentity(value?: string | null) {
   const target = raw.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(raw) || "" : toUnderlyingUrl(raw);
   if (!target || !isValidHttpUrl(target)) return "";
   try {
+    let slot = "";
+    if (raw.startsWith("/api/embed-proxy?")) {
+      try {
+        slot = String(new URL(raw, "http://localhost").searchParams.get("s5_slot") || "").trim();
+      } catch { }
+    }
     const u = new URL(target);
+    if (!slot) slot = String(u.searchParams.get("s5_slot") || "").trim();
+    const slotPart = slot ? `|slot:${slot}` : "";
     const host = u.hostname.toLowerCase();
     if (!isServer5StackHost(host)) return "";
     const path = u.pathname.toLowerCase();
     const proxyMono = path.match(/\/proxy\/([a-z0-9/_-]+)\/([a-z0-9_-]+)\/mono\.(?:m3u8|css)$/i);
     if (proxyMono) {
-      return `${host}|proxy|${String(proxyMono[1] || "").toLowerCase()}|${String(proxyMono[2] || "").toLowerCase()}`;
+      return `${host}|proxy|${String(proxyMono[1] || "").toLowerCase()}|${String(proxyMono[2] || "").toLowerCase()}${slotPart}`;
     }
     const legacyMono = path.match(/\/([a-z0-9/_-]+)\/([a-z0-9_-]+)\/mono\.css$/i);
     if (legacyMono) {
-      return `${host}|legacy|${String(legacyMono[1] || "").toLowerCase()}|${String(legacyMono[2] || "").toLowerCase()}`;
+      return `${host}|legacy|${String(legacyMono[1] || "").toLowerCase()}|${String(legacyMono[2] || "").toLowerCase()}${slotPart}`;
     }
-    return canonicalizeUrl(target) || target.toLowerCase();
+    return `${canonicalizeUrl(target) || target.toLowerCase()}${slotPart}`;
   } catch {
     return "";
   }
@@ -2456,35 +2464,74 @@ function prioritizeServer5LookupEndpointCandidates(
   return out;
 }
 
-function buildServer5ManifestUrls(serverKeyRaw: string, channelKeyRaw: string, lookupEndpointUrl?: string | null) {
+function buildServer5ManifestUrls(
+  serverKeyRaw: string,
+  channelKeyRaw: string,
+  lookupEndpointUrl?: string | null,
+  mode: "fast" | "final" = "final"
+) {
   const channelKey = sanitizeServer5ChannelKey(channelKeyRaw);
   const serverKey = String(serverKeyRaw || "").trim().toLowerCase();
   if (!channelKey || !serverKey) return [] as string[];
 
-  const out = new Set<string>();
-  for (const value of buildServer5DvalnaManifestUrls(serverKey, channelKey)) out.add(value);
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (value: string) => {
+    const v = String(value || "").trim();
+    if (!v) return;
+    const key = v.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(v);
+  };
 
   const endpointRaw = String(lookupEndpointUrl || "").trim();
+  let addedEndpointProxy = false;
   if (endpointRaw && /^[a-z0-9/_-]{2,40}$/i.test(serverKey)) {
     try {
       const endpoint = new URL(endpointRaw);
       const origin = endpoint.origin;
       for (const ext of ["m3u8", "css"]) {
         if (serverKey === "top1/cdn") {
-          out.add(`${origin}/proxy/top1/cdn/${channelKey}/mono.${ext}`);
+          push(`${origin}/proxy/top1/cdn/${channelKey}/mono.${ext}`);
         } else {
-          out.add(`${origin}/proxy/${serverKey}/${channelKey}/mono.${ext}`);
+          push(`${origin}/proxy/${serverKey}/${channelKey}/mono.${ext}`);
         }
+        addedEndpointProxy = true;
       }
     } catch { }
   }
 
-  return Array.from(out);
+  const includeDvalnaFallback = mode !== "fast";
+  if (includeDvalnaFallback) {
+    for (const value of buildServer5DvalnaManifestUrls(serverKey, channelKey)) push(value);
+  } else if (!addedEndpointProxy) {
+    // Fast mode stays origin-only for Server 5 to avoid slow dvalna retries.
+    return [];
+  }
+
+  return out;
 }
 
 function buildServer5SearchTerms(values: Array<string | null | undefined>) {
   const out: string[] = [];
   const seen = new Set<string>();
+  const maybeDecodePercentEncoded = (raw: string) => {
+    const value = String(raw || "").trim();
+    if (!/%[0-9a-f]{2}/i.test(value)) return "";
+    let current = value;
+    for (let i = 0; i < 3; i += 1) {
+      if (!/%[0-9a-f]{2}/i.test(current)) break;
+      try {
+        const decoded = decodeURIComponent(current).trim();
+        if (!decoded || decoded === current) break;
+        current = decoded;
+      } catch {
+        break;
+      }
+    }
+    return current !== value ? current : "";
+  };
   const push = (raw: string) => {
     const term = String(raw || "").replace(/\s+/g, " ").trim();
     if (term.length < 2 || term.length > 120) return;
@@ -2497,6 +2544,8 @@ function buildServer5SearchTerms(values: Array<string | null | undefined>) {
   for (const value of values) {
     const text = String(value || "").replace(/\s+/g, " ").trim();
     if (!text) continue;
+    const decodedText = maybeDecodePercentEncoded(text);
+    if (decodedText) push(decodedText);
     push(text);
     push(
       text
@@ -2505,7 +2554,10 @@ function buildServer5SearchTerms(values: Array<string | null | undefined>) {
         .replace(/\s+/g, " ")
         .trim()
     );
-    push(text.replace(/[^a-z0-9\u0600-\u06ff\s-]+/gi, " ").replace(/\s+/g, " ").trim());
+    const normalized = text.replace(/[^a-z0-9\u0600-\u06ff\s-]+/gi, " ").replace(/\s+/g, " ").trim();
+    const decodedNormalized = maybeDecodePercentEncoded(normalized);
+    if (decodedNormalized) push(decodedNormalized);
+    push(normalized);
     if (out.length >= 6) break;
   }
 
@@ -3938,6 +3990,15 @@ async function resolveCandidatesForServer(
         let channelProduced = false;
         for (const lookupEndpointUrl of lookupEndpointCandidates) {
           if (signal.aborted) throw new DOMException("aborted", "AbortError");
+          const missCacheTtlMs = (() => {
+            try {
+              const host = new URL(lookupEndpointUrl).hostname.toLowerCase();
+              if (host === "dvalna.ru" || host.endsWith(".dvalna.ru")) {
+                return server5Mode === "fast" ? 20_000 : 45_000;
+              }
+            } catch { }
+            return SERVER5_LOOKUP_MISS_CACHE_TTL_MS;
+          })();
           const lookupCacheKey = buildServer5LookupCacheKey(landingId, channelKey, lookupEndpointUrl);
           let serverKey = getServer5LookupCacheEntry(lookupCacheKey);
           if (serverKey === undefined) {
@@ -3959,19 +4020,19 @@ async function resolveCandidatesForServer(
                     timeoutMs
                   );
                   if (!lookupRes.ok) {
-                    setServer5LookupCacheEntry(lookupCacheKey, null, SERVER5_LOOKUP_MISS_CACHE_TTL_MS);
+                    setServer5LookupCacheEntry(lookupCacheKey, null, missCacheTtlMs);
                     return null;
                   }
                   const lookupText = await lookupRes.text();
                   const extractedServerKey = extractServer5LookupServerKey(lookupText);
                   if (!extractedServerKey) {
-                    setServer5LookupCacheEntry(lookupCacheKey, null, SERVER5_LOOKUP_MISS_CACHE_TTL_MS);
+                    setServer5LookupCacheEntry(lookupCacheKey, null, missCacheTtlMs);
                     return null;
                   }
                   setServer5LookupCacheEntry(lookupCacheKey, extractedServerKey, SERVER5_LOOKUP_SUCCESS_CACHE_TTL_MS);
                   return extractedServerKey;
                 } catch {
-                  setServer5LookupCacheEntry(lookupCacheKey, null, SERVER5_LOOKUP_MISS_CACHE_TTL_MS);
+                  setServer5LookupCacheEntry(lookupCacheKey, null, missCacheTtlMs);
                   return null;
                 } finally {
                   server5LookupInFlight.delete(lookupCacheKey);
@@ -3985,7 +4046,7 @@ async function resolveCandidatesForServer(
           if (signal.aborted) throw new DOMException("aborted", "AbortError");
           if (!serverKey) continue;
 
-          const manifests = buildServer5ManifestUrls(serverKey, channelKey, lookupEndpointUrl);
+          const manifests = buildServer5ManifestUrls(serverKey, channelKey, lookupEndpointUrl, server5Mode);
           const authForChannel =
             landingAuthContext && landingAuthContext.channelKey.toLowerCase() === channelKey.toLowerCase()
               ? landingAuthContext
@@ -4434,9 +4495,37 @@ async function probeHlsCandidateInternal(candidateUrl: string, opts?: ProbeHlsOp
   const signal = opts?.signal;
   const server5AuthHeaders = buildServer5ProxyAuthHeadersFromCandidate(candidateUrl);
   const isServer5Candidate = isServer5StackCandidate(candidateUrl);
+  const probeRangeHeaderValue = isServer5Candidate ? "bytes=0-4095" : "bytes=0-1024";
+  const decodeServer5NumericManifest = (rawManifest: string, ctx: "root" | "child") => {
+    const text = String(rawManifest || "").trim();
+    if (!isServer5Candidate || !text || /^\s*#EXTM3U/m.test(text)) return rawManifest;
+    if (!/^\d{1,3}(?:\s+\d{1,3}){24,}$/.test(text)) return rawManifest;
+
+    const parts = text.split(/\s+/).filter(Boolean);
+    if (parts.length < 25) return rawManifest;
+    const bytes = new Uint8Array(parts.length);
+    for (let i = 0; i < parts.length; i += 1) {
+      const n = Number.parseInt(parts[i], 10);
+      if (!Number.isFinite(n) || n < 0 || n > 255) return rawManifest;
+      bytes[i] = n;
+    }
+
+    const decoded = new TextDecoder("utf-8").decode(bytes).trim();
+    if (!/^\s*#EXTM3U/m.test(decoded)) return rawManifest;
+    const hasMediaLine = decoded.split(/\r?\n/).some((line) => {
+      const trimmed = line.trim();
+      return !!trimmed && !trimmed.startsWith("#");
+    });
+    if (!hasMediaLine) return rawManifest;
+    pushDiag?.(`probe server5 numeric-manifest decoded ctx=${ctx} bytes=${bytes.byteLength}`);
+    return decoded;
+  };
   const looksLikeServer5PlayableSegment = async (response: Response) => {
     if (!response.ok) return false;
     const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    const contentRange = String(response.headers.get("content-range") || "").trim();
+    const isPartial = response.status === 206 || !!contentRange;
+    const minBytes = isPartial ? 256 : 4096;
     const contentLength = Number.parseInt(String(response.headers.get("content-length") || "0"), 10);
     if (
       contentType.includes("text/html") ||
@@ -4445,14 +4534,37 @@ async function probeHlsCandidateInternal(candidateUrl: string, opts?: ProbeHlsOp
       contentType.includes("javascript") ||
       contentType.includes("xml")
     ) {
+      if (isServer5Candidate && isPartial) {
+        pushDiag?.(`probe server5 partial-reject reason=text-ct status=${response.status} bytes=${Number.isFinite(contentLength) ? contentLength : 0}`);
+      }
       return false;
     }
-    if (Number.isFinite(contentLength) && contentLength > 0 && contentLength < 8192) return false;
+    if (Number.isFinite(contentLength) && contentLength > 0 && contentLength < minBytes) {
+      if (isServer5Candidate && isPartial) {
+        pushDiag?.(`probe server5 partial-reject reason=small-content-length status=${response.status} bytes=${contentLength}`);
+      }
+      return false;
+    }
     const bytes = await response.arrayBuffer();
-    if (!bytes.byteLength || bytes.byteLength < 8192) return false;
+    if (!bytes.byteLength || bytes.byteLength < minBytes) {
+      if (isServer5Candidate && isPartial) {
+        pushDiag?.(`probe server5 partial-reject reason=small-bytes status=${response.status} bytes=${bytes.byteLength || 0}`);
+      }
+      return false;
+    }
     const probeText = new TextDecoder("utf-8").decode(bytes.slice(0, Math.min(120, bytes.byteLength))).trim().toLowerCase();
-    if (!probeText) return true;
-    if (probeText.startsWith("#extm3u")) return false;
+    if (!probeText) {
+      if (isServer5Candidate && isPartial) {
+        pushDiag?.(`probe server5 partial-ok status=${response.status} bytes=${bytes.byteLength}`);
+      }
+      return true;
+    }
+    if (probeText.startsWith("#extm3u")) {
+      if (isServer5Candidate && isPartial) {
+        pushDiag?.(`probe server5 partial-reject reason=playlist-payload status=${response.status} bytes=${bytes.byteLength}`);
+      }
+      return false;
+    }
     if (
       probeText.startsWith("<!doctype") ||
       probeText.startsWith("<html") ||
@@ -4460,7 +4572,30 @@ async function probeHlsCandidateInternal(candidateUrl: string, opts?: ProbeHlsOp
       probeText.startsWith("<?xml") ||
       probeText.startsWith("{")
     ) {
+      if (isServer5Candidate && isPartial) {
+        pushDiag?.(`probe server5 partial-reject reason=text-payload status=${response.status} bytes=${bytes.byteLength}`);
+      }
       return false;
+    }
+    const looksLikeCssOrJsPayload =
+      probeText.startsWith("@import") ||
+      probeText.includes("url(") ||
+      probeText.startsWith("/*") ||
+      probeText.startsWith("//") ||
+      probeText.startsWith("var ") ||
+      probeText.startsWith("const ") ||
+      probeText.startsWith("let ") ||
+      probeText.startsWith("function ") ||
+      probeText.startsWith("export ") ||
+      probeText.startsWith("import ");
+    if (looksLikeCssOrJsPayload) {
+      if (isServer5Candidate && isPartial) {
+        pushDiag?.(`probe server5 partial-reject reason=text-css-js status=${response.status} bytes=${bytes.byteLength}`);
+      }
+      return false;
+    }
+    if (isServer5Candidate && isPartial) {
+      pushDiag?.(`probe server5 partial-ok status=${response.status} bytes=${bytes.byteLength}`);
     }
     return true;
   };
@@ -4509,7 +4644,7 @@ async function probeHlsCandidateInternal(candidateUrl: string, opts?: ProbeHlsOp
             method: "GET",
             cache: "no-store",
             credentials: "same-origin",
-            headers: { "x-embed-proxy-probe": "1", range: "bytes=0-1024", ...server5AuthHeaders },
+            headers: { "x-embed-proxy-probe": "1", range: probeRangeHeaderValue, ...server5AuthHeaders },
           },
           timeoutMs,
           signal
@@ -4542,7 +4677,8 @@ async function probeHlsCandidateInternal(candidateUrl: string, opts?: ProbeHlsOp
     }
 
     const contentType = (manifestRes.headers.get("content-type") || "").toLowerCase();
-    const manifestText = await manifestRes.text();
+    let manifestText = await manifestRes.text();
+    manifestText = decodeServer5NumericManifest(manifestText, "root");
     const hasExtM3u = /^\s*#EXTM3U/m.test(manifestText);
     if (!contentTypeLooksLikeHls(contentType) && !hasExtM3u) {
       pushDiag?.(`probe not-hls ct=${contentType}`);
@@ -4598,7 +4734,8 @@ async function probeHlsCandidateInternal(candidateUrl: string, opts?: ProbeHlsOp
             signal
           );
           if (childManifestRes.ok) {
-            const childText = await childManifestRes.text();
+            let childText = await childManifestRes.text();
+            childText = decodeServer5NumericManifest(childText, "child");
             const childHasExtM3u = /^\s*#EXTM3U/m.test(childText);
             if (
               childHasExtM3u &&
@@ -4620,7 +4757,7 @@ async function probeHlsCandidateInternal(candidateUrl: string, opts?: ProbeHlsOp
             method: "GET",
             cache: "no-store",
             credentials: "same-origin",
-            headers: { "x-embed-proxy-probe": "1", range: "bytes=0-1024", ...server5AuthHeaders },
+            headers: { "x-embed-proxy-probe": "1", range: probeRangeHeaderValue, ...server5AuthHeaders },
           },
           timeoutMs,
           signal

@@ -485,8 +485,38 @@ function isServer5AuthHost(hostname: string) {
 
 function isServer5MonoCssLikeManifestUrl(target: URL) {
   const path = String(target.pathname || "").toLowerCase();
-  if (!isDvalnaHost(target.hostname)) return false;
+  const host = normalizeHost(target.hostname);
+  if (
+    !(
+      isDvalnaHost(target.hostname) ||
+      host === "soyspace.cyou" ||
+      host.endsWith(".soyspace.cyou") ||
+      host === "embedkclx.sbs" ||
+      host.endsWith(".embedkclx.sbs")
+    )
+  ) {
+    return false;
+  }
   return /\/mono\.css(?:$|[/?#])/i.test(path);
+}
+
+function hasServer5PassAuthContext(source?: URLSearchParams | null) {
+  if (!source) return false;
+  const auth = String(source.get("s5_ep_auth") || "").trim();
+  const ck = String(source.get("s5_ep_ck") || "").trim();
+  const cs = String(source.get("s5_ep_cs") || "").trim();
+  return !!(auth && ck && cs);
+}
+
+function isServer5ChunkLikeTarget(target: URL, passQuery?: URLSearchParams | null) {
+  if (!hasServer5PassAuthContext(passQuery)) return false;
+  const value = `${target.pathname}${target.search}`.toLowerCase();
+  if (/\/proxy\/[a-z0-9/_-]+\/[a-z0-9_-]+\/mono\.(?:m3u8|css)(?:[?#]|$)/i.test(value)) return false;
+  if (/\/key\/[^/]+\/\d+(?:[/?#]|$)/i.test(value)) return true;
+  if (/\/v\/[a-z0-9._~%-]+/i.test(value)) return true;
+  if (/\/assets\/\d{4}-\d{2}-\d{2}\//i.test(value) && /\.(?:css|js)(?:[?#]|$)/i.test(value)) return true;
+  if (/\/(?:chunks?|live|hls)\//i.test(value) && /\.(?:css|js)(?:[?#]|$)/i.test(value)) return true;
+  return false;
 }
 
 type UpstreamFetchPolicyName = "html_page" | "hls_manifest" | "hls_segment_or_chunk" | "dvalna_server_lookup";
@@ -510,7 +540,7 @@ function classifyProxyTarget(target: URL): UpstreamFetchPolicyName {
   return "html_page";
 }
 
-function getUpstreamFetchPolicy(target: URL, method: string): UpstreamFetchPolicy {
+function getUpstreamFetchPolicy(target: URL, method: string, passQuery?: URLSearchParams | null): UpstreamFetchPolicy {
   const methodUpper = String(method || "GET").toUpperCase();
   if (methodUpper !== "GET" && methodUpper !== "HEAD") {
     return {
@@ -521,9 +551,12 @@ function getUpstreamFetchPolicy(target: URL, method: string): UpstreamFetchPolic
     };
   }
 
-  const kind: UpstreamFetchPolicyName = isServer5MonoCssLikeManifestUrl(target)
-    ? "hls_manifest"
-    : classifyProxyTarget(target);
+  const server5ChunkTarget = isServer5ChunkLikeTarget(target, passQuery);
+  const kind: UpstreamFetchPolicyName = server5ChunkTarget
+    ? "hls_segment_or_chunk"
+    : isServer5MonoCssLikeManifestUrl(target)
+      ? "hls_manifest"
+      : classifyProxyTarget(target);
   const dvalnaTarget = isDvalnaHost(target.hostname);
   const dvalnaLookupTarget = dvalnaTarget && /\/server_lookup(?:$|\/)/i.test(String(target.pathname || ""));
   if (dvalnaLookupTarget) {
@@ -2231,6 +2264,31 @@ function applyServer5AuthHeaders(out: Headers, incoming: Headers, target: URL, q
   }
 }
 
+function decodeNumericAsciiManifest(raw: string) {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+  if (/^\s*#EXTM3U/m.test(text)) return null;
+  if (!/^\d{1,3}(?:\s+\d{1,3}){24,}$/.test(text)) return null;
+
+  const parts = text.split(/\s+/).filter(Boolean);
+  if (parts.length < 25) return null;
+  const bytes = new Uint8Array(parts.length);
+  for (let i = 0; i < parts.length; i += 1) {
+    const n = Number.parseInt(parts[i], 10);
+    if (!Number.isFinite(n) || n < 0 || n > 255) return null;
+    bytes[i] = n;
+  }
+
+  const decoded = new TextDecoder("utf-8").decode(bytes).trim();
+  if (!/^\s*#EXTM3U/m.test(decoded)) return null;
+  const hasMediaLine = decoded.split(/\r?\n/).some((line) => {
+    const trimmed = line.trim();
+    return !!trimmed && !trimmed.startsWith("#");
+  });
+  if (!hasMediaLine) return null;
+  return decoded;
+}
+
 function buildUpstreamRequestHeaders(req: Request, target: URL, referrerUrl?: string | null) {
   const out = new Headers();
   const incoming = new Headers(req.headers);
@@ -2464,7 +2522,7 @@ async function handleProxyRequest(req: Request) {
     }
 
     const method = String(req.method || "GET").toUpperCase();
-    const fetchPolicy = getUpstreamFetchPolicy(target, method);
+    const fetchPolicy = getUpstreamFetchPolicy(target, method, server5PassQuery);
     let upstreamAttempts = 0;
     const withProxyMetaHeaders = (headers: Headers) => {
       headers.set("x-embed-proxy-target", target.toString());
@@ -2528,7 +2586,9 @@ async function handleProxyRequest(req: Request) {
       const targetLooksLikeM3u8 = isLikelyM3u8(target, contentType);
       const targetLooksLikeServer5Mono = isServer5MonoCssLikeManifestUrl(target);
       if (targetLooksLikeM3u8 || targetLooksLikeServer5Mono) {
-        const rawMaybeManifest = await upstream.text();
+        const upstreamText = await upstream.text();
+        const decodedNumericManifest = decodeNumericAsciiManifest(upstreamText);
+        const rawMaybeManifest = decodedNumericManifest || upstreamText;
         prefetchedNonHtmlText = rawMaybeManifest;
         const hasExtM3u = /^\s*#EXTM3U/m.test(rawMaybeManifest);
         if (targetLooksLikeM3u8 || hasExtM3u) {
