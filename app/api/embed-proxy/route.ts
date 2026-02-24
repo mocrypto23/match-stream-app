@@ -2264,6 +2264,41 @@ function applyServer5AuthHeaders(out: Headers, incoming: Headers, target: URL, q
   }
 }
 
+function isKeyOrAuthLikeTarget(target: URL, fetchPolicy: UpstreamFetchPolicy) {
+  const path = String(target.pathname || "").toLowerCase();
+  if (fetchPolicy.name === "dvalna_server_lookup") return true;
+  if (/\/server_lookup(?:$|\/)/i.test(path)) return true;
+  if (/\/key\/[^/]+\/\d+(?:$|[/?#])/i.test(path)) return true;
+  if (/\.key(?:$|[?#])/i.test(path)) return true;
+  if (/\/(?:auth|token|session)(?:$|\/)/i.test(path)) return true;
+  return false;
+}
+
+function applyEdgeCacheHeaders(headers: Headers, target: URL, fetchPolicy: UpstreamFetchPolicy) {
+  if (isKeyOrAuthLikeTarget(target, fetchPolicy)) {
+    headers.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    headers.set("CDN-Cache-Control", "no-store");
+    headers.set("Pragma", "no-cache");
+    return;
+  }
+
+  if (fetchPolicy.name === "hls_segment_or_chunk") {
+    headers.set("Cache-Control", "public, s-maxage=120, stale-while-revalidate=30");
+    headers.set("CDN-Cache-Control", "public, s-maxage=120");
+    return;
+  }
+
+  if (fetchPolicy.name === "hls_manifest" || isLikelyM3u8(target, headers.get("content-type") || "")) {
+    headers.set("Cache-Control", "public, s-maxage=3, stale-while-revalidate=3");
+    headers.set("CDN-Cache-Control", "public, s-maxage=3");
+    return;
+  }
+
+  headers.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  headers.set("CDN-Cache-Control", "no-store");
+  headers.set("Pragma", "no-cache");
+}
+
 function decodeNumericAsciiManifest(raw: string) {
   const text = String(raw || "").trim();
   if (!text) return null;
@@ -2532,6 +2567,7 @@ async function handleProxyRequest(req: Request) {
       headers.set("x-embed-proxy-policy", fetchPolicy.name);
       headers.set("x-embed-proxy-timeout-ms", String(fetchPolicy.timeoutMs));
       headers.set("x-embed-proxy-retries", String(fetchPolicy.retries));
+      applyEdgeCacheHeaders(headers, target, fetchPolicy);
       return headers;
     };
 
