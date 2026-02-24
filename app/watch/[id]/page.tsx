@@ -37,6 +37,8 @@ const SERVER_SOURCE_LABELS: Record<number, string> = {
   3: "سيرفر 3 ",
   4: "سيرفر 4 ",
 };
+const FORCE_IFRAME_PLAYER = String(process.env.NEXT_PUBLIC_FORCE_IFRAME_PLAYER || "0") === "1";
+const IFRAME_PLAYER_ORIGIN = String(process.env.NEXT_PUBLIC_IFRAME_PLAYER_ORIGIN || "").trim().replace(/\/+$/, "");
 
 const PREMATCH_OPEN_WINDOW_MINUTES = 30;
 const STALL_FREEZE_MS = 12000;
@@ -4952,6 +4954,17 @@ export default function WatchPage() {
   const server5PrewarmResolveInFlightRef = useRef<Map<string, Promise<string[]>>>(new Map());
 
   const diagEnabled = searchParams.get("diag") === "1";
+  const externalPlayerSrc = useMemo(() => {
+    if (!FORCE_IFRAME_PLAYER) return "";
+    if (!IFRAME_PLAYER_ORIGIN || !idNum) return "";
+    try {
+      const target = new URL(`${IFRAME_PLAYER_ORIGIN}/watch/${encodeURIComponent(String(idNum))}`);
+      if (diagEnabled) target.searchParams.set("diag", "1");
+      return target.toString();
+    } catch {
+      return "";
+    }
+  }, [diagEnabled, idNum]);
   const pushDiag = useCallback((line: string) => {
     if (!diagEnabled) return;
     setDiagLogs((prev) => [line, ...prev].slice(0, 120));
@@ -6443,6 +6456,21 @@ export default function WatchPage() {
 
   if (loading) return <div className="text-white text-center mt-20">جاري تحميل البث...</div>;
   if (errMsg) return <div className="text-white text-center mt-20">{errMsg}</div>;
+  if (externalPlayerSrc) {
+    return (
+      <div className="min-h-screen bg-black p-0 sm:p-3">
+        <div className="w-full h-screen sm:h-[calc(100vh-24px)] overflow-hidden border-0 sm:border sm:border-gray-800 sm:rounded-xl bg-black">
+          <iframe
+            title="TwoFooty External Player"
+            src={externalPlayerSrc}
+            allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
+            referrerPolicy="no-referrer"
+            className="w-full h-full border-0 bg-black"
+          />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-black text-white p-4">
