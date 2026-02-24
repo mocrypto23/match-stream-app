@@ -6482,7 +6482,18 @@ export default function WatchPage() {
     <div className="min-h-screen bg-black text-white p-4">
       <div className="max-w-5xl mx-auto">
         <div className="mb-4 flex flex-wrap items-center gap-3">
-          <Link href={isTfPlayerHost ? "https://twofooty.com" : "/"} className="text-gray-400 hover:text-white">Back Home</Link>
+          {isTfPlayerHost ? (
+            <a
+              href="https://twofooty.com/"
+              target="_top"
+              rel="noopener noreferrer"
+              className="text-gray-400 hover:text-white"
+            >
+              Back Home
+            </a>
+          ) : (
+            <Link href="/" className="text-gray-400 hover:text-white">Back Home</Link>
+          )}
           {!isTfPlayerHost ? <Link href="/test" className="text-blue-400 hover:text-blue-300 font-bold text-sm">Test</Link> : null}
         </div>
 

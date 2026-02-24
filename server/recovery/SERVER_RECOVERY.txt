@@ -1,0 +1,55 @@
+SERVER RECOVERY KIT (tf-player.site + twofooty.com)
+====================================================
+
+Purpose
+-------
+If the project is lost, this folder helps rebuild deployment quickly.
+
+Important Paths
+---------------
+1) Nginx config template:
+   server/nginx/tf-player.site.conf
+
+2) Deploy script template (OVH):
+   server/deploy/deploy-tf-player.sh
+
+3) Full OVH rebuild steps:
+   server/recovery/OVH_RECOVERY.md
+
+4) Cloudflare + Vercel checklist:
+   server/recovery/CLOUDFLARE_VERCEL_CHECKLIST.md
+
+5) Env template (no secrets):
+   server/recovery/env.example
+
+Critical Runtime Rule
+---------------------
+On tf-player host, always keep:
+  NEXT_PUBLIC_FORCE_IFRAME_PLAYER=0
+  NEXT_PUBLIC_IFRAME_PLAYER_ORIGIN=
+
+On Vercel (twofooty), keep:
+  NEXT_PUBLIC_FORCE_IFRAME_PLAYER=1
+  NEXT_PUBLIC_IFRAME_PLAYER_ORIGIN=https://tf-player.site
+
+Normal Update Flow
+------------------
+1) Local:
+   git add .
+   git commit -m "update"
+   git push
+
+2) OVH:
+   bash /home/ubuntu/deploy-tf-player.sh
+
+What Not To Store In Git
+------------------------
+- Real API keys
+- Passwords
+- Private tokens
+
+Store secrets only in:
+- /var/www/tf-player/.env.local (OVH)
+- Vercel Environment Variables
+- Cloudflare dashboard
+
