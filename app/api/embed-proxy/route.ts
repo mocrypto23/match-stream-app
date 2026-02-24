@@ -2283,12 +2283,14 @@ function applyEdgeCacheHeaders(headers: Headers, target: URL, fetchPolicy: Upstr
   }
 
   if (fetchPolicy.name === "hls_segment_or_chunk") {
+    headers.delete("Pragma");
     headers.set("Cache-Control", "public, s-maxage=120, stale-while-revalidate=30");
     headers.set("CDN-Cache-Control", "public, s-maxage=120");
     return;
   }
 
   if (fetchPolicy.name === "hls_manifest" || isLikelyM3u8(target, headers.get("content-type") || "")) {
+    headers.delete("Pragma");
     headers.set("Cache-Control", "public, s-maxage=3, stale-while-revalidate=3");
     headers.set("CDN-Cache-Control", "public, s-maxage=3");
     return;
