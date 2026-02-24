@@ -2278,26 +2278,34 @@ function applyEdgeCacheHeaders(headers: Headers, target: URL, fetchPolicy: Upstr
   if (isKeyOrAuthLikeTarget(target, fetchPolicy)) {
     headers.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     headers.set("CDN-Cache-Control", "no-store");
+    headers.set("Cloudflare-CDN-Cache-Control", "no-store");
     headers.set("Pragma", "no-cache");
     return;
   }
 
   if (fetchPolicy.name === "hls_segment_or_chunk") {
     headers.delete("Pragma");
-    headers.set("Cache-Control", "public, s-maxage=120, stale-while-revalidate=30");
+    headers.delete("Expires");
+    headers.set("Vary", "Accept-Encoding");
+    headers.set("Cache-Control", "public, max-age=30, s-maxage=120, stale-while-revalidate=30");
     headers.set("CDN-Cache-Control", "public, s-maxage=120");
+    headers.set("Cloudflare-CDN-Cache-Control", "public, s-maxage=120");
     return;
   }
 
   if (fetchPolicy.name === "hls_manifest" || isLikelyM3u8(target, headers.get("content-type") || "")) {
     headers.delete("Pragma");
-    headers.set("Cache-Control", "public, s-maxage=3, stale-while-revalidate=3");
+    headers.delete("Expires");
+    headers.set("Vary", "Accept-Encoding");
+    headers.set("Cache-Control", "public, max-age=1, s-maxage=3, stale-while-revalidate=3");
     headers.set("CDN-Cache-Control", "public, s-maxage=3");
+    headers.set("Cloudflare-CDN-Cache-Control", "public, s-maxage=3");
     return;
   }
 
   headers.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
   headers.set("CDN-Cache-Control", "no-store");
+  headers.set("Cloudflare-CDN-Cache-Control", "no-store");
   headers.set("Pragma", "no-cache");
 }
 
