@@ -4931,6 +4931,7 @@ export default function WatchPage() {
   const [playerError, setPlayerError] = useState<string | null>(null);
   const [serverHealth, setServerHealth] = useState<Record<number, ServerHealthState>>({});
   const [diagLogs, setDiagLogs] = useState<string[]>([]);
+  const [isTfPlayerHost, setIsTfPlayerHost] = useState(false);
   const candidatesRef = useRef<string[]>([]);
   const selectedCandidateRef = useRef(0);
   const selectedServerRef = useRef(1);
@@ -4954,6 +4955,11 @@ export default function WatchPage() {
   const server5PrewarmResolveInFlightRef = useRef<Map<string, Promise<string[]>>>(new Map());
 
   const diagEnabled = searchParams.get("diag") === "1";
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const host = String(window.location.hostname || "").toLowerCase();
+    setIsTfPlayerHost(host === "tf-player.site" || host.endsWith(".tf-player.site"));
+  }, []);
   const externalPlayerSrc = useMemo(() => {
     if (!FORCE_IFRAME_PLAYER) return "";
     if (!IFRAME_PLAYER_ORIGIN || !idNum) return "";
@@ -6476,8 +6482,8 @@ export default function WatchPage() {
     <div className="min-h-screen bg-black text-white p-4">
       <div className="max-w-5xl mx-auto">
         <div className="mb-4 flex flex-wrap items-center gap-3">
-          <Link href="/" className="text-gray-400 hover:text-white">Back Home</Link>
-          <Link href="/test" className="text-blue-400 hover:text-blue-300 font-bold text-sm">Test</Link>
+          <Link href={isTfPlayerHost ? "https://twofooty.com" : "/"} className="text-gray-400 hover:text-white">Back Home</Link>
+          {!isTfPlayerHost ? <Link href="/test" className="text-blue-400 hover:text-blue-300 font-bold text-sm">Test</Link> : null}
         </div>
 
         <div className="mb-4 rounded-2xl border border-gray-800 bg-gradient-to-r from-[#1b1b1b] via-[#111111] to-[#1b1b1b] p-5 shadow-2xl">
