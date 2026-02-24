@@ -21,12 +21,13 @@ type MatchApiRow = {
   stream_url_7?: string | null;
   match_start?: string | null;
   status_key?: string | null;
+  match_day?: string | null;
 };
 
 const SELECT_WITH_SERVER_7 =
-  "id,match_key,home_team,away_team,home_logo,away_logo,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,stream_url_6,stream_url_7,match_start,status_key";
+  "id,match_key,home_team,away_team,home_logo,away_logo,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,stream_url_6,stream_url_7,match_start,status_key,match_day";
 const SELECT_LEGACY =
-  "id,match_key,home_team,away_team,home_logo,away_logo,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,match_start,status_key";
+  "id,match_key,home_team,away_team,home_logo,away_logo,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5,match_start,status_key,match_day";
 const RESOLVE_TIMEOUT_MS = 4500;
 const RESOLVE_CACHE_TTL_MS = 60_000;
 const RESOLVE_CACHE_MAX = 250;
@@ -193,6 +194,58 @@ function normalizeTeamNameForCompare(value: unknown) {
     .replace(/ئ/g, "ي")
     .replace(/ة/g, "ه")
     .replace(/[^a-z0-9\u0600-\u06ff]+/g, "");
+}
+
+function normalizeTeamAliasForCompare(value: unknown) {
+  let s = normalizeTeamNameForCompare(value);
+  if (!s) return "";
+  s = s
+    .replace(/^(?:نادي|فريق|الشباب|سيدات|الرياضي|الرياضيه|منتخب)/, "")
+    .replace(/(?:club|fc|sc|u\d{1,2}|women|youth)$/g, "");
+  return s.trim();
+}
+
+function buildUnorderedTeamPairKey(home: unknown, away: unknown) {
+  const a = normalizeTeamAliasForCompare(home);
+  const b = normalizeTeamAliasForCompare(away);
+  if (!a || !b) return "";
+  return [a, b].sort().join("|");
+}
+
+function extractDayKeyFromRow(row: MatchApiRow) {
+  const matchDay = String(row.match_day || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(matchDay)) return matchDay;
+  const key = String(row.match_key || "");
+  const fromKey = key.split("||")[0] || "";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(fromKey)) return fromKey;
+  if (row.match_start) return getCairoDayKey(row.match_start);
+  return getCairoDayKey();
+}
+
+function countPresentStreams(row: MatchApiRow) {
+  const urls = [
+    row.stream_url,
+    row.stream_url_2,
+    row.stream_url_3,
+    row.stream_url_4,
+    row.stream_url_5,
+    row.stream_url_6,
+    row.stream_url_7,
+  ];
+  return urls.reduce((n, u) => (isValidHttpUrl(u) ? n + 1 : n), 0);
+}
+
+function mergeMissingStreams(base: MatchApiRow, donor: MatchApiRow) {
+  const next: MatchApiRow = { ...base };
+  if (!isValidHttpUrl(next.stream_url) && isValidHttpUrl(donor.stream_url)) next.stream_url = donor.stream_url;
+  if (!isValidHttpUrl(next.stream_url_2) && isValidHttpUrl(donor.stream_url_2)) next.stream_url_2 = donor.stream_url_2;
+  if (!isValidHttpUrl(next.stream_url_3) && isValidHttpUrl(donor.stream_url_3)) next.stream_url_3 = donor.stream_url_3;
+  if (!isValidHttpUrl(next.stream_url_4) && isValidHttpUrl(donor.stream_url_4)) next.stream_url_4 = donor.stream_url_4;
+  if (!isValidHttpUrl(next.stream_url_5) && isValidHttpUrl(donor.stream_url_5)) next.stream_url_5 = donor.stream_url_5;
+  if (!isValidHttpUrl(next.stream_url_6) && isValidHttpUrl(donor.stream_url_6)) next.stream_url_6 = donor.stream_url_6;
+  if (!isValidHttpUrl(next.stream_url_7) && isValidHttpUrl(donor.stream_url_7)) next.stream_url_7 = donor.stream_url_7;
+  if (!next.match_start && donor.match_start) next.match_start = donor.match_start;
+  return next;
 }
 
 function getCairoDayKey(value?: string | null) {
@@ -749,6 +802,54 @@ async function fetchMatchByKey(matchKey: string) {
   };
 }
 
+async function fetchMatchesByDayKey(dayKey: string) {
+  const safeDayKey = String(dayKey || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(safeDayKey)) return [] as MatchApiRow[];
+
+  let { data, error } = await supabaseAdmin
+    .from("match-stream-app")
+    .select(SELECT_WITH_SERVER_7)
+    .like("match_key", `${safeDayKey}||%`)
+    .limit(300);
+
+  if (error && /stream_url_6|stream_url_7/i.test(error.message || "")) {
+    const legacyRes = await supabaseAdmin
+      .from("match-stream-app")
+      .select(SELECT_LEGACY)
+      .like("match_key", `${safeDayKey}||%`)
+      .limit(300);
+    error = legacyRes.error;
+    data = (legacyRes.data || []).map((r) => ({ ...r, stream_url_6: null, stream_url_7: null }));
+  }
+
+  if (error || !Array.isArray(data)) return [] as MatchApiRow[];
+  return data as MatchApiRow[];
+}
+
+async function enrichWithDuplicateSiblingStreams(row: MatchApiRow) {
+  const currentPair = buildUnorderedTeamPairKey(row.home_team, row.away_team);
+  if (!currentPair) return row;
+  const dayKey = extractDayKeyFromRow(row);
+  const sameDayRows = await fetchMatchesByDayKey(dayKey);
+  if (!sameDayRows.length) return row;
+
+  const siblings = sameDayRows
+    .filter((candidate) => Number(candidate.id) !== Number(row.id))
+    .filter((candidate) => buildUnorderedTeamPairKey(candidate.home_team, candidate.away_team) === currentPair);
+  if (!siblings.length) return row;
+
+  const donor = siblings.sort((a, b) => {
+    const streamDelta = countPresentStreams(b) - countPresentStreams(a);
+    if (streamDelta !== 0) return streamDelta;
+    const startA = a.match_start ? new Date(a.match_start).getTime() : 0;
+    const startB = b.match_start ? new Date(b.match_start).getTime() : 0;
+    if (startB !== startA) return startB - startA;
+    return Number(b.id || 0) - Number(a.id || 0);
+  })[0];
+  if (!donor) return row;
+  return mergeMissingStreams(row, donor);
+}
+
 export async function GET(req: Request, ctx: Ctx) {
   const { id: fromParams } = await ctx.params;
   const requestUrl = new URL(req.url);
@@ -782,6 +883,9 @@ export async function GET(req: Request, ctx: Ctx) {
   let payload = data as MatchApiRow;
   try {
     payload = await hydrateStreamFallbacks(payload);
+  } catch {}
+  try {
+    payload = await enrichWithDuplicateSiblingStreams(payload);
   } catch {}
 
   let server5RefreshStatus: Server5RefreshStatus = "skip";
