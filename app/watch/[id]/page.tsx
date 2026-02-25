@@ -32,11 +32,12 @@ type ServerOption = {
 type ServerHealthState = "ok" | "down" | "pending";
 
 const SERVER_SOURCE_LABELS: Record<number, string> = {
-  1: "سيرفر 1 ",
+  1: "سيرفر 4 ",
   2: "سيرفر 2 ",
   3: "سيرفر 3 ",
-  4: "سيرفر 4 ",
+  4: "سيرفر 1 ",
 };
+const SERVER_DISPLAY_ORDER = [4, 2, 3, 1, 5, 6] as const;
 const FORCE_IFRAME_PLAYER = String(process.env.NEXT_PUBLIC_FORCE_IFRAME_PLAYER || "0") === "1";
 const IFRAME_PLAYER_ORIGIN = String(process.env.NEXT_PUBLIC_IFRAME_PLAYER_ORIGIN || "").trim().replace(/\/+$/, "");
 
@@ -4920,7 +4921,7 @@ export default function WatchPage() {
   const [errMsg, setErrMsg] = useState<string | null>(null);
   const [hlsInstance, setHlsInstance] = useState<Hls | null>(null);
 
-  const [selectedServer, setSelectedServer] = useState(1);
+  const [selectedServer, setSelectedServer] = useState(4);
   const [runtimeServer5Url, setRuntimeServer5Url] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [resolverLoading, setResolverLoading] = useState(false);
@@ -4935,7 +4936,7 @@ export default function WatchPage() {
   const [isTfPlayerHost, setIsTfPlayerHost] = useState(false);
   const candidatesRef = useRef<string[]>([]);
   const selectedCandidateRef = useRef(0);
-  const selectedServerRef = useRef(1);
+  const selectedServerRef = useRef(4);
   const recoveryTimerRef = useRef<number | null>(null);
   const recoveryAttemptRef = useRef(0);
   const lastResolveKickRef = useRef(0);
@@ -5398,6 +5399,9 @@ export default function WatchPage() {
       const sticky = stickyConfig && isSafeToCacheUrl(url);
       out.push({ n, label, url, sticky });
     }
+    const orderIndex = new Map<number, number>();
+    SERVER_DISPLAY_ORDER.forEach((n, idx) => orderIndex.set(n, idx));
+    out.sort((a, b) => (orderIndex.get(a.n) ?? 999) - (orderIndex.get(b.n) ?? 999));
     return out;
   }, [match, derivedServer3Url, runtimeServer5Url]);
 
