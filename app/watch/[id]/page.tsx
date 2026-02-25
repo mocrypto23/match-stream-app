@@ -6041,7 +6041,7 @@ export default function WatchPage() {
             const keepPlayerv2Cache = selectedServer === 2 && isPlayerv2LikeUrl(selectedUrl);
             if (!keepPlayerv2Cache) clearCachedResolveCandidates(selectedUrl);
             setResolverError(NO_STREAM_SELECTED_SERVER_MESSAGE);
-            if (selectedServer !== 3 || isServer3Livehd) scheduleResolveRecovery("resolver-empty");
+            if (selectedServer !== 3) scheduleResolveRecovery("resolver-empty");
             else resetRecoveryState();
           } else {
             hadPlayable = true;
@@ -6062,7 +6062,7 @@ export default function WatchPage() {
             } else {
               setResolverError(rawErrorMessage);
             }
-            if (selectedServer !== 3 || isServer3Livehd) {
+            if (selectedServer !== 3) {
               const immediate = isProbeTimeout; // Retry immediately heavily favored for timeouts
               scheduleResolveRecovery("resolver-error", immediate);
             } else {
@@ -6221,14 +6221,44 @@ export default function WatchPage() {
       clearLoadingOverlayTimer();
       setPlayerLoading(false);
     };
+    let autoplayAttempts = 0;
+    let autoplaySettled = false;
+    const ensureLoudAudio = () => {
+      video.volume = 1;
+      video.muted = false;
+      video.defaultMuted = false;
+      video.removeAttribute("muted");
+    };
     const playWithAutoplayFallback = () => {
-      video.play().catch(() => {
-        if (cancel) return;
-        video.muted = true;
-        video.defaultMuted = true;
-        video.setAttribute("muted", "");
-        video.play().catch(() => { });
-      });
+      if (cancel || autoplaySettled) return;
+      autoplayAttempts += 1;
+      video.play()
+        .then(() => {
+          autoplaySettled = true;
+          ensureLoudAudio();
+        })
+        .catch(() => {
+          if (cancel || autoplaySettled) return;
+          video.muted = true;
+          video.defaultMuted = true;
+          video.setAttribute("muted", "");
+          video.play()
+            .then(() => {
+              autoplaySettled = true;
+              // Try restoring normal loud audio shortly after startup.
+              queueTimeout(() => {
+                if (cancel) return;
+                ensureLoudAudio();
+              }, 450);
+            })
+            .catch(() => {
+              if (cancel || autoplaySettled) return;
+              if (autoplayAttempts < 8) {
+                const backoff = Math.min(1600, 200 + autoplayAttempts * 180);
+                queueTimeout(() => playWithAutoplayFallback(), backoff);
+              }
+            });
+        });
     };
     const seekToLiveEdgeIfBehind = (liveEdgeHint?: number | null) => {
       const hintedEdge =
@@ -6333,6 +6363,7 @@ export default function WatchPage() {
     };
     const onLoaded = () => {
       if (cancel) return;
+      playWithAutoplayFallback();
       markProgress();
       if (video.videoWidth > 0 || video.videoHeight > 0) markServer5VisualStart();
       hidePlayerLoading();
@@ -6356,6 +6387,8 @@ export default function WatchPage() {
     };
     const onPlaying = () => {
       if (cancel) return;
+      autoplaySettled = true;
+      ensureLoudAudio();
       freezeTriggered = false;
       markProgress();
       if (hasServer5VisualStart()) markServer5VisualStart();
@@ -6378,7 +6411,13 @@ export default function WatchPage() {
         hidePlayerLoading();
       }
     };
+    const onCanPlay = () => {
+      if (cancel) return;
+      if (!autoplaySettled || video.paused) playWithAutoplayFallback();
+    };
     video.addEventListener("loadeddata", onLoaded);
+    video.addEventListener("canplay", onCanPlay);
+    video.addEventListener("loadedmetadata", onCanPlay);
     video.addEventListener("waiting", onWaiting);
     video.addEventListener("stalled", onWaiting);
     video.addEventListener("playing", onPlaying);
@@ -6598,6 +6637,8 @@ export default function WatchPage() {
       clearLoadingOverlayTimer();
       clearStallWatchdog();
       video.removeEventListener("loadeddata", onLoaded);
+      video.removeEventListener("canplay", onCanPlay);
+      video.removeEventListener("loadedmetadata", onCanPlay);
       video.removeEventListener("waiting", onWaiting);
       video.removeEventListener("stalled", onWaiting);
       video.removeEventListener("playing", onPlaying);

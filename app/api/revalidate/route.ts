@@ -1,4 +1,4 @@
-import { revalidatePath } from "next/cache";
+import { revalidatePath, revalidateTag } from "next/cache";
 import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
@@ -55,9 +55,13 @@ export async function POST(req: NextRequest) {
     revalidatePath(path);
   }
 
+  // Keep matches API data cache aligned with scraper cron updates.
+  revalidateTag("matches-list", "max");
+
   return NextResponse.json({
     ok: true,
     revalidated: paths,
+    revalidatedTags: ["matches-list"],
     at: new Date().toISOString(),
   });
 }

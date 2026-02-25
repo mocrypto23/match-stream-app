@@ -1,10 +1,14 @@
 // app/api/matches/route.ts
 import { NextResponse } from "next/server";
+import { unstable_cache } from "next/cache";
 import { supabaseAdmin } from "../_supabase";
 
 export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
 const TABLE = "match-stream-app";
+const MATCHES_CACHE_TTL_SECONDS = Math.max(
+  60,
+  Number.parseInt(process.env.MATCHES_CACHE_TTL_SECONDS ?? "1200", 10) || 1200
+);
 
 type MatchApiRow = {
   id: number;
@@ -111,14 +115,7 @@ async function hydrateMissingLogos(rows: MatchApiRow[]) {
   });
 }
 
-export async function GET(req: Request) {
-  const { searchParams } = new URL(req.url);
-  const day = searchParams.get("day");
-
-  if (!day || !/^\d{4}-\d{2}-\d{2}$/.test(day)) {
-    return NextResponse.json({ error: "Invalid day" }, { status: 400 });
-  }
-
+async function fetchMatchesForDay(day: string) {
   const { data, error } = await supabaseAdmin
     .from(TABLE)
     .select(
@@ -129,16 +126,43 @@ export async function GET(req: Request) {
     .order("id", { ascending: true });
 
   if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    throw new Error(error.message);
   }
 
   const hydrated = await hydrateMissingLogos((data ?? []) as MatchApiRow[]);
-  const normalized = hydrated.map((row) => ({
+  return hydrated.map((row) => ({
     ...row,
     match_time: sanitizeMatchTimeForClient(row.match_time),
   }));
-  const res = NextResponse.json(normalized);
-  res.headers.set("Cache-Control", "public, s-maxage=10, stale-while-revalidate=60");
-  res.headers.set("Vary", "Accept-Encoding");
-  return res;
+}
+
+function getCachedMatchesFetcher(day: string) {
+  return unstable_cache(() => fetchMatchesForDay(day), [`matches-day:${day}`], {
+    revalidate: MATCHES_CACHE_TTL_SECONDS,
+    tags: ["matches-list", `matches-day:${day}`],
+  });
+}
+
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url);
+  const day = searchParams.get("day");
+
+  if (!day || !/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    return NextResponse.json({ error: "Invalid day" }, { status: 400 });
+  }
+
+  try {
+    const normalized = await getCachedMatchesFetcher(day)();
+    const res = NextResponse.json(normalized);
+    res.headers.set(
+      "Cache-Control",
+      `public, s-maxage=${MATCHES_CACHE_TTL_SECONDS}, stale-while-revalidate=120`
+    );
+    res.headers.set("X-Matches-Cache-TTL", String(MATCHES_CACHE_TTL_SECONDS));
+    res.headers.set("Vary", "Accept-Encoding");
+    return res;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to load matches";
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
 }
