@@ -30,6 +30,15 @@ type ServerOption = {
   sticky?: boolean;
 };
 type ServerHealthState = "ok" | "down" | "pending";
+type P2PWeakNetworkState = { weak: boolean; reason: string | null };
+type P2PDownloadSource = "p2p" | "http" | "hybrid";
+type P2PEngineCtor = new (config?: Record<string, unknown>) => {
+  getConfigForHlsJs: () => Record<string, unknown>;
+  applyDynamicConfig: (cfg: unknown) => void;
+  addEventListener: (eventName: string, cb: (...args: unknown[]) => void) => void;
+  bindHls: (hls: unknown | (() => unknown)) => void;
+  destroy: () => void;
+};
 
 const SERVER_SOURCE_LABELS: Record<number, string> = {
   1: "سيرفر 4 ",
@@ -40,6 +49,11 @@ const SERVER_SOURCE_LABELS: Record<number, string> = {
 const SERVER_DISPLAY_ORDER = [4, 2, 3, 1, 5, 6] as const;
 const FORCE_IFRAME_PLAYER = String(process.env.NEXT_PUBLIC_FORCE_IFRAME_PLAYER || "0") === "1";
 const IFRAME_PLAYER_ORIGIN = String(process.env.NEXT_PUBLIC_IFRAME_PLAYER_ORIGIN || "").trim().replace(/\/+$/, "");
+const P2P_ENABLED = String(process.env.NEXT_PUBLIC_P2P_ENABLED || "0") === "1";
+const P2P_AGGRESSIVE = String(process.env.NEXT_PUBLIC_P2P_AGGRESSIVE || "0") === "1";
+const P2P_DISABLE_ON_WEAK_NET = String(process.env.NEXT_PUBLIC_P2P_DISABLE_ON_WEAK_NET || "1") === "1";
+const P2P_MAX_PEERS = Number.parseInt(String(process.env.NEXT_PUBLIC_P2P_MAX_PEERS || "8"), 10) || 8;
+const P2P_UPLOAD_CAP_KBPS = Number.parseInt(String(process.env.NEXT_PUBLIC_P2P_UPLOAD_CAP_KBPS || "400"), 10) || 400;
 
 const PREMATCH_OPEN_WINDOW_MINUTES = 30;
 const STALL_FREEZE_MS = 12000;
@@ -1083,6 +1097,22 @@ function shouldUseNativeHls(video: HTMLVideoElement) {
     ua.includes("safari") && !/(chrome|chromium|crios|edg|opr|opera|fxios|firefox|android)/.test(ua);
   const isIOS = /iphone|ipad|ipod/.test(ua);
   return isSafari || isIOS;
+}
+
+function getWeakNetworkState(): P2PWeakNetworkState {
+  if (typeof navigator === "undefined") return { weak: false, reason: null };
+  const nav = navigator as Navigator & {
+    connection?: { effectiveType?: string; saveData?: boolean; downlink?: number };
+    mozConnection?: { effectiveType?: string; saveData?: boolean; downlink?: number };
+    webkitConnection?: { effectiveType?: string; saveData?: boolean; downlink?: number };
+  };
+  const conn = nav.connection || nav.mozConnection || nav.webkitConnection;
+  if (!conn) return { weak: false, reason: null };
+  if (conn.saveData) return { weak: true, reason: "save-data" };
+  const effectiveType = String(conn.effectiveType || "").toLowerCase();
+  if (effectiveType === "slow-2g" || effectiveType === "2g") return { weak: true, reason: `effective-type:${effectiveType}` };
+  if (typeof conn.downlink === "number" && conn.downlink > 0 && conn.downlink < 1.2) return { weak: true, reason: `downlink:${conn.downlink}` };
+  return { weak: false, reason: null };
 }
 
 function contentTypeLooksLikeHls(contentType: string) {
@@ -4934,6 +4964,7 @@ export default function WatchPage() {
   const [serverHealth, setServerHealth] = useState<Record<number, ServerHealthState>>({});
   const [diagLogs, setDiagLogs] = useState<string[]>([]);
   const [isTfPlayerHost, setIsTfPlayerHost] = useState(false);
+  const [p2pEngineCtor, setP2PEngineCtor] = useState<P2PEngineCtor | null>(null);
   const candidatesRef = useRef<string[]>([]);
   const selectedCandidateRef = useRef(0);
   const selectedServerRef = useRef(4);
@@ -4955,12 +4986,27 @@ export default function WatchPage() {
   const lastFastFailoverAtByServerRef = useRef<Record<number, number>>({ 1: 0, 3: 0, 5: 0 });
   const server5RefreshInFlightRef = useRef<Promise<string | null> | null>(null);
   const server5PrewarmResolveInFlightRef = useRef<Map<string, Promise<string[]>>>(new Map());
+  const p2pDisabledReasonRef = useRef<string | null>(null);
 
   const diagEnabled = searchParams.get("diag") === "1";
   useEffect(() => {
     if (typeof window === "undefined") return;
     const host = String(window.location.hostname || "").toLowerCase();
     setIsTfPlayerHost(host === "tf-player.site" || host.endsWith(".tf-player.site"));
+  }, []);
+  useEffect(() => {
+    if (!P2P_ENABLED || typeof window === "undefined") return;
+    let cancelled = false;
+    import("p2p-media-loader-hlsjs")
+      .then((mod) => {
+        if (cancelled) return;
+        const ctor = (mod as { HlsJsP2PEngine?: P2PEngineCtor }).HlsJsP2PEngine;
+        if (ctor) setP2PEngineCtor(() => ctor);
+      })
+      .catch(() => { });
+    return () => {
+      cancelled = true;
+    };
   }, []);
   const externalPlayerSrc = useMemo(() => {
     if (!FORCE_IFRAME_PLAYER) return "";
@@ -6267,6 +6313,24 @@ export default function WatchPage() {
     video.removeAttribute("muted");
     markProgress();
     let fatalRetries = 0;
+    let waitingHitsEarly = 0;
+    const playbackBootAt = Date.now();
+    let p2pEngine: InstanceType<P2PEngineCtor> | null = null;
+    let p2pDisabled = false;
+    const disableP2P = (reason: string) => {
+      if (!p2pEngine || p2pDisabled) return;
+      p2pDisabled = true;
+      p2pDisabledReasonRef.current = reason;
+      try {
+        p2pEngine.applyDynamicConfig({
+          core: {
+            isP2PDisabled: true,
+            isP2PUploadDisabled: true,
+          },
+        });
+      } catch { }
+      pushDiag(`p2p disabled: ${reason}`);
+    };
     const onLoaded = () => {
       if (cancel) return;
       markProgress();
@@ -6275,6 +6339,10 @@ export default function WatchPage() {
     };
     const onWaiting = () => {
       if (cancel) return;
+      if (P2P_ENABLED && !p2pDisabled && Date.now() - playbackBootAt <= 45_000) {
+        waitingHitsEarly += 1;
+        if (waitingHitsEarly >= 2) disableP2P("early-stall");
+      }
       const server5RecentProgress = selectedServer === 5 && Date.now() - lastProgressAtRef.current < 2500;
       if (!server5RecentProgress) showPlayerLoadingDelayed();
       try {
@@ -6322,7 +6390,70 @@ export default function WatchPage() {
       playWithAutoplayFallback();
     } else if (Hls.isSupported()) {
       const isServer5Playback = selectedServer === 5;
+      const weakNet = getWeakNetworkState();
+      const allowP2P = P2P_ENABLED && (!P2P_DISABLE_ON_WEAK_NET || !weakNet.weak);
+      if (allowP2P && p2pEngineCtor) {
+        const disableUploadByConfig = P2P_UPLOAD_CAP_KBPS <= 0;
+        const targetP2PDownloads = Math.max(2, Math.min(P2P_MAX_PEERS, P2P_AGGRESSIVE ? 8 : 5));
+        pushDiag(`p2p enabled dls=${targetP2PDownloads} upcap=${P2P_UPLOAD_CAP_KBPS}kbps`);
+        p2pEngine = new p2pEngineCtor({
+          core: {
+            announceTrackers: [
+              "wss://tracker.novage.com.ua",
+              "wss://tracker.webtorrent.dev",
+              "wss://openwebtorrent.com",
+            ],
+            simultaneousP2PDownloads: targetP2PDownloads,
+            simultaneousHttpDownloads: P2P_AGGRESSIVE ? 1 : 2,
+            httpDownloadTimeWindow: P2P_AGGRESSIVE ? 1200 : 2000,
+            p2pDownloadTimeWindow: P2P_AGGRESSIVE ? 9000 : 6000,
+            p2pNotReceivingBytesTimeoutMs: 1800,
+            httpNotReceivingBytesTimeoutMs: 3000,
+            isP2PUploadDisabled: disableUploadByConfig,
+            isP2PDisabled: false,
+            webRtcMaxMessageSize: 64 * 1024 - 1,
+            rtcConfig: {
+              iceServers: [
+                { urls: "stun:stun.l.google.com:19302" },
+                { urls: "stun:global.stun.twilio.com:3478" },
+              ],
+            },
+          },
+        });
+        p2pDisabledReasonRef.current = null;
+        try {
+          p2pEngine.applyDynamicConfig({
+            core: {
+              announceTrackers: [
+                "wss://tracker.novage.com.ua",
+                "wss://tracker.webtorrent.dev",
+                "wss://openwebtorrent.com",
+              ],
+              isP2PUploadDisabled: disableUploadByConfig,
+              isP2PDisabled: false,
+            },
+          });
+        } catch { }
+        p2pEngine.addEventListener("onChunkDownloaded", (...args: unknown[]) => {
+          if (!diagEnabled) return;
+          const bytesLength = Number(args[0] || 0);
+          const source = String(args[1] || "http") as P2PDownloadSource;
+          if (source !== "p2p") return;
+          if (bytesLength <= 0) return;
+          pushDiag(`p2p chunk +${bytesLength}b`);
+        });
+        p2pEngine.addEventListener("onPeerConnect", () => {
+          if (!diagEnabled) return;
+          pushDiag("p2p peer connected");
+        });
+      } else if (weakNet.weak) {
+        p2pDisabledReasonRef.current = weakNet.reason || "weak-network";
+        pushDiag(`p2p skipped: ${p2pDisabledReasonRef.current}`);
+      } else if (allowP2P && !p2pEngineCtor) {
+        pushDiag("p2p skipped: module-not-ready");
+      }
       hls = new Hls({
+        ...(p2pEngine ? p2pEngine.getConfigForHlsJs() : {}),
         enableWorker: true,
         xhrSetup: (xhr, requestUrl) => {
           applyServer5ProxyAuthToXhr(xhr, requestUrl);
@@ -6343,6 +6474,11 @@ export default function WatchPage() {
         abrBandWidthFactor: 0.85,
         abrBandWidthUpFactor: 0.7,
       });
+      if (p2pEngine) {
+        try {
+          p2pEngine.bindHls(() => hls as Hls);
+        } catch { }
+      }
       setHlsInstance(hls);
       hls.on(Hls.Events.MEDIA_ATTACHED, () => hls?.loadSource(selectedHlsUrl));
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -6467,6 +6603,7 @@ export default function WatchPage() {
       video.removeEventListener("playing", onPlaying);
       video.removeEventListener("timeupdate", onTimeUpdate);
       try { hls?.destroy(); } catch { }
+      try { p2pEngine?.destroy(); } catch { }
       setHlsInstance(null);
       reset();
     };
@@ -6483,6 +6620,7 @@ export default function WatchPage() {
     setResolverError,
     scheduleResolveRecovery,
     resetRecoveryState,
+    p2pEngineCtor,
   ]);
 
   const prettyStart = formatStartTimeAr(match?.match_start);
