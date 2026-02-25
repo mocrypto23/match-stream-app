@@ -208,6 +208,9 @@ const SERVER5_LOOKUP_ENDPOINT_FALLBACKS = [
 ] as const;
 const SERVER5_STARTUP_NO_FRAME_TIMEOUT_MS = 5_500;
 const SERVER5_STARTUP_NO_FRAME_RECHECK_MS = 1_500;
+const AUDIO_INTENT_STORAGE_KEY = "tf_audio_intent";
+const SERVER3_AUTOSWITCH_WINDOW_MS = 20_000;
+const SERVER3_AUTOSWITCH_LIMIT = 3;
 
 type Playerv2TokenPayload = { token: string; session_id: string };
 type AlbaRollingConfig = { ch: string; dm: string[]; iv: number };
@@ -981,9 +984,36 @@ function isSafeToCacheUrl(value?: string | null) {
   return true;
 }
 
+function isServer2HardWrapperLikeUrl(value?: string | null) {
+  const raw = toUnderlyingUrl(String(value || ""));
+  if (!raw || !isValidHttpUrl(raw)) return false;
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase();
+    const hostAllowed =
+      host === "yallashot.us" ||
+      host.endsWith(".yallashot.us") ||
+      host === "aleynoxitram.sbs" ||
+      host.endsWith(".aleynoxitram.sbs") ||
+      host === "siiir.tv" ||
+      host.endsWith(".siiir.tv");
+    if (!hostAllowed) return false;
+    if (!/\/hard\/[^/?#]+\.html$/i.test(path)) return false;
+    const matchId = String(u.searchParams.get("match") || "").trim().toLowerCase().replace(/^match/, "");
+    return /^\d{1,6}$/.test(matchId);
+  } catch {
+    return false;
+  }
+}
+
 function isPlayerv2LikeUrl(value?: string | null) {
   const raw = toUnderlyingUrl(String(value || ""));
-  return /\/playerv2\.php(?:\?|$)/i.test(raw) || /[?&]action=generate_token(?:&|$)/i.test(raw);
+  return (
+    /\/playerv2\.php(?:\?|$)/i.test(raw) ||
+    /[?&]action=generate_token(?:&|$)/i.test(raw) ||
+    isServer2HardWrapperLikeUrl(raw)
+  );
 }
 
 function isLivehd77LikeUrl(value?: string | null) {
@@ -2999,7 +3029,7 @@ function scoreServer5Candidate(value: string) {
 }
 
 function isFastFailoverServer(server: number) {
-  return server === 1 || server === 3 || server === 5;
+  return server === 1 || server === 5;
 }
 
 function escapeRegExp(value: string) {
@@ -4946,6 +4976,7 @@ export default function WatchPage() {
   const [match, setMatch] = useState<MatchRow | null>(null);
   const [derivedServer3Url, setDerivedServer3Url] = useState<string | null>(null);
   const [server3DeriveState, setServer3DeriveState] = useState<Server3DeriveState>("idle");
+  const [server3VerifiedAvailable, setServer3VerifiedAvailable] = useState<boolean | null>(null);
   const [, setDerivedServerVariants] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [errMsg, setErrMsg] = useState<string | null>(null);
@@ -4987,8 +5018,20 @@ export default function WatchPage() {
   const server5RefreshInFlightRef = useRef<Promise<string | null> | null>(null);
   const server5PrewarmResolveInFlightRef = useRef<Map<string, Promise<string[]>>>(new Map());
   const p2pDisabledReasonRef = useRef<string | null>(null);
+  const server3AutoSwitchWindowRef = useRef<{ windowStart: number; count: number }>({ windowStart: 0, count: 0 });
+  const userPausedRef = useRef(false);
+  const lastUserInteractionAtRef = useRef(0);
+  const audioIntentEnabledRef = useRef(false);
 
   const diagEnabled = searchParams.get("diag") === "1";
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      audioIntentEnabledRef.current = window.localStorage.getItem(AUDIO_INTENT_STORAGE_KEY) === "1";
+    } catch {
+      audioIntentEnabledRef.current = false;
+    }
+  }, []);
   useEffect(() => {
     if (typeof window === "undefined") return;
     const host = String(window.location.hostname || "").toLowerCase();
@@ -5034,7 +5077,15 @@ export default function WatchPage() {
 
   useEffect(() => {
     selectedServerRef.current = selectedServer;
+    if (selectedServer !== 3) {
+      server3AutoSwitchWindowRef.current = { windowStart: 0, count: 0 };
+    }
   }, [selectedServer]);
+
+  useEffect(() => {
+    setServer3VerifiedAvailable(null);
+    server3AutoSwitchWindowRef.current = { windowStart: 0, count: 0 };
+  }, [match?.id, match?.stream_url_3, derivedServer3Url]);
 
   const mergeServer3Provenance = useCallback((incoming?: Map<string, Server3CandidateProvenance>) => {
     if (!incoming || !incoming.size) return;
@@ -5416,6 +5467,7 @@ export default function WatchPage() {
     const server3Source = (() => {
       const explicitServer3 = String(match?.stream_url_3 || "").trim();
       if (explicitServer3 && isValidHttpUrl(explicitServer3)) return explicitServer3;
+      if (server3VerifiedAvailable === false) return null;
       const derivedServer3 = String(derivedServer3Url || "").trim();
       if (derivedServer3 && isValidHttpUrl(derivedServer3)) return derivedServer3;
       return null;
@@ -5449,7 +5501,7 @@ export default function WatchPage() {
     SERVER_DISPLAY_ORDER.forEach((n, idx) => orderIndex.set(n, idx));
     out.sort((a, b) => (orderIndex.get(a.n) ?? 999) - (orderIndex.get(b.n) ?? 999));
     return out;
-  }, [match, derivedServer3Url, runtimeServer5Url]);
+  }, [match, derivedServer3Url, runtimeServer5Url, server3VerifiedAvailable]);
 
   const validServers = useMemo(() => serverOptions.filter((s) => s.url && isValidHttpUrl(s.url)), [serverOptions]);
   useEffect(() => {
@@ -5460,19 +5512,31 @@ export default function WatchPage() {
     setServerHealth(() => {
       const next: Record<number, ServerHealthState> = {};
       for (const s of serverOptions) {
-        if (s.url && isValidHttpUrl(s.url)) {
-          next[s.n] = "ok";
+        if (s.n === 3) {
+          if (server3VerifiedAvailable === false) {
+            next[s.n] = "down";
+            continue;
+          }
+          if (s.url && isValidHttpUrl(s.url)) {
+            next[s.n] = "ok";
+            continue;
+          }
+          if (server3DeriveState === "loading") {
+            next[s.n] = "pending";
+            continue;
+          }
+          next[s.n] = "down";
           continue;
         }
-        if (s.n === 3 && server3DeriveState === "loading") {
-          next[s.n] = "pending";
+        if (s.url && isValidHttpUrl(s.url)) {
+          next[s.n] = "ok";
           continue;
         }
         next[s.n] = "down";
       }
       return next;
     });
-  }, [serverOptions, server3DeriveState]);
+  }, [serverOptions, server3DeriveState, server3VerifiedAvailable]);
 
   const handleVideoDoubleClick = useCallback(() => {
     const video = videoRef.current;
@@ -5769,8 +5833,8 @@ export default function WatchPage() {
       ) => {
         if (!incoming.length) return;
         if (selectedServer === 3) mergeServer3Provenance(provenance);
-        if (selectedServer === 5) {
-          // Server 5 is verified-only: do not expose raw/unverified batches to the UI.
+        if (selectedServer === 5 || selectedServer === 3) {
+          // Server 3/5 are verified-only: do not expose raw/unverified batches to the UI.
           return;
         }
         hadPlayable = true;
@@ -6013,7 +6077,7 @@ export default function WatchPage() {
               pushDiag,
             });
           }
-          const allowRawFallback = selectedServer === 1 || selectedServer === 3 || isServer2Playerv2;
+          const allowRawFallback = selectedServer === 1 || isServer2Playerv2;
           const mergedRawByPolicy =
             selectedServer === 3 && isServer3Livehd
               ? (() => {
@@ -6021,15 +6085,23 @@ export default function WatchPage() {
                 return dedupeUrls([...buckets.bucket0, ...buckets.bucket1]);
               })()
               : mergedRaw;
-          const merged = verified.length ? verified : (allowRawFallback ? mergedRawByPolicy : []);
+          if (selectedServer === 3) {
+            pushDiag(`server3 verified=${verified.length} raw=${mergedRawByPolicy.length}`);
+            if (verified.length) setServer3VerifiedAvailable(true);
+            else {
+              setServer3VerifiedAvailable(false);
+              pushDiag("server3 disabled no-verified");
+            }
+          }
+          const merged =
+            selectedServer === 3
+              ? verified
+              : (verified.length ? verified : (allowRawFallback ? mergedRawByPolicy : []));
           if (!verified.length && selectedServer === 1 && mergedRaw.length) {
             pushDiag("raw-fallback server1");
           }
           if (!verified.length && isServer2Playerv2 && mergedRaw.length) {
             pushDiag("probe fallback server2-playerv2 raw");
-          }
-          if (!verified.length && selectedServer === 3 && mergedRawByPolicy.length) {
-            pushDiag("raw-fallback server3");
           }
           if (mergedRaw.length) pushDiag(`probe ok ${merged.length}/${mergedRaw.length}`);
           applyCandidatesPreservingSelection(merged);
@@ -6061,6 +6133,10 @@ export default function WatchPage() {
               setResolverError(null);
             } else {
               setResolverError(rawErrorMessage);
+            }
+            if (selectedServer === 3) {
+              setServer3VerifiedAvailable(false);
+              pushDiag("server3 disabled no-verified");
             }
             if (selectedServer !== 3) {
               const immediate = isProbeTimeout; // Retry immediately heavily favored for timeouts
@@ -6102,7 +6178,17 @@ export default function WatchPage() {
   ]);
 
   const selectedHlsUrl = candidates[selectedCandidate] || "";
-  const candidateGroups = useMemo(() => groupCandidates(candidates), [candidates]);
+  const candidateGroups = useMemo(() => {
+    if (selectedServer === 3) {
+      return candidates.map((candidate, idx) => ({
+        key: `s3:${canonicalizeUrl(candidate) || candidate.toLowerCase()}:${idx}`,
+        primaryIndex: idx,
+        members: [idx],
+        label: extractQualityTagFromUrl(candidate) || "",
+      }));
+    }
+    return groupCandidates(candidates);
+  }, [candidates, selectedServer]);
   const activeCandidateGroupIndex = useMemo(
     () => candidateGroups.findIndex((g) => g.members.includes(selectedCandidate)),
     [candidateGroups, selectedCandidate]
@@ -6223,7 +6309,9 @@ export default function WatchPage() {
     };
     let autoplayAttempts = 0;
     let autoplaySettled = false;
-    let loudPromoteAttempted = false;
+    let startupAutoplayGuardTimer: number | null = null;
+    let loudPromotionAttempted = false;
+    const prefersLoudAudio = !!audioIntentEnabledRef.current;
     const ensureLoudAudio = () => {
       video.volume = 1;
       video.muted = false;
@@ -6235,21 +6323,25 @@ export default function WatchPage() {
       video.defaultMuted = true;
       video.setAttribute("muted", "");
     };
-    const tryPromoteToLoudAudio = () => {
-      if (loudPromoteAttempted) return;
-      loudPromoteAttempted = true;
-      const wasPlaying = !video.paused;
-      if (cancel) return;
+    const persistAudioIntent = () => {
+      audioIntentEnabledRef.current = true;
+      try {
+        window.localStorage.setItem(AUDIO_INTENT_STORAGE_KEY, "1");
+      } catch { }
+    };
+    const tryPromoteLoudAudioFromIntent = () => {
+      if (!prefersLoudAudio || loudPromotionAttempted || cancel) return;
+      loudPromotionAttempted = true;
       ensureLoudAudio();
       queueTimeout(() => {
         if (cancel) return;
-        // Never let loud-audio promotion break autoplay.
-        if (!wasPlaying || !video.paused) return;
+        if (!video.paused) return;
+        // Keep playback alive if browser refuses unmuted autoplay.
         keepMutedAutoplay();
         try {
           video.play().catch(() => { });
         } catch { }
-      }, 140);
+      }, 130);
     };
     const playWithAutoplayFallback = () => {
       if (cancel || autoplaySettled) return;
@@ -6260,8 +6352,8 @@ export default function WatchPage() {
         .then(() => {
           autoplaySettled = true;
           queueTimeout(() => {
-            tryPromoteToLoudAudio();
-          }, 420);
+            tryPromoteLoudAudioFromIntent();
+          }, 260);
         })
         .catch(() => {
           if (cancel || autoplaySettled) return;
@@ -6270,8 +6362,8 @@ export default function WatchPage() {
             .then(() => {
               autoplaySettled = true;
               queueTimeout(() => {
-                tryPromoteToLoudAudio();
-              }, 520);
+                tryPromoteLoudAudioFromIntent();
+              }, 260);
             })
             .catch(() => {
               if (cancel || autoplaySettled) return;
@@ -6318,8 +6410,25 @@ export default function WatchPage() {
     const moveNext = (reason: string) => {
       const total = candidatesRef.current.length;
       setResolverError(null);
-      if (current + 1 < total) {
-        const nextIndex = current + 1;
+      const activeIndex = selectedCandidateRef.current;
+      if (activeIndex + 1 < total) {
+        if (selectedServer === 3) {
+          const now = Date.now();
+          const windowState = server3AutoSwitchWindowRef.current;
+          if (now - windowState.windowStart > SERVER3_AUTOSWITCH_WINDOW_MS) {
+            windowState.windowStart = now;
+            windowState.count = 0;
+          }
+          windowState.count += 1;
+          if (windowState.count > SERVER3_AUTOSWITCH_LIMIT) {
+            pushDiag("server3 autoswitch-guard stop");
+            setPlayerError("تم إيقاف التحويل التلقائي مؤقتًا لتفادي الدوران. اختر مصدرًا آخر.");
+            setResolverError(NO_STREAM_SELECTED_SERVER_MESSAGE);
+            hidePlayerLoading();
+            return;
+          }
+        }
+        const nextIndex = activeIndex + 1;
         selectedCandidateRef.current = nextIndex;
         setSelectedCandidate(nextIndex);
         setPlayerError(`تعثر المصدر الحالي (${reason})، جاري التحويل تلقائيًا للمصدر التالي.`);
@@ -6408,6 +6517,10 @@ export default function WatchPage() {
     const onPlaying = () => {
       if (cancel) return;
       autoplaySettled = true;
+      userPausedRef.current = false;
+      if (selectedServer === 3) {
+        server3AutoSwitchWindowRef.current = { windowStart: 0, count: 0 };
+      }
       if (!video.muted) ensureLoudAudio();
       freezeTriggered = false;
       markProgress();
@@ -6435,8 +6548,57 @@ export default function WatchPage() {
       if (cancel) return;
       if (!autoplaySettled || video.paused) playWithAutoplayFallback();
     };
+    const onAnyUserInteraction = () => {
+      lastUserInteractionAtRef.current = Date.now();
+    };
+    const startStartupAutoplayGuard = () => {
+      const startedAt = Date.now();
+      const guardWindowMs = 15_000;
+      const tick = () => {
+        if (cancel) return;
+        if (Date.now() - startedAt > guardWindowMs) {
+          if (startupAutoplayGuardTimer !== null) {
+            window.clearInterval(startupAutoplayGuardTimer);
+            startupAutoplayGuardTimer = null;
+          }
+          return;
+        }
+        if (document.visibilityState !== "visible") return;
+        if (userPausedRef.current) return;
+        if (!video.paused || video.ended || video.seeking) return;
+        keepMutedAutoplay();
+        try {
+          video.play().catch(() => { });
+        } catch { }
+      };
+      tick();
+      startupAutoplayGuardTimer = window.setInterval(tick, 900);
+    };
+    const onPause = () => {
+      if (cancel) return;
+      const now = Date.now();
+      const userTriggeredPause = now - lastUserInteractionAtRef.current < 1_200 && Number(video.currentTime) > 1.2;
+      if (userTriggeredPause) {
+        userPausedRef.current = true;
+        return;
+      }
+      if (userPausedRef.current) return;
+      // During startup only, auto-resume if browser paused unexpectedly.
+      if (Number(video.currentTime) > 2.2) return;
+      if (video.ended || video.seeking) return;
+      if (document.visibilityState !== "visible") return;
+      queueTimeout(() => {
+        if (cancel) return;
+        if (!video.paused) return;
+        keepMutedAutoplay();
+        playWithAutoplayFallback();
+      }, 120);
+    };
     const onUserGesture = () => {
       if (cancel) return;
+      onAnyUserInteraction();
+      userPausedRef.current = false;
+      persistAudioIntent();
       ensureLoudAudio();
       try {
         if (video.paused) video.play().catch(() => { });
@@ -6448,7 +6610,11 @@ export default function WatchPage() {
     video.addEventListener("waiting", onWaiting);
     video.addEventListener("stalled", onWaiting);
     video.addEventListener("playing", onPlaying);
+    video.addEventListener("pause", onPause);
     video.addEventListener("timeupdate", onTimeUpdate);
+    startStartupAutoplayGuard();
+    window.addEventListener("pointerdown", onAnyUserInteraction, { passive: true });
+    window.addEventListener("keydown", onAnyUserInteraction);
     window.addEventListener("pointerdown", onUserGesture, { once: true, passive: true });
     window.addEventListener("keydown", onUserGesture, { once: true });
     if (shouldUseNativeHls(video)) {
@@ -6578,7 +6744,7 @@ export default function WatchPage() {
           const prev = networkFatalCountByCandidateRef.current.get(currentCandidateKey) || 0;
           const next = prev + 1;
           networkFatalCountByCandidateRef.current.set(currentCandidateKey, next);
-          const fastFailoverThreshold = selectedServer === 3 ? 1 : selectedServer === 5 ? 3 : 2;
+          const fastFailoverThreshold = selectedServer === 5 ? 3 : 2;
           if (useFastFailover && next >= fastFailoverThreshold) {
             if (selectedServer === 5) {
               const now = Date.now();
@@ -6671,7 +6837,14 @@ export default function WatchPage() {
       video.removeEventListener("waiting", onWaiting);
       video.removeEventListener("stalled", onWaiting);
       video.removeEventListener("playing", onPlaying);
+      video.removeEventListener("pause", onPause);
       video.removeEventListener("timeupdate", onTimeUpdate);
+      window.removeEventListener("pointerdown", onAnyUserInteraction);
+      window.removeEventListener("keydown", onAnyUserInteraction);
+      if (startupAutoplayGuardTimer !== null) {
+        window.clearInterval(startupAutoplayGuardTimer);
+        startupAutoplayGuardTimer = null;
+      }
       window.removeEventListener("pointerdown", onUserGesture);
       window.removeEventListener("keydown", onUserGesture);
       try { hls?.destroy(); } catch { }

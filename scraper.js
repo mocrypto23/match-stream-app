@@ -2386,16 +2386,26 @@ async function resolveSiiirPlayerIframeSrc(page, matchPageUrl) {
     }
 
     if (onlyPlayer.length) {
-      // لو في كذا واحد، استخدم scorer (بس كله playerv2)
       const best = pickBestUrl(onlyPlayer);
-      dbg("🟣 SIIIR best (playerv2 only):", best || onlyPlayer[0]);
+      dbg("SIIIR best (playerv2 only):", best || onlyPlayer[0]);
       return best || onlyPlayer[0];
     }
 
-    // ✅ لو لم نجد playerv2 => null (وليس hard)
-    dbg("🟣 SIIIR no playerv2 found => null");
+    const hardOnly = clean.filter((u) => isHard(u) && isServer2HardWrapperUrl(u));
+    if (hardOnly.length) {
+      const bestHard = pickBestUrl(hardOnly);
+      dbg("SIIIR fallback hard wrapper:", bestHard || hardOnly[0]);
+      return bestHard || hardOnly[0];
+    }
+    const directHard = normalizeUrl(matchPageUrl, matchPageUrl);
+    if (directHard && isServer2HardWrapperUrl(directHard)) {
+      dbg("SIIIR fallback direct hard wrapper:", directHard);
+      return directHard;
+    }
+
+    dbg("SIIIR no playerv2/hard found => null");
     return null;
-  } catch (e) {
+    } catch (e) {
     dbg("⚠️ SIIIR resolve error:", e?.message || e);
     return null;
   } finally {
@@ -3405,6 +3415,7 @@ function isWeakStreamUrl(u) {
 
   // أي لينك بين-لايف ماتش ضعيف
   if (s.includes("bein-live.com") && s.includes("match")) return true;
+  if (isServer2HardWrapperUrl(s)) return false;
 
   // hard wrapper غير موثوق داخل iframe => ضعيف
   if (s.includes("/hard/") && s.includes("aleynoxitram.sbs")) return true;
@@ -3458,6 +3469,23 @@ function hostMatchesAnyHint(hostname, hints) {
   return normalizedHints.some((hint) => host === hint || host.endsWith("." + hint));
 }
 
+function isServer2HardWrapperUrl(u) {
+  const normalized = normalizeUrl(u, u);
+  if (!normalized) return false;
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname.toLowerCase();
+    const hostLooksServer2 = hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[2]);
+    if (!hostLooksServer2) return false;
+    if (!/\/hard\/[^/?#]+\.html$/i.test(path)) return false;
+    const matchId = normalizeDigits(parsed.searchParams.get("match") || "").trim().replace(/^match/i, "");
+    return /^\d{1,6}$/.test(matchId);
+  } catch {
+    return false;
+  }
+}
+
 function createServerIsolationStats() {
   return {
     isolation_reject_server2: 0,
@@ -3505,8 +3533,9 @@ function validateServerUrlBySlot(slot, url, { stats = null, reason = "", matchKe
       }
       case 2: {
         const isPlayerv2 = /\/playerv2\.php(\?|$)/i.test(`${parsed.pathname}${parsed.search}`);
+        const isHardWrapper = isServer2HardWrapperUrl(normalized);
         const hostLooksSiiir = hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[2]);
-        allowed = isPlayerv2 && (hostLooksSiiir || !isClearlyNonStreamUrl(normalized));
+        allowed = (isPlayerv2 || isHardWrapper) && (hostLooksSiiir || !isClearlyNonStreamUrl(normalized));
         if (!allowed) rejectReason = reason || "server2_requires_playerv2";
         break;
       }
@@ -6580,10 +6609,12 @@ async function startScraping() {
       if (!server2) {
         const directSiiirServer2 = [m.match_url, m.deep_stream_url]
           .map((u) => normalizeUrl(u, m.match_url || m.deep_stream_url || ""))
-          .find((u) => u && /\/playerv2\.php(\?|$)/i.test(String(u)));
+          .find((u) => u && (/\/playerv2\.php(\?|$)/i.test(String(u)) || isServer2HardWrapperUrl(String(u))));
         if (directSiiirServer2) server2 = directSiiirServer2;
       }
-      if (server2 && !/\/playerv2\.php(\?|$)/i.test(String(server2))) server2 = null;
+      if (server2 && !(/\/playerv2\.php(\?|$)/i.test(String(server2)) || isServer2HardWrapperUrl(String(server2)))) {
+        server2 = null;
+      }
       server2 = validateServerUrlBySlot(2, server2, {
         stats: isolationStats,
         reason: "extract_server2_invalid",
