@@ -6229,27 +6229,44 @@ export default function WatchPage() {
       video.defaultMuted = false;
       video.removeAttribute("muted");
     };
+    const tryPromoteToLoudAudio = () => {
+      if (cancel) return;
+      ensureLoudAudio();
+      queueTimeout(() => {
+        if (cancel) return;
+        // Never let loud-audio promotion break autoplay.
+        if (!video.paused) return;
+        video.muted = true;
+        video.defaultMuted = true;
+        video.setAttribute("muted", "");
+        try {
+          video.play().catch(() => { });
+        } catch { }
+      }, 140);
+    };
     const playWithAutoplayFallback = () => {
       if (cancel || autoplaySettled) return;
       autoplayAttempts += 1;
+      // Start muted-first for highest autoplay success across browsers.
+      video.muted = true;
+      video.defaultMuted = true;
+      video.setAttribute("muted", "");
       video.play()
         .then(() => {
           autoplaySettled = true;
-          ensureLoudAudio();
+          queueTimeout(() => {
+            tryPromoteToLoudAudio();
+          }, 420);
         })
         .catch(() => {
           if (cancel || autoplaySettled) return;
-          video.muted = true;
-          video.defaultMuted = true;
-          video.setAttribute("muted", "");
+          // Retry with identical muted setup/backoff.
           video.play()
             .then(() => {
               autoplaySettled = true;
-              // Try restoring normal loud audio shortly after startup.
               queueTimeout(() => {
-                if (cancel) return;
-                ensureLoudAudio();
-              }, 450);
+                tryPromoteToLoudAudio();
+              }, 520);
             })
             .catch(() => {
               if (cancel || autoplaySettled) return;
@@ -6338,9 +6355,9 @@ export default function WatchPage() {
     setPlayerLoading(true);
     scheduleServer5StartupNoFrameWatchdog();
     video.volume = 1;
-    video.muted = false;
-    video.defaultMuted = false;
-    video.removeAttribute("muted");
+    video.muted = true;
+    video.defaultMuted = true;
+    video.setAttribute("muted", "");
     markProgress();
     let fatalRetries = 0;
     let waitingHitsEarly = 0;
@@ -6388,7 +6405,7 @@ export default function WatchPage() {
     const onPlaying = () => {
       if (cancel) return;
       autoplaySettled = true;
-      ensureLoudAudio();
+      tryPromoteToLoudAudio();
       freezeTriggered = false;
       markProgress();
       if (hasServer5VisualStart()) markServer5VisualStart();
