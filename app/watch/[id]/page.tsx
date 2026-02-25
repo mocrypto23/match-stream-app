@@ -6374,7 +6374,15 @@ export default function WatchPage() {
             });
         });
     };
-    const seekToLiveEdgeIfBehind = (liveEdgeHint?: number | null) => {
+    let lastLiveEdgeSeekAt = 0;
+    const seekToLiveEdgeIfBehind = (
+      liveEdgeHint?: number | null,
+      opts?: { toleranceSec?: number; minIntervalMs?: number }
+    ) => {
+      const toleranceSec = Math.max(2, opts?.toleranceSec ?? LIVE_EDGE_SEEK_TOLERANCE_SEC);
+      const minIntervalMs = Math.max(0, opts?.minIntervalMs ?? 0);
+      const nowAt = Date.now();
+      if (minIntervalMs > 0 && nowAt - lastLiveEdgeSeekAt < minIntervalMs) return;
       const hintedEdge =
         typeof liveEdgeHint === "number" && Number.isFinite(liveEdgeHint) && liveEdgeHint > 0
           ? liveEdgeHint
@@ -6391,9 +6399,10 @@ export default function WatchPage() {
       if (!Number.isFinite(edge) || edge <= 0) return;
       const now = Number(video.currentTime);
       if (!Number.isFinite(now) || now < 0) return;
-      if (edge - now <= LIVE_EDGE_SEEK_TOLERANCE_SEC) return;
+      if (edge - now <= toleranceSec) return;
       try {
         video.currentTime = Math.max(0, edge - 1.5);
+        lastLiveEdgeSeekAt = nowAt;
       } catch { }
     };
     const applyServer5ProxyAuthToXhr = (xhr: XMLHttpRequest, requestUrl: string) => {
@@ -6620,7 +6629,7 @@ export default function WatchPage() {
     if (shouldUseNativeHls(video)) {
       video.src = selectedHlsUrl;
       video.load();
-      queueTimeout(() => seekToLiveEdgeIfBehind(null), 600);
+      queueTimeout(() => seekToLiveEdgeIfBehind(null, { toleranceSec: 8, minIntervalMs: 0 }), 600);
       playWithAutoplayFallback();
     } else if (Hls.isSupported()) {
       const isServer5Playback = selectedServer === 5;
@@ -6728,13 +6737,15 @@ export default function WatchPage() {
         setPlayerError(null);
         setResolverError(null);
         if (useFastFailover) clearCandidateFailureMarks(selectedServer, selectedHlsUrl);
-        queueTimeout(() => seekToLiveEdgeIfBehind(hls?.liveSyncPosition ?? null), 220);
+        // One startup catch-up is enough; repeated seeks every playlist refresh cause visible jumps.
+        queueTimeout(() => seekToLiveEdgeIfBehind(hls?.liveSyncPosition ?? null, { toleranceSec: 10, minIntervalMs: 0 }), 220);
         playWithAutoplayFallback();
       });
       hls.on(Hls.Events.LEVEL_LOADED, (_event, data) => {
         if (cancel) return;
         if (!data?.details?.live) return;
-        queueTimeout(() => seekToLiveEdgeIfBehind(hls?.liveSyncPosition ?? null), 120);
+        // Only correct when the player drifts far behind and never more than once per 45s.
+        queueTimeout(() => seekToLiveEdgeIfBehind(hls?.liveSyncPosition ?? null, { toleranceSec: 22, minIntervalMs: 45_000 }), 120);
       });
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (cancel || !data.fatal) return;
@@ -6822,7 +6833,28 @@ export default function WatchPage() {
       try {
         video.play().catch(() => { });
       } catch { }
-      queueTimeout(() => moveNext("stall"), 250);
+      if (total <= 1) {
+        // Single-source playback: avoid hard source switch loops; keep trying in-place.
+        setPlayerError("انقطاع مؤقت... جاري إعادة المزامنة");
+        queueTimeout(() => {
+          freezeTriggered = false;
+          hidePlayerLoading();
+          try {
+            if (video.paused) video.play().catch(() => { });
+          } catch { }
+        }, 1200);
+        return;
+      }
+      queueTimeout(() => {
+        if (cancel) return;
+        const progressed = Number(video.currentTime);
+        if (Number.isFinite(progressed) && progressed > lastProgressRef.current + 0.2) {
+          freezeTriggered = false;
+          hidePlayerLoading();
+          return;
+        }
+        moveNext("stall");
+      }, 900);
     }, 1500);
 
     return () => {
