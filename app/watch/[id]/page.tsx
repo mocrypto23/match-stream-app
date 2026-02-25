@@ -6223,22 +6223,29 @@ export default function WatchPage() {
     };
     let autoplayAttempts = 0;
     let autoplaySettled = false;
+    let loudPromoteAttempted = false;
     const ensureLoudAudio = () => {
       video.volume = 1;
       video.muted = false;
       video.defaultMuted = false;
       video.removeAttribute("muted");
     };
+    const keepMutedAutoplay = () => {
+      video.muted = true;
+      video.defaultMuted = true;
+      video.setAttribute("muted", "");
+    };
     const tryPromoteToLoudAudio = () => {
+      if (loudPromoteAttempted) return;
+      loudPromoteAttempted = true;
+      const wasPlaying = !video.paused;
       if (cancel) return;
       ensureLoudAudio();
       queueTimeout(() => {
         if (cancel) return;
         // Never let loud-audio promotion break autoplay.
-        if (!video.paused) return;
-        video.muted = true;
-        video.defaultMuted = true;
-        video.setAttribute("muted", "");
+        if (!wasPlaying || !video.paused) return;
+        keepMutedAutoplay();
         try {
           video.play().catch(() => { });
         } catch { }
@@ -6248,9 +6255,7 @@ export default function WatchPage() {
       if (cancel || autoplaySettled) return;
       autoplayAttempts += 1;
       // Start muted-first for highest autoplay success across browsers.
-      video.muted = true;
-      video.defaultMuted = true;
-      video.setAttribute("muted", "");
+      keepMutedAutoplay();
       video.play()
         .then(() => {
           autoplaySettled = true;
@@ -6355,9 +6360,7 @@ export default function WatchPage() {
     setPlayerLoading(true);
     scheduleServer5StartupNoFrameWatchdog();
     video.volume = 1;
-    video.muted = true;
-    video.defaultMuted = true;
-    video.setAttribute("muted", "");
+    keepMutedAutoplay();
     markProgress();
     let fatalRetries = 0;
     let waitingHitsEarly = 0;
@@ -6405,7 +6408,7 @@ export default function WatchPage() {
     const onPlaying = () => {
       if (cancel) return;
       autoplaySettled = true;
-      tryPromoteToLoudAudio();
+      if (!video.muted) ensureLoudAudio();
       freezeTriggered = false;
       markProgress();
       if (hasServer5VisualStart()) markServer5VisualStart();
@@ -6432,6 +6435,13 @@ export default function WatchPage() {
       if (cancel) return;
       if (!autoplaySettled || video.paused) playWithAutoplayFallback();
     };
+    const onUserGesture = () => {
+      if (cancel) return;
+      ensureLoudAudio();
+      try {
+        if (video.paused) video.play().catch(() => { });
+      } catch { }
+    };
     video.addEventListener("loadeddata", onLoaded);
     video.addEventListener("canplay", onCanPlay);
     video.addEventListener("loadedmetadata", onCanPlay);
@@ -6439,6 +6449,8 @@ export default function WatchPage() {
     video.addEventListener("stalled", onWaiting);
     video.addEventListener("playing", onPlaying);
     video.addEventListener("timeupdate", onTimeUpdate);
+    window.addEventListener("pointerdown", onUserGesture, { once: true, passive: true });
+    window.addEventListener("keydown", onUserGesture, { once: true });
     if (shouldUseNativeHls(video)) {
       video.src = selectedHlsUrl;
       video.load();
@@ -6660,6 +6672,8 @@ export default function WatchPage() {
       video.removeEventListener("stalled", onWaiting);
       video.removeEventListener("playing", onPlaying);
       video.removeEventListener("timeupdate", onTimeUpdate);
+      window.removeEventListener("pointerdown", onUserGesture);
+      window.removeEventListener("keydown", onUserGesture);
       try { hls?.destroy(); } catch { }
       try { p2pEngine?.destroy(); } catch { }
       setHlsInstance(null);
