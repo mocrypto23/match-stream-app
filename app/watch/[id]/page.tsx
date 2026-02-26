@@ -38,12 +38,44 @@ const SERVER_SOURCE_LABELS: Record<number, string> = {
   4: "سيرفر 1 ",
 };
 const SERVER_DISPLAY_ORDER = [4, 2, 3, 1, 5, 6] as const;
+const P2P_SUPPORTED_SERVERS = [1, 2, 3, 4] as const;
+type P2PProfile = "balanced" | "max-stability" | "low-latency";
+type P2PEventName = "onPeerConnect" | "onPeerClose" | "onChunkDownloaded" | "onChunkUploaded" | "onSegmentError";
+type P2PEngineInstance = {
+  addEventListener: (eventName: P2PEventName, listener: (...args: unknown[]) => void) => void;
+  removeEventListener: (eventName: P2PEventName, listener: (...args: unknown[]) => void) => void;
+  getConfigForHlsJs: () => Record<string, unknown>;
+  bindHls: (hls: Hls) => void;
+  destroy: () => void;
+};
+type P2PEngineConstructor = new (config?: { core?: { swarmId?: string } }) => P2PEngineInstance;
 
 const PREMATCH_OPEN_WINDOW_MINUTES = 30;
 const STALL_FREEZE_MS = 18000;
+const P2P_STALL_FREEZE_MS = 30000;
+const P2P_WAITING_RECOVERY_MIN_STALL_MS = 10000;
+const P2P_WAITING_RECOVERY_MAX_BUFFER_AHEAD_S = 0.6;
+const P2P_RECOVERY_THROTTLE_MS = 8000;
 const PLAYER_LOADING_OVERLAY_DELAY_MS = 1200;
 const DEFAULT_PLAYER_QUALITY_HEIGHT = 480;
 const AUTO_AUDIO_SYNC_ON_START = process.env.NEXT_PUBLIC_AUTO_AUDIO_SYNC_ON_START !== "0";
+const P2P_HLSJS_BROWSER_MODULE_URL = "https://esm.sh/p2p-media-loader-hlsjs@2.2.2?bundle&conditions=browser";
+const ESM_SH_PROCESS_SHIM_URL = "https://esm.sh/node/process.mjs";
+const P2P_FEATURE_FLAG = String(process.env.NEXT_PUBLIC_P2P_ENABLED || "").trim() === "1";
+const P2P_PROFILE = (() => {
+  const raw = String(process.env.NEXT_PUBLIC_P2P_PROFILE || "").trim().toLowerCase();
+  if (raw === "max-stability") return "max-stability" as const;
+  if (raw === "low-latency") return "low-latency" as const;
+  return "balanced" as const;
+})();
+const P2P_ENABLED_SERVER_SET = (() => {
+  const configured = String(process.env.NEXT_PUBLIC_P2P_SERVERS || "")
+    .split(",")
+    .map((item) => Number.parseInt(item.trim(), 10))
+    .filter((item) => Number.isFinite(item) && P2P_SUPPORTED_SERVERS.includes(item as (typeof P2P_SUPPORTED_SERVERS)[number]));
+  const picked = configured.length ? configured : [...P2P_SUPPORTED_SERVERS];
+  return new Set<number>(picked);
+})();
 const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const RESOLVE_COOLDOWN_MS = 1500;
 const CANDIDATE_PROBE_TIMEOUT_MS = 6500;
@@ -203,6 +235,31 @@ const SERVER5_STARTUP_NO_FRAME_TIMEOUT_MS = 5_500;
 const SERVER5_STARTUP_NO_FRAME_RECHECK_MS = 1_500;
 const SERVER3_AUTOSWITCH_WINDOW_MS = 20_000;
 const SERVER3_AUTOSWITCH_LIMIT = 3;
+
+function getP2PProfileHlsTuning(profile: P2PProfile) {
+  if (profile === "max-stability") {
+    return {
+      liveSyncDurationCount: 7,
+      liveMaxLatencyDurationCount: 20,
+      maxBufferLength: 75,
+      maxBufferSize: 40 * 1000 * 1000,
+    };
+  }
+  if (profile === "low-latency") {
+    return {
+      liveSyncDurationCount: 4,
+      liveMaxLatencyDurationCount: 12,
+      maxBufferLength: 45,
+      maxBufferSize: 20 * 1000 * 1000,
+    };
+  }
+  return {
+    liveSyncDurationCount: 6,
+    liveMaxLatencyDurationCount: 18,
+    maxBufferLength: 60,
+    maxBufferSize: 30 * 1000 * 1000,
+  };
+}
 
 type Playerv2TokenPayload = { token: string; session_id: string };
 type AlbaRollingConfig = { ch: string; dm: string[]; iv: number };
@@ -6290,9 +6347,14 @@ export default function WatchPage() {
     if (!video) return;
     let cancel = false;
     let hls: Hls | null = null;
+    let p2pEngine: P2PEngineInstance | null = null;
+    let detachP2PListeners: (() => void) | null = null;
     const current = selectedCandidate;
     const currentCandidateKey = candidateFailureKey(selectedHlsUrl);
     const useFastFailover = isFastFailoverServer(selectedServer);
+    const isP2PPlayback =
+      P2P_FEATURE_FLAG && selectedServer !== 5 && P2P_ENABLED_SERVER_SET.has(selectedServer) && selectedServer <= 4;
+    const p2pTuning = getP2PProfileHlsTuning(P2P_PROFILE);
     const server5PlayerAuthHeaders =
       selectedServer === 5 ? buildServer5ProxyAuthHeadersFromCandidate(selectedHlsUrl) : ({} as Record<string, string>);
     let freezeTriggered = false;
@@ -6403,6 +6465,13 @@ export default function WatchPage() {
     let stallFreezeCount = 0;
     let autoAudioSyncAttempted = false;
     let autoAudioSyncTimer: number | null = null;
+    const p2pStats = {
+      p2pBytes: 0,
+      httpBytes: 0,
+      uploadedBytes: 0,
+      peerCount: 0,
+      lastLogAt: 0,
+    };
     const syncVolumeUiState = () => {
       try {
         video.dispatchEvent(new Event("volumechange"));
@@ -6484,10 +6553,37 @@ export default function WatchPage() {
           }, 250);
         });
     };
-    const requestSoftRecovery = () => {
+    const getBufferedAheadSeconds = () => {
+      try {
+        const t = Number(video.currentTime);
+        if (!Number.isFinite(t)) return 0;
+        const ranges = video.buffered;
+        for (let i = 0; i < ranges.length; i += 1) {
+          const start = ranges.start(i);
+          const end = ranges.end(i);
+          if (t >= start - 0.05 && t <= end + 0.05) return Math.max(0, end - t);
+        }
+        return 0;
+      } catch {
+        return 0;
+      }
+    };
+    const logP2PStats = (force = false) => {
+      if (!isP2PPlayback) return;
+      const now = Date.now();
+      if (!force && now - p2pStats.lastLogAt < 5000) return;
+      p2pStats.lastLogAt = now;
+      const totalDownloadBytes = p2pStats.p2pBytes + p2pStats.httpBytes;
+      const ratio = totalDownloadBytes > 0 ? Math.round((p2pStats.p2pBytes / totalDownloadBytes) * 100) : 0;
+      pushDiag(
+        `p2p peers=${p2pStats.peerCount} p2pBytes=${p2pStats.p2pBytes} httpBytes=${p2pStats.httpBytes} upBytes=${p2pStats.uploadedBytes} p2pRatio=${ratio}%`
+      );
+    };
+    const requestSoftRecovery = (reason = "generic") => {
       if (userPausedRef.current) return;
       const now = Date.now();
-      if (now - lastRecoveryAttemptAt < 3000) return;
+      const recoveryThrottleMs = isP2PPlayback ? P2P_RECOVERY_THROTTLE_MS : 3000;
+      if (now - lastRecoveryAttemptAt < recoveryThrottleMs) return;
       const currentTime = Number(video.currentTime);
       if (
         video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA &&
@@ -6497,6 +6593,7 @@ export default function WatchPage() {
         return;
       }
       lastRecoveryAttemptAt = now;
+      if (isP2PPlayback) pushDiag(`soft-recovery (${reason})`);
       try { hls?.startLoad(); } catch { }
       queueTimeout(() => {
         if (cancel) return;
@@ -6599,7 +6696,19 @@ export default function WatchPage() {
       if (cancel) return;
       const server5RecentProgress = selectedServer === 5 && Date.now() - lastProgressAtRef.current < 2500;
       if (!server5RecentProgress && video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) showPlayerLoadingDelayed();
-      requestSoftRecovery();
+      if (!isP2PPlayback) {
+        requestSoftRecovery("waiting");
+        return;
+      }
+      const stalledFor = Date.now() - lastProgressAtRef.current;
+      const bufferedAhead = getBufferedAheadSeconds();
+      if (
+        stalledFor >= P2P_WAITING_RECOVERY_MIN_STALL_MS &&
+        video.readyState <= HTMLMediaElement.HAVE_CURRENT_DATA &&
+        bufferedAhead <= P2P_WAITING_RECOVERY_MAX_BUFFER_AHEAD_S
+      ) {
+        requestSoftRecovery("waiting-p2p");
+      }
     };
     const onPlaying = () => {
       if (cancel) return;
@@ -6663,18 +6772,25 @@ export default function WatchPage() {
       playMutedSafely();
     } else if (Hls.isSupported()) {
       const isServer5Playback = selectedServer === 5;
-      hls = new Hls({
+      const baseHlsConfig = {
         enableWorker: true,
-        xhrSetup: (xhr, requestUrl) => {
+        xhrSetup: (xhr: XMLHttpRequest, requestUrl: string) => {
           applyServer5ProxyAuthToXhr(xhr, requestUrl);
         },
         lowLatencyMode: false,
         capLevelToPlayerSize: true,
         backBufferLength: isServer5Playback ? SERVER5_HLS_BACK_BUFFER_LENGTH : 90,
-        maxBufferLength: isServer5Playback ? SERVER5_HLS_MAX_BUFFER_LENGTH : 60,
+        maxBufferLength: isServer5Playback
+          ? SERVER5_HLS_MAX_BUFFER_LENGTH
+          : (isP2PPlayback ? p2pTuning.maxBufferLength : 60),
         maxMaxBufferLength: isServer5Playback ? SERVER5_HLS_MAX_MAX_BUFFER_LENGTH : 120,
-        liveSyncDurationCount: isServer5Playback ? SERVER5_HLS_LIVE_SYNC_COUNT : 5,
-        liveMaxLatencyDurationCount: isServer5Playback ? SERVER5_HLS_LIVE_MAX_LATENCY_COUNT : 15,
+        maxBufferSize: isP2PPlayback ? p2pTuning.maxBufferSize : 60 * 1000 * 1000,
+        liveSyncDurationCount: isServer5Playback
+          ? SERVER5_HLS_LIVE_SYNC_COUNT
+          : (isP2PPlayback ? p2pTuning.liveSyncDurationCount : 5),
+        liveMaxLatencyDurationCount: isServer5Playback
+          ? SERVER5_HLS_LIVE_MAX_LATENCY_COUNT
+          : (isP2PPlayback ? p2pTuning.liveMaxLatencyDurationCount : 15),
         startFragPrefetch: true,
         maxBufferHole: 1.2,
         highBufferWatchdogPeriod: 2,
@@ -6683,81 +6799,172 @@ export default function WatchPage() {
         fragLoadingMaxRetry: isServer5Playback ? SERVER5_HLS_FRAG_RETRIES : 8,
         abrBandWidthFactor: 0.85,
         abrBandWidthUpFactor: 0.7,
-      });
-      setHlsInstance(hls);
-      hls.on(Hls.Events.MEDIA_ATTACHED, () => hls?.loadSource(selectedHlsUrl));
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        if (cancel) return;
-        const defaultLevel = pickDefaultHlsLevel(hls?.levels || []);
-        if (defaultLevel >= 0 && hls) {
-          // Hls.js quality switch API is implemented via mutable property assignment.
-          hls.currentLevel = defaultLevel;
-        }
-        markProgress();
-        resetRecoveryState();
-        hidePlayerLoading();
-        setPlayerError(null);
-        setResolverError(null);
-        if (useFastFailover) clearCandidateFailureMarks(selectedServer, selectedHlsUrl);
-        playMutedSafely();
-      });
-      hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (cancel || !data.fatal) return;
-        fatalRetries += 1;
-        pushDiag(`fatal ${data.type} ${String(data.details)} retry=${fatalRetries}`);
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && currentCandidateKey) {
-          const prev = networkFatalCountByCandidateRef.current.get(currentCandidateKey) || 0;
-          const next = prev + 1;
-          networkFatalCountByCandidateRef.current.set(currentCandidateKey, next);
-          const fastFailoverThreshold = selectedServer === 5 ? 3 : 2;
-          if (useFastFailover && next >= fastFailoverThreshold) {
-            if (selectedServer === 5) {
-              const now = Date.now();
-              const lastFastFailoverAt = lastFastFailoverAtByServerRef.current[5] || 0;
-              if (now - lastFastFailoverAt < SERVER5_FAST_FAILOVER_COOLDOWN_MS) {
-                pushDiag("fast-failover server5 cooldown");
-                return;
+      };
+      const attachHlsInstance = (instance: Hls) => {
+        hls = instance;
+        setHlsInstance(instance);
+        instance.on(Hls.Events.MEDIA_ATTACHED, () => instance.loadSource(selectedHlsUrl));
+        instance.on(Hls.Events.MANIFEST_PARSED, () => {
+          if (cancel) return;
+          const defaultLevel = pickDefaultHlsLevel(instance.levels || []);
+          if (defaultLevel >= 0) {
+            // Hls.js quality switch API is implemented via mutable property assignment.
+            instance.currentLevel = defaultLevel;
+          }
+          markProgress();
+          resetRecoveryState();
+          hidePlayerLoading();
+          setPlayerError(null);
+          setResolverError(null);
+          if (useFastFailover) clearCandidateFailureMarks(selectedServer, selectedHlsUrl);
+          playMutedSafely();
+        });
+        instance.on(Hls.Events.ERROR, (_event, data) => {
+          if (cancel || !data.fatal) return;
+          fatalRetries += 1;
+          pushDiag(`fatal ${data.type} ${String(data.details)} retry=${fatalRetries}`);
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR && currentCandidateKey) {
+            const prev = networkFatalCountByCandidateRef.current.get(currentCandidateKey) || 0;
+            const next = prev + 1;
+            networkFatalCountByCandidateRef.current.set(currentCandidateKey, next);
+            const fastFailoverThreshold = selectedServer === 5 ? 3 : 2;
+            if (useFastFailover && next >= fastFailoverThreshold) {
+              if (selectedServer === 5) {
+                const now = Date.now();
+                const lastFastFailoverAt = lastFastFailoverAtByServerRef.current[5] || 0;
+                if (now - lastFastFailoverAt < SERVER5_FAST_FAILOVER_COOLDOWN_MS) {
+                  pushDiag("fast-failover server5 cooldown");
+                  return;
+                }
+                lastFastFailoverAtByServerRef.current[5] = now;
               }
-              lastFastFailoverAtByServerRef.current[5] = now;
+              pushDiag(`fast-failover server${selectedServer} network=${next}`);
+              markCandidateAsBad(selectedServer, selectedHlsUrl, "network-fast-failover");
+              moveNext("network-fast-failover");
+              return;
             }
-            pushDiag(`fast-failover server${selectedServer} network=${next}`);
-            markCandidateAsBad(selectedServer, selectedHlsUrl, "network-fast-failover");
-            moveNext("network-fast-failover");
-            return;
           }
-        }
-        if (fatalRetries <= 6) {
-          const delay = Math.min(3500, 500 + fatalRetries * 700);
-          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            setPlayerError("انقطاع مؤقت بالشبكة... جاري المحاولة تلقائيًا");
-            queueTimeout(() => {
-              requestSoftRecovery();
-            }, delay);
-            return;
-          }
-          if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-            setPlayerError("خطأ وسائط... جاري الإصلاح تلقائيًا");
-            queueTimeout(() => {
-              try { hls?.recoverMediaError(); } catch { }
+          if (fatalRetries <= 6) {
+            const delay = Math.min(3500, 500 + fatalRetries * 700);
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+              setPlayerError("انقطاع مؤقت بالشبكة... جاري المحاولة تلقائيًا");
               queueTimeout(() => {
                 requestSoftRecovery();
-              }, 150);
-            }, delay);
-            return;
+              }, delay);
+              return;
+            }
+            if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+              setPlayerError("خطأ وسائط... جاري الإصلاح تلقائيًا");
+              queueTimeout(() => {
+                try { instance.recoverMediaError(); } catch { }
+                queueTimeout(() => {
+                  requestSoftRecovery();
+                }, 150);
+              }, delay);
+              return;
+            }
           }
-        }
-        if (useFastFailover) {
-          markCandidateAsBad(selectedServer, selectedHlsUrl, `fatal-${String(data.type || "unknown")}`);
-        }
-        moveNext(`${data.type}`);
-      });
-      hls.attachMedia(video);
+          if (useFastFailover) {
+            markCandidateAsBad(selectedServer, selectedHlsUrl, `fatal-${String(data.type || "unknown")}`);
+          }
+          moveNext(`${data.type}`);
+        });
+        instance.attachMedia(video);
+      };
+
+      const initStandardHls = () => {
+        if (cancel) return;
+        const instance = new Hls(baseHlsConfig);
+        attachHlsInstance(instance);
+      };
+
+      if (isP2PPlayback) {
+        const swarmMatchId = idNum ?? "unknown";
+        const swarmId = `match-${swarmMatchId}-server-${selectedServer}`;
+        void import(/* webpackIgnore: true */ ESM_SH_PROCESS_SHIM_URL)
+          .then((procMod) => {
+            const shim = (procMod as { default?: { browser?: boolean } }).default;
+            if (shim && typeof shim === "object") shim.browser = true;
+          })
+          .catch(() => { })
+          .then(() => import(/* webpackIgnore: true */ P2P_HLSJS_BROWSER_MODULE_URL))
+          .then((mod) => {
+            if (cancel) return;
+            const EngineCtor = (mod as { HlsJsP2PEngine?: P2PEngineConstructor }).HlsJsP2PEngine;
+            if (typeof EngineCtor !== "function") throw new Error("P2P engine export is missing");
+            p2pEngine = new EngineCtor({
+              core: {
+                swarmId,
+              },
+            });
+            const mergedConfig = {
+              ...baseHlsConfig,
+              ...p2pEngine.getConfigForHlsJs(),
+            };
+            const instance = new Hls(mergedConfig);
+            if (cancel) {
+              try { p2pEngine.destroy(); } catch { }
+              try { instance.destroy(); } catch { }
+              return;
+            }
+            p2pEngine.bindHls(instance);
+            pushDiag(`p2p enabled profile=${P2P_PROFILE} swarm=${swarmId}`);
+
+            const onPeerConnect = () => {
+              p2pStats.peerCount += 1;
+              logP2PStats();
+            };
+            const onPeerClose = () => {
+              p2pStats.peerCount = Math.max(0, p2pStats.peerCount - 1);
+              logP2PStats();
+            };
+            const onChunkDownloaded = (...args: unknown[]) => {
+              const bytesLength = Number(args[0] || 0);
+              const downloadSource = String(args[1] || "").toLowerCase();
+              if (!Number.isFinite(bytesLength) || bytesLength <= 0) return;
+              if (downloadSource === "p2p") p2pStats.p2pBytes += bytesLength;
+              else p2pStats.httpBytes += bytesLength;
+              logP2PStats();
+            };
+            const onChunkUploaded = (...args: unknown[]) => {
+              const bytesLength = Number(args[0] || 0);
+              if (!Number.isFinite(bytesLength) || bytesLength <= 0) return;
+              p2pStats.uploadedBytes += bytesLength;
+              logP2PStats();
+            };
+            const onSegmentError = () => {
+              pushDiag("p2p segment-error");
+              logP2PStats(true);
+            };
+            p2pEngine.addEventListener("onPeerConnect", onPeerConnect);
+            p2pEngine.addEventListener("onPeerClose", onPeerClose);
+            p2pEngine.addEventListener("onChunkDownloaded", onChunkDownloaded);
+            p2pEngine.addEventListener("onChunkUploaded", onChunkUploaded);
+            p2pEngine.addEventListener("onSegmentError", onSegmentError);
+            detachP2PListeners = () => {
+              if (!p2pEngine) return;
+              p2pEngine.removeEventListener("onPeerConnect", onPeerConnect);
+              p2pEngine.removeEventListener("onPeerClose", onPeerClose);
+              p2pEngine.removeEventListener("onChunkDownloaded", onChunkDownloaded);
+              p2pEngine.removeEventListener("onChunkUploaded", onChunkUploaded);
+              p2pEngine.removeEventListener("onSegmentError", onSegmentError);
+            };
+            attachHlsInstance(instance);
+          })
+          .catch((error: unknown) => {
+            pushDiag(`p2p init failed: ${error instanceof Error ? error.message : String(error)}`);
+            initStandardHls();
+          });
+      } else {
+        initStandardHls();
+      }
     } else {
       setPlayerError("متصفحك لا يدعم تشغيل HLS داخليًا.");
       hidePlayerLoading();
     }
 
-    const stallFreezeMs = STALL_FREEZE_MS;
+    const stallFreezeMs = isP2PPlayback ? P2P_STALL_FREEZE_MS : STALL_FREEZE_MS;
+    const minStallBeforeSwitchMs = isP2PPlayback ? stallFreezeMs * 2 : stallFreezeMs;
     stallTimerRef.current = window.setInterval(() => {
       if (cancel) return;
       if (video.paused || video.seeking) {
@@ -6783,14 +6990,14 @@ export default function WatchPage() {
       stallFreezeCount += 1;
       const total = candidatesRef.current.length;
       pushDiag(`stall-freeze ${stalledFor}ms source=${current + 1}/${Math.max(1, total)}`);
-      requestSoftRecovery();
+      requestSoftRecovery("stall-watchdog");
       if (total <= 1) {
         // Single-source playback: avoid hard source switch loops; keep trying in-place.
         setPlayerError("انقطاع مؤقت... جاري إعادة المزامنة");
         queueTimeout(() => {
           freezeTriggered = false;
           hidePlayerLoading();
-          requestSoftRecovery();
+          requestSoftRecovery("stall-single-source");
         }, 1800);
         return;
       }
@@ -6814,11 +7021,19 @@ export default function WatchPage() {
           hidePlayerLoading();
           return;
         }
+        const stalledTotalMs = Date.now() - lastProgressAtRef.current;
+        if (stalledTotalMs < minStallBeforeSwitchMs) {
+          setPlayerError("انقطاع مؤقت... جاري إعادة المزامنة");
+          freezeTriggered = false;
+          hidePlayerLoading();
+          requestSoftRecovery("stall-pre-switch-guard");
+          return;
+        }
         if (stallFreezeCount < 2) {
           setPlayerError("انقطاع مؤقت... جاري إعادة المزامنة");
           freezeTriggered = false;
           hidePlayerLoading();
-          requestSoftRecovery();
+          requestSoftRecovery("stall-retry");
           return;
         }
         stallFreezeCount = 0;
@@ -6842,11 +7057,15 @@ export default function WatchPage() {
       video.removeEventListener("playing", onPlaying);
       video.removeEventListener("pause", onPause);
       video.removeEventListener("timeupdate", onTimeUpdate);
+      if (isP2PPlayback) logP2PStats(true);
+      try { detachP2PListeners?.(); } catch { }
+      try { p2pEngine?.destroy(); } catch { }
       try { hls?.destroy(); } catch { }
       setHlsInstance(null);
       reset();
     };
   }, [
+    idNum,
     selectedHlsUrl,
     selectedCandidate,
     selectedServer,
