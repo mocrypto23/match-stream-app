@@ -3023,6 +3023,84 @@ function scoreServer3Candidate(value: string) {
   return score;
 }
 
+function toServer3CandidateIdentity(value: string) {
+  const raw = value.startsWith("/api/embed-proxy?") ? getProxyTargetUrl(value) || value : value;
+  if (!isValidHttpUrl(raw)) return canonicalizeUrl(value) || String(value || "").trim().toLowerCase();
+
+  try {
+    const u = new URL(raw);
+    const params = new URLSearchParams(u.search);
+    for (const key of [
+      "ts",
+      "token",
+      "token_path",
+      "sid",
+      "nonce",
+      "nimblesessionid",
+      "expires",
+      "exp",
+      "signature",
+      "sig",
+      "auth",
+      "key",
+      "q",
+      "quality",
+      "res",
+      "resolution",
+      "br",
+      "bitrate",
+      "height",
+      "width",
+    ]) {
+      params.delete(key);
+    }
+
+    const parts = u.pathname
+      .toLowerCase()
+      .replace(/\/+$/, "")
+      .split("/")
+      .filter(Boolean);
+    const qualityTokenRe = /^(?:\d{3,4}p|\d{3,4}k|sd|hd|fhd|uhd|low|mid|high)$/i;
+
+    if (parts.length) {
+      const last = parts[parts.length - 1];
+      if (/\.m3u8$/i.test(last)) {
+        const stem = last.replace(/\.m3u8$/i, "");
+        if (/^(?:index|master|playlist|mainindex|chunklist|live|stream)$/i.test(stem) || qualityTokenRe.test(stem)) {
+          parts.pop();
+        }
+      }
+    }
+    if (parts.length && qualityTokenRe.test(parts[parts.length - 1])) parts.pop();
+
+    const path = parts.length ? `/${parts.join("/")}` : u.pathname.toLowerCase().replace(/\/+$/, "");
+    const stableParams = Array.from(params.entries())
+      .sort((a, b) => (a[0] === b[0] ? a[1].localeCompare(b[1]) : a[0].localeCompare(b[0])))
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join("&");
+
+    return `${u.hostname.toLowerCase()}${path}${stableParams ? `?${stableParams}` : ""}`;
+  } catch {
+    return canonicalizeUrl(value) || String(value || "").trim().toLowerCase();
+  }
+}
+
+function collapseServer3EquivalentCandidates(values: string[]) {
+  const out = new Map<string, string>();
+  for (const value of dedupeUrls(values)) {
+    const id = toServer3CandidateIdentity(value);
+    const existing = out.get(id);
+    if (!existing) {
+      out.set(id, value);
+      continue;
+    }
+    if (scoreServer3Candidate(value) > scoreServer3Candidate(existing)) {
+      out.set(id, value);
+    }
+  }
+  return Array.from(out.values());
+}
+
 function scoreServer5Candidate(value: string) {
   const raw = String(value || "").trim();
   if (!raw) return 0;
@@ -5216,7 +5294,12 @@ export default function WatchPage() {
     const buckets = splitServer3CandidatesByRootServ(base, server3ProvenanceRef.current);
     const bucket0Sorted = sortByScore(buckets.bucket0);
     const bucket1Sorted = sortByScore(buckets.bucket1);
-    return [...bucket0Sorted, ...bucket1Sorted];
+    const ordered = [...bucket0Sorted, ...bucket1Sorted];
+    const collapsed = collapseServer3EquivalentCandidates(ordered);
+    if (collapsed.length !== ordered.length) {
+      pushDiag(`server3 collapse-equivalent=${ordered.length - collapsed.length}`);
+    }
+    return collapsed;
   }, [pushDiag]);
 
   const applyCandidatesPreservingSelection = useCallback((nextCandidates: string[]) => {
@@ -6326,17 +6409,7 @@ export default function WatchPage() {
       window.removeEventListener("pageshow", onPageShow);
     };
   }, [hlsInstance, selectedHlsUrl, shouldBlockStream]);
-  const candidateGroups = useMemo(() => {
-    if (selectedServer === 3) {
-      return candidates.map((candidate, idx) => ({
-        key: `s3:${canonicalizeUrl(candidate) || candidate.toLowerCase()}:${idx}`,
-        primaryIndex: idx,
-        members: [idx],
-        label: extractQualityTagFromUrl(candidate) || "",
-      }));
-    }
-    return groupCandidates(candidates);
-  }, [candidates, selectedServer]);
+  const candidateGroups = useMemo(() => groupCandidates(candidates), [candidates]);
   const activeCandidateGroupIndex = useMemo(
     () => candidateGroups.findIndex((g) => g.members.includes(selectedCandidate)),
     [candidateGroups, selectedCandidate]
