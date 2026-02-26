@@ -153,6 +153,7 @@ export default function VideoPlayerControls({
         const sec = Math.floor(s % 60);
         return `${m}:${sec < 10 ? "0" : ""}${sec}`;
     };
+    const isAudioOff = isMuted || volume === 0;
 
     return (
         <div
@@ -231,18 +232,30 @@ export default function VideoPlayerControls({
                             {isPlaying ? <PauseIcon /> : <PlayIcon />}
                         </button>
 
-                        <div className="flex items-center gap-2 group">
-                            <button onClick={toggleMute} className="text-white hover:text-blue-400 transition-colors">
-                                {isMuted || volume === 0 ? <MuteIcon /> : <VolumeIcon />}
+                        <div className="flex items-center gap-2">
+                            <button
+                                onClick={toggleMute}
+                                className={[
+                                    "rounded-md border px-1.5 py-1 transition-colors",
+                                    isAudioOff
+                                        ? "text-red-300 border-red-500/60 bg-red-500/20 hover:text-red-200"
+                                        : "text-emerald-300 border-emerald-500/60 bg-emerald-500/20 hover:text-emerald-200",
+                                ].join(" ")}
+                                aria-label={isAudioOff ? "Unmute" : "Mute"}
+                            >
+                                <VolumeIcon muted={isAudioOff} />
                             </button>
                             <input
                                 type="range"
                                 min={0}
                                 max={1}
                                 step={0.05}
-                                value={isMuted ? 0 : volume}
+                                value={isAudioOff ? 0 : volume}
                                 onChange={handleVolumeChange}
-                                className="w-0 group-hover:w-20 transition-all duration-300 h-1 accent-blue-500 bg-gray-600 rounded-lg appearance-none cursor-pointer"
+                                className={[
+                                    "w-20 sm:w-24 h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer",
+                                    isAudioOff ? "accent-red-500" : "accent-emerald-500",
+                                ].join(" ")}
                             />
                         </div>
                     </div>
@@ -280,21 +293,17 @@ function PauseIcon({ size = 24 }: { size?: number }) {
     );
 }
 
-function VolumeIcon({ size = 24 }: { size?: number }) {
+function VolumeIcon({ size = 24, muted = false }: { size?: number; muted?: boolean }) {
     return (
         <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
             <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
-        </svg>
-    );
-}
-
-function MuteIcon({ size = 24 }: { size?: number }) {
-    return (
-        <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
-            <line x1="23" y1="9" x2="17" y2="15"></line>
-            <line x1="17" y1="9" x2="23" y2="15"></line>
+            {muted ? (
+                <>
+                    <line x1="22" y1="8" x2="16" y2="14"></line>
+                    <line x1="16" y1="8" x2="22" y2="14"></line>
+                </>
+            ) : null}
         </svg>
     );
 }
