@@ -43,6 +43,7 @@ const PREMATCH_OPEN_WINDOW_MINUTES = 30;
 const STALL_FREEZE_MS = 18000;
 const PLAYER_LOADING_OVERLAY_DELAY_MS = 1200;
 const DEFAULT_PLAYER_QUALITY_HEIGHT = 480;
+const AUTO_AUDIO_SYNC_ON_START = process.env.NEXT_PUBLIC_AUTO_AUDIO_SYNC_ON_START !== "0";
 const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const RESOLVE_COOLDOWN_MS = 1500;
 const CANDIDATE_PROBE_TIMEOUT_MS = 6500;
@@ -6295,6 +6296,8 @@ export default function WatchPage() {
     let autoplayRetryUsed = false;
     let lastRecoveryAttemptAt = 0;
     let stallFreezeCount = 0;
+    let autoAudioSyncAttempted = false;
+    let autoAudioSyncTimer: number | null = null;
     const ensureLoudAudio = () => {
       video.volume = 1;
       video.muted = false;
@@ -6305,6 +6308,66 @@ export default function WatchPage() {
       video.muted = true;
       video.defaultMuted = true;
       video.setAttribute("muted", "");
+    };
+    const clearAutoAudioSyncTimer = () => {
+      if (autoAudioSyncTimer !== null) {
+        window.clearTimeout(autoAudioSyncTimer);
+        autoAudioSyncTimer = null;
+      }
+    };
+    const scheduleAutoAudioSync = () => {
+      if (!AUTO_AUDIO_SYNC_ON_START) return;
+      if (autoAudioSyncAttempted) return;
+      if (cancel || userPausedRef.current) return;
+      if (video.paused) return;
+      autoAudioSyncAttempted = true;
+      clearAutoAudioSyncTimer();
+      autoAudioSyncTimer = window.setTimeout(() => {
+        autoAudioSyncTimer = null;
+        if (cancel || userPausedRef.current) return;
+        if (video.paused) return;
+        ensureLoudAudio();
+        const rollbackToMuted = () => {
+          keepMutedAutoplay();
+          queueTimeout(() => {
+            if (cancel || userPausedRef.current) return;
+            try {
+              if (video.paused) video.play().catch(() => { });
+            } catch { }
+          }, 120);
+          pushDiag("audio-sync blocked -> muted");
+        };
+        try {
+          const playPromise = video.play();
+          if (playPromise && typeof playPromise.then === "function") {
+            playPromise
+              .then(() => {
+                queueTimeout(() => {
+                  if (cancel) return;
+                  if (video.paused) {
+                    rollbackToMuted();
+                    return;
+                  }
+                  pushDiag("audio-sync enabled");
+                }, 120);
+              })
+              .catch(() => {
+                rollbackToMuted();
+              });
+            return;
+          }
+          queueTimeout(() => {
+            if (cancel) return;
+            if (video.paused) {
+              rollbackToMuted();
+              return;
+            }
+            pushDiag("audio-sync enabled");
+          }, 120);
+        } catch {
+          rollbackToMuted();
+        }
+      }, 350);
     };
     const playMutedSafely = () => {
       if (cancel) return;
@@ -6458,6 +6521,7 @@ export default function WatchPage() {
       setPlayerError(null);
       setResolverError(null);
       if (useFastFailover) clearCandidateFailureMarks(selectedServer, selectedHlsUrl);
+      scheduleAutoAudioSync();
     };
     const onTimeUpdate = () => {
       markProgress();
@@ -6469,6 +6533,7 @@ export default function WatchPage() {
       }
       if (Number.isFinite(progressed) && progressed > 0.2) {
         userPausedRef.current = false;
+        scheduleAutoAudioSync();
       }
     };
     const onPause = () => {
@@ -6678,6 +6743,7 @@ export default function WatchPage() {
       for (const id of timeoutHandles) window.clearTimeout(id);
       clearServer5StartupNoFrameTimer();
       clearLoadingOverlayTimer();
+      clearAutoAudioSyncTimer();
       clearStallWatchdog();
       video.removeEventListener("loadeddata", onLoaded);
       video.removeEventListener("canplay", onCanPlay);
