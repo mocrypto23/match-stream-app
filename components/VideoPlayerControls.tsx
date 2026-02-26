@@ -204,6 +204,7 @@ export default function VideoPlayerControls({
                     paddingTop: "0.75rem",
                     paddingBottom: "max(0.75rem, env(safe-area-inset-bottom))",
                 }}
+                onPointerDown={(e) => e.stopPropagation()}
                 onClick={(e) => e.stopPropagation()} // Prevent playing when clicking bar
             >
                 {/* Progress Bar (if not live or valid duration) */}
