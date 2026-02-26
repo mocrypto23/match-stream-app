@@ -44,7 +44,6 @@ const STALL_FREEZE_MS = 18000;
 const PLAYER_LOADING_OVERLAY_DELAY_MS = 1200;
 const DEFAULT_PLAYER_QUALITY_HEIGHT = 480;
 const AUTO_AUDIO_SYNC_ON_START = process.env.NEXT_PUBLIC_AUTO_AUDIO_SYNC_ON_START !== "0";
-const AUTO_AUDIO_SYNC_ATTEMPT_DELAYS_MS = [350, 850, 1500] as const;
 const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const RESOLVE_COOLDOWN_MS = 1500;
 const CANDIDATE_PROBE_TIMEOUT_MS = 6500;
@@ -6298,9 +6297,7 @@ export default function WatchPage() {
     let lastRecoveryAttemptAt = 0;
     let stallFreezeCount = 0;
     let autoAudioSyncAttempted = false;
-    let autoAudioSyncAttemptIndex = 0;
     let autoAudioSyncTimer: number | null = null;
-    let suppressUserPauseUntil = 0;
     const ensureLoudAudio = () => {
       video.volume = 1;
       video.muted = false;
@@ -6318,55 +6315,17 @@ export default function WatchPage() {
         autoAudioSyncTimer = null;
       }
     };
-    const clearUserPauseSuppression = () => {
-      suppressUserPauseUntil = 0;
-    };
-    const suppressUserPauseFor = (ms: number) => {
-      const until = Date.now() + Math.max(0, ms);
-      if (until > suppressUserPauseUntil) suppressUserPauseUntil = until;
-    };
-    const isUserPauseSuppressed = () => Date.now() < suppressUserPauseUntil;
-    const runAutoAudioSyncAttempt = () => {
-      if (cancel || userPausedRef.current) return;
-      if (video.paused) return;
-      const attemptNo = autoAudioSyncAttemptIndex + 1;
-      suppressUserPauseFor(500);
-      ensureLoudAudio();
-      queueTimeout(() => {
-        clearUserPauseSuppression();
-        if (cancel || userPausedRef.current) return;
-        const pausedByAttempt = video.paused;
-        const audioOpen = !video.muted && video.volume > 0;
-        if (!pausedByAttempt && audioOpen) {
-          pushDiag(`audio-sync enabled try=${attemptNo}`);
-          return;
-        }
-        if (pausedByAttempt) {
-          keepMutedAutoplay();
-          // Keep playback alive if browser paused due autoplay-with-sound policy.
-          suppressUserPauseFor(900);
-          queueTimeout(() => {
-            if (cancel || userPausedRef.current) return;
-            if (!video.paused) return;
-            try {
-              video.play().catch(() => { });
-            } catch { }
-          }, 60);
-          pushDiag(`audio-sync try=${attemptNo} paused -> remute+resume`);
-          return;
-        }
-        keepMutedAutoplay();
-        autoAudioSyncAttemptIndex += 1;
-        if (autoAudioSyncAttemptIndex >= AUTO_AUDIO_SYNC_ATTEMPT_DELAYS_MS.length) {
-          pushDiag("audio-sync retries exhausted -> muted");
-          return;
-        }
-        clearAutoAudioSyncTimer();
-        autoAudioSyncTimer = window.setTimeout(() => {
-          autoAudioSyncTimer = null;
-          runAutoAudioSyncAttempt();
-        }, AUTO_AUDIO_SYNC_ATTEMPT_DELAYS_MS[autoAudioSyncAttemptIndex]);
-      }, 130);
+    const isAudibleAutoplayAllowed = () => {
+      const nav = navigator as Navigator & {
+        getAutoplayPolicy?: (target?: HTMLMediaElement | string) => string;
+      };
+      const getter = nav.getAutoplayPolicy;
+      if (typeof getter !== "function") return false;
+      try {
+        return getter(video) === "allowed";
+      } catch {
+        return false;
+      }
     };
     const scheduleAutoAudioSync = () => {
       if (!AUTO_AUDIO_SYNC_ON_START) return;
@@ -6374,12 +6333,28 @@ export default function WatchPage() {
       if (cancel || userPausedRef.current) return;
       if (video.paused) return;
       autoAudioSyncAttempted = true;
-      autoAudioSyncAttemptIndex = 0;
       clearAutoAudioSyncTimer();
       autoAudioSyncTimer = window.setTimeout(() => {
         autoAudioSyncTimer = null;
-        runAutoAudioSyncAttempt();
-      }, AUTO_AUDIO_SYNC_ATTEMPT_DELAYS_MS[0]);
+        if (cancel || userPausedRef.current) return;
+        if (video.paused) return;
+        if (!isAudibleAutoplayAllowed()) {
+          pushDiag("audio-sync skipped policy!=allowed");
+          return;
+        }
+        try {
+          ensureLoudAudio();
+          if (video.paused) {
+            keepMutedAutoplay();
+            pushDiag("audio-sync reverted muted (pause-risk)");
+            return;
+          }
+          pushDiag("audio-sync enabled");
+        } catch {
+          keepMutedAutoplay();
+          pushDiag("audio-sync reverted muted");
+        }
+      }, 350);
     };
     const playMutedSafely = () => {
       if (cancel) return;
@@ -6517,7 +6492,6 @@ export default function WatchPage() {
     const onPlaying = () => {
       if (cancel) return;
       userPausedRef.current = false;
-      clearUserPauseSuppression();
       if (selectedServer === 3) {
         server3AutoSwitchWindowRef.current = { windowStart: 0, count: 0 };
       }
@@ -6556,7 +6530,7 @@ export default function WatchPage() {
         !video.seeking &&
         !document.hidden &&
         video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA;
-      if (likelyUserPause && !isUserPauseSuppressed()) userPausedRef.current = true;
+      if (likelyUserPause) userPausedRef.current = true;
     };
     const onCanPlay = () => {
       if (cancel) return;
