@@ -6341,11 +6341,21 @@ export default function WatchPage() {
           pushDiag(`audio-sync enabled try=${attemptNo}`);
           return;
         }
-        keepMutedAutoplay();
         if (pausedByAttempt) {
-          pushDiag(`audio-sync try=${attemptNo} paused -> stop`);
+          keepMutedAutoplay();
+          // Keep playback alive if browser paused due autoplay-with-sound policy.
+          suppressUserPauseFor(900);
+          queueTimeout(() => {
+            if (cancel || userPausedRef.current) return;
+            if (!video.paused) return;
+            try {
+              video.play().catch(() => { });
+            } catch { }
+          }, 60);
+          pushDiag(`audio-sync try=${attemptNo} paused -> remute+resume`);
           return;
         }
+        keepMutedAutoplay();
         autoAudioSyncAttemptIndex += 1;
         if (autoAudioSyncAttemptIndex >= AUTO_AUDIO_SYNC_ATTEMPT_DELAYS_MS.length) {
           pushDiag("audio-sync retries exhausted -> muted");
