@@ -51,10 +51,10 @@ const FAST_PHASE_PROBE_TIMEOUT_MS = 2200;
 const FAST_PHASE_MAX_PLAYER_PAGES = 5;
 const FAST_PHASE_MAX_DEEP_CANDIDATES = 6;
 const FAST_PHASE_MAX_PLAYERV2_POOL = 2;
-const SERVER5_STAGE1_MAX_CHECKS = 6;
-const SERVER5_STAGE1_TIMEOUT_MS = 2800;
-const SERVER5_FAST_STAGE0_MAX_CHECKS = 6;
-const SERVER5_FAST_STAGE0_TIMEOUT_MS = 2100;
+const SERVER5_STAGE1_MAX_CHECKS = 4;
+const SERVER5_STAGE1_TIMEOUT_MS = 2000;
+const SERVER5_FAST_STAGE0_MAX_CHECKS = 4;
+const SERVER5_FAST_STAGE0_TIMEOUT_MS = 1600;
 const RESOLVE_CHILD_CONCURRENCY = 3;
 const EXPAND_VARIANTS_CONCURRENCY = 4;
 const PROBE_CONCURRENCY = 4;
@@ -93,13 +93,22 @@ const SERVER5_HLS_MANIFEST_RETRIES = 8;
 const SERVER5_HLS_LEVEL_RETRIES = 8;
 const SERVER5_HLS_FRAG_RETRIES = 10;
 const SERVER3_DERIVE_CACHE_TTL_MS = 120_000;
-const SERVER5_FAST_LANDING_LIMIT = 6;
-const SERVER5_FINAL_LANDING_LIMIT = 6;
-const SERVER5_FAST_CHANNEL_KEY_LIMIT = 3;
-const SERVER5_FINAL_CHANNEL_KEY_LIMIT = 4;
-const SERVER5_FAST_LOOKUP_ENDPOINT_LIMIT = 2;
-const SERVER5_FINAL_LOOKUP_ENDPOINT_LIMIT = 3;
-const SERVER5_FAST_MIN_RESOLVED_CANDIDATES = 3;
+const SERVER5_FAST_LANDING_LIMIT = 3;
+const SERVER5_FINAL_LANDING_LIMIT = 4;
+const SERVER5_FAST_CHANNEL_KEY_LIMIT = 2;
+const SERVER5_FINAL_CHANNEL_KEY_LIMIT = 3;
+const SERVER5_FAST_LOOKUP_ENDPOINT_LIMIT = 1;
+const SERVER5_FINAL_LOOKUP_ENDPOINT_LIMIT = 2;
+const SERVER5_FAST_MIN_RESOLVED_CANDIDATES = 2;
+const SERVER5_RESOLVE_TOTAL_BUDGET_MS = 9_000;
+const SERVER5_PREWARM_SYNC_WAIT_MS = 700;
+const SERVER5_LOOKUP_TIMEOUT_FAST_MS = 1_200;
+const SERVER5_LOOKUP_TIMEOUT_FINAL_MS = 2_200;
+const SERVER5_FETCH_TIMEOUT_FINAL_MS = 3_000;
+const SERVER5_PROBE_TIMEOUT_MS = 2_200;
+const SERVER5_STAGE2_MAX_CHECKS = 8;
+const SERVER5_STAGE2_TIMEOUT_MS = 2_000;
+const SERVER5_STAGE2_MAX_CHECKS_WHEN_STAGE1_HIT = 3;
 const SERVER5_FAST_FAILOVER_COOLDOWN_MS = 4_000;
 const SERVER5_LOOKUP_SUCCESS_CACHE_TTL_MS = 5 * 60_000;
 const SERVER5_LOOKUP_MISS_CACHE_TTL_MS = 90_000;
@@ -3537,6 +3546,15 @@ async function resolveCandidatesForServer(
   const server5AllowSitemap = opts?.server5AllowSitemap ?? true;
   const server5SearchTerms = buildServer5SearchTerms(opts?.server5SearchTerms || []);
   const isServer5Resolution = !!opts?.server5Mode && isLikelyServer5LookupLandingUrl(sourceUrl);
+  const server5ResolveDeadlineAt = isServer5Resolution ? Date.now() + SERVER5_RESOLVE_TOTAL_BUDGET_MS : 0;
+  const getServer5BudgetRemainingMs = () =>
+    isServer5Resolution ? Math.max(0, server5ResolveDeadlineAt - Date.now()) : Number.POSITIVE_INFINITY;
+  const getServer5BudgetScopedTimeoutMs = (preferredMs: number, minMs: number) => {
+    if (!isServer5Resolution) return preferredMs;
+    const remaining = getServer5BudgetRemainingMs();
+    if (!Number.isFinite(remaining) || remaining <= minMs + 80) return 0;
+    return Math.max(minMs, Math.min(preferredMs, remaining - 80));
+  };
   const sourceServ = getServFromUrl(sourceUrl);
   const sourcePathKey = normalizePathKey(sourceUrl);
   const sourceLivehdTv = parseLivehdTvMeta(sourceUrl);
@@ -3750,6 +3768,14 @@ async function resolveCandidatesForServer(
     if (cached) server5SiblingDiscoveryCache.delete(cacheKey);
 
     const out: string[] = [];
+    const finalize = () => {
+      const finalized = dedupeUrls(out).slice(0, server5LandingLimit);
+      if (finalized.length > 1) {
+        server5SiblingDiscoveryCache.set(cacheKey, { expiresAt: now + SERVER5_SIBLING_DISCOVERY_TTL_MS, urls: finalized });
+        trimServer5SiblingDiscoveryCache(now);
+      }
+      return finalized.length ? finalized : ([landingUrl] as string[]);
+    };
     const maxMatchPageScan =
       server5Mode === "fast"
         ? Math.min(3, SERVER5_MATCH_PAGE_SCAN_LIMIT)
@@ -3834,8 +3860,12 @@ async function resolveCandidatesForServer(
 
     addBatch([landingUrl]);
     if (landingHtml) addBatch(extractServer5LandingUrlsFromHtml(landingHtml, landingUrl));
+    if (server5Mode === "fast") return finalize();
     if (out.length >= server5LandingLimit) {
-      return dedupeUrls(out).slice(0, server5LandingLimit);
+      return finalize();
+    }
+    if (getServer5BudgetRemainingMs() <= 260) {
+      return finalize();
     }
 
     const searchUrl = `https://anewssport.fun/?s=${encodeURIComponent(sourceId)}`;
@@ -3853,9 +3883,10 @@ async function resolveCandidatesForServer(
     }
 
     if ((candidateMatchPages.size < maxMatchPageScan || out.length < Math.min(2, server5LandingLimit)) && server5SearchTerms.length) {
-      const teamSearchTerms = server5Mode === "fast" ? server5SearchTerms.slice(0, 1) : server5SearchTerms;
+      const teamSearchTerms = server5SearchTerms;
       for (const searchTerm of teamSearchTerms) {
         if (signal.aborted) throw new DOMException("aborted", "AbortError");
+        if (getServer5BudgetRemainingMs() <= 260) break;
         const searchByTeamUrl = `https://anewssport.fun/?s=${encodeURIComponent(searchTerm)}`;
         const searchByTeamProbe = toEmbedProxyUrl(searchByTeamUrl, searchByTeamUrl);
         if (!searchByTeamProbe) continue;
@@ -3864,7 +3895,8 @@ async function resolveCandidatesForServer(
           if (searchByTeamRes.ct.includes("text/html") || searchByTeamRes.ct.includes("application/xhtml+xml")) {
             const searchByTeamHtml = await searchByTeamRes.res.text();
             addMatchPages(extractAnewssportMatchPageUrlsFromHtml(searchByTeamHtml, searchByTeamUrl), false);
-            if (candidateMatchPages.size >= maxMatchPageScan || (server5Mode === "fast" && candidateMatchPages.size >= 2)) break;
+            if (candidateMatchPages.size >= maxMatchPageScan) break;
+            if (getServer5BudgetRemainingMs() <= 260) break;
           }
         } catch (e: unknown) {
           if (e instanceof Error && e.name === "AbortError") throw e;
@@ -3881,8 +3913,9 @@ async function resolveCandidatesForServer(
           if (sitemapIndexRes.res.ok) {
             const indexXml = await sitemapIndexRes.res.text();
             const sitemapUrls = extractAnewssportMatchSitemapUrlsFromIndexXml(indexXml);
-            for (const sitemapUrl of sitemapUrls.slice(0, server5Mode === "fast" ? 0 : 3)) {
+            for (const sitemapUrl of sitemapUrls.slice(0, 3)) {
               if (signal.aborted) throw new DOMException("aborted", "AbortError");
+              if (getServer5BudgetRemainingMs() <= 260) break;
               const sitemapProbe = toEmbedProxyUrl(sitemapUrl, sitemapIndexUrl);
               if (!sitemapProbe) continue;
               try {
@@ -3909,21 +3942,17 @@ async function resolveCandidatesForServer(
     const strictCount = orderedMatchPages.filter((entry) => entry.requireSourceId).length;
     opts?.playerv2Diag?.(`server5 siblings pages=${orderedMatchPages.length} strict=${strictCount}`);
     const pagesToScan = orderedMatchPages.slice(0, maxMatchPageScan);
-    const scanConcurrency = server5Mode === "fast" ? Math.min(3, pagesToScan.length || 1) : Math.min(2, pagesToScan.length || 1);
+    const scanConcurrency = Math.min(2, pagesToScan.length || 1);
     if (pagesToScan.length) {
       await mapWithConcurrency(pagesToScan, scanConcurrency, async (entry) => {
         if (signal.aborted) throw new DOMException("aborted", "AbortError");
+        if (getServer5BudgetRemainingMs() <= 200) return;
         if (out.length >= server5LandingLimit) return;
         await processMatchPage(entry.url, entry.requireSourceId);
       });
     }
 
-    const finalized = dedupeUrls(out).slice(0, server5LandingLimit);
-    if (finalized.length > 1) {
-      server5SiblingDiscoveryCache.set(cacheKey, { expiresAt: now + SERVER5_SIBLING_DISCOVERY_TTL_MS, urls: finalized });
-      trimServer5SiblingDiscoveryCache(now);
-    }
-    return finalized.length ? finalized : ([landingUrl] as string[]);
+    return finalize();
   };
 
   const resolveServer5LookupCandidates = async (pageUrl: string, pageHtml: string) => {
@@ -3941,15 +3970,19 @@ async function resolveCandidatesForServer(
           const fromHtml = extractServer5LandingUrlsFromHtml(pageHtml, pageUrl);
           return fromHtml.length ? fromHtml : [pageUrl];
         })();
-    const timeoutMs =
+    const lookupTimeoutPreferredMs =
       server5Mode === "fast"
-        ? Math.max(1400, Math.min(fetchTimeoutMs, 2600))
-        : Math.max(2400, Math.min(fetchTimeoutMs, 9000));
+        ? Math.max(900, Math.min(fetchTimeoutMs, SERVER5_LOOKUP_TIMEOUT_FAST_MS))
+        : Math.max(1200, Math.min(fetchTimeoutMs, SERVER5_LOOKUP_TIMEOUT_FINAL_MS));
+    const getLookupTimeoutMs = () =>
+      getServer5BudgetScopedTimeoutMs(lookupTimeoutPreferredMs, server5Mode === "fast" ? 500 : 700);
     const out: string[] = [];
     let fastStop = false;
+    const scopedLandingLimit = server5Mode === "fast" ? Math.min(2, server5LandingLimit) : Math.min(4, server5LandingLimit);
 
-    for (const landingUrl of dedupeUrls(landingUrls).slice(0, server5LandingLimit)) {
+    for (const landingUrl of dedupeUrls(landingUrls).slice(0, scopedLandingLimit)) {
       if (signal.aborted) throw new DOMException("aborted", "AbortError");
+      if (getServer5BudgetRemainingMs() <= 200) break;
       if (server5Mode === "fast" && fastStop) break;
       let landingHtml = landingUrl === pageUrl ? String(pageHtml || "") : "";
       let landingSlot = "";
@@ -3972,7 +4005,9 @@ async function resolveCandidatesForServer(
         landingUrl,
         server5Mode
       );
-      if (!lookupEndpointCandidates.length) continue;
+      const scopedLookupEndpointCandidates =
+        server5Mode === "fast" ? lookupEndpointCandidates.slice(0, 1) : lookupEndpointCandidates.slice(0, 2);
+      if (!scopedLookupEndpointCandidates.length) continue;
       const explicitChannelKeys = extractServer5ChannelKeyCandidates(landingUrl, landingHtml)
         .map((value) => sanitizeServer5ChannelKey(value))
         .filter(Boolean);
@@ -3986,7 +4021,7 @@ async function resolveCandidatesForServer(
       })();
       const derivedLower = derivedChannelFromLandingId.toLowerCase();
       const authLower = landingAuthContext?.channelKey.toLowerCase() || "";
-      const channelKeyLimit = server5Mode === "fast" ? Math.min(2, server5ChannelKeyLimit) : server5ChannelKeyLimit;
+      const channelKeyLimit = server5Mode === "fast" ? Math.min(1, server5ChannelKeyLimit) : Math.min(2, server5ChannelKeyLimit);
       const channelKeys = Array.from(
         new Set(
           [landingAuthContext?.channelKey || "", derivedChannelFromLandingId, ...explicitChannelKeys]
@@ -4018,9 +4053,15 @@ async function resolveCandidatesForServer(
       if (!channelKeys.length) continue;
       for (const channelKey of channelKeys) {
         if (signal.aborted) throw new DOMException("aborted", "AbortError");
+        if (getServer5BudgetRemainingMs() <= 200) break;
         let channelProduced = false;
-        for (const lookupEndpointUrl of lookupEndpointCandidates) {
+        for (const lookupEndpointUrl of scopedLookupEndpointCandidates) {
           if (signal.aborted) throw new DOMException("aborted", "AbortError");
+          const lookupTimeoutMs = getLookupTimeoutMs();
+          if (lookupTimeoutMs <= 0) {
+            fastStop = true;
+            break;
+          }
           const missCacheTtlMs = (() => {
             try {
               const host = new URL(lookupEndpointUrl).hostname.toLowerCase();
@@ -4048,7 +4089,7 @@ async function resolveCandidatesForServer(
                       credentials: "same-origin",
                       headers: { "x-embed-proxy-probe": "1" },
                     },
-                    timeoutMs
+                    lookupTimeoutMs
                   );
                   if (!lookupRes.ok) {
                     setServer5LookupCacheEntry(lookupCacheKey, null, missCacheTtlMs);
@@ -4106,9 +4147,11 @@ async function resolveCandidatesForServer(
               }
             }
           }
+          if (server5Mode !== "fast" && out.length >= SERVER5_FAST_MIN_RESOLVED_CANDIDATES + 1) break;
           if (server5Mode === "fast" && channelProduced) break;
           if (server5Mode === "fast" && fastStop) break;
         }
+        if (server5Mode !== "fast" && out.length >= SERVER5_FAST_MIN_RESOLVED_CANDIDATES + 1) break;
         if (server5Mode === "fast" && fastStop) break;
       }
       if (server5Mode === "fast" && fastStop) break;
@@ -5699,6 +5742,9 @@ export default function WatchPage() {
         resetRecoveryState();
         return;
       }
+      const server5ResolveDeadlineAt = selectedServer === 5 ? Date.now() + SERVER5_RESOLVE_TOTAL_BUDGET_MS : 0;
+      const getServer5ResolveBudgetRemainingMs = () =>
+        selectedServer === 5 ? Math.max(0, server5ResolveDeadlineAt - Date.now()) : Number.POSITIVE_INFINITY;
       const seedCandidates = (() => {
         const seedUrls: string[] = [];
         if (selectedServer === 5) {
@@ -5728,7 +5774,28 @@ export default function WatchPage() {
       const stickyCandidates = isServer2Playerv2 ? getPlayerv2StickyCandidates(selectedUrl) : [];
       let prewarmedServer5Candidates = selectedServer === 5 ? getServer5PrewarmCandidates(selectedUrl) : [];
       if (selectedServer === 5 && !prewarmedServer5Candidates.length) {
-        prewarmedServer5Candidates = await warmServer5PrewarmCandidates(selectedUrl, "resolve");
+        const warmPromise = warmServer5PrewarmCandidates(selectedUrl, "resolve");
+        prewarmedServer5Candidates = await new Promise<string[]>((resolve) => {
+          let settled = false;
+          const timeoutId = window.setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            resolve([]);
+          }, SERVER5_PREWARM_SYNC_WAIT_MS);
+          warmPromise
+            .then((value) => {
+              if (settled) return;
+              settled = true;
+              window.clearTimeout(timeoutId);
+              resolve(value);
+            })
+            .catch(() => {
+              if (settled) return;
+              settled = true;
+              window.clearTimeout(timeoutId);
+              resolve([]);
+            });
+        });
       }
       const initialCandidates = dedupeUrls(
         [...prewarmedServer5Candidates, ...stickyCandidates, ...cachedCandidates, ...seedCandidates].filter((candidate) =>
@@ -5748,14 +5815,18 @@ export default function WatchPage() {
           ? SERVER4_FETCH_TIMEOUT_FINAL_MS
           : isServer1Primary
             ? SERVER1_FETCH_TIMEOUT_FINAL_MS
-            : CANDIDATE_PROBE_TIMEOUT_MS;
+            : selectedServer === 5
+              ? SERVER5_FETCH_TIMEOUT_FINAL_MS
+              : CANDIDATE_PROBE_TIMEOUT_MS;
       const probeTimeoutMs = isServer3Livehd
         ? LIVEHD77_PROBE_TIMEOUT_MS
         : isServer4Livekora
           ? SERVER4_PROBE_TIMEOUT_MS
           : isServer1Primary
             ? SERVER1_PROBE_TIMEOUT_MS
-            : CANDIDATE_PROBE_TIMEOUT_MS;
+            : selectedServer === 5
+              ? SERVER5_PROBE_TIMEOUT_MS
+              : CANDIDATE_PROBE_TIMEOUT_MS;
       const resolveFetchRetries = isServer3Livehd
         ? LIVEHD77_FETCH_RETRIES
         : isServer4Livekora
@@ -5901,6 +5972,20 @@ export default function WatchPage() {
           return;
         }
 
+        if (selectedServer === 5) {
+          const remainingBeforeFinal = getServer5ResolveBudgetRemainingMs();
+          if (remainingBeforeFinal <= 750 && candidatesRef.current.length) {
+            pushDiag(`server5 budget skip-final remaining=${remainingBeforeFinal}ms`);
+            setResolverLoading(false);
+            return;
+          }
+        }
+
+        const server5FinalFetchTimeoutMs =
+          selectedServer === 5
+            ? Math.min(resolveFetchTimeoutFinal, Math.max(1200, getServer5ResolveBudgetRemainingMs() - 250))
+            : resolveFetchTimeoutFinal;
+
         const finalResolved = await resolveCandidatesForServer(selectedUrl, controller.signal, {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
@@ -5909,9 +5994,9 @@ export default function WatchPage() {
           server5Mode: selectedServer === 5 ? "final" : undefined,
           server5LandingLimit: selectedServer === 5 ? SERVER5_FINAL_LANDING_LIMIT : undefined,
           server5ChannelKeyLimit: selectedServer === 5 ? SERVER5_FINAL_CHANNEL_KEY_LIMIT : undefined,
-          server5AllowSitemap: selectedServer === 5 ? true : undefined,
+          server5AllowSitemap: selectedServer === 5 ? false : undefined,
           server5SearchTerms: selectedServer === 5 ? [match?.home_team ?? "", match?.away_team ?? ""] : undefined,
-          fetchTimeoutMs: resolveFetchTimeoutFinal,
+          fetchTimeoutMs: server5FinalFetchTimeoutMs,
           fetchRetries: resolveFetchRetries,
           fetchRetryDelayMs: resolveFetchRetryDelayMs,
           onBatchCandidates: (batch, phase, batchProvenance) => {
@@ -5923,14 +6008,17 @@ export default function WatchPage() {
         if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
         if (selectedServer === 3) mergeServer3Provenance(finalResolved.provenanceByKey);
         const finalList = finalResolved.candidates;
-        const playableList = await expandCandidatesWithManifestVariants(finalList, {
-          signal: controller.signal,
-          timeoutMs: probeTimeoutMs,
-          maxParents: 8,
-          maxVariantsPerParent: 12,
-          concurrency: EXPAND_VARIANTS_CONCURRENCY,
-          pushDiag,
-        });
+        const playableList =
+          selectedServer === 5
+            ? ([] as string[])
+            : await expandCandidatesWithManifestVariants(finalList, {
+              signal: controller.signal,
+              timeoutMs: probeTimeoutMs,
+              maxParents: 8,
+              maxVariantsPerParent: 12,
+              concurrency: EXPAND_VARIANTS_CONCURRENCY,
+              pushDiag,
+            });
         if (cancel || controller.signal.aborted || activeResolveIdRef.current !== resolveId) return;
         if (!cancel) {
           const mergedRawPrePolicy = dedupeUrls([...candidatesRef.current, ...fastMerged, ...finalList, ...playableList]);
@@ -5980,7 +6068,7 @@ export default function WatchPage() {
               stage1Verified = await filterPlayableCandidates(mergedRaw, {
                 signal: controller.signal,
                 timeoutMs: Math.min(probeTimeoutMs, SERVER5_STAGE1_TIMEOUT_MS),
-                maxChildChecks: 2,
+                maxChildChecks: 1,
                 maxChecks: stage1Checks,
                 concurrency: Math.min(3, PROBE_CONCURRENCY),
                 pushDiag,
@@ -6002,17 +6090,34 @@ export default function WatchPage() {
                 setResolverLoading(false);
               }
             }
-
-            const stage2Verified = await filterPlayableCandidates(mergedRaw, {
-              signal: controller.signal,
-              timeoutMs: probeTimeoutMs,
-              maxChecks,
-              concurrency: Math.min(3, PROBE_CONCURRENCY),
-              pushDiag,
-            });
-            const collapsedStage2 = prioritizeServer5Candidates(stage2Verified);
-            pushDiag(`server5 stage2 verified=${collapsedStage2.length}/${maxChecks}`);
-            verified = prioritizeServer5Candidates([...stage1Verified, ...collapsedStage2]);
+            if (stage1Verified.length >= SERVER5_FAST_MIN_RESOLVED_CANDIDATES) {
+              pushDiag("server5 stage2 skipped stage1-ready");
+              verified = stage1Verified;
+            } else {
+              const stage1KeySet = new Set(
+                stage1Verified.map((candidate) => canonicalizeUrl(candidate) || String(candidate || "").toLowerCase())
+              );
+              const stage2Input = mergedRaw.filter(
+                (candidate) => !stage1KeySet.has(canonicalizeUrl(candidate) || String(candidate || "").toLowerCase())
+              );
+              const stage2Checks = stage1Verified.length
+                ? Math.min(SERVER5_STAGE2_MAX_CHECKS_WHEN_STAGE1_HIT, stage2Input.length)
+                : Math.min(SERVER5_STAGE2_MAX_CHECKS, stage2Input.length);
+              let stage2Verified: string[] = [];
+              if (stage2Checks > 0) {
+                stage2Verified = await filterPlayableCandidates(stage2Input, {
+                  signal: controller.signal,
+                  timeoutMs: Math.min(probeTimeoutMs, SERVER5_STAGE2_TIMEOUT_MS),
+                  maxChildChecks: 1,
+                  maxChecks: stage2Checks,
+                  concurrency: Math.min(4, PROBE_CONCURRENCY),
+                  pushDiag,
+                });
+              }
+              const collapsedStage2 = prioritizeServer5Candidates(stage2Verified);
+              pushDiag(`server5 stage2 verified=${collapsedStage2.length}/${stage2Checks}`);
+              verified = prioritizeServer5Candidates([...stage1Verified, ...collapsedStage2]);
+            }
           } else {
             verified = await filterPlayableCandidates(mergedRaw, {
               signal: controller.signal,

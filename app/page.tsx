@@ -1,6 +1,6 @@
 ﻿"use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type DayKey = "yesterday" | "today" | "tomorrow";
 const TZ = "Africa/Cairo";
@@ -22,6 +22,20 @@ type MatchRow = {
   status_key?: string | null;
   status_text?: string | null;
 };
+
+type BannerAtOptions = {
+  key: string;
+  format: "iframe";
+  height: number;
+  width: number;
+  params: Record<string, string>;
+};
+
+declare global {
+  interface Window {
+    atOptions?: BannerAtOptions;
+  }
+}
 
 function isValidHttpUrl(raw: unknown): raw is string {
   if (typeof raw !== "string") return false;
@@ -142,6 +156,7 @@ export default function Home() {
   const [day, setDay] = useState<DayKey>("today");
   const [matches, setMatches] = useState<MatchRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const noticeBannerRef = useRef<HTMLDivElement | null>(null);
 
   const tabs = useMemo(
     () => [
@@ -189,6 +204,33 @@ export default function Home() {
     fetchMatches();
     return () => ac.abort();
   }, [day]);
+
+  useEffect(() => {
+    if (!MATCH_NOTICE_ENABLED || loading) return;
+    const container = noticeBannerRef.current;
+    if (!container) return;
+
+    container.innerHTML = "";
+
+    window.atOptions = {
+      key: "6a12e1a77f6425cf6359cb652cff80e3",
+      format: "iframe",
+      height: 90,
+      width: 728,
+      params: {},
+    };
+
+    const script = document.createElement("script");
+    script.type = "text/javascript";
+    script.src = "https://www.highperformanceformat.com/6a12e1a77f6425cf6359cb652cff80e3/invoke.js";
+    script.async = true;
+
+    container.appendChild(script);
+
+    return () => {
+      container.innerHTML = "";
+    };
+  }, [loading]);
 
   const sortedMatches = useMemo(() => {
     const getStatus = (m: MatchRow) => {
@@ -271,6 +313,10 @@ export default function Home() {
               </span>{" "}
               (إذا كنت مهتماً به) ويحفزنا على التطوير لضمان أفضل جودة لك.
             </p>
+
+            <div className="mt-3 overflow-x-auto" dir="ltr">
+              <div ref={noticeBannerRef} className="mx-auto h-[90px] w-[728px] min-w-[728px]" />
+            </div>
 
             <div className="absolute -left-5 -bottom-5 opacity-5" aria-hidden="true">
               <svg width="100" height="100" viewBox="0 0 24 24" fill="#2ecc71">
