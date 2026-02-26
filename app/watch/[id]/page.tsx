@@ -44,6 +44,7 @@ const STALL_FREEZE_MS = 18000;
 const PLAYER_LOADING_OVERLAY_DELAY_MS = 1200;
 const DEFAULT_PLAYER_QUALITY_HEIGHT = 480;
 const AUTO_AUDIO_SYNC_ON_START = process.env.NEXT_PUBLIC_AUTO_AUDIO_SYNC_ON_START !== "0";
+const AUTO_AUDIO_SYNC_ATTEMPT_DELAYS_MS = [350, 850, 1500] as const;
 const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const RESOLVE_COOLDOWN_MS = 1500;
 const CANDIDATE_PROBE_TIMEOUT_MS = 6500;
@@ -6297,6 +6298,7 @@ export default function WatchPage() {
     let lastRecoveryAttemptAt = 0;
     let stallFreezeCount = 0;
     let autoAudioSyncAttempted = false;
+    let autoAudioSyncAttemptIndex = 0;
     let autoAudioSyncTimer: number | null = null;
     let suppressUserPauseUntil = 0;
     const ensureLoudAudio = () => {
@@ -6324,64 +6326,50 @@ export default function WatchPage() {
       if (until > suppressUserPauseUntil) suppressUserPauseUntil = until;
     };
     const isUserPauseSuppressed = () => Date.now() < suppressUserPauseUntil;
+    const runAutoAudioSyncAttempt = () => {
+      if (cancel || userPausedRef.current) return;
+      if (video.paused) return;
+      const attemptNo = autoAudioSyncAttemptIndex + 1;
+      suppressUserPauseFor(500);
+      ensureLoudAudio();
+      queueTimeout(() => {
+        clearUserPauseSuppression();
+        if (cancel || userPausedRef.current) return;
+        const pausedByAttempt = video.paused;
+        const audioOpen = !video.muted && video.volume > 0;
+        if (!pausedByAttempt && audioOpen) {
+          pushDiag(`audio-sync enabled try=${attemptNo}`);
+          return;
+        }
+        keepMutedAutoplay();
+        if (pausedByAttempt) {
+          pushDiag(`audio-sync try=${attemptNo} paused -> stop`);
+          return;
+        }
+        autoAudioSyncAttemptIndex += 1;
+        if (autoAudioSyncAttemptIndex >= AUTO_AUDIO_SYNC_ATTEMPT_DELAYS_MS.length) {
+          pushDiag("audio-sync retries exhausted -> muted");
+          return;
+        }
+        clearAutoAudioSyncTimer();
+        autoAudioSyncTimer = window.setTimeout(() => {
+          autoAudioSyncTimer = null;
+          runAutoAudioSyncAttempt();
+        }, AUTO_AUDIO_SYNC_ATTEMPT_DELAYS_MS[autoAudioSyncAttemptIndex]);
+      }, 130);
+    };
     const scheduleAutoAudioSync = () => {
       if (!AUTO_AUDIO_SYNC_ON_START) return;
       if (autoAudioSyncAttempted) return;
       if (cancel || userPausedRef.current) return;
       if (video.paused) return;
       autoAudioSyncAttempted = true;
+      autoAudioSyncAttemptIndex = 0;
       clearAutoAudioSyncTimer();
       autoAudioSyncTimer = window.setTimeout(() => {
         autoAudioSyncTimer = null;
-        if (cancel || userPausedRef.current) return;
-        if (video.paused) return;
-        ensureLoudAudio();
-        const rollbackToMuted = () => {
-          keepMutedAutoplay();
-          queueTimeout(() => {
-            if (cancel) return;
-            if (userPausedRef.current && !isUserPauseSuppressed()) return;
-            suppressUserPauseFor(900);
-            try {
-              if (video.paused) video.play().catch(() => { });
-            } catch { }
-          }, 120);
-          pushDiag("audio-sync blocked -> muted");
-        };
-        try {
-          suppressUserPauseFor(1200);
-          const playPromise = video.play();
-          if (playPromise && typeof playPromise.then === "function") {
-            playPromise
-              .then(() => {
-                queueTimeout(() => {
-                  if (cancel) return;
-                  if (video.paused) {
-                    rollbackToMuted();
-                    return;
-                  }
-                  clearUserPauseSuppression();
-                  pushDiag("audio-sync enabled");
-                }, 120);
-              })
-              .catch(() => {
-                rollbackToMuted();
-              });
-            return;
-          }
-          queueTimeout(() => {
-            if (cancel) return;
-            if (video.paused) {
-              rollbackToMuted();
-              return;
-            }
-            clearUserPauseSuppression();
-            pushDiag("audio-sync enabled");
-          }, 120);
-        } catch {
-          rollbackToMuted();
-        }
-      }, 350);
+        runAutoAudioSyncAttempt();
+      }, AUTO_AUDIO_SYNC_ATTEMPT_DELAYS_MS[0]);
     };
     const playMutedSafely = () => {
       if (cancel) return;
