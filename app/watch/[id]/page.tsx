@@ -6298,6 +6298,7 @@ export default function WatchPage() {
     let stallFreezeCount = 0;
     let autoAudioSyncAttempted = false;
     let autoAudioSyncTimer: number | null = null;
+    let suppressUserPauseUntil = 0;
     const ensureLoudAudio = () => {
       video.volume = 1;
       video.muted = false;
@@ -6315,6 +6316,14 @@ export default function WatchPage() {
         autoAudioSyncTimer = null;
       }
     };
+    const clearUserPauseSuppression = () => {
+      suppressUserPauseUntil = 0;
+    };
+    const suppressUserPauseFor = (ms: number) => {
+      const until = Date.now() + Math.max(0, ms);
+      if (until > suppressUserPauseUntil) suppressUserPauseUntil = until;
+    };
+    const isUserPauseSuppressed = () => Date.now() < suppressUserPauseUntil;
     const scheduleAutoAudioSync = () => {
       if (!AUTO_AUDIO_SYNC_ON_START) return;
       if (autoAudioSyncAttempted) return;
@@ -6330,7 +6339,9 @@ export default function WatchPage() {
         const rollbackToMuted = () => {
           keepMutedAutoplay();
           queueTimeout(() => {
-            if (cancel || userPausedRef.current) return;
+            if (cancel) return;
+            if (userPausedRef.current && !isUserPauseSuppressed()) return;
+            suppressUserPauseFor(900);
             try {
               if (video.paused) video.play().catch(() => { });
             } catch { }
@@ -6338,6 +6349,7 @@ export default function WatchPage() {
           pushDiag("audio-sync blocked -> muted");
         };
         try {
+          suppressUserPauseFor(1200);
           const playPromise = video.play();
           if (playPromise && typeof playPromise.then === "function") {
             playPromise
@@ -6348,6 +6360,7 @@ export default function WatchPage() {
                     rollbackToMuted();
                     return;
                   }
+                  clearUserPauseSuppression();
                   pushDiag("audio-sync enabled");
                 }, 120);
               })
@@ -6362,6 +6375,7 @@ export default function WatchPage() {
               rollbackToMuted();
               return;
             }
+            clearUserPauseSuppression();
             pushDiag("audio-sync enabled");
           }, 120);
         } catch {
@@ -6505,6 +6519,7 @@ export default function WatchPage() {
     const onPlaying = () => {
       if (cancel) return;
       userPausedRef.current = false;
+      clearUserPauseSuppression();
       if (selectedServer === 3) {
         server3AutoSwitchWindowRef.current = { windowStart: 0, count: 0 };
       }
@@ -6543,7 +6558,7 @@ export default function WatchPage() {
         !video.seeking &&
         !document.hidden &&
         video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA;
-      if (likelyUserPause) userPausedRef.current = true;
+      if (likelyUserPause && !isUserPauseSuppressed()) userPausedRef.current = true;
     };
     const onCanPlay = () => {
       if (cancel) return;
