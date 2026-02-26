@@ -6403,16 +6403,23 @@ export default function WatchPage() {
     let stallFreezeCount = 0;
     let autoAudioSyncAttempted = false;
     let autoAudioSyncTimer: number | null = null;
+    const syncVolumeUiState = () => {
+      try {
+        video.dispatchEvent(new Event("volumechange"));
+      } catch { }
+    };
     const ensureLoudAudio = () => {
       video.volume = 1;
       video.muted = false;
       video.defaultMuted = false;
       video.removeAttribute("muted");
+      syncVolumeUiState();
     };
     const keepMutedAutoplay = () => {
       video.muted = true;
       video.defaultMuted = true;
       video.setAttribute("muted", "");
+      syncVolumeUiState();
     };
     const clearAutoAudioSyncTimer = () => {
       if (autoAudioSyncTimer !== null) {
