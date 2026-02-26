@@ -30,15 +30,6 @@ type ServerOption = {
   sticky?: boolean;
 };
 type ServerHealthState = "ok" | "down" | "pending";
-type P2PWeakNetworkState = { weak: boolean; reason: string | null };
-type P2PDownloadSource = "p2p" | "http" | "hybrid";
-type P2PEngineCtor = new (config?: Record<string, unknown>) => {
-  getConfigForHlsJs: () => Record<string, unknown>;
-  applyDynamicConfig: (cfg: unknown) => void;
-  addEventListener: (eventName: string, cb: (...args: unknown[]) => void) => void;
-  bindHls: (hls: unknown | (() => unknown)) => void;
-  destroy: () => void;
-};
 
 const SERVER_SOURCE_LABELS: Record<number, string> = {
   1: "سيرفر 4 ",
@@ -49,15 +40,10 @@ const SERVER_SOURCE_LABELS: Record<number, string> = {
 const SERVER_DISPLAY_ORDER = [4, 2, 3, 1, 5, 6] as const;
 const FORCE_IFRAME_PLAYER = String(process.env.NEXT_PUBLIC_FORCE_IFRAME_PLAYER || "0") === "1";
 const IFRAME_PLAYER_ORIGIN = String(process.env.NEXT_PUBLIC_IFRAME_PLAYER_ORIGIN || "").trim().replace(/\/+$/, "");
-const P2P_ENABLED = String(process.env.NEXT_PUBLIC_P2P_ENABLED || "0") === "1";
-const P2P_AGGRESSIVE = String(process.env.NEXT_PUBLIC_P2P_AGGRESSIVE || "0") === "1";
-const P2P_DISABLE_ON_WEAK_NET = String(process.env.NEXT_PUBLIC_P2P_DISABLE_ON_WEAK_NET || "1") === "1";
-const P2P_MAX_PEERS = Number.parseInt(String(process.env.NEXT_PUBLIC_P2P_MAX_PEERS || "8"), 10) || 8;
-const P2P_UPLOAD_CAP_KBPS = Number.parseInt(String(process.env.NEXT_PUBLIC_P2P_UPLOAD_CAP_KBPS || "400"), 10) || 400;
 
 const PREMATCH_OPEN_WINDOW_MINUTES = 30;
 const STALL_FREEZE_MS = 12000;
-const PLAYER_LOADING_OVERLAY_DELAY_MS = 600;
+const PLAYER_LOADING_OVERLAY_DELAY_MS = 1200;
 const DEFAULT_PLAYER_QUALITY_HEIGHT = 480;
 const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const RESOLVE_COOLDOWN_MS = 1500;
@@ -116,7 +102,7 @@ const SERVER5_FAST_LOOKUP_ENDPOINT_LIMIT = 2;
 const SERVER5_FINAL_LOOKUP_ENDPOINT_LIMIT = 3;
 const SERVER5_FAST_MIN_RESOLVED_CANDIDATES = 3;
 const SERVER5_FAST_FAILOVER_COOLDOWN_MS = 4_000;
-const LIVE_EDGE_SEEK_TOLERANCE_SEC = 8;
+const LIVE_EDGE_SEEK_TOLERANCE_SEC = 20;
 const SERVER5_LOOKUP_SUCCESS_CACHE_TTL_MS = 5 * 60_000;
 const SERVER5_LOOKUP_MISS_CACHE_TTL_MS = 90_000;
 const SERVER5_HTML_FETCH_CACHE_TTL_MS = 150_000;
@@ -208,7 +194,6 @@ const SERVER5_LOOKUP_ENDPOINT_FALLBACKS = [
 ] as const;
 const SERVER5_STARTUP_NO_FRAME_TIMEOUT_MS = 5_500;
 const SERVER5_STARTUP_NO_FRAME_RECHECK_MS = 1_500;
-const AUDIO_INTENT_STORAGE_KEY = "tf_audio_intent";
 const SERVER3_AUTOSWITCH_WINDOW_MS = 20_000;
 const SERVER3_AUTOSWITCH_LIMIT = 3;
 
@@ -1127,22 +1112,6 @@ function shouldUseNativeHls(video: HTMLVideoElement) {
     ua.includes("safari") && !/(chrome|chromium|crios|edg|opr|opera|fxios|firefox|android)/.test(ua);
   const isIOS = /iphone|ipad|ipod/.test(ua);
   return isSafari || isIOS;
-}
-
-function getWeakNetworkState(): P2PWeakNetworkState {
-  if (typeof navigator === "undefined") return { weak: false, reason: null };
-  const nav = navigator as Navigator & {
-    connection?: { effectiveType?: string; saveData?: boolean; downlink?: number };
-    mozConnection?: { effectiveType?: string; saveData?: boolean; downlink?: number };
-    webkitConnection?: { effectiveType?: string; saveData?: boolean; downlink?: number };
-  };
-  const conn = nav.connection || nav.mozConnection || nav.webkitConnection;
-  if (!conn) return { weak: false, reason: null };
-  if (conn.saveData) return { weak: true, reason: "save-data" };
-  const effectiveType = String(conn.effectiveType || "").toLowerCase();
-  if (effectiveType === "slow-2g" || effectiveType === "2g") return { weak: true, reason: `effective-type:${effectiveType}` };
-  if (typeof conn.downlink === "number" && conn.downlink > 0 && conn.downlink < 1.2) return { weak: true, reason: `downlink:${conn.downlink}` };
-  return { weak: false, reason: null };
 }
 
 function contentTypeLooksLikeHls(contentType: string) {
@@ -4995,7 +4964,6 @@ export default function WatchPage() {
   const [serverHealth, setServerHealth] = useState<Record<number, ServerHealthState>>({});
   const [diagLogs, setDiagLogs] = useState<string[]>([]);
   const [isTfPlayerHost, setIsTfPlayerHost] = useState(false);
-  const [p2pEngineCtor, setP2PEngineCtor] = useState<P2PEngineCtor | null>(null);
   const candidatesRef = useRef<string[]>([]);
   const selectedCandidateRef = useRef(0);
   const selectedServerRef = useRef(4);
@@ -5017,39 +4985,13 @@ export default function WatchPage() {
   const lastFastFailoverAtByServerRef = useRef<Record<number, number>>({ 1: 0, 3: 0, 5: 0 });
   const server5RefreshInFlightRef = useRef<Promise<string | null> | null>(null);
   const server5PrewarmResolveInFlightRef = useRef<Map<string, Promise<string[]>>>(new Map());
-  const p2pDisabledReasonRef = useRef<string | null>(null);
   const server3AutoSwitchWindowRef = useRef<{ windowStart: number; count: number }>({ windowStart: 0, count: 0 });
-  const userPausedRef = useRef(false);
-  const lastUserInteractionAtRef = useRef(0);
-  const audioIntentEnabledRef = useRef(false);
 
   const diagEnabled = searchParams.get("diag") === "1";
   useEffect(() => {
     if (typeof window === "undefined") return;
-    try {
-      audioIntentEnabledRef.current = window.localStorage.getItem(AUDIO_INTENT_STORAGE_KEY) === "1";
-    } catch {
-      audioIntentEnabledRef.current = false;
-    }
-  }, []);
-  useEffect(() => {
-    if (typeof window === "undefined") return;
     const host = String(window.location.hostname || "").toLowerCase();
     setIsTfPlayerHost(host === "tf-player.site" || host.endsWith(".tf-player.site"));
-  }, []);
-  useEffect(() => {
-    if (!P2P_ENABLED || typeof window === "undefined") return;
-    let cancelled = false;
-    import("p2p-media-loader-hlsjs")
-      .then((mod) => {
-        if (cancelled) return;
-        const ctor = (mod as { HlsJsP2PEngine?: P2PEngineCtor }).HlsJsP2PEngine;
-        if (ctor) setP2PEngineCtor(() => ctor);
-      })
-      .catch(() => { });
-    return () => {
-      cancelled = true;
-    };
   }, []);
   const externalPlayerSrc = useMemo(() => {
     if (!FORCE_IFRAME_PLAYER) return "";
@@ -6307,11 +6249,10 @@ export default function WatchPage() {
       clearLoadingOverlayTimer();
       setPlayerLoading(false);
     };
-    let autoplayAttempts = 0;
-    let autoplaySettled = false;
-    let startupAutoplayGuardTimer: number | null = null;
+    let autoplayRetryUsed = false;
+    let loudPromotionScheduled = false;
     let loudPromotionAttempted = false;
-    const prefersLoudAudio = !!audioIntentEnabledRef.current;
+    let lastRecoveryAttemptAt = 0;
     const ensureLoudAudio = () => {
       video.volume = 1;
       video.muted = false;
@@ -6323,66 +6264,55 @@ export default function WatchPage() {
       video.defaultMuted = true;
       video.setAttribute("muted", "");
     };
-    const persistAudioIntent = () => {
-      audioIntentEnabledRef.current = true;
-      try {
-        window.localStorage.setItem(AUDIO_INTENT_STORAGE_KEY, "1");
-      } catch { }
+    const playMutedSafely = () => {
+      if (cancel) return;
+      keepMutedAutoplay();
+      video.play()
+        .catch(() => {
+          if (cancel || autoplayRetryUsed) return;
+          autoplayRetryUsed = true;
+          queueTimeout(() => {
+            if (cancel) return;
+            keepMutedAutoplay();
+            try {
+              video.play().catch(() => { });
+            } catch { }
+          }, 250);
+        });
     };
-    const tryPromoteLoudAudioFromIntent = () => {
-      if (!prefersLoudAudio || loudPromotionAttempted || cancel) return;
-      loudPromotionAttempted = true;
-      ensureLoudAudio();
+    const tryPromoteLoudAudioAfterStableStart = () => {
+      if (cancel || loudPromotionScheduled || loudPromotionAttempted) return;
+      loudPromotionScheduled = true;
       queueTimeout(() => {
         if (cancel) return;
-        if (!video.paused) return;
-        // Keep playback alive if browser refuses unmuted autoplay.
+        loudPromotionScheduled = false;
+        if (loudPromotionAttempted) return;
+        loudPromotionAttempted = true;
+        const wasPlaying = !video.paused;
+        ensureLoudAudio();
+        if (!wasPlaying || !video.paused) return;
+        // Browser blocked unmuted autoplay; keep playback alive muted.
         keepMutedAutoplay();
         try {
           video.play().catch(() => { });
         } catch { }
-      }, 130);
+      }, 2000);
     };
-    const playWithAutoplayFallback = () => {
-      if (cancel || autoplaySettled) return;
-      autoplayAttempts += 1;
-      // Start muted-first for highest autoplay success across browsers.
-      keepMutedAutoplay();
-      video.play()
-        .then(() => {
-          autoplaySettled = true;
-          queueTimeout(() => {
-            tryPromoteLoudAudioFromIntent();
-          }, 260);
-        })
-        .catch(() => {
-          if (cancel || autoplaySettled) return;
-          // Retry with identical muted setup/backoff.
-          video.play()
-            .then(() => {
-              autoplaySettled = true;
-              queueTimeout(() => {
-                tryPromoteLoudAudioFromIntent();
-              }, 260);
-            })
-            .catch(() => {
-              if (cancel || autoplaySettled) return;
-              if (autoplayAttempts < 8) {
-                const backoff = Math.min(1600, 200 + autoplayAttempts * 180);
-                queueTimeout(() => playWithAutoplayFallback(), backoff);
-              }
-            });
-        });
+    const requestSoftRecovery = () => {
+      const now = Date.now();
+      if (now - lastRecoveryAttemptAt < 3000) return;
+      lastRecoveryAttemptAt = now;
+      try { hls?.startLoad(); } catch { }
+      queueTimeout(() => {
+        if (cancel) return;
+        if (!video.paused) return;
+        try {
+          video.play().catch(() => { });
+        } catch { }
+      }, 150);
     };
-    let lastLiveEdgeSeekAt = 0;
-    const seekToLiveEdgeIfBehind = (
-      liveEdgeHint?: number | null,
-      opts?: { toleranceSec?: number; minIntervalMs?: number }
-    ) => {
-      const toleranceSec = Math.max(2, opts?.toleranceSec ?? LIVE_EDGE_SEEK_TOLERANCE_SEC);
-      const minIntervalMs = Math.max(0, opts?.minIntervalMs ?? 0);
-      const nowAt = Date.now();
-      if (minIntervalMs > 0 && nowAt - lastLiveEdgeSeekAt < minIntervalMs) return;
+    let liveEdgeCorrectedOnce = false;
+    const seekToLiveEdgeIfBehind = (liveEdgeHint?: number | null) => {
       const hintedEdge =
         typeof liveEdgeHint === "number" && Number.isFinite(liveEdgeHint) && liveEdgeHint > 0
           ? liveEdgeHint
@@ -6399,10 +6329,10 @@ export default function WatchPage() {
       if (!Number.isFinite(edge) || edge <= 0) return;
       const now = Number(video.currentTime);
       if (!Number.isFinite(now) || now < 0) return;
-      if (edge - now <= toleranceSec) return;
+      if (edge - now <= LIVE_EDGE_SEEK_TOLERANCE_SEC) return;
       try {
         video.currentTime = Math.max(0, edge - 1.5);
-        lastLiveEdgeSeekAt = nowAt;
+        liveEdgeCorrectedOnce = true;
       } catch { }
     };
     const applyServer5ProxyAuthToXhr = (xhr: XMLHttpRequest, requestUrl: string) => {
@@ -6481,56 +6411,25 @@ export default function WatchPage() {
     keepMutedAutoplay();
     markProgress();
     let fatalRetries = 0;
-    let waitingHitsEarly = 0;
-    const playbackBootAt = Date.now();
-    let p2pEngine: InstanceType<P2PEngineCtor> | null = null;
-    let p2pDisabled = false;
-    const disableP2P = (reason: string) => {
-      if (!p2pEngine || p2pDisabled) return;
-      p2pDisabled = true;
-      p2pDisabledReasonRef.current = reason;
-      try {
-        p2pEngine.applyDynamicConfig({
-          core: {
-            isP2PDisabled: true,
-            isP2PUploadDisabled: true,
-          },
-        });
-      } catch { }
-      pushDiag(`p2p disabled: ${reason}`);
-    };
     const onLoaded = () => {
       if (cancel) return;
-      playWithAutoplayFallback();
+      playMutedSafely();
       markProgress();
       if (video.videoWidth > 0 || video.videoHeight > 0) markServer5VisualStart();
       hidePlayerLoading();
     };
     const onWaiting = () => {
       if (cancel) return;
-      if (P2P_ENABLED && !p2pDisabled && Date.now() - playbackBootAt <= 45_000) {
-        waitingHitsEarly += 1;
-        if (waitingHitsEarly >= 2) disableP2P("early-stall");
-      }
       const server5RecentProgress = selectedServer === 5 && Date.now() - lastProgressAtRef.current < 2500;
-      if (!server5RecentProgress) showPlayerLoadingDelayed();
-      try {
-        hls?.startLoad();
-      } catch { }
-      queueTimeout(() => {
-        try {
-          video.play().catch(() => { });
-        } catch { }
-      }, 150);
+      if (!server5RecentProgress && video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) showPlayerLoadingDelayed();
+      requestSoftRecovery();
     };
     const onPlaying = () => {
       if (cancel) return;
-      autoplaySettled = true;
-      userPausedRef.current = false;
       if (selectedServer === 3) {
         server3AutoSwitchWindowRef.current = { windowStart: 0, count: 0 };
       }
-      if (!video.muted) ensureLoudAudio();
+      tryPromoteLoudAudioAfterStableStart();
       freezeTriggered = false;
       markProgress();
       if (hasServer5VisualStart()) markServer5VisualStart();
@@ -6552,62 +6451,16 @@ export default function WatchPage() {
       if (!video.paused && (video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA || server5HasProgress)) {
         hidePlayerLoading();
       }
+      if (Number.isFinite(progressed) && progressed > 0.2) {
+        tryPromoteLoudAudioAfterStableStart();
+      }
     };
     const onCanPlay = () => {
       if (cancel) return;
-      if (!autoplaySettled || video.paused) playWithAutoplayFallback();
-    };
-    const onAnyUserInteraction = () => {
-      lastUserInteractionAtRef.current = Date.now();
-    };
-    const startStartupAutoplayGuard = () => {
-      const startedAt = Date.now();
-      const guardWindowMs = 15_000;
-      const tick = () => {
-        if (cancel) return;
-        if (Date.now() - startedAt > guardWindowMs) {
-          if (startupAutoplayGuardTimer !== null) {
-            window.clearInterval(startupAutoplayGuardTimer);
-            startupAutoplayGuardTimer = null;
-          }
-          return;
-        }
-        if (document.visibilityState !== "visible") return;
-        if (userPausedRef.current) return;
-        if (!video.paused || video.ended || video.seeking) return;
-        keepMutedAutoplay();
-        try {
-          video.play().catch(() => { });
-        } catch { }
-      };
-      tick();
-      startupAutoplayGuardTimer = window.setInterval(tick, 900);
-    };
-    const onPause = () => {
-      if (cancel) return;
-      const now = Date.now();
-      const userTriggeredPause = now - lastUserInteractionAtRef.current < 1_200 && Number(video.currentTime) > 1.2;
-      if (userTriggeredPause) {
-        userPausedRef.current = true;
-        return;
-      }
-      if (userPausedRef.current) return;
-      // During startup only, auto-resume if browser paused unexpectedly.
-      if (Number(video.currentTime) > 2.2) return;
-      if (video.ended || video.seeking) return;
-      if (document.visibilityState !== "visible") return;
-      queueTimeout(() => {
-        if (cancel) return;
-        if (!video.paused) return;
-        keepMutedAutoplay();
-        playWithAutoplayFallback();
-      }, 120);
+      if (video.paused) playMutedSafely();
     };
     const onUserGesture = () => {
       if (cancel) return;
-      onAnyUserInteraction();
-      userPausedRef.current = false;
-      persistAudioIntent();
       ensureLoudAudio();
       try {
         if (video.paused) video.play().catch(() => { });
@@ -6619,84 +6472,17 @@ export default function WatchPage() {
     video.addEventListener("waiting", onWaiting);
     video.addEventListener("stalled", onWaiting);
     video.addEventListener("playing", onPlaying);
-    video.addEventListener("pause", onPause);
     video.addEventListener("timeupdate", onTimeUpdate);
-    startStartupAutoplayGuard();
-    window.addEventListener("pointerdown", onAnyUserInteraction, { passive: true });
-    window.addEventListener("keydown", onAnyUserInteraction);
     window.addEventListener("pointerdown", onUserGesture, { once: true, passive: true });
     window.addEventListener("keydown", onUserGesture, { once: true });
     if (shouldUseNativeHls(video)) {
       video.src = selectedHlsUrl;
       video.load();
-      queueTimeout(() => seekToLiveEdgeIfBehind(null, { toleranceSec: 8, minIntervalMs: 0 }), 600);
-      playWithAutoplayFallback();
+      queueTimeout(() => seekToLiveEdgeIfBehind(null), 600);
+      playMutedSafely();
     } else if (Hls.isSupported()) {
       const isServer5Playback = selectedServer === 5;
-      const weakNet = getWeakNetworkState();
-      const allowP2P = P2P_ENABLED && (!P2P_DISABLE_ON_WEAK_NET || !weakNet.weak);
-      if (allowP2P && p2pEngineCtor) {
-        const disableUploadByConfig = P2P_UPLOAD_CAP_KBPS <= 0;
-        const targetP2PDownloads = Math.max(2, Math.min(P2P_MAX_PEERS, P2P_AGGRESSIVE ? 8 : 5));
-        pushDiag(`p2p enabled dls=${targetP2PDownloads} upcap=${P2P_UPLOAD_CAP_KBPS}kbps`);
-        p2pEngine = new p2pEngineCtor({
-          core: {
-            announceTrackers: [
-              "wss://tracker.novage.com.ua",
-              "wss://tracker.webtorrent.dev",
-              "wss://openwebtorrent.com",
-            ],
-            simultaneousP2PDownloads: targetP2PDownloads,
-            simultaneousHttpDownloads: P2P_AGGRESSIVE ? 1 : 2,
-            httpDownloadTimeWindow: P2P_AGGRESSIVE ? 1200 : 2000,
-            p2pDownloadTimeWindow: P2P_AGGRESSIVE ? 9000 : 6000,
-            p2pNotReceivingBytesTimeoutMs: 1800,
-            httpNotReceivingBytesTimeoutMs: 3000,
-            isP2PUploadDisabled: disableUploadByConfig,
-            isP2PDisabled: false,
-            webRtcMaxMessageSize: 64 * 1024 - 1,
-            rtcConfig: {
-              iceServers: [
-                { urls: "stun:stun.l.google.com:19302" },
-                { urls: "stun:global.stun.twilio.com:3478" },
-              ],
-            },
-          },
-        });
-        p2pDisabledReasonRef.current = null;
-        try {
-          p2pEngine.applyDynamicConfig({
-            core: {
-              announceTrackers: [
-                "wss://tracker.novage.com.ua",
-                "wss://tracker.webtorrent.dev",
-                "wss://openwebtorrent.com",
-              ],
-              isP2PUploadDisabled: disableUploadByConfig,
-              isP2PDisabled: false,
-            },
-          });
-        } catch { }
-        p2pEngine.addEventListener("onChunkDownloaded", (...args: unknown[]) => {
-          if (!diagEnabled) return;
-          const bytesLength = Number(args[0] || 0);
-          const source = String(args[1] || "http") as P2PDownloadSource;
-          if (source !== "p2p") return;
-          if (bytesLength <= 0) return;
-          pushDiag(`p2p chunk +${bytesLength}b`);
-        });
-        p2pEngine.addEventListener("onPeerConnect", () => {
-          if (!diagEnabled) return;
-          pushDiag("p2p peer connected");
-        });
-      } else if (weakNet.weak) {
-        p2pDisabledReasonRef.current = weakNet.reason || "weak-network";
-        pushDiag(`p2p skipped: ${p2pDisabledReasonRef.current}`);
-      } else if (allowP2P && !p2pEngineCtor) {
-        pushDiag("p2p skipped: module-not-ready");
-      }
       hls = new Hls({
-        ...(p2pEngine ? p2pEngine.getConfigForHlsJs() : {}),
         enableWorker: true,
         xhrSetup: (xhr, requestUrl) => {
           applyServer5ProxyAuthToXhr(xhr, requestUrl);
@@ -6717,11 +6503,6 @@ export default function WatchPage() {
         abrBandWidthFactor: 0.85,
         abrBandWidthUpFactor: 0.7,
       });
-      if (p2pEngine) {
-        try {
-          p2pEngine.bindHls(() => hls as Hls);
-        } catch { }
-      }
       setHlsInstance(hls);
       hls.on(Hls.Events.MEDIA_ATTACHED, () => hls?.loadSource(selectedHlsUrl));
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -6737,15 +6518,10 @@ export default function WatchPage() {
         setPlayerError(null);
         setResolverError(null);
         if (useFastFailover) clearCandidateFailureMarks(selectedServer, selectedHlsUrl);
-        // One startup catch-up is enough; repeated seeks every playlist refresh cause visible jumps.
-        queueTimeout(() => seekToLiveEdgeIfBehind(hls?.liveSyncPosition ?? null, { toleranceSec: 10, minIntervalMs: 0 }), 220);
-        playWithAutoplayFallback();
-      });
-      hls.on(Hls.Events.LEVEL_LOADED, (_event, data) => {
-        if (cancel) return;
-        if (!data?.details?.live) return;
-        // Only correct when the player drifts far behind and never more than once per 45s.
-        queueTimeout(() => seekToLiveEdgeIfBehind(hls?.liveSyncPosition ?? null, { toleranceSec: 22, minIntervalMs: 45_000 }), 120);
+        if (!liveEdgeCorrectedOnce) {
+          queueTimeout(() => seekToLiveEdgeIfBehind(hls?.liveSyncPosition ?? null), 220);
+        }
+        playMutedSafely();
       });
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (cancel || !data.fatal) return;
@@ -6777,8 +6553,7 @@ export default function WatchPage() {
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
             setPlayerError("انقطاع مؤقت بالشبكة... جاري المحاولة تلقائيًا");
             queueTimeout(() => {
-              try { hls?.startLoad(); } catch { }
-              if (video.paused) playWithAutoplayFallback();
+              requestSoftRecovery();
             }, delay);
             return;
           }
@@ -6787,7 +6562,7 @@ export default function WatchPage() {
             queueTimeout(() => {
               try { hls?.recoverMediaError(); } catch { }
               queueTimeout(() => {
-                if (video.paused) playWithAutoplayFallback();
+                requestSoftRecovery();
               }, 150);
             }, delay);
             return;
@@ -6804,7 +6579,7 @@ export default function WatchPage() {
       hidePlayerLoading();
     }
 
-    const stallFreezeMs = selectedServer === 5 ? 4_500 : STALL_FREEZE_MS;
+    const stallFreezeMs = Math.max(18_000, STALL_FREEZE_MS);
     stallTimerRef.current = window.setInterval(() => {
       if (cancel) return;
       if (video.paused || video.seeking) {
@@ -6827,22 +6602,15 @@ export default function WatchPage() {
       freezeTriggered = true;
       const total = candidatesRef.current.length;
       pushDiag(`stall-freeze ${stalledFor}ms source=${current + 1}/${Math.max(1, total)}`);
-      try {
-        hls?.startLoad();
-      } catch { }
-      try {
-        video.play().catch(() => { });
-      } catch { }
+      requestSoftRecovery();
       if (total <= 1) {
         // Single-source playback: avoid hard source switch loops; keep trying in-place.
         setPlayerError("انقطاع مؤقت... جاري إعادة المزامنة");
         queueTimeout(() => {
           freezeTriggered = false;
           hidePlayerLoading();
-          try {
-            if (video.paused) video.play().catch(() => { });
-          } catch { }
-        }, 1200);
+          requestSoftRecovery();
+        }, 1800);
         return;
       }
       queueTimeout(() => {
@@ -6853,8 +6621,18 @@ export default function WatchPage() {
           hidePlayerLoading();
           return;
         }
+        const stillWaiting =
+          video.readyState <= 2 ||
+          video.networkState === HTMLMediaElement.NETWORK_LOADING ||
+          video.networkState === HTMLMediaElement.NETWORK_IDLE;
+        const stillStalled = Date.now() - lastProgressAtRef.current >= stallFreezeMs;
+        if (!stillWaiting || !stillStalled) {
+          freezeTriggered = false;
+          hidePlayerLoading();
+          return;
+        }
         moveNext("stall");
-      }, 900);
+      }, 1200);
     }, 1500);
 
     return () => {
@@ -6869,18 +6647,10 @@ export default function WatchPage() {
       video.removeEventListener("waiting", onWaiting);
       video.removeEventListener("stalled", onWaiting);
       video.removeEventListener("playing", onPlaying);
-      video.removeEventListener("pause", onPause);
       video.removeEventListener("timeupdate", onTimeUpdate);
-      window.removeEventListener("pointerdown", onAnyUserInteraction);
-      window.removeEventListener("keydown", onAnyUserInteraction);
-      if (startupAutoplayGuardTimer !== null) {
-        window.clearInterval(startupAutoplayGuardTimer);
-        startupAutoplayGuardTimer = null;
-      }
       window.removeEventListener("pointerdown", onUserGesture);
       window.removeEventListener("keydown", onUserGesture);
       try { hls?.destroy(); } catch { }
-      try { p2pEngine?.destroy(); } catch { }
       setHlsInstance(null);
       reset();
     };
@@ -6897,7 +6667,6 @@ export default function WatchPage() {
     setResolverError,
     scheduleResolveRecovery,
     resetRecoveryState,
-    p2pEngineCtor,
   ]);
 
   const prettyStart = formatStartTimeAr(match?.match_start);
