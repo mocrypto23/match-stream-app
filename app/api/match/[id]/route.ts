@@ -36,6 +36,7 @@ const SERVER5_REFRESH_REQUEST_TIMEOUT_MS = 1200;
 const SERVER5_REFRESH_CACHE_TTL_MS = 90_000;
 const SERVER5_REFRESH_PREMATCH_WINDOW_MS = 90 * 60 * 1000;
 const SERVER5_REFRESH_POSTMATCH_WINDOW_MS = 3 * 60 * 60 * 1000;
+const DUPLICATE_SIBLING_START_WINDOW_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 
@@ -188,28 +189,48 @@ function normalizeTeamNameForCompare(value: unknown) {
   return String(value || "")
     .toLowerCase()
     .replace(/[\u064b-\u065f\u0670\u0610-\u061a]/g, "")
-    .replace(/[أإآ]/g, "ا")
-    .replace(/ى/g, "ي")
-    .replace(/ؤ/g, "و")
-    .replace(/ئ/g, "ي")
-    .replace(/ة/g, "ه")
+    .replace(/[\u0623\u0625\u0622]/g, "\u0627")
+    .replace(/\u0649/g, "\u064a")
+    .replace(/\u0624/g, "\u0648")
+    .replace(/\u0626/g, "\u064a")
+    .replace(/\u0629/g, "\u0647")
     .replace(/[^a-z0-9\u0600-\u06ff]+/g, "");
 }
 
-function normalizeTeamAliasForCompare(value: unknown) {
+function normalizeTeamAliasForCompare(value: unknown, opts?: { stripGeo?: boolean }) {
   let s = normalizeTeamNameForCompare(value);
   if (!s) return "";
   s = s
-    .replace(/^(?:نادي|فريق|الشباب|سيدات|الرياضي|الرياضيه|منتخب)/, "")
+    .replace(/^(?:\u0646\u0627\u062f\u064a|\u0641\u0631\u064a\u0642|\u0627\u0644\u0634\u0628\u0627\u0628|\u0633\u064a\u062f\u0627\u062a|\u0627\u0644\u0631\u064a\u0627\u0636\u064a|\u0627\u0644\u0631\u064a\u0627\u0636\u064a\u0647|\u0645\u0646\u062a\u062e\u0628)/, "")
     .replace(/(?:club|fc|sc|u\d{1,2}|women|youth)$/g, "");
+  if (opts?.stripGeo) {
+    s = s.replace(
+      /(?:\u0627\u0644\u0633\u0639\u0648\u062f\u064a|\u0627\u0644\u0645\u0635\u0631\u064a|\u0627\u0644\u0627\u0645\u0627\u0631\u0627\u062a\u064a|\u0627\u0644\u0625\u0645\u0627\u0631\u0627\u062a\u064a|\u0627\u0644\u0645\u063a\u0631\u0628\u064a|\u0627\u0644\u062c\u0632\u0627\u0626\u0631\u064a|\u0627\u0644\u0642\u0637\u0631\u064a|\u0627\u0644\u0643\u0648\u064a\u062a\u064a|\u0627\u0644\u0628\u062d\u0631\u064a\u0646\u064a|\u0627\u0644\u0639\u0645\u0627\u0646\u064a|\u0627\u0644\u0639\u0631\u0627\u0642\u064a|\u0627\u0644\u0633\u0648\u0631\u064a|\u0627\u0644\u0627\u0631\u062f\u0646\u064a|\u0627\u0644\u0623\u0631\u062f\u0646\u064a|\u0627\u0644\u0644\u0628\u0646\u0627\u0646\u064a|\u0627\u0644\u0644\u064a\u0628\u064a|\u0627\u0644\u062a\u0648\u0646\u0633\u064a|\u0627\u0644\u0641\u0644\u0633\u0637\u064a\u0646\u064a|\u0627\u0644\u0645\u0648\u0631\u064a\u062a\u0627\u0646\u064a)$/g,
+      ""
+    );
+  }
   return s.trim();
 }
 
-function buildUnorderedTeamPairKey(home: unknown, away: unknown) {
-  const a = normalizeTeamAliasForCompare(home);
-  const b = normalizeTeamAliasForCompare(away);
+function buildUnorderedTeamPairKey(home: unknown, away: unknown, opts?: { stripGeo?: boolean }) {
+  const a = normalizeTeamAliasForCompare(home, opts);
+  const b = normalizeTeamAliasForCompare(away, opts);
   if (!a || !b) return "";
   return [a, b].sort().join("|");
+}
+
+function matchStartMs(raw: unknown) {
+  const value = typeof raw === "string" ? raw : "";
+  if (!value) return null as number | null;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function areSiblingKickoffsClose(left: MatchApiRow, right: MatchApiRow) {
+  const leftMs = matchStartMs(left.match_start);
+  const rightMs = matchStartMs(right.match_start);
+  if (leftMs === null || rightMs === null) return true;
+  return Math.abs(leftMs - rightMs) <= DUPLICATE_SIBLING_START_WINDOW_MS;
 }
 
 function extractDayKeyFromRow(row: MatchApiRow) {
@@ -828,14 +849,21 @@ async function fetchMatchesByDayKey(dayKey: string) {
 
 async function enrichWithDuplicateSiblingStreams(row: MatchApiRow) {
   const currentPair = buildUnorderedTeamPairKey(row.home_team, row.away_team);
-  if (!currentPair) return row;
+  const currentLoosePair = buildUnorderedTeamPairKey(row.home_team, row.away_team, { stripGeo: true });
+  if (!currentPair && !currentLoosePair) return row;
   const dayKey = extractDayKeyFromRow(row);
   const sameDayRows = await fetchMatchesByDayKey(dayKey);
   if (!sameDayRows.length) return row;
 
   const siblings = sameDayRows
     .filter((candidate) => Number(candidate.id) !== Number(row.id))
-    .filter((candidate) => buildUnorderedTeamPairKey(candidate.home_team, candidate.away_team) === currentPair);
+    .filter((candidate) => {
+      if (!areSiblingKickoffsClose(row, candidate)) return false;
+      const strictPair = buildUnorderedTeamPairKey(candidate.home_team, candidate.away_team);
+      if (currentPair && strictPair && strictPair === currentPair) return true;
+      const loosePair = buildUnorderedTeamPairKey(candidate.home_team, candidate.away_team, { stripGeo: true });
+      return !!(currentLoosePair && loosePair && loosePair === currentLoosePair);
+    });
   if (!siblings.length) return row;
 
   const donor = siblings.sort((a, b) => {
@@ -911,3 +939,5 @@ export async function GET(req: Request, ctx: Ctx) {
   res.headers.set("x-server5-refresh-ms", String(shouldRefreshServer5 ? server5RefreshMs : 0));
   return res;
 }
+
+
