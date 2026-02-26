@@ -43,7 +43,7 @@ const PREMATCH_OPEN_WINDOW_MINUTES = 30;
 const STALL_FREEZE_MS = 18000;
 const PLAYER_LOADING_OVERLAY_DELAY_MS = 1200;
 const DEFAULT_PLAYER_QUALITY_HEIGHT = 480;
-const AUTO_AUDIO_SYNC_ON_START = process.env.NEXT_PUBLIC_AUTO_AUDIO_SYNC_ON_START !== "0";
+const AUTO_AUDIO_SYNC_ON_START = process.env.NEXT_PUBLIC_AUTO_AUDIO_SYNC_ON_START === "1";
 const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const RESOLVE_COOLDOWN_MS = 1500;
 const CANDIDATE_PROBE_TIMEOUT_MS = 6500;
@@ -1440,7 +1440,7 @@ function materializeTemplateUrl(raw: string, sourceUrl: string) {
   let matchId = "";
   try {
     matchId = String(new URL(sourceUrl).searchParams.get("match") || "").trim();
-  } catch { }
+  } catch {}
   if (!matchId) return "";
 
   const encoded = encodeURIComponent(matchId);
@@ -2031,7 +2031,7 @@ function extractAnewssportMatchPageUrlsFromHtml(html: string, baseUrl: string) {
     const doc = new DOMParser().parseFromString(text, "text/html");
     const anchors = Array.from(doc.querySelectorAll<HTMLAnchorElement>("a[href]"));
     for (const anchor of anchors) push(String(anchor.getAttribute("href") || ""));
-  } catch { }
+  } catch {}
 
   const normalized = text.replace(/\\\//g, "/").replace(/&amp;/gi, "&");
   for (const m of normalized.match(/https?:\/\/(?:www\.)?anewssport\.fun\/matches\/[a-z0-9-]+\/?/gi) || []) push(m);
@@ -2148,7 +2148,7 @@ function extractAnewssportEventTeamNamesFromHtml(html: string) {
     const doc = new DOMParser().parseFromString(text, "text/html");
     const nodes = Array.from(doc.querySelectorAll(".EventTeamName"));
     for (const node of nodes) push(node.textContent || "");
-  } catch {}
+  } catch { }
 
   if (!out.length) {
     for (const m of text.matchAll(/class=["'][^"']*EventTeamName[^"']*["'][^>]*>([^<]+)/gi)) {
@@ -2198,7 +2198,7 @@ function extractServer5LandingUrlsFromSnsPayload(rawText: string, baseUrl: strin
         const tagged = new URL(abs);
         tagged.searchParams.set("s5_slot", String(nextCount));
         abs = tagged.toString();
-      } catch { }
+      } catch {}
     }
     out.push(abs);
   };
@@ -2213,7 +2213,7 @@ function extractServer5LandingUrlsFromSnsPayload(rawText: string, baseUrl: strin
       push(item);
     }
     if (out.length) return out;
-  } catch { }
+  } catch {}
 
   for (const m of text.match(/https?:\/\/[^"'`\s<>()]+\/(?:yalla|watch)\.php\?[^"'`\s<>()]*/gi) || []) push(m);
   return out;
@@ -2457,7 +2457,7 @@ function prioritizeServer5LookupEndpointCandidates(
   let landingHost = "";
   try {
     landingHost = new URL(landingUrl).hostname.toLowerCase();
-  } catch {}
+  } catch { }
 
   const ranked = unique
     .map((url, index) => {
@@ -2465,7 +2465,7 @@ function prioritizeServer5LookupEndpointCandidates(
       let score = index === 0 ? 80 : 0;
       try {
         host = new URL(url).hostname.toLowerCase();
-      } catch {}
+      } catch { }
 
       if (host) {
         if (isServer5StackHost(host)) score += 40;
@@ -2990,7 +2990,7 @@ function scoreServer5Candidate(value: string) {
       else if (slot === 1) score += 80;
       else score += Math.max(0, 60 - slot * 4);
     }
-  } catch {}
+  } catch { }
 
   return score;
 }
@@ -4967,6 +4967,7 @@ export default function WatchPage() {
   const [serverHealth, setServerHealth] = useState<Record<number, ServerHealthState>>({});
   const [diagLogs, setDiagLogs] = useState<string[]>([]);
   const [isTfPlayerHost, setIsTfPlayerHost] = useState(false);
+  const [audioHintDismissed, setAudioHintDismissed] = useState(false);
   const candidatesRef = useRef<string[]>([]);
   const selectedCandidateRef = useRef(0);
   const selectedServerRef = useRef(4);
@@ -5003,6 +5004,22 @@ export default function WatchPage() {
     if (!diagEnabled) return;
     setDiagLogs((prev) => [line, ...prev].slice(0, 120));
   }, [diagEnabled]);
+  const tryEnableAudioByGesture = useCallback(() => {
+    userPausedRef.current = false;
+    setAudioHintDismissed(true);
+    const video = videoRef.current;
+    if (!video) return;
+    try {
+      video.volume = 1;
+      video.muted = false;
+      video.defaultMuted = false;
+      video.removeAttribute("muted");
+      if (video.paused) video.play().catch(() => { });
+    } catch { }
+  }, []);
+  const dismissAudioHint = useCallback(() => {
+    tryEnableAudioByGesture();
+  }, [tryEnableAudioByGesture]);
 
   useEffect(() => {
     candidatesRef.current = candidates;
@@ -6130,6 +6147,18 @@ export default function WatchPage() {
   ]);
 
   const selectedHlsUrl = candidates[selectedCandidate] || "";
+  useEffect(() => {
+    if (!selectedHlsUrl || audioHintDismissed) return;
+    const onFirstInteraction = () => {
+      tryEnableAudioByGesture();
+    };
+    window.addEventListener("pointerdown", onFirstInteraction, { once: true, passive: true });
+    window.addEventListener("keydown", onFirstInteraction, { once: true });
+    return () => {
+      window.removeEventListener("pointerdown", onFirstInteraction);
+      window.removeEventListener("keydown", onFirstInteraction);
+    };
+  }, [selectedHlsUrl, audioHintDismissed, tryEnableAudioByGesture]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -6298,13 +6327,6 @@ export default function WatchPage() {
     let stallFreezeCount = 0;
     let autoAudioSyncAttempted = false;
     let autoAudioSyncTimer: number | null = null;
-    let suppressUserPauseUntil = 0;
-    const ensureLoudAudio = () => {
-      video.volume = 1;
-      video.muted = false;
-      video.defaultMuted = false;
-      video.removeAttribute("muted");
-    };
     const keepMutedAutoplay = () => {
       video.muted = true;
       video.defaultMuted = true;
@@ -6316,72 +6338,16 @@ export default function WatchPage() {
         autoAudioSyncTimer = null;
       }
     };
-    const clearUserPauseSuppression = () => {
-      suppressUserPauseUntil = 0;
-    };
-    const suppressUserPauseFor = (ms: number) => {
-      const until = Date.now() + Math.max(0, ms);
-      if (until > suppressUserPauseUntil) suppressUserPauseUntil = until;
-    };
-    const isUserPauseSuppressed = () => Date.now() < suppressUserPauseUntil;
     const scheduleAutoAudioSync = () => {
       if (!AUTO_AUDIO_SYNC_ON_START) return;
       if (autoAudioSyncAttempted) return;
-      if (cancel || userPausedRef.current) return;
-      if (video.paused) return;
+      if (cancel || userPausedRef.current || video.paused) return;
       autoAudioSyncAttempted = true;
-      clearAutoAudioSyncTimer();
-      autoAudioSyncTimer = window.setTimeout(() => {
-        autoAudioSyncTimer = null;
-        if (cancel || userPausedRef.current) return;
-        if (video.paused) return;
-        ensureLoudAudio();
-        const rollbackToMuted = () => {
-          keepMutedAutoplay();
-          queueTimeout(() => {
-            if (cancel) return;
-            if (userPausedRef.current && !isUserPauseSuppressed()) return;
-            suppressUserPauseFor(900);
-            try {
-              if (video.paused) video.play().catch(() => { });
-            } catch { }
-          }, 120);
-          pushDiag("audio-sync blocked -> muted");
-        };
-        try {
-          suppressUserPauseFor(1200);
-          const playPromise = video.play();
-          if (playPromise && typeof playPromise.then === "function") {
-            playPromise
-              .then(() => {
-                queueTimeout(() => {
-                  if (cancel) return;
-                  if (video.paused) {
-                    rollbackToMuted();
-                    return;
-                  }
-                  clearUserPauseSuppression();
-                  pushDiag("audio-sync enabled");
-                }, 120);
-              })
-              .catch(() => {
-                rollbackToMuted();
-              });
-            return;
-          }
-          queueTimeout(() => {
-            if (cancel) return;
-            if (video.paused) {
-              rollbackToMuted();
-              return;
-            }
-            clearUserPauseSuppression();
-            pushDiag("audio-sync enabled");
-          }, 120);
-        } catch {
-          rollbackToMuted();
-        }
-      }, 350);
+      // Keep startup playback muted for stability; unmute stays user-driven.
+      keepMutedAutoplay();
+      if (video.paused) {
+        try { video.play().catch(() => { }); } catch { }
+      }
     };
     const playMutedSafely = () => {
       if (cancel) return;
@@ -6519,7 +6485,6 @@ export default function WatchPage() {
     const onPlaying = () => {
       if (cancel) return;
       userPausedRef.current = false;
-      clearUserPauseSuppression();
       if (selectedServer === 3) {
         server3AutoSwitchWindowRef.current = { windowStart: 0, count: 0 };
       }
@@ -6558,20 +6523,12 @@ export default function WatchPage() {
         !video.seeking &&
         !document.hidden &&
         video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA;
-      if (likelyUserPause && !isUserPauseSuppressed()) userPausedRef.current = true;
+      if (likelyUserPause) userPausedRef.current = true;
     };
     const onCanPlay = () => {
       if (cancel) return;
       if (userPausedRef.current) return;
       if (video.paused) playMutedSafely();
-    };
-    const onUserGesture = () => {
-      if (cancel) return;
-      userPausedRef.current = false;
-      ensureLoudAudio();
-      try {
-        if (video.paused) video.play().catch(() => { });
-      } catch { }
     };
     video.addEventListener("loadeddata", onLoaded);
     video.addEventListener("canplay", onCanPlay);
@@ -6581,8 +6538,6 @@ export default function WatchPage() {
     video.addEventListener("playing", onPlaying);
     video.addEventListener("pause", onPause);
     video.addEventListener("timeupdate", onTimeUpdate);
-    window.addEventListener("pointerdown", onUserGesture, { once: true, passive: true });
-    window.addEventListener("keydown", onUserGesture, { once: true });
     if (shouldUseNativeHls(video)) {
       video.src = selectedHlsUrl;
       video.load();
@@ -6768,8 +6723,6 @@ export default function WatchPage() {
       video.removeEventListener("playing", onPlaying);
       video.removeEventListener("pause", onPause);
       video.removeEventListener("timeupdate", onTimeUpdate);
-      window.removeEventListener("pointerdown", onUserGesture);
-      window.removeEventListener("keydown", onUserGesture);
       try { hls?.destroy(); } catch { }
       setHlsInstance(null);
       reset();
@@ -6797,6 +6750,7 @@ export default function WatchPage() {
   const noStreamLabel = selectedUrl ? NO_STREAM_SELECTED_SERVER_MESSAGE : "لا يوجد بث";
   const home = match?.home_team ?? "الفريق الأول";
   const away = match?.away_team ?? "الفريق الثاني";
+  const showAudioHint = !!selectedHlsUrl && !audioHintDismissed;
 
   if (loading) return <div className="text-white text-center mt-20">جاري تحميل البث...</div>;
   if (errMsg) return <div className="text-white text-center mt-20">{errMsg}</div>;
@@ -6904,6 +6858,15 @@ export default function WatchPage() {
                 title={`${home} ${match?.match_start ? "" : ""} vs ${away}`}
                 isLive={true}
               />
+              {showAudioHint ? (
+                <button
+                  type="button"
+                  onClick={dismissAudioHint}
+                  className="absolute top-3 left-1/2 -translate-x-1/2 z-[60] rounded-full border border-amber-300/40 bg-black/70 px-4 py-2 text-xs sm:text-sm font-bold text-amber-100 shadow-lg backdrop-blur-md"
+                >
+                  اضغط لتشغيل الصوت 🔇
+                </button>
+              ) : null}
               {playerLoading ? <div className="absolute inset-0 flex items-center justify-center bg-black/50 text-sm text-gray-200">جاري تشغيل البث</div> : null}
             </div>
           ) : resolverLoading ? (
