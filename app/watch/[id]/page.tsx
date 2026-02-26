@@ -38,11 +38,9 @@ const SERVER_SOURCE_LABELS: Record<number, string> = {
   4: "سيرفر 1 ",
 };
 const SERVER_DISPLAY_ORDER = [4, 2, 3, 1, 5, 6] as const;
-const FORCE_IFRAME_PLAYER = String(process.env.NEXT_PUBLIC_FORCE_IFRAME_PLAYER || "0") === "1";
-const IFRAME_PLAYER_ORIGIN = String(process.env.NEXT_PUBLIC_IFRAME_PLAYER_ORIGIN || "").trim().replace(/\/+$/, "");
 
 const PREMATCH_OPEN_WINDOW_MINUTES = 30;
-const STALL_FREEZE_MS = 12000;
+const STALL_FREEZE_MS = 18000;
 const PLAYER_LOADING_OVERLAY_DELAY_MS = 1200;
 const DEFAULT_PLAYER_QUALITY_HEIGHT = 480;
 const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
@@ -102,7 +100,6 @@ const SERVER5_FAST_LOOKUP_ENDPOINT_LIMIT = 2;
 const SERVER5_FINAL_LOOKUP_ENDPOINT_LIMIT = 3;
 const SERVER5_FAST_MIN_RESOLVED_CANDIDATES = 3;
 const SERVER5_FAST_FAILOVER_COOLDOWN_MS = 4_000;
-const LIVE_EDGE_SEEK_TOLERANCE_SEC = 20;
 const SERVER5_LOOKUP_SUCCESS_CACHE_TTL_MS = 5 * 60_000;
 const SERVER5_LOOKUP_MISS_CACHE_TTL_MS = 90_000;
 const SERVER5_HTML_FETCH_CACHE_TTL_MS = 150_000;
@@ -4805,6 +4802,11 @@ async function probeHlsCandidateInternal(candidateUrl: string, opts?: ProbeHlsOp
       }
     }
 
+    if (!isServer5Candidate && hasExtM3u) {
+      pushDiag?.("probe soft-pass manifest");
+      return true;
+    }
+
     pushDiag?.("probe no reachable child line");
     return false;
   } catch (e: unknown) {
@@ -4971,9 +4973,12 @@ export default function WatchPage() {
   const recoveryAttemptRef = useRef(0);
   const lastResolveKickRef = useRef(0);
   const resolveLockRef = useRef(false);
+  const pendingResolveKickReasonRef = useRef<string | null>(null);
   const activeResolveIdRef = useRef(0);
   const lastProgressRef = useRef(0);
   const lastProgressAtRef = useRef(Date.now());
+  const userPausedRef = useRef(false);
+  const ignorePauseTrackingRef = useRef(false);
   const stallTimerRef = useRef<number | null>(null);
   const badCandidateKeysByServerRef = useRef<Record<number, Set<string>>>({
     1: new Set<string>(),
@@ -4993,17 +4998,6 @@ export default function WatchPage() {
     const host = String(window.location.hostname || "").toLowerCase();
     setIsTfPlayerHost(host === "tf-player.site" || host.endsWith(".tf-player.site"));
   }, []);
-  const externalPlayerSrc = useMemo(() => {
-    if (!FORCE_IFRAME_PLAYER) return "";
-    if (!IFRAME_PLAYER_ORIGIN || !idNum) return "";
-    try {
-      const target = new URL(`${IFRAME_PLAYER_ORIGIN}/watch/${encodeURIComponent(String(idNum))}`);
-      if (diagEnabled) target.searchParams.set("diag", "1");
-      return target.toString();
-    } catch {
-      return "";
-    }
-  }, [diagEnabled, idNum]);
   const pushDiag = useCallback((line: string) => {
     if (!diagEnabled) return;
     setDiagLogs((prev) => [line, ...prev].slice(0, 120));
@@ -5171,6 +5165,7 @@ export default function WatchPage() {
 
   const resetRecoveryState = useCallback(() => {
     recoveryAttemptRef.current = 0;
+    pendingResolveKickReasonRef.current = null;
     clearRecoveryTimer();
   }, [clearRecoveryTimer]);
 
@@ -5193,6 +5188,13 @@ export default function WatchPage() {
   const scheduleResolveRecovery = useCallback(
     (reason: string, immediate = false) => {
       clearRecoveryTimer();
+      if (resolveLockRef.current) {
+        if (!pendingResolveKickReasonRef.current) {
+          pendingResolveKickReasonRef.current = `${reason}:pending`;
+          pushDiag(`resolve pending (${reason})`);
+        }
+        return;
+      }
       if (immediate && bumpResolveRevision(`${reason}:immediate`)) return;
 
       const idx = Math.min(recoveryAttemptRef.current, AUTO_RECOVERY_SCHEDULE_MS.length - 1);
@@ -5202,10 +5204,10 @@ export default function WatchPage() {
       recoveryTimerRef.current = window.setTimeout(() => {
         recoveryTimerRef.current = null;
         if (bumpResolveRevision(`${reason}:timer`)) return;
-        recoveryTimerRef.current = window.setTimeout(() => {
-          recoveryTimerRef.current = null;
-          bumpResolveRevision(`${reason}:timer-retry`);
-        }, RESOLVE_COOLDOWN_MS);
+        if (resolveLockRef.current && !pendingResolveKickReasonRef.current) {
+          pendingResolveKickReasonRef.current = `${reason}:pending`;
+          pushDiag(`resolve pending (${reason})`);
+        }
       }, delay);
     },
     [bumpResolveRevision, clearRecoveryTimer, pushDiag]
@@ -6094,6 +6096,13 @@ export default function WatchPage() {
         if (!cancel && activeResolveIdRef.current === resolveId) {
           setResolverLoading(false);
           resolveLockRef.current = false;
+          const pendingKick = pendingResolveKickReasonRef.current;
+          if (pendingKick) {
+            pendingResolveKickReasonRef.current = null;
+            lastResolveKickRef.current = Date.now();
+            setResolveRevision((prev) => prev + 1);
+            pushDiag(`resolve bump (${pendingKick})`);
+          }
         }
       }
     })();
@@ -6120,6 +6129,40 @@ export default function WatchPage() {
   ]);
 
   const selectedHlsUrl = candidates[selectedCandidate] || "";
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const tryResume = () => {
+      if (shouldBlockStream || !selectedHlsUrl) return;
+      if (userPausedRef.current) return;
+
+      const progressingRecently = Date.now() - lastProgressAtRef.current < 1500;
+      if (!video.paused && progressingRecently) return;
+
+      try {
+        hlsInstance?.startLoad();
+      } catch {}
+      try {
+        video.play().catch(() => {});
+      } catch {}
+      lastProgressAtRef.current = Date.now();
+    };
+
+    const onVisibilityChange = () => {
+      if (!document.hidden) tryResume();
+    };
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted || video.paused) tryResume();
+    };
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("pageshow", onPageShow);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("pageshow", onPageShow);
+    };
+  }, [hlsInstance, selectedHlsUrl, shouldBlockStream]);
   const candidateGroups = useMemo(() => {
     if (selectedServer === 3) {
       return candidates.map((candidate, idx) => ({
@@ -6250,9 +6293,8 @@ export default function WatchPage() {
       setPlayerLoading(false);
     };
     let autoplayRetryUsed = false;
-    let loudPromotionScheduled = false;
-    let loudPromotionAttempted = false;
     let lastRecoveryAttemptAt = 0;
+    let stallFreezeCount = 0;
     const ensureLoudAudio = () => {
       video.volume = 1;
       video.muted = false;
@@ -6280,60 +6322,28 @@ export default function WatchPage() {
           }, 250);
         });
     };
-    const tryPromoteLoudAudioAfterStableStart = () => {
-      if (cancel || loudPromotionScheduled || loudPromotionAttempted) return;
-      loudPromotionScheduled = true;
-      queueTimeout(() => {
-        if (cancel) return;
-        loudPromotionScheduled = false;
-        if (loudPromotionAttempted) return;
-        loudPromotionAttempted = true;
-        const wasPlaying = !video.paused;
-        ensureLoudAudio();
-        if (!wasPlaying || !video.paused) return;
-        // Browser blocked unmuted autoplay; keep playback alive muted.
-        keepMutedAutoplay();
-        try {
-          video.play().catch(() => { });
-        } catch { }
-      }, 2000);
-    };
     const requestSoftRecovery = () => {
+      if (userPausedRef.current) return;
       const now = Date.now();
       if (now - lastRecoveryAttemptAt < 3000) return;
+      const currentTime = Number(video.currentTime);
+      if (
+        video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA &&
+        Number.isFinite(currentTime) &&
+        currentTime > lastProgressRef.current + 0.05
+      ) {
+        return;
+      }
       lastRecoveryAttemptAt = now;
       try { hls?.startLoad(); } catch { }
       queueTimeout(() => {
         if (cancel) return;
+        if (userPausedRef.current) return;
         if (!video.paused) return;
         try {
           video.play().catch(() => { });
         } catch { }
       }, 150);
-    };
-    let liveEdgeCorrectedOnce = false;
-    const seekToLiveEdgeIfBehind = (liveEdgeHint?: number | null) => {
-      const hintedEdge =
-        typeof liveEdgeHint === "number" && Number.isFinite(liveEdgeHint) && liveEdgeHint > 0
-          ? liveEdgeHint
-          : NaN;
-      const seekableEdge = (() => {
-        try {
-          if (!video.seekable || video.seekable.length <= 0) return NaN;
-          return Number(video.seekable.end(video.seekable.length - 1));
-        } catch {
-          return NaN;
-        }
-      })();
-      const edge = Number.isFinite(hintedEdge) ? hintedEdge : seekableEdge;
-      if (!Number.isFinite(edge) || edge <= 0) return;
-      const now = Number(video.currentTime);
-      if (!Number.isFinite(now) || now < 0) return;
-      if (edge - now <= LIVE_EDGE_SEEK_TOLERANCE_SEC) return;
-      try {
-        video.currentTime = Math.max(0, edge - 1.5);
-        liveEdgeCorrectedOnce = true;
-      } catch { }
     };
     const applyServer5ProxyAuthToXhr = (xhr: XMLHttpRequest, requestUrl: string) => {
       if (!server5PlayerAuthHeaders || !Object.keys(server5PlayerAuthHeaders).length) return;
@@ -6396,15 +6406,20 @@ export default function WatchPage() {
       hidePlayerLoading();
     };
     const reset = () => {
+      ignorePauseTrackingRef.current = true;
       try { video.pause(); } catch { }
       video.removeAttribute("src");
       video.load();
+      queueTimeout(() => {
+        ignorePauseTrackingRef.current = false;
+      }, 0);
     };
     clearStallWatchdog();
     reset();
     hidePlayerLoading();
     setPlayerError(null);
     if (shouldBlockStream || !selectedHlsUrl) return;
+    userPausedRef.current = false;
     setPlayerLoading(true);
     scheduleServer5StartupNoFrameWatchdog();
     video.volume = 1;
@@ -6426,11 +6441,12 @@ export default function WatchPage() {
     };
     const onPlaying = () => {
       if (cancel) return;
+      userPausedRef.current = false;
       if (selectedServer === 3) {
         server3AutoSwitchWindowRef.current = { windowStart: 0, count: 0 };
       }
-      tryPromoteLoudAudioAfterStableStart();
       freezeTriggered = false;
+      stallFreezeCount = 0;
       markProgress();
       if (hasServer5VisualStart()) markServer5VisualStart();
       if (selectedServer === 5 && selectedUrl && isValidHttpUrl(selectedUrl) && selectedHlsUrl) {
@@ -6452,15 +6468,26 @@ export default function WatchPage() {
         hidePlayerLoading();
       }
       if (Number.isFinite(progressed) && progressed > 0.2) {
-        tryPromoteLoudAudioAfterStableStart();
+        userPausedRef.current = false;
       }
+    };
+    const onPause = () => {
+      if (cancel) return;
+      if (ignorePauseTrackingRef.current) return;
+      const likelyUserPause =
+        !video.seeking &&
+        !document.hidden &&
+        video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA;
+      if (likelyUserPause) userPausedRef.current = true;
     };
     const onCanPlay = () => {
       if (cancel) return;
+      if (userPausedRef.current) return;
       if (video.paused) playMutedSafely();
     };
     const onUserGesture = () => {
       if (cancel) return;
+      userPausedRef.current = false;
       ensureLoudAudio();
       try {
         if (video.paused) video.play().catch(() => { });
@@ -6472,13 +6499,13 @@ export default function WatchPage() {
     video.addEventListener("waiting", onWaiting);
     video.addEventListener("stalled", onWaiting);
     video.addEventListener("playing", onPlaying);
+    video.addEventListener("pause", onPause);
     video.addEventListener("timeupdate", onTimeUpdate);
     window.addEventListener("pointerdown", onUserGesture, { once: true, passive: true });
     window.addEventListener("keydown", onUserGesture, { once: true });
     if (shouldUseNativeHls(video)) {
       video.src = selectedHlsUrl;
       video.load();
-      queueTimeout(() => seekToLiveEdgeIfBehind(null), 600);
       playMutedSafely();
     } else if (Hls.isSupported()) {
       const isServer5Playback = selectedServer === 5;
@@ -6518,9 +6545,6 @@ export default function WatchPage() {
         setPlayerError(null);
         setResolverError(null);
         if (useFastFailover) clearCandidateFailureMarks(selectedServer, selectedHlsUrl);
-        if (!liveEdgeCorrectedOnce) {
-          queueTimeout(() => seekToLiveEdgeIfBehind(hls?.liveSyncPosition ?? null), 220);
-        }
         playMutedSafely();
       });
       hls.on(Hls.Events.ERROR, (_event, data) => {
@@ -6579,7 +6603,7 @@ export default function WatchPage() {
       hidePlayerLoading();
     }
 
-    const stallFreezeMs = Math.max(18_000, STALL_FREEZE_MS);
+    const stallFreezeMs = STALL_FREEZE_MS;
     stallTimerRef.current = window.setInterval(() => {
       if (cancel) return;
       if (video.paused || video.seeking) {
@@ -6590,6 +6614,8 @@ export default function WatchPage() {
       if (Number.isFinite(currentTime) && currentTime > lastProgressRef.current + 0.05) {
         lastProgressRef.current = currentTime;
         lastProgressAtRef.current = Date.now();
+        stallFreezeCount = 0;
+        freezeTriggered = false;
         if (selectedServer === 5) hidePlayerLoading();
         return;
       }
@@ -6600,6 +6626,7 @@ export default function WatchPage() {
         video.networkState === HTMLMediaElement.NETWORK_IDLE;
       if (!waitingState || stalledFor < stallFreezeMs || freezeTriggered) return;
       freezeTriggered = true;
+      stallFreezeCount += 1;
       const total = candidatesRef.current.length;
       pushDiag(`stall-freeze ${stalledFor}ms source=${current + 1}/${Math.max(1, total)}`);
       requestSoftRecovery();
@@ -6617,6 +6644,7 @@ export default function WatchPage() {
         if (cancel) return;
         const progressed = Number(video.currentTime);
         if (Number.isFinite(progressed) && progressed > lastProgressRef.current + 0.2) {
+          stallFreezeCount = 0;
           freezeTriggered = false;
           hidePlayerLoading();
           return;
@@ -6627,10 +6655,20 @@ export default function WatchPage() {
           video.networkState === HTMLMediaElement.NETWORK_IDLE;
         const stillStalled = Date.now() - lastProgressAtRef.current >= stallFreezeMs;
         if (!stillWaiting || !stillStalled) {
+          stallFreezeCount = 0;
           freezeTriggered = false;
           hidePlayerLoading();
           return;
         }
+        if (stallFreezeCount < 2) {
+          setPlayerError("انقطاع مؤقت... جاري إعادة المزامنة");
+          freezeTriggered = false;
+          hidePlayerLoading();
+          requestSoftRecovery();
+          return;
+        }
+        stallFreezeCount = 0;
+        freezeTriggered = false;
         moveNext("stall");
       }, 1200);
     }, 1500);
@@ -6647,6 +6685,7 @@ export default function WatchPage() {
       video.removeEventListener("waiting", onWaiting);
       video.removeEventListener("stalled", onWaiting);
       video.removeEventListener("playing", onPlaying);
+      video.removeEventListener("pause", onPause);
       video.removeEventListener("timeupdate", onTimeUpdate);
       window.removeEventListener("pointerdown", onUserGesture);
       window.removeEventListener("keydown", onUserGesture);
@@ -6680,21 +6719,6 @@ export default function WatchPage() {
 
   if (loading) return <div className="text-white text-center mt-20">جاري تحميل البث...</div>;
   if (errMsg) return <div className="text-white text-center mt-20">{errMsg}</div>;
-  if (externalPlayerSrc) {
-    return (
-      <div className="min-h-screen bg-black p-0 sm:p-3">
-        <div className="w-full h-screen sm:h-[calc(100vh-24px)] overflow-hidden border-0 sm:border sm:border-gray-800 sm:rounded-xl bg-black">
-          <iframe
-            title="TwoFooty External Player"
-            src={externalPlayerSrc}
-            allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
-            referrerPolicy="no-referrer"
-            className="w-full h-full border-0 bg-black"
-          />
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div className="min-h-screen bg-black text-white p-4">
