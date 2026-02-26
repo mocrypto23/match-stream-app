@@ -1056,6 +1056,27 @@ function isServer2HardWrapperLikeUrl(value?: string | null) {
   }
 }
 
+function isSiiirHost(value?: string | null) {
+  const raw = String(value || "").trim();
+  if (!isValidHttpUrl(raw)) return false;
+  try {
+    const host = new URL(raw).hostname.toLowerCase();
+    return host === "siiir.tv" || host.endsWith(".siiir.tv");
+  } catch {
+    return false;
+  }
+}
+
+function isServer2SiiirRelatedCandidate(value?: string | null) {
+  const raw = String(value || "").trim();
+  if (!raw) return false;
+  const target = toUnderlyingUrl(raw);
+  if (isSiiirHost(target)) return true;
+  const ref = getProxyRefUrlFromCandidate(raw);
+  if (ref && isSiiirHost(ref)) return true;
+  return false;
+}
+
 function isPlayerv2LikeUrl(value?: string | null) {
   const raw = toUnderlyingUrl(String(value || ""));
   return (
@@ -3273,6 +3294,19 @@ function toCandidateGroupKey(value: string) {
       .split("/")
       .filter(Boolean);
     const qualityTokenRe = /^(?:\d{3,4}p|\d{3,4}k|sd|hd|fhd|uhd|low|mid|high)$/i;
+    const isYallaShotFamily = host.includes("yallashot") || host.includes("yallashoot");
+
+    // Server 2 (playerv2) can emit both `/kooora/<slug>` and `/kooora/<slug>.m3u8` for the same feed.
+    // Collapse them to one source group so the UI doesn't show a fake extra source.
+    if (isYallaShotFamily && parts.length >= 2 && parts[0] === "hls" && parts[1] === "kooora") {
+      parts.shift();
+    }
+    if (isYallaShotFamily && parts.length >= 2 && parts[0] === "kooora") {
+      const last = parts[parts.length - 1];
+      if (/\.m3u8$/i.test(last)) {
+        parts[parts.length - 1] = last.replace(/\.m3u8$/i, "");
+      }
+    }
 
     if (parts.length) {
       const last = parts[parts.length - 1];
@@ -5258,6 +5292,15 @@ export default function WatchPage() {
         .map((candidate, idx) => ({ candidate, idx, score: scoreServer5Candidate(candidate) }))
         .sort((a, b) => (b.score === a.score ? a.idx - b.idx : b.score - a.score))
         .map((item) => item.candidate);
+    }
+    if (server === 2 && base.length > 1) {
+      const withoutSiiir = base.filter((candidate) => !isServer2SiiirRelatedCandidate(candidate));
+      if (withoutSiiir.length && withoutSiiir.length !== base.length) {
+        pushDiag(`server2 drop-siiir=${base.length - withoutSiiir.length}`);
+        base = withoutSiiir;
+      } else if (!withoutSiiir.length && base.length) {
+        pushDiag("server2 drop-siiir fallback-all");
+      }
     }
     if (server !== 3 || base.length < 2) return base;
 
