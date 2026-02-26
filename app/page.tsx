@@ -137,6 +137,33 @@ function normalizeStatusKey(sk: any): "live" | "finished" | "upcoming" | "unknow
   return "unknown";
 }
 
+function resolveDisplayStatus(day: DayKey, match: MatchRow): "live" | "finished" | "upcoming" {
+  if (day === "yesterday") return "finished";
+  if (day === "tomorrow") return "upcoming";
+
+  const sk = normalizeStatusKey(match.status_key);
+  const fallbackLive = isLiveWindow(match.match_start);
+  const fallbackFinished = isFinishedByTime(match.match_start);
+  const scoresReady = hasScores(match);
+
+  // Some providers send "live" too early; clamp with kickoff window unless real scores exist.
+  if (sk === "live") {
+    if (fallbackLive || scoresReady) return "live";
+    if (fallbackFinished) return "finished";
+    return "upcoming";
+  }
+
+  if (sk === "finished") {
+    if (fallbackFinished || scoresReady) return "finished";
+    if (fallbackLive) return "live";
+    return "upcoming";
+  }
+
+  if (fallbackFinished) return "finished";
+  if (fallbackLive) return "live";
+  return "upcoming";
+}
+
 function sanitizeDisplayMatchTime(raw: unknown) {
   const value = typeof raw === "string" ? raw.trim() : "";
   if (!value) return null as string | null;
@@ -233,33 +260,13 @@ export default function Home() {
   }, [loading]);
 
   const sortedMatches = useMemo(() => {
-    const getStatus = (m: MatchRow) => {
-      if (day === "yesterday") return "finished" as const;
-
-      const sk = normalizeStatusKey(m.status_key);
-
-      // If DB explicitly says live/finished, trust it first (especially for "today")
-      if (day === "today") {
-        if (sk === "live") return "live";
-        if (sk === "finished") return "finished";
-      }
-
-      if (day === "tomorrow") return "upcoming" as const;
-
-      // Fallback to time-based if status is unknown/upcoming but time passed
-      if (isFinishedByTime(m.match_start)) return "finished" as const;
-      if (isLiveWindow(m.match_start)) return "live" as const;
-
-      return "upcoming" as const;
-    };
-
     const arr = [...matches];
 
     const rank = (s: string) => (s === "live" ? 0 : s === "upcoming" ? 1 : 2);
 
     arr.sort((a, b) => {
-      const sa = getStatus(a);
-      const sb = getStatus(b);
+      const sa = resolveDisplayStatus(day, a);
+      const sb = resolveDisplayStatus(day, b);
       const ra = rank(sa);
       const rb = rank(sb);
       if (ra !== rb) return ra - rb;
@@ -348,23 +355,7 @@ export default function Home() {
         {sortedMatches.length > 0 ? (
           sortedMatches.map((match) => {
             const scores = hasScores(match);
-
-            const sk = normalizeStatusKey(match.status_key);
-            const fallbackLive = day === "today" && isLiveWindow(match.match_start);
-            const fallbackFinished = day === "today" && isFinishedByTime(match.match_start);
-
-            const status =
-              day === "yesterday"
-                ? "finished"
-                : day === "tomorrow"
-                  ? "upcoming"
-                  : sk === "live" || sk === "finished"
-                    ? sk
-                    : fallbackFinished
-                      ? "finished"
-                      : fallbackLive
-                        ? "live"
-                        : "upcoming";
+            const status = resolveDisplayStatus(day, match);
 
             const centerText =
               (() => {
@@ -373,7 +364,7 @@ export default function Home() {
                   ? safeMatchTime || "—"
                   : scores
                     ? `${match.home_score} - ${match.away_score}`
-                    : status === "finished"
+                    : status === "finished" || status === "live"
                       ? "— - —"
                       : safeMatchTime || "—";
               })();
