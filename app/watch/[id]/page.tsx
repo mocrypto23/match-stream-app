@@ -6642,14 +6642,6 @@ export default function WatchPage() {
       if (userPausedRef.current) return;
       if (video.paused) playMutedSafely();
     };
-    const onUserGesture = () => {
-      if (cancel) return;
-      userPausedRef.current = false;
-      ensureLoudAudio();
-      try {
-        if (video.paused) video.play().catch(() => { });
-      } catch { }
-    };
     video.addEventListener("loadeddata", onLoaded);
     video.addEventListener("canplay", onCanPlay);
     video.addEventListener("loadedmetadata", onCanPlay);
@@ -6658,8 +6650,6 @@ export default function WatchPage() {
     video.addEventListener("playing", onPlaying);
     video.addEventListener("pause", onPause);
     video.addEventListener("timeupdate", onTimeUpdate);
-    window.addEventListener("pointerdown", onUserGesture, { once: true, passive: true });
-    window.addEventListener("keydown", onUserGesture, { once: true });
     if (shouldUseNativeHls(video)) {
       video.src = selectedHlsUrl;
       video.load();
@@ -6845,8 +6835,6 @@ export default function WatchPage() {
       video.removeEventListener("playing", onPlaying);
       video.removeEventListener("pause", onPause);
       video.removeEventListener("timeupdate", onTimeUpdate);
-      window.removeEventListener("pointerdown", onUserGesture);
-      window.removeEventListener("keydown", onUserGesture);
       try { hls?.destroy(); } catch { }
       setHlsInstance(null);
       reset();
