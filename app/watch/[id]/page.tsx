@@ -6123,6 +6123,12 @@ export default function WatchPage() {
             if (fastVerifiedNow.length) pushDiag("server5 fast defer-untrusted");
             setResolverLoading(true);
           }
+        } else if (selectedServer === 3) {
+          if (fastMerged.length) {
+            pushDiag(`server3 fast awaiting-verify raw=${fastMerged.length}`);
+          }
+          // Server 3 is verify-first. Do not start playback from fast (unverified) sources.
+          setResolverLoading(true);
         } else if (fastMerged.length) {
           hadPlayable = true;
           applyCandidatesPreservingSelection(fastMerged);
