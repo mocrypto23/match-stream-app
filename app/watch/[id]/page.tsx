@@ -124,6 +124,9 @@ const LIVEHD77_FETCH_TIMEOUT_FINAL_MS = 25000; // Increased for max reliability 
 const LIVEHD77_PROBE_TIMEOUT_MS = 15000; // Deep scraping needs time
 const LIVEHD77_FETCH_RETRIES = 2;
 const LIVEHD77_FETCH_RETRY_DELAY_MS = 220;
+const SERVER3_STAGE0_MAX_CHECKS = 5;
+const SERVER3_STAGE0_TIMEOUT_MS = 2200;
+const SERVER3_STAGE0_MAX_CHILD_CHECKS = 1;
 const SERVER4_FETCH_TIMEOUT_FAST_MS = 6500;
 const SERVER4_FETCH_TIMEOUT_FINAL_MS = 16000;
 const SERVER4_PROBE_TIMEOUT_MS = 12000;
@@ -6478,6 +6481,33 @@ export default function WatchPage() {
           let verified: string[] = [];
           if (selectedServer === 3 && isServer3Livehd) {
             const rawBuckets = splitServer3CandidatesByRootServ(mergedRaw, server3ProvenanceRef.current);
+            const stage0Checks = Math.min(SERVER3_STAGE0_MAX_CHECKS, rawBuckets.bucket0.length);
+            let stage0Verified: string[] = [];
+            if (stage0Checks > 0) {
+              stage0Verified = await filterPlayableCandidates(rawBuckets.bucket0, {
+                signal: controller.signal,
+                timeoutMs: Math.min(probeTimeoutMs, SERVER3_STAGE0_TIMEOUT_MS),
+                maxChildChecks: SERVER3_STAGE0_MAX_CHILD_CHECKS,
+                maxChecks: stage0Checks,
+                concurrency: Math.min(4, PROBE_CONCURRENCY),
+                pushDiag,
+              });
+              pushDiag(`server3 stage0 verified=${stage0Verified.length}/${stage0Checks}`);
+              if (
+                stage0Verified.length &&
+                !cancel &&
+                !controller.signal.aborted &&
+                activeResolveIdRef.current === resolveId
+              ) {
+                hadPlayable = true;
+                applyCandidatesPreservingSelection(stage0Verified);
+                setPlayerError(null);
+                setResolverError(null);
+                resetRecoveryState();
+                setResolverLoading(false);
+                setServer3VerifiedAvailable(true);
+              }
+            }
             const maxChecks0 = Math.min(maxChecks, rawBuckets.bucket0.length);
             const verified0 = maxChecks0
               ? await filterPlayableCandidates(rawBuckets.bucket0, {
@@ -6584,14 +6614,20 @@ export default function WatchPage() {
             pushDiag(`server3 verified=${verified.length} raw=${mergedRawByPolicy.length}`);
             if (verified.length) setServer3VerifiedAvailable(true);
             else {
-              setServer3VerifiedAvailable(false);
-              pushDiag("server3 disabled no-verified");
+              if (candidatesRef.current.length) {
+                pushDiag("server3 keep-previous-verified");
+              } else {
+                setServer3VerifiedAvailable(false);
+                pushDiag("server3 disabled no-verified");
+              }
             }
           }
+          const keepExistingServer3 = selectedServer === 3 && !verified.length && candidatesRef.current.length > 0;
           const merged =
             selectedServer === 3
-              ? verified
+              ? (verified.length ? verified : (keepExistingServer3 ? candidatesRef.current : []))
               : (verified.length ? verified : (allowRawFallback ? mergedRawByPolicy : []));
+          if (keepExistingServer3) pushDiag("server3 keep-playing-current");
           if (!verified.length && selectedServer === 1 && mergedRaw.length) {
             pushDiag("raw-fallback server1");
           }
