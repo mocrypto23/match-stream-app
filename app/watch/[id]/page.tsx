@@ -5274,6 +5274,7 @@ export default function WatchPage() {
   const [serverHealth, setServerHealth] = useState<Record<number, ServerHealthState>>({});
   const [diagLogs, setDiagLogs] = useState<string[]>([]);
   const [isTfPlayerHost, setIsTfPlayerHost] = useState(false);
+  const [repackBypassVersion, setRepackBypassVersion] = useState(0);
   const candidatesRef = useRef<string[]>([]);
   const selectedCandidateRef = useRef(0);
   const selectedServerRef = useRef(4);
@@ -5300,6 +5301,7 @@ export default function WatchPage() {
   const server5PrewarmResolveInFlightRef = useRef<Map<string, Promise<string[]>>>(new Map());
   const server3AutoSwitchWindowRef = useRef<{ windowStart: number; count: number }>({ windowStart: 0, count: 0 });
   const repackSeedSentRef = useRef<Set<string>>(new Set());
+  const repackBypassServersRef = useRef<Set<number>>(new Set());
   const repackFallbackReasonByServerRef = useRef<Record<number, string>>({});
   const repackCacheStatusByServerRef = useRef<Record<number, string>>({});
   const repackStallCountByServerRef = useRef<Record<number, number>>({});
@@ -5347,11 +5349,14 @@ export default function WatchPage() {
       if (!runtimeRepackFlags.enabled) return;
       if (!runtimeRepackFlags.repackServers.has(params.serverId)) return;
       if (runtimeRepackFlags.forceDisableServers.has(params.serverId)) return;
-      const candidateUnderlying = toUnderlyingUrl(params.sourceCandidate) || params.sourceCandidate;
-      const sourceUnderlying = toUnderlyingUrl(params.sourceUrl) || params.sourceUrl;
-      if (!candidateUnderlying || !sourceUnderlying) return;
+      const sourceCandidate = String(params.sourceCandidate || "").trim();
+      const sourceUrl = String(params.sourceUrl || "").trim();
+      const candidateUnderlying = toUnderlyingUrl(sourceCandidate) || sourceCandidate;
+      const sourceUnderlying = toUnderlyingUrl(sourceUrl) || sourceUrl;
+      if (!sourceCandidate || !sourceUrl) return;
+      if (!isValidHttpUrl(candidateUnderlying) || !isValidHttpUrl(sourceUnderlying)) return;
       if (isRepackPlaylistUrl(candidateUnderlying) || isRepackPlaylistUrl(sourceUnderlying)) return;
-      const dedupeKey = `${idNum}:${params.serverId}:${canonicalizeUrl(candidateUnderlying) || candidateUnderlying}`;
+      const dedupeKey = `${idNum}:${params.serverId}:${canonicalizeUrl(sourceCandidate) || sourceCandidate}`;
       if (repackSeedSentRef.current.has(dedupeKey)) return;
       repackSeedSentRef.current.add(dedupeKey);
       try {
@@ -5364,8 +5369,8 @@ export default function WatchPage() {
           body: JSON.stringify({
             matchId: idNum,
             serverId: params.serverId,
-            sourceUrl: sourceUnderlying,
-            sourceCandidate: candidateUnderlying,
+            sourceUrl,
+            sourceCandidate,
             matchStatus: String(match.status_key || ""),
             viewerSessionId,
           }),
@@ -5403,10 +5408,12 @@ export default function WatchPage() {
 
   useEffect(() => {
     repackSeedSentRef.current = new Set();
+    repackBypassServersRef.current = new Set();
     repackFallbackReasonByServerRef.current = {};
     repackCacheStatusByServerRef.current = {};
     repackStallCountByServerRef.current = {};
     repackPlaybackStartedAtByServerRef.current = {};
+    setRepackBypassVersion((prev) => prev + 1);
   }, [idNum]);
 
   const mergeServer3Provenance = useCallback((incoming?: Map<string, Server3CandidateProvenance>) => {
@@ -5807,6 +5814,7 @@ export default function WatchPage() {
   }, []);
 
   const serverOptions = useMemo<ServerOption[]>(() => {
+    void repackBypassVersion;
     // Strict isolation: each server only uses its own dedicated URL
     const server3Source = (() => {
       const explicitServer3 = String(match?.stream_url_3 || "").trim();
@@ -5843,7 +5851,10 @@ export default function WatchPage() {
       let repackDecisionReason = "not-eligible";
       let repackReadPct = 0;
       let repackBucket = -1;
-      if (legacyUrl && idNum && allowRepackRead && capability?.repackEligible) {
+      const repackRuntimeBypass = repackBypassServersRef.current.has(n);
+      if (repackRuntimeBypass && legacyUrl && capability?.repackEligible) {
+        repackDecisionReason = "runtime-unavailable";
+      } else if (legacyUrl && idNum && allowRepackRead && capability?.repackEligible) {
         const decision = shouldUseRepackForViewer({
           flags: runtimeRepackFlags,
           serverId: n,
@@ -5890,7 +5901,7 @@ export default function WatchPage() {
     SERVER_DISPLAY_ORDER.forEach((n, idx) => orderIndex.set(n, idx));
     out.sort((a, b) => (orderIndex.get(a.n) ?? 999) - (orderIndex.get(b.n) ?? 999));
     return out;
-  }, [match, derivedServer3Url, runtimeServer5Url, server3VerifiedAvailable, idNum, runtimeRepackFlags, viewerSessionId]);
+  }, [match, derivedServer3Url, runtimeServer5Url, server3VerifiedAvailable, idNum, runtimeRepackFlags, viewerSessionId, repackBypassVersion]);
 
   const validServers = useMemo(() => serverOptions.filter((s) => s.url && isValidHttpUrl(s.url)), [serverOptions]);
   useEffect(() => {
@@ -6178,7 +6189,12 @@ export default function WatchPage() {
         }
         const out: string[] = [];
         for (const seedUrl of dedupeUrls(seedUrls)) {
-          if (!isStrongPlayableStreamUrl(seedUrl) && !isLikelyLivePhpEndpointUrl(seedUrl)) continue;
+          const normalizedSeed = canonicalizeUrl(seedUrl) || String(seedUrl || "").trim().toLowerCase();
+          const normalizedFallback =
+            canonicalizeUrl(selectedFallbackUrl) || String(selectedFallbackUrl || "").trim().toLowerCase();
+          const isSelectedFallbackSeed = !!normalizedFallback && normalizedSeed === normalizedFallback;
+          // Keep the selected fallback candidate even if it is not classified as "strong".
+          if (!isSelectedFallbackSeed && !isStrongPlayableStreamUrl(seedUrl) && !isLikelyLivePhpEndpointUrl(seedUrl)) continue;
           if (isRepackPlaylistUrl(seedUrl)) {
             out.push(seedUrl);
             continue;
@@ -7249,6 +7265,30 @@ export default function WatchPage() {
         });
         instance.on(Hls.Events.ERROR, (_event, data) => {
           if (cancel || !data.fatal) return;
+          const repackCandidate = isRepackPlaylistUrl(selectedHlsUrl);
+          const responseCode = Number((data as { response?: { code?: number } })?.response?.code || 0);
+          const errorDetails = String(data.details || "").toLowerCase();
+          const repackManifestUnavailable =
+            repackCandidate &&
+            (responseCode === 404 ||
+              responseCode === 403 ||
+              errorDetails.includes("manifestloaderror") ||
+              errorDetails.includes("manifestloadtimeout") ||
+              errorDetails.includes("levelloaderror") ||
+              errorDetails.includes("levelloadtimeout"));
+          if (repackManifestUnavailable) {
+            pushDiag(`repack unavailable code=${responseCode || 0} details=${errorDetails || "n/a"}`);
+            if (!repackBypassServersRef.current.has(selectedServer)) {
+              repackBypassServersRef.current.add(selectedServer);
+              setRepackBypassVersion((prev) => prev + 1);
+              pushDiag(`repack runtime-bypass s${selectedServer}`);
+            }
+            if (useFastFailover) {
+              markCandidateAsBad(selectedServer, selectedHlsUrl, `repack-unavailable-${responseCode || 0}`);
+            }
+            moveNext("repack-unavailable");
+            return;
+          }
           fatalRetries += 1;
           pushDiag(`fatal ${data.type} ${String(data.details)} retry=${fatalRetries}`);
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR && currentCandidateKey) {
