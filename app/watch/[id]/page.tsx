@@ -6749,11 +6749,23 @@ export default function WatchPage() {
       server5VisualStarted = true;
       clearServer5StartupNoFrameTimer();
     };
+    const getServer5DecodedFrameCount = () => {
+      try {
+        const quality =
+          typeof video.getVideoPlaybackQuality === "function" ? video.getVideoPlaybackQuality() : null;
+        const fromQuality = Number(quality?.totalVideoFrames ?? 0);
+        if (Number.isFinite(fromQuality) && fromQuality > 0) return fromQuality;
+      } catch {}
+      const fallbackDecoded = Number(
+        (video as HTMLVideoElement & { webkitDecodedFrameCount?: number }).webkitDecodedFrameCount ?? 0
+      );
+      return Number.isFinite(fallbackDecoded) ? fallbackDecoded : 0;
+    };
     const hasServer5VisualStart = () => {
-      const progressed = Number(video.currentTime);
-      const hasProgress = Number.isFinite(progressed) && progressed > 0.15;
-      const hasFrame = video.videoWidth > 0 && video.videoHeight > 0;
-      return hasProgress || hasFrame;
+      const hasFrameDimensions = video.videoWidth > 0 && video.videoHeight > 0;
+      const decodedFrames = getServer5DecodedFrameCount();
+      if (decodedFrames > 0) return true;
+      return hasFrameDimensions && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA;
     };
     const scheduleServer5StartupNoFrameWatchdog = () => {
       if (selectedServer !== 5 || startupNoFrameTimer !== null) return;
@@ -7088,8 +7100,8 @@ export default function WatchPage() {
         }
         reportRepackPlaybackDiag("native-loaded", selectedServer, selectedHlsUrl);
       }
-      if (video.videoWidth > 0 || video.videoHeight > 0) markServer5VisualStart();
-      hidePlayerLoading();
+      if (hasServer5VisualStart()) markServer5VisualStart();
+      if (selectedServer !== 5 || hasServer5VisualStart()) hidePlayerLoading();
     };
     const onWaiting = () => {
       if (cancel) return;
@@ -7124,7 +7136,7 @@ export default function WatchPage() {
         setServer5PrewarmCandidates(selectedUrl, [selectedHlsUrl, ...existing]);
       }
       resetRecoveryState();
-      hidePlayerLoading();
+      if (selectedServer !== 5 || hasServer5VisualStart()) hidePlayerLoading();
       setPlayerError(null);
       setResolverError(null);
       if (useFastFailover) clearCandidateFailureMarks(selectedServer, selectedHlsUrl);
@@ -7132,12 +7144,13 @@ export default function WatchPage() {
     };
     const onTimeUpdate = () => {
       markProgress();
-      const progressed = Number(video.currentTime);
-      const server5HasProgress = selectedServer === 5 && Number.isFinite(progressed) && progressed > 0.15;
-      if (server5HasProgress) markServer5VisualStart();
-      if (!video.paused && (video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA || server5HasProgress)) {
+      const server5HasVisual = selectedServer === 5 && hasServer5VisualStart();
+      if (server5HasVisual) markServer5VisualStart();
+      const nonServer5Ready = selectedServer !== 5 && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA;
+      if (!video.paused && (nonServer5Ready || server5HasVisual)) {
         hidePlayerLoading();
       }
+      const progressed = Number(video.currentTime);
       if (Number.isFinite(progressed) && progressed > 0.2) {
         userPausedRef.current = false;
         scheduleAutoAudioSync();
@@ -7222,7 +7235,7 @@ export default function WatchPage() {
           }
           markProgress();
           resetRecoveryState();
-          hidePlayerLoading();
+          if (selectedServer !== 5 || hasServer5VisualStart()) hidePlayerLoading();
           setPlayerError(null);
           setResolverError(null);
           if (useFastFailover) clearCandidateFailureMarks(selectedServer, selectedHlsUrl);
