@@ -57,6 +57,11 @@ echo 'NEXT_PUBLIC_IFRAME_PLAYER_ORIGIN=' >> "$ENV_FILE"
 npm ci --no-audit --no-fund
 npm run build
 pm2 restart tf-player --update-env || PORT=3000 NODE_ENV=production pm2 start npm --name tf-player -- start
+if command -v ffmpeg >/dev/null 2>&1; then
+  pm2 restart tf-repackager --update-env || NODE_ENV=production pm2 start npm --name tf-repackager -- run repackager:start
+else
+  echo "[deploy] WARN: ffmpeg is not installed; tf-repackager was not started"
+fi
 pm2 save
 sudo systemctl start nginx || true
 

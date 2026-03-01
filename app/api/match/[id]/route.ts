@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "../../_supabase";
+import { getRuntimeRepackFlags } from "@/lib/repack-flags";
+import { listServerCapabilities } from "@/lib/server-capabilities";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -944,7 +946,30 @@ export async function GET(req: Request, ctx: Ctx) {
     }
   }
 
-  const res = NextResponse.json(payload);
+  const repackFlags = getRuntimeRepackFlags();
+  const repackHints = {
+    enabled: repackFlags.enabled,
+    readPct: repackFlags.readPct,
+    readPctByServer: Object.fromEntries(Array.from(repackFlags.readPctByServer.entries())),
+    forceDisableServers: Array.from(repackFlags.forceDisableServers).sort((a, b) => a - b),
+    repackServers: Array.from(repackFlags.repackServers).sort((a, b) => a - b),
+    p2pServers: Array.from(repackFlags.p2pServers).sort((a, b) => a - b),
+    publicBaseUrl: repackFlags.publicBaseUrl,
+    capabilityRegistry: listServerCapabilities().map((item) => ({
+      serverId: item.serverId,
+      repackEligible: item.repackEligible,
+      p2pEligible: item.p2pEligible,
+      proxyAuthMode: item.proxyAuthMode,
+      tokenMode: item.tokenMode,
+      fallbackPolicy: item.fallbackPolicy,
+      repackProfile: item.repackProfile,
+    })),
+  };
+
+  const res = NextResponse.json({
+    ...payload,
+    repack: repackHints,
+  });
   res.headers.set("Cache-Control", "public, s-maxage=10, stale-while-revalidate=60");
   res.headers.set("x-server5-refresh", shouldRefreshServer5 ? server5RefreshStatus : "skip");
   res.headers.set("x-server5-refresh-ms", String(shouldRefreshServer5 ? server5RefreshMs : 0));

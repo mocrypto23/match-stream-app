@@ -1,0 +1,691 @@
+#!/usr/bin/env node
+"use strict";
+/* eslint-disable @typescript-eslint/no-require-imports */
+
+const http = require("http");
+const fsp = require("fs/promises");
+const path = require("path");
+const { spawn } = require("child_process");
+const dotenv = require("dotenv");
+const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+
+dotenv.config({ path: path.join(process.cwd(), ".env.local") });
+
+const DEFAULT_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function toInt(raw, fallback, min = Number.MIN_SAFE_INTEGER) {
+  const n = Number.parseInt(String(raw || "").trim(), 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, n);
+}
+
+function toBool(raw, fallback = false) {
+  const v = String(raw || "").trim().toLowerCase();
+  if (!v) return fallback;
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+function isHttpUrl(value) {
+  try {
+    const u = new URL(String(value || ""));
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function normalizeCandidateUrl(raw, playerOrigin) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  if (isHttpUrl(value)) return value;
+  if (value.startsWith("/")) return `${String(playerOrigin || "").replace(/\/+$/, "")}${value}`;
+  return "";
+}
+
+function readJsonBody(req, maxBytes = 64 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        reject(new Error("Payload too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      try {
+        const raw = Buffer.concat(chunks).toString("utf8");
+        resolve(raw ? JSON.parse(raw) : {});
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function sendJson(res, statusCode, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(statusCode, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "content-length": Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+class RepackJob {
+  constructor(manager, input) {
+    this.manager = manager;
+    this.matchId = input.matchId;
+    this.serverId = input.serverId;
+    this.ingestUrl = input.ingestUrl;
+    this.workDir = input.workDir;
+    this.remotePrefix = input.remotePrefix.replace(/\/+$/, "");
+    this.profile = input.profile;
+    this.state = "starting";
+    this.createdAt = Date.now();
+    this.lastSeedAt = Date.now();
+    this.lastPublishAt = 0;
+    this.lastErrorAt = 0;
+    this.sourceReadErrors = 0;
+    this.consecutiveUploadErrors = 0;
+    this.uploadedSegments = new Map();
+    this.remoteSeq = 0;
+    this.totalPlaylistPublishes = 0;
+    this.totalSegmentUploads = 0;
+    this.totalSegmentBytes = 0;
+    this.lastUploadLatencyMs = 0;
+    this.lastPlaylistLatencyMs = 0;
+    this.remoteHistory = [];
+    this.ffmpegProc = null;
+    this.uploadTimer = null;
+    this.monitorTimer = null;
+    this.stdoutLog = [];
+    this.stderrLog = [];
+  }
+
+  get key() {
+    return `m${this.matchId}:s${this.serverId}`;
+  }
+
+  get playlistPath() {
+    return path.join(this.workDir, "index.m3u8");
+  }
+
+  async start() {
+    await fsp.mkdir(this.workDir, { recursive: true });
+    this.spawnFfmpeg();
+    const pollMs = this.manager.config.uploadPollMs;
+    this.uploadTimer = setInterval(() => {
+      this.syncPlaylist().catch((error) => {
+        this.lastErrorAt = Date.now();
+        this.consecutiveUploadErrors += 1;
+        this.manager.log("warn", "repack sync failed", {
+          job: this.key,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }, pollMs);
+    this.monitorTimer = setInterval(() => this.healthSweep(), 2500);
+    this.state = "running";
+  }
+
+  spawnFfmpeg() {
+    const ffmpegBin = this.manager.config.ffmpegBin;
+    const segmentPattern = path.join(this.workDir, "seg-%08d.ts");
+    const args = [
+      "-nostdin",
+      "-hide_banner",
+      "-loglevel",
+      "warning",
+      "-user_agent",
+      DEFAULT_USER_AGENT,
+      "-rw_timeout",
+      "15000000",
+      "-i",
+      this.ingestUrl,
+      "-c",
+      "copy",
+      "-f",
+      "hls",
+      "-hls_time",
+      String(this.profile.segmentDurationSec),
+      "-hls_list_size",
+      String(this.profile.playlistSize),
+      "-hls_flags",
+      "delete_segments+append_list+omit_endlist+program_date_time",
+      "-hls_segment_filename",
+      segmentPattern,
+      this.playlistPath,
+    ];
+
+    this.ffmpegProc = spawn(ffmpegBin, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    this.ffmpegProc.stdout?.on("data", (chunk) => {
+      const line = String(chunk || "").trim();
+      if (!line) return;
+      this.stdoutLog.unshift(line);
+      if (this.stdoutLog.length > 50) this.stdoutLog.length = 50;
+    });
+
+    this.ffmpegProc.stderr?.on("data", (chunk) => {
+      const line = String(chunk || "").trim();
+      if (!line) return;
+      this.stderrLog.unshift(line);
+      if (this.stderrLog.length > 80) this.stderrLog.length = 80;
+      const lower = line.toLowerCase();
+      if (
+        lower.includes("error") ||
+        lower.includes("failed") ||
+        lower.includes("timed out") ||
+        lower.includes("404")
+      ) {
+        this.sourceReadErrors += 1;
+        this.lastErrorAt = Date.now();
+      }
+    });
+
+    this.ffmpegProc.on("exit", (code, signal) => {
+      this.manager.log("warn", "ffmpeg exited", {
+        job: this.key,
+        code: Number.isFinite(code) ? code : null,
+        signal: signal || null,
+      });
+      this.ffmpegProc = null;
+      this.lastErrorAt = Date.now();
+      if (this.state === "stopped") return;
+      this.state = "restarting";
+      setTimeout(() => {
+        if (this.state === "stopped") return;
+        this.spawnFfmpeg();
+        this.state = "running";
+      }, 1400);
+    });
+  }
+
+  touchSeed(ingestUrl) {
+    this.lastSeedAt = Date.now();
+    if (ingestUrl && ingestUrl !== this.ingestUrl) {
+      this.ingestUrl = ingestUrl;
+      this.manager.log("info", "repack source updated", { job: this.key });
+      if (this.ffmpegProc) {
+        try {
+          this.ffmpegProc.kill("SIGTERM");
+        } catch {}
+      } else {
+        this.spawnFfmpeg();
+      }
+    }
+  }
+
+  parsePlaylist(rawText) {
+    const lines = String(rawText || "").split(/\r?\n/);
+    const segmentLines = [];
+    for (const line of lines) {
+      const value = String(line || "").trim();
+      if (!value || value.startsWith("#")) continue;
+      segmentLines.push(value);
+    }
+    return { lines, segmentLines };
+  }
+
+  buildRemoteSegmentName() {
+    const nowMs = Date.now();
+    this.remoteSeq += 1;
+    return `seg-${nowMs}-${String(this.remoteSeq).padStart(6, "0")}.ts`;
+  }
+
+  async uploadSegment(localName) {
+    const localPath = path.join(this.workDir, localName);
+    let stat;
+    try {
+      stat = await fsp.stat(localPath);
+    } catch {
+      return false;
+    }
+    if (!stat.isFile() || stat.size <= 0) return false;
+
+    const remoteName = this.buildRemoteSegmentName();
+    const remoteKey = `${this.remotePrefix}/${remoteName}`;
+    const startedAt = Date.now();
+    const fileBody = await fsp.readFile(localPath);
+    await this.manager.putObject({
+      key: remoteKey,
+      body: fileBody,
+      contentType: "video/mp2t",
+      cacheControl: "public, max-age=30, s-maxage=120, stale-while-revalidate=30",
+    });
+
+    this.lastUploadLatencyMs = Date.now() - startedAt;
+    this.totalSegmentUploads += 1;
+    this.totalSegmentBytes += stat.size;
+    this.uploadedSegments.set(localName, {
+      remoteName,
+      remoteKey,
+      uploadedAt: Date.now(),
+      bytes: stat.size,
+    });
+    this.remoteHistory.push({
+      key: remoteKey,
+      uploadedAt: Date.now(),
+    });
+    if (this.remoteHistory.length > 2000) this.remoteHistory.splice(0, this.remoteHistory.length - 1200);
+    return true;
+  }
+
+  async uploadPlaylist(lines) {
+    const startedAt = Date.now();
+    const rewritten = lines
+      .map((line) => {
+        const trimmed = String(line || "").trim();
+        if (!trimmed || trimmed.startsWith("#")) return line;
+        const mapped = this.uploadedSegments.get(trimmed);
+        return mapped ? mapped.remoteName : line;
+      })
+      .join("\n");
+
+    await this.manager.putObject({
+      key: `${this.remotePrefix}/index.m3u8`,
+      body: Buffer.from(rewritten, "utf8"),
+      contentType: "application/vnd.apple.mpegurl; charset=utf-8",
+      cacheControl: "public, max-age=1, s-maxage=3, stale-while-revalidate=3",
+    });
+    this.lastPlaylistLatencyMs = Date.now() - startedAt;
+    this.lastPublishAt = Date.now();
+    this.totalPlaylistPublishes += 1;
+    this.consecutiveUploadErrors = 0;
+  }
+
+  async syncPlaylist() {
+    if (this.state === "stopped") return;
+    let playlistRaw;
+    try {
+      playlistRaw = await fsp.readFile(this.playlistPath, "utf8");
+    } catch {
+      return;
+    }
+    const { lines, segmentLines } = this.parsePlaylist(playlistRaw);
+    if (!segmentLines.length) return;
+
+    for (const segmentName of segmentLines) {
+      if (this.uploadedSegments.has(segmentName)) continue;
+      const ok = await this.uploadSegment(segmentName);
+      if (!ok) return;
+    }
+
+    for (const segmentName of segmentLines) {
+      if (!this.uploadedSegments.has(segmentName)) return;
+    }
+
+    await this.uploadPlaylist(lines);
+    await this.cleanupLocal(segmentLines);
+    await this.cleanupRemote(segmentLines);
+  }
+
+  async cleanupLocal(activeSegments) {
+    const safeSet = new Set(activeSegments);
+    const retentionMs = this.manager.config.localRetentionMs;
+    const now = Date.now();
+    let files = [];
+    try {
+      files = await fsp.readdir(this.workDir);
+    } catch {
+      return;
+    }
+    for (const file of files) {
+      if (!file.endsWith(".ts")) continue;
+      if (safeSet.has(file)) continue;
+      const filePath = path.join(this.workDir, file);
+      try {
+        const stat = await fsp.stat(filePath);
+        if (now - stat.mtimeMs < retentionMs) continue;
+        await fsp.unlink(filePath);
+      } catch {}
+    }
+  }
+
+  async cleanupRemote(activeSegments) {
+    const activeRemote = new Set(
+      activeSegments.map((name) => this.uploadedSegments.get(name)?.remoteKey).filter(Boolean)
+    );
+    const now = Date.now();
+    const retentionMs = this.manager.config.remoteRetentionMs;
+    const staleKeys = [];
+
+    for (const [localName, meta] of this.uploadedSegments.entries()) {
+      if (activeRemote.has(meta.remoteKey)) continue;
+      if (now - meta.uploadedAt < retentionMs) continue;
+      staleKeys.push({ localName, remoteKey: meta.remoteKey });
+    }
+
+    if (!staleKeys.length) return;
+    for (const item of staleKeys.slice(0, 12)) {
+      try {
+        await this.manager.deleteObject(item.remoteKey);
+      } catch {}
+      this.uploadedSegments.delete(item.localName);
+    }
+  }
+
+  healthSweep() {
+    const now = Date.now();
+    if (now - this.lastSeedAt > this.manager.config.idleStopMs) {
+      this.manager.log("info", "repack idle-stop", { job: this.key });
+      this.stop();
+      return;
+    }
+    const staleMs = this.manager.config.stalePublishMs;
+    if (this.lastPublishAt && now - this.lastPublishAt > staleMs) {
+      this.manager.log("warn", "repack stale publish", { job: this.key, staleMs: now - this.lastPublishAt });
+    }
+  }
+
+  async stop() {
+    if (this.state === "stopped") return;
+    this.state = "stopped";
+    if (this.uploadTimer) clearInterval(this.uploadTimer);
+    if (this.monitorTimer) clearInterval(this.monitorTimer);
+    this.uploadTimer = null;
+    this.monitorTimer = null;
+    if (this.ffmpegProc) {
+      try {
+        this.ffmpegProc.kill("SIGTERM");
+      } catch {}
+      this.ffmpegProc = null;
+    }
+  }
+
+  toDiag() {
+    return {
+      key: this.key,
+      matchId: this.matchId,
+      serverId: this.serverId,
+      state: this.state,
+      ingestUrl: this.ingestUrl,
+      createdAt: this.createdAt,
+      lastSeedAt: this.lastSeedAt,
+      lastPublishAt: this.lastPublishAt,
+      lastErrorAt: this.lastErrorAt,
+      sourceReadErrors: this.sourceReadErrors,
+      consecutiveUploadErrors: this.consecutiveUploadErrors,
+      totalPlaylistPublishes: this.totalPlaylistPublishes,
+      totalSegmentUploads: this.totalSegmentUploads,
+      totalSegmentBytes: this.totalSegmentBytes,
+      lastUploadLatencyMs: this.lastUploadLatencyMs,
+      lastPlaylistLatencyMs: this.lastPlaylistLatencyMs,
+      stderrTail: this.stderrLog.slice(0, 20),
+    };
+  }
+}
+
+class RepackManager {
+  constructor(config) {
+    this.config = config;
+    this.jobs = new Map();
+    this.startedAt = Date.now();
+    this.metrics = {
+      seedRequests: 0,
+      seedAccepted: 0,
+      seedRejected: 0,
+      uploadErrors: 0,
+      lastError: "",
+    };
+
+    this.s3 = new S3Client({
+      region: "auto",
+      endpoint: config.r2Endpoint,
+      forcePathStyle: true,
+      credentials: {
+        accessKeyId: config.r2AccessKeyId,
+        secretAccessKey: config.r2SecretAccessKey,
+      },
+    });
+  }
+
+  log(level, message, extra = {}) {
+    const record = { ts: nowIso(), level, message, ...extra };
+    process.stdout.write(`${JSON.stringify(record)}\n`);
+  }
+
+  async putObject(input) {
+    try {
+      await this.s3.send(
+        new PutObjectCommand({
+          Bucket: this.config.r2Bucket,
+          Key: input.key,
+          Body: input.body,
+          ContentType: input.contentType,
+          CacheControl: input.cacheControl,
+        })
+      );
+    } catch (error) {
+      this.metrics.uploadErrors += 1;
+      this.metrics.lastError = error instanceof Error ? error.message : String(error);
+      throw error;
+    }
+  }
+
+  async deleteObject(key) {
+    try {
+      await this.s3.send(
+        new DeleteObjectCommand({
+          Bucket: this.config.r2Bucket,
+          Key: key,
+        })
+      );
+    } catch (error) {
+      this.metrics.uploadErrors += 1;
+      this.metrics.lastError = error instanceof Error ? error.message : String(error);
+      throw error;
+    }
+  }
+
+  resolveIngestUrl(payload) {
+    const candidate = normalizeCandidateUrl(payload.sourceCandidate, this.config.playerOrigin);
+    if (candidate) return candidate;
+    const source = normalizeCandidateUrl(payload.sourceUrl, this.config.playerOrigin);
+    if (source) return source;
+    return "";
+  }
+
+  async seed(payload) {
+    this.metrics.seedRequests += 1;
+    const matchId = toInt(payload.matchId, NaN, 1);
+    const serverId = toInt(payload.serverId, NaN, 1);
+    const matchStatus = String(payload.matchStatus || "").trim().toLowerCase();
+    const liveOnly = this.config.liveOnly;
+
+    if (!Number.isFinite(matchId) || !Number.isFinite(serverId)) {
+      this.metrics.seedRejected += 1;
+      return { accepted: false, reason: "invalid-input" };
+    }
+    if (!this.config.repackServers.has(serverId)) {
+      this.metrics.seedRejected += 1;
+      return { accepted: false, reason: "server-not-enabled" };
+    }
+    if (liveOnly && matchStatus && matchStatus !== "live") {
+      this.metrics.seedRejected += 1;
+      return { accepted: false, reason: "match-not-live" };
+    }
+    const ingestUrl = this.resolveIngestUrl(payload);
+    if (!isHttpUrl(ingestUrl)) {
+      this.metrics.seedRejected += 1;
+      return { accepted: false, reason: "invalid-ingest-url" };
+    }
+
+    const key = `m${matchId}:s${serverId}`;
+    let job = this.jobs.get(key);
+    if (!job) {
+      const workDir = path.join(this.config.workRoot, `m${matchId}`, `s${serverId}`);
+      const remotePrefix = `live/m${matchId}/s${serverId}`;
+      job = new RepackJob(this, {
+        matchId,
+        serverId,
+        ingestUrl,
+        workDir,
+        remotePrefix,
+        profile: this.config.repackProfile,
+      });
+      this.jobs.set(key, job);
+      await job.start();
+      this.log("info", "repack job started", {
+        job: key,
+        matchId,
+        serverId,
+        source: ingestUrl,
+      });
+    } else {
+      job.touchSeed(ingestUrl);
+    }
+    this.metrics.seedAccepted += 1;
+    return { accepted: true, reason: "ok", jobKey: key, ingestUrl };
+  }
+
+  async stopAll() {
+    const jobs = Array.from(this.jobs.values());
+    for (const job of jobs) {
+      await job.stop();
+    }
+    this.jobs.clear();
+  }
+
+  diag() {
+    const jobs = Array.from(this.jobs.values()).map((job) => job.toDiag());
+    const perServer = {};
+    for (const job of jobs) {
+      perServer[String(job.serverId)] = {
+        repack_on: job.state === "running" || job.state === "restarting",
+        fallback_reason_top: job.consecutiveUploadErrors > 0 ? "upload-errors" : "none",
+        cache_status_mix: "n/a",
+        stall_rate: "n/a",
+      };
+    }
+    return {
+      ok: true,
+      uptimeMs: Date.now() - this.startedAt,
+      config: {
+        bind: this.config.bind,
+        port: this.config.port,
+        liveOnly: this.config.liveOnly,
+        repackServers: Array.from(this.config.repackServers).sort((a, b) => a - b),
+        r2Bucket: this.config.r2Bucket,
+        publicBaseUrl: this.config.publicBaseUrl,
+      },
+      metrics: this.metrics,
+      jobs,
+      perServer,
+    };
+  }
+}
+
+function loadConfig() {
+  const repackServers = new Set(
+    String(process.env.REPACK_SERVERS || "1,2,3,4")
+      .split(",")
+      .map((item) => Number.parseInt(item.trim(), 10))
+      .filter((item) => Number.isFinite(item) && item > 0)
+  );
+
+  const cfg = {
+    bind: String(process.env.REPACK_AGENT_BIND || "127.0.0.1").trim(),
+    port: toInt(process.env.REPACK_AGENT_PORT, 3400, 1),
+    ffmpegBin: String(process.env.REPACK_FFMPEG_BIN || "ffmpeg").trim(),
+    workRoot: String(process.env.REPACK_WORK_ROOT || "/tmp/tf-repack").trim(),
+    uploadPollMs: toInt(process.env.REPACK_UPLOAD_POLL_MS, 1200, 400),
+    idleStopMs: toInt(process.env.REPACK_IDLE_STOP_MS, 15 * 60 * 1000, 10_000),
+    stalePublishMs: toInt(process.env.REPACK_STALE_PUBLISH_MS, 25_000, 4000),
+    localRetentionMs: toInt(process.env.REPACK_LOCAL_RETENTION_MS, 8 * 60 * 1000, 30_000),
+    remoteRetentionMs: toInt(process.env.REPACK_REMOTE_RETENTION_MS, 8 * 60 * 1000, 30_000),
+    liveOnly: toBool(process.env.REPACK_LIVE_ONLY, true),
+    publicBaseUrl: String(process.env.REPACK_PUBLIC_BASE_URL || "https://r2.tf-player.site/live").trim(),
+    playerOrigin: String(process.env.REPACK_PLAYER_ORIGIN || "https://tf-player.site").trim(),
+    repackServers,
+    repackProfile: {
+      segmentDurationSec: toInt(process.env.REPACK_SEGMENT_DURATION_SEC, 4, 2),
+      playlistSize: toInt(process.env.REPACK_PLAYLIST_SIZE, 6, 3),
+    },
+    r2Endpoint: String(process.env.R2_ENDPOINT || process.env.REPACK_R2_ENDPOINT || "").trim(),
+    r2Bucket: String(process.env.R2_BUCKET || process.env.REPACK_R2_BUCKET || "").trim(),
+    r2AccessKeyId: String(process.env.R2_ACCESS_KEY_ID || process.env.REPACK_R2_ACCESS_KEY_ID || "").trim(),
+    r2SecretAccessKey: String(process.env.R2_SECRET_ACCESS_KEY || process.env.REPACK_R2_SECRET_ACCESS_KEY || "").trim(),
+  };
+
+  if (!cfg.r2Endpoint || !cfg.r2Bucket || !cfg.r2AccessKeyId || !cfg.r2SecretAccessKey) {
+    throw new Error("Missing R2 configuration (endpoint/bucket/access key/secret).");
+  }
+  return cfg;
+}
+
+async function main() {
+  const config = loadConfig();
+  await fsp.mkdir(config.workRoot, { recursive: true });
+  const manager = new RepackManager(config);
+  const startedAt = Date.now();
+
+  const server = http.createServer(async (req, res) => {
+    const method = String(req.method || "GET").toUpperCase();
+    const pathname = String((req.url || "").split("?")[0] || "/");
+    try {
+      if (method === "GET" && pathname === "/healthz") {
+        return sendJson(res, 200, {
+          ok: true,
+          uptimeMs: Date.now() - startedAt,
+          jobs: manager.jobs.size,
+          ts: nowIso(),
+        });
+      }
+
+      if (method === "GET" && pathname === "/diag") {
+        return sendJson(res, 200, manager.diag());
+      }
+
+      if (method === "POST" && pathname === "/seed") {
+        const payload = await readJsonBody(req);
+        const result = await manager.seed(payload || {});
+        if (!result.accepted) return sendJson(res, 202, result);
+        return sendJson(res, 200, result);
+      }
+
+      return sendJson(res, 404, { ok: false, error: "Not found" });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      manager.log("error", "http handler failed", { method, pathname, error: message });
+      return sendJson(res, 500, { ok: false, error: message });
+    }
+  });
+
+  server.listen(config.port, config.bind, () => {
+    manager.log("info", "repackager started", {
+      bind: config.bind,
+      port: config.port,
+      publicBaseUrl: config.publicBaseUrl,
+      repackServers: Array.from(config.repackServers).sort((a, b) => a - b),
+    });
+  });
+
+  const shutdown = async (signal) => {
+    manager.log("info", "shutdown requested", { signal });
+    server.close();
+    await manager.stopAll();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+main().catch((error) => {
+  const message = error instanceof Error ? error.stack || error.message : String(error);
+  process.stderr.write(`[repackager] fatal: ${message}\n`);
+  process.exit(1);
+});
