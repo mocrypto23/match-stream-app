@@ -6721,6 +6721,7 @@ export default function WatchPage() {
             const pickBestSeedCandidate = (pool: string[], sourceForSeed: string) => {
               const sourceRaw = String(sourceForSeed || "").trim();
               const sourceCanonical = canonicalizeUrl(sourceRaw) || sourceRaw.toLowerCase();
+              const nowSec = Math.floor(Date.now() / 1000);
               let sourceHost = "";
               try {
                 sourceHost = new URL(sourceRaw).hostname.toLowerCase();
@@ -6734,6 +6735,21 @@ export default function WatchPage() {
                 let score = 0;
                 if (underlying.includes(".m3u8")) score += 140;
                 if (/\/hls\/|\/live\/|\/playlist\/|\/manifest\/|\/kooora\//i.test(underlying)) score += 90;
+                try {
+                  const urlObj = new URL(underlyingRaw);
+                  const token = String(urlObj.searchParams.get("token") || "").trim();
+                  const sid = String(urlObj.searchParams.get("sid") || "").trim();
+                  const tsRaw = String(urlObj.searchParams.get("ts") || "").trim();
+                  const tsVal = Number.parseInt(tsRaw, 10);
+                  if ((token || sid) && Number.isFinite(tsVal) && tsVal > 0) {
+                    const ageSec = Math.max(0, nowSec - tsVal);
+                    if (ageSec > 180) continue;
+                    if (ageSec <= 90) score += Math.max(40, 260 - ageSec * 2);
+                    else score -= 80;
+                  } else if (token || sid) {
+                    score -= 35;
+                  }
+                } catch { }
                 const refUrl = getProxyRefUrlFromCandidate(candidate);
                 const refCanonical = canonicalizeUrl(refUrl) || String(refUrl || "").trim().toLowerCase();
                 if (sourceCanonical && refCanonical && refCanonical === sourceCanonical) score += 520;
