@@ -7537,6 +7537,29 @@ export default function WatchPage() {
       pushDiag(`stall-freeze ${stalledFor}ms source=${current + 1}/${Math.max(1, total)}`);
       requestSoftRecovery("stall-watchdog");
       if (total <= 1) {
+        const fallbackCandidate = String(selectedFallbackUrl || "").trim();
+        const fallbackUnderlying = String(toUnderlyingUrl(fallbackCandidate) || fallbackCandidate).trim();
+        const canSwitchToLegacyFallback =
+          stallFreezeCount >= 2 &&
+          isRepackPlaylistUrl(selectedHlsUrl) &&
+          !!fallbackCandidate &&
+          !isRepackPlaylistUrl(fallbackUnderlying) &&
+          isValidHttpUrl(fallbackUnderlying);
+        if (canSwitchToLegacyFallback) {
+          pushDiag("repack single-source stall -> legacy fallback");
+          trackRepackFallback("stall-single-source", selectedHlsUrl, fallbackCandidate);
+          if (useFastFailover) {
+            markCandidateAsBad(selectedServer, selectedHlsUrl, "repack-single-source-stall");
+          }
+          applyCandidatesPreservingSelection([fallbackCandidate]);
+          selectedCandidateRef.current = 0;
+          setSelectedCandidate(0);
+          setPlayerError("تم التحويل تلقائيًا للمصدر الاحتياطي لضمان استمرارية البث.");
+          hidePlayerLoading();
+          freezeTriggered = false;
+          stallFreezeCount = 0;
+          return;
+        }
         // Single-source playback: avoid hard source switch loops; keep trying in-place.
         setPlayerError("انقطاع مؤقت... جاري إعادة المزامنة");
         queueTimeout(() => {

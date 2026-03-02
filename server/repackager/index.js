@@ -630,7 +630,8 @@ function loadConfig() {
     ffmpegBin: String(process.env.REPACK_FFMPEG_BIN || "ffmpeg").trim(),
     workRoot: String(process.env.REPACK_WORK_ROOT || "/tmp/tf-repack").trim(),
     uploadPollMs: toInt(process.env.REPACK_UPLOAD_POLL_MS, 1200, 400),
-    idleStopMs: toInt(process.env.REPACK_IDLE_STOP_MS, 15 * 60 * 1000, 10_000),
+    // Keep seeded jobs alive long enough for full match windows unless explicitly overridden by env.
+    idleStopMs: toInt(process.env.REPACK_IDLE_STOP_MS, 8 * 60 * 60 * 1000, 10_000),
     stalePublishMs: toInt(process.env.REPACK_STALE_PUBLISH_MS, 25_000, 4000),
     localRetentionMs: toInt(process.env.REPACK_LOCAL_RETENTION_MS, 8 * 60 * 1000, 30_000),
     remoteRetentionMs: toInt(process.env.REPACK_REMOTE_RETENTION_MS, 8 * 60 * 1000, 30_000),
