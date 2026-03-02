@@ -6638,6 +6638,23 @@ export default function WatchPage() {
             isRepackPlaylistUrl(selectedUrl) && !repackBypassServersRef.current.has(selectedServer)
               ? dedupeUrls([selectedUrl, ...merged])
               : merged;
+          if (isRepackPlaylistUrl(selectedUrl)) {
+            const seedFrom = dedupeUrls([...verified, ...mergedRaw, ...initialCandidates]).find((candidate) => {
+              const underlying = String(toUnderlyingUrl(candidate) || candidate || "").trim().toLowerCase();
+              if (!underlying) return false;
+              if (isRepackPlaylistUrl(underlying)) return false;
+              if (!isValidHttpUrl(underlying)) return false;
+              return underlying.includes(".m3u8");
+            });
+            if (seedFrom) {
+              const sourceForSeed = String(selectedFallbackUrl || selectedUrl || "").trim();
+              void requestRepackSeed({
+                serverId: selectedServer,
+                sourceUrl: sourceForSeed,
+                sourceCandidate: seedFrom,
+              });
+            }
+          }
           if (mergedRaw.length) pushDiag(`probe ok ${mergedPreferred.length}/${mergedRaw.length}`);
           applyCandidatesPreservingSelection(mergedPreferred);
           if (selectedServer === 5 && merged.length) {
@@ -6718,6 +6735,7 @@ export default function WatchPage() {
     match?.home_team,
     match?.away_team,
     selectedFallbackUrl,
+    requestRepackSeed,
   ]);
 
   const selectedHlsUrl = candidates[selectedCandidate] || "";
