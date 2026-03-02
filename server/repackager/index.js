@@ -3,6 +3,7 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 
 const http = require("http");
+const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const { spawn } = require("child_process");
@@ -164,7 +165,27 @@ class RepackJob {
     this.state = "running";
   }
 
+  resetEncoderRunState() {
+    // ffmpeg may restart and reuse local names (seg-00000001.ts ...).
+    // Reset mappings to avoid reusing stale remote segment links.
+    this.uploadedSegments = new Map();
+    this.lastPublishAt = 0;
+    try {
+      const entries = fs.readdirSync(this.workDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const name = String(entry.name || "").toLowerCase();
+        if (name === "index.m3u8" || name.endsWith(".ts")) {
+          try {
+            fs.unlinkSync(path.join(this.workDir, entry.name));
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
   spawnFfmpeg() {
+    this.resetEncoderRunState();
     const ffmpegBin = this.manager.config.ffmpegBin;
     const segmentPattern = path.join(this.workDir, "seg-%08d.ts");
     const args = [
@@ -189,7 +210,7 @@ class RepackJob {
       "-hls_list_size",
       String(this.profile.playlistSize),
       "-hls_flags",
-      "delete_segments+append_list+omit_endlist+program_date_time",
+      "delete_segments+omit_endlist+program_date_time",
       "-hls_segment_filename",
       segmentPattern,
       this.playlistPath,
@@ -273,15 +294,16 @@ class RepackJob {
     return `seg-${nowMs}-${String(this.remoteSeq).padStart(6, "0")}.ts`;
   }
 
-  async uploadSegment(localName) {
+  async uploadSegment(localName, providedStat = null) {
     const localPath = path.join(this.workDir, localName);
-    let stat;
+    let stat = providedStat;
     try {
-      stat = await fsp.stat(localPath);
+      if (!stat) stat = await fsp.stat(localPath);
     } catch {
       return false;
     }
     if (!stat.isFile() || stat.size <= 0) return false;
+    const localSignature = `${stat.size}:${Math.floor(stat.mtimeMs)}`;
 
     const remoteName = this.buildRemoteSegmentName();
     const remoteKey = `${this.remotePrefix}/${remoteName}`;
@@ -302,6 +324,7 @@ class RepackJob {
       remoteKey,
       uploadedAt: Date.now(),
       bytes: stat.size,
+      localSignature,
     });
     this.remoteHistory.push({
       key: remoteKey,
@@ -346,8 +369,18 @@ class RepackJob {
     if (!segmentLines.length) return;
 
     for (const segmentName of segmentLines) {
-      if (this.uploadedSegments.has(segmentName)) continue;
-      const ok = await this.uploadSegment(segmentName);
+      const localPath = path.join(this.workDir, segmentName);
+      let stat;
+      try {
+        stat = await fsp.stat(localPath);
+      } catch {
+        return;
+      }
+      if (!stat.isFile() || stat.size <= 0) return;
+      const localSignature = `${stat.size}:${Math.floor(stat.mtimeMs)}`;
+      const existing = this.uploadedSegments.get(segmentName);
+      if (existing && existing.localSignature === localSignature) continue;
+      const ok = await this.uploadSegment(segmentName, stat);
       if (!ok) return;
     }
 
