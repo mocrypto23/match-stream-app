@@ -84,6 +84,7 @@ type P2PEngineConstructor = new (config?: { core?: { swarmId?: string } }) => P2
 const PREMATCH_OPEN_WINDOW_MINUTES = 30;
 const STALL_FREEZE_MS = 18000;
 const P2P_STALL_FREEZE_MS = 30000;
+const REPACK_STALE_PLAYLIST_MAX_IDLE_MS = 22_000;
 const P2P_WAITING_RECOVERY_MIN_STALL_MS = 10000;
 const P2P_WAITING_RECOVERY_MAX_BUFFER_AHEAD_S = 0.6;
 const P2P_RECOVERY_THROTTLE_MS = 8000;
@@ -6191,14 +6192,6 @@ export default function WatchPage() {
       }
       const repackPrimaryOnlyMode =
         isRepackPlaylistUrl(selectedUrl) && !repackBypassServersRef.current.has(selectedServer);
-      if (repackPrimaryOnlyMode) {
-        applyCandidatesPreservingSelection([selectedUrl]);
-        setResolverError(null);
-        setResolverLoading(false);
-        resolveLockRef.current = false;
-        resetRecoveryState();
-        return;
-      }
       const server5ResolveDeadlineAt = selectedServer === 5 ? Date.now() + SERVER5_RESOLVE_TOTAL_BUDGET_MS : 0;
       const getServer5ResolveBudgetRemainingMs = () =>
         selectedServer === 5 ? Math.max(0, server5ResolveDeadlineAt - Date.now()) : Number.POSITIVE_INFINITY;
@@ -6214,6 +6207,7 @@ export default function WatchPage() {
         } else {
           seedUrls.push(selectedUrl);
           if (
+            !repackPrimaryOnlyMode &&
             selectedFallbackUrl &&
             isValidHttpUrl(selectedFallbackUrl) &&
             canonicalizeUrl(selectedFallbackUrl) !== canonicalizeUrl(selectedUrl)
@@ -6322,7 +6316,7 @@ export default function WatchPage() {
       ) => {
         if (!incoming.length) return;
         if (selectedServer === 3) mergeServer3Provenance(provenance);
-        if (selectedServer === 5 || selectedServer === 3) {
+        if (selectedServer === 5 || selectedServer === 3 || repackPrimaryOnlyMode) {
           // Server 3/5 are verified-only: do not expose raw/unverified batches to the UI.
           return;
         }
@@ -6666,22 +6660,134 @@ export default function WatchPage() {
             pushDiag("probe fallback server2-playerv2 raw");
           }
           const mergedPreferred =
-            isRepackPlaylistUrl(selectedUrl) && !repackBypassServersRef.current.has(selectedServer)
-              ? dedupeUrls([selectedUrl, ...merged])
+            repackPrimaryOnlyMode
+              ? [selectedUrl]
+              : isRepackPlaylistUrl(selectedUrl) && !repackBypassServersRef.current.has(selectedServer)
+                ? dedupeUrls([selectedUrl, ...merged])
               : merged;
           if (isRepackPlaylistUrl(selectedUrl)) {
-            const seedFrom = dedupeUrls([...verified, ...mergedRaw, ...initialCandidates]).find((candidate) => {
+            const isLikelySeedableCandidate = (candidate: string) => {
               const underlying = String(toUnderlyingUrl(candidate) || candidate || "").trim().toLowerCase();
               if (!underlying) return false;
               if (isRepackPlaylistUrl(underlying)) return false;
               if (!isValidHttpUrl(underlying)) return false;
-              return underlying.includes(".m3u8");
-            });
+              return (
+                underlying.includes(".m3u8") ||
+                /\/hls\/|\/live\/|\/playlist\/|\/manifest\/|\/kooora\//i.test(underlying)
+              );
+            };
+            const pickBestSeedCandidate = (pool: string[], sourceForSeed: string) => {
+              const sourceRaw = String(sourceForSeed || "").trim();
+              const sourceCanonical = canonicalizeUrl(sourceRaw) || sourceRaw.toLowerCase();
+              let sourceHost = "";
+              try {
+                sourceHost = new URL(sourceRaw).hostname.toLowerCase();
+              } catch { }
+              let best = "";
+              let bestScore = Number.NEGATIVE_INFINITY;
+              for (const candidate of dedupeUrls(pool || [])) {
+                if (!isLikelySeedableCandidate(candidate)) continue;
+                const underlyingRaw = String(toUnderlyingUrl(candidate) || candidate || "").trim();
+                const underlying = underlyingRaw.toLowerCase();
+                let score = 0;
+                if (underlying.includes(".m3u8")) score += 140;
+                if (/\/hls\/|\/live\/|\/playlist\/|\/manifest\/|\/kooora\//i.test(underlying)) score += 90;
+                const refUrl = getProxyRefUrlFromCandidate(candidate);
+                const refCanonical = canonicalizeUrl(refUrl) || String(refUrl || "").trim().toLowerCase();
+                if (sourceCanonical && refCanonical && refCanonical === sourceCanonical) score += 520;
+                if (sourceHost) {
+                  if (refCanonical.includes(sourceHost)) score += 180;
+                  try {
+                    const uHost = new URL(underlyingRaw).hostname.toLowerCase();
+                    if (uHost === sourceHost) score += 260;
+                    else if (uHost.endsWith(`.${sourceHost}`) || sourceHost.endsWith(`.${uHost}`)) score += 190;
+                  } catch { }
+                }
+                if (candidate.startsWith("/api/embed-proxy?")) score += 25;
+                if (score > bestScore) {
+                  bestScore = score;
+                  best = candidate;
+                }
+              }
+              return best;
+            };
+            const sourceForSeed = String(selectedFallbackUrl || selectedUrl || "").trim();
+            let seedSourceUrl = sourceForSeed;
+            let seedPool = dedupeUrls([...verified, ...mergedRaw, ...initialCandidates]);
+            let seedFrom = pickBestSeedCandidate(seedPool, sourceForSeed);
+            if (!seedFrom && repackPrimaryOnlyMode && selectedFallbackUrl && isValidHttpUrl(selectedFallbackUrl)) {
+              try {
+                const seedResolved = await resolveCandidatesForServer(selectedFallbackUrl, controller.signal, {
+                  playerv2Diag: pushDiag,
+                  parallelChildConcurrency: Math.min(2, RESOLVE_CHILD_CONCURRENCY),
+                  allowSamePathServVariants: selectedServer === 3 || selectedServer === 4,
+                  livehdServPreference: isServer3Livehd ? "prefer0" : "all",
+                  maxPlayerPages: isServer2Playerv2 ? 1 : 3,
+                  maxDeepCandidates: isServer2Playerv2 ? 4 : 5,
+                  maxPlayerv2Pool: isServer2Playerv2 ? 1 : 0,
+                  fetchTimeoutMs: Math.min(resolveFetchTimeoutFast, 3600),
+                  fetchRetries: 0,
+                  fetchRetryDelayMs: 0,
+                });
+                seedPool = dedupeUrls([...seedPool, ...seedResolved.candidates]);
+                seedFrom = pickBestSeedCandidate(seedPool, sourceForSeed);
+                pushDiag(`repack seed-resolve s${selectedServer} +${seedResolved.candidates.length}`);
+              } catch (e: unknown) {
+                pushDiag(`repack seed-resolve s${selectedServer} fail=${e instanceof Error ? e.message : String(e)}`);
+              }
+            }
+            if (!seedFrom && repackPrimaryOnlyMode) {
+              const selectedKeys = new Set<string>(
+                [
+                  canonicalizeUrl(selectedUrl) || String(selectedUrl || "").trim().toLowerCase(),
+                  canonicalizeUrl(selectedFallbackUrl) || String(selectedFallbackUrl || "").trim().toLowerCase(),
+                ].filter(Boolean)
+              );
+              const alternateSeedSources = dedupeUrls(
+                [
+                  String(match?.stream_url || "").trim(),
+                  String(match?.stream_url_2 || "").trim(),
+                  String(match?.stream_url_3 || "").trim(),
+                  String(match?.stream_url_4 || "").trim(),
+                ].filter((url) => {
+                  const value = String(url || "").trim();
+                  if (!value || !isValidHttpUrl(value)) return false;
+                  const key = canonicalizeUrl(value) || value.toLowerCase();
+                  return !selectedKeys.has(key);
+                })
+              ).slice(0, 3);
+              for (const altSource of alternateSeedSources) {
+                if (seedFrom) break;
+                try {
+                  const altResolved = await resolveCandidatesForServer(altSource, controller.signal, {
+                    playerv2Diag: pushDiag,
+                    parallelChildConcurrency: Math.min(2, RESOLVE_CHILD_CONCURRENCY),
+                    allowSamePathServVariants: selectedServer === 3 || selectedServer === 4,
+                    livehdServPreference: isServer3Livehd ? "prefer0" : "all",
+                    maxPlayerPages: 2,
+                    maxDeepCandidates: 4,
+                    maxPlayerv2Pool: 0,
+                    fetchTimeoutMs: Math.min(resolveFetchTimeoutFast, 3200),
+                    fetchRetries: 0,
+                    fetchRetryDelayMs: 0,
+                  });
+                  seedPool = dedupeUrls([...seedPool, ...altResolved.candidates]);
+                  seedFrom = pickBestSeedCandidate(seedPool, altSource);
+                  if (seedFrom) {
+                    seedSourceUrl = altSource;
+                    pushDiag(`repack seed-alt s${selectedServer} host=${new URL(altSource).hostname} +${altResolved.candidates.length}`);
+                    break;
+                  }
+                  pushDiag(`repack seed-alt s${selectedServer} host=${new URL(altSource).hostname} +0`);
+                } catch (e: unknown) {
+                  pushDiag(`repack seed-alt s${selectedServer} fail=${e instanceof Error ? e.message : String(e)}`);
+                }
+              }
+            }
             if (seedFrom) {
-              const sourceForSeed = String(selectedFallbackUrl || selectedUrl || "").trim();
               void requestRepackSeed({
                 serverId: selectedServer,
-                sourceUrl: sourceForSeed,
+                sourceUrl: seedSourceUrl,
                 sourceCandidate: seedFrom,
               });
             }
@@ -7191,6 +7297,8 @@ export default function WatchPage() {
     keepMutedAutoplay();
     markProgress();
     let fatalRetries = 0;
+    let repackLevelFingerprint = "";
+    let repackLevelChangedAt = Date.now();
     let nativeStartupReported = false;
     const onLoaded = () => {
       if (cancel) return;
@@ -7365,6 +7473,51 @@ export default function WatchPage() {
           }
           reportRepackPlaybackDiag("manifest", selectedServer, selectedHlsUrl);
           playMutedSafely();
+        });
+        instance.on(Hls.Events.LEVEL_LOADED, (_event, data) => {
+          if (cancel) return;
+          if (!isRepackPlaylistUrl(selectedHlsUrl)) return;
+          const details = (data as { details?: { startSN?: number; endSN?: number; fragments?: Array<{ relurl?: string; url?: string }> } })
+            ?.details;
+          let fingerprint = "";
+          const startSN = Number(details?.startSN);
+          const endSN = Number(details?.endSN);
+          if (Number.isFinite(startSN) || Number.isFinite(endSN)) {
+            fingerprint = `${Number.isFinite(startSN) ? startSN : "na"}:${Number.isFinite(endSN) ? endSN : "na"}`;
+          } else if (Array.isArray(details?.fragments) && details.fragments.length) {
+            fingerprint = details.fragments
+              .slice(-2)
+              .map((frag) => String(frag?.relurl || frag?.url || "").trim())
+              .filter(Boolean)
+              .join("|");
+          }
+          if (!fingerprint) return;
+
+          const now = Date.now();
+          if (!repackLevelFingerprint || repackLevelFingerprint !== fingerprint) {
+            repackLevelFingerprint = fingerprint;
+            repackLevelChangedAt = now;
+            return;
+          }
+          const idleMs = now - repackLevelChangedAt;
+          if (idleMs < REPACK_STALE_PLAYLIST_MAX_IDLE_MS) return;
+          if (repackBypassServersRef.current.has(selectedServer)) return;
+
+          pushDiag(`repack stale-manifest s${selectedServer} idle=${idleMs}ms`);
+          repackBypassServersRef.current.add(selectedServer);
+          setRepackBypassVersion((prev) => prev + 1);
+          pushDiag(`repack runtime-bypass s${selectedServer}`);
+          if (useFastFailover) {
+            markCandidateAsBad(selectedServer, selectedHlsUrl, "repack-stale-manifest");
+          }
+          applyCandidatesPreservingSelection([]);
+          selectedCandidateRef.current = 0;
+          setSelectedCandidate(0);
+          setResolverLoading(true);
+          setPlayerError("تحديث R2 متوقف... جاري التحويل تلقائيًا للمصدر الاحتياطي.");
+          scheduleResolveRecovery("repack-stale-manifest", true);
+          hidePlayerLoading();
+          try { instance.stopLoad(); } catch { }
         });
         instance.on(Hls.Events.ERROR, (_event, data) => {
           if (cancel || !data.fatal) return;
