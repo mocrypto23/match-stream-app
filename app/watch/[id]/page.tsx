@@ -6741,6 +6741,10 @@ export default function WatchPage() {
                   const sid = String(urlObj.searchParams.get("sid") || "").trim();
                   const tsRaw = String(urlObj.searchParams.get("ts") || "").trim();
                   const tsVal = Number.parseInt(tsRaw, 10);
+                  const pathname = String(urlObj.pathname || "").toLowerCase();
+                  const qualityTagged = /(?:[_-])(?:\d{3,4}p|sd|hd|fhd|uhd)\.m3u8$/i.test(pathname);
+                  if (qualityTagged) score += 190;
+                  else if (pathname.endsWith(".m3u8")) score -= 70;
                   if ((token || sid) && Number.isFinite(tsVal) && tsVal > 0) {
                     const ageSec = Math.max(0, nowSec - tsVal);
                     if (ageSec > 180) continue;
@@ -6750,6 +6754,14 @@ export default function WatchPage() {
                     score -= 35;
                   }
                 } catch { }
+                if (candidate.startsWith("/api/embed-proxy?")) {
+                  try {
+                    const proxyUrl = new URL(candidate, "http://localhost");
+                    const depth = Number.parseInt(String(proxyUrl.searchParams.get("depth") || "0"), 10);
+                    if (depth >= 1) score += 60;
+                    else score -= 20;
+                  } catch { }
+                }
                 const refUrl = getProxyRefUrlFromCandidate(candidate);
                 const refCanonical = canonicalizeUrl(refUrl) || String(refUrl || "").trim().toLowerCase();
                 if (sourceCanonical && refCanonical && refCanonical === sourceCanonical) score += 520;
