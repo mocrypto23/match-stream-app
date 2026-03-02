@@ -89,7 +89,8 @@ const P2P_WAITING_RECOVERY_MAX_BUFFER_AHEAD_S = 0.6;
 const P2P_RECOVERY_THROTTLE_MS = 8000;
 const PLAYER_LOADING_OVERLAY_DELAY_MS = 1200;
 const DEFAULT_PLAYER_QUALITY_HEIGHT = 480;
-const AUTO_AUDIO_SYNC_ON_START = process.env.NEXT_PUBLIC_AUTO_AUDIO_SYNC_ON_START !== "0";
+// Keep auto-unmute opt-in only; auto audio toggling can trigger browser pause on some devices.
+const AUTO_AUDIO_SYNC_ON_START = process.env.NEXT_PUBLIC_AUTO_AUDIO_SYNC_ON_START === "1";
 const P2P_HLSJS_BROWSER_MODULE_URL = "https://esm.sh/p2p-media-loader-hlsjs@2.2.2?bundle&conditions=browser";
 const ESM_SH_PROCESS_SHIM_URL = "https://esm.sh/node/process.mjs";
 const P2P_FEATURE_FLAG = String(process.env.NEXT_PUBLIC_P2P_ENABLED || "").trim() === "1";
@@ -7233,11 +7234,24 @@ export default function WatchPage() {
     const onPause = () => {
       if (cancel) return;
       if (ignorePauseTrackingRef.current) return;
+      const isSilentPlayback = video.muted || Number(video.volume) <= 0.0001;
       const likelyUserPause =
+        !isSilentPlayback &&
         !video.seeking &&
         !document.hidden &&
         video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA;
-      if (likelyUserPause) userPausedRef.current = true;
+      if (likelyUserPause) {
+        userPausedRef.current = true;
+        return;
+      }
+      // Pause while muted is frequently policy/network side-effect, not explicit user intent.
+      userPausedRef.current = false;
+      queueTimeout(() => {
+        if (cancel || userPausedRef.current) return;
+        if (!video.paused) return;
+        try { hls?.startLoad(); } catch { }
+        playMutedSafely();
+      }, 160);
     };
     const onCanPlay = () => {
       if (cancel) return;
