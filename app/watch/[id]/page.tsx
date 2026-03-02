@@ -5309,7 +5309,6 @@ export default function WatchPage() {
   const repackCacheStatusByServerRef = useRef<Record<number, string>>({});
   const repackStallCountByServerRef = useRef<Record<number, number>>({});
   const repackPlaybackStartedAtByServerRef = useRef<Record<number, number>>({});
-  const repackWarmupRetryByServerRef = useRef<Record<number, number>>({});
 
   const runtimeRepackFlags = useMemo(() => buildClientRepackFlags(match?.repack ?? null), [match?.repack]);
   const p2pEnabledServerSet = useMemo(() => {
@@ -5417,7 +5416,6 @@ export default function WatchPage() {
     repackCacheStatusByServerRef.current = {};
     repackStallCountByServerRef.current = {};
     repackPlaybackStartedAtByServerRef.current = {};
-    repackWarmupRetryByServerRef.current = {};
     setRepackBypassVersion((prev) => prev + 1);
   }, [idNum]);
 
@@ -5977,19 +5975,6 @@ export default function WatchPage() {
       } pct=${selectedOption.repackReadPct ?? 0} bucket=${selectedOption.repackBucket ?? -1}`
     );
   }, [pushDiag, selectedOption]);
-
-  useEffect(() => {
-    if (!selectedOption?.repackActive) return;
-    const repackUrl = String(selectedUrl || "").trim();
-    const fallbackSource = String(selectedFallbackUrl || "").trim();
-    if (!repackUrl || !isRepackPlaylistUrl(repackUrl)) return;
-    if (!fallbackSource || !isValidHttpUrl(toUnderlyingUrl(fallbackSource) || fallbackSource)) return;
-    void requestRepackSeed({
-      serverId: selectedServer,
-      sourceUrl: fallbackSource,
-      sourceCandidate: fallbackSource,
-    });
-  }, [requestRepackSeed, selectedOption?.repackActive, selectedFallbackUrl, selectedServer, selectedUrl]);
 
   useEffect(() => {
     if (!idNum) {
@@ -7333,27 +7318,6 @@ export default function WatchPage() {
               errorDetails.includes("levelloadtimeout"));
           if (repackManifestUnavailable) {
             pushDiag(`repack unavailable code=${responseCode || 0} details=${errorDetails || "n/a"}`);
-            const warmupRetry = repackWarmupRetryByServerRef.current[selectedServer] || 0;
-            if (
-              warmupRetry < 1 &&
-              selectedFallbackUrl &&
-              isValidHttpUrl(toUnderlyingUrl(selectedFallbackUrl) || selectedFallbackUrl)
-            ) {
-              repackWarmupRetryByServerRef.current[selectedServer] = warmupRetry + 1;
-              pushDiag(`repack warmup retry s${selectedServer} attempt=${warmupRetry + 1}`);
-              void requestRepackSeed({
-                serverId: selectedServer,
-                sourceUrl: selectedFallbackUrl,
-                sourceCandidate: selectedFallbackUrl,
-              });
-              queueTimeout(() => {
-                if (cancel) return;
-                try {
-                  instance.startLoad();
-                } catch {}
-              }, 1200);
-              return;
-            }
             if (!repackBypassServersRef.current.has(selectedServer)) {
               repackBypassServersRef.current.add(selectedServer);
               setRepackBypassVersion((prev) => prev + 1);

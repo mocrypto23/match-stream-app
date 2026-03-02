@@ -47,6 +47,31 @@ function normalizeCandidateUrl(raw, playerOrigin) {
   return "";
 }
 
+function safeDecodeURIComponent(value) {
+  try {
+    return decodeURIComponent(String(value || ""));
+  } catch {
+    return String(value || "");
+  }
+}
+
+function isLikelyHlsManifestUrl(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    const pathname = String(url.pathname || "").toLowerCase();
+    const search = String(url.search || "").toLowerCase();
+    if (pathname.endsWith(".m3u8")) return true;
+    if (`${pathname}${search}`.includes(".m3u8")) return true;
+    if (pathname.includes("/api/embed-proxy")) {
+      const target = safeDecodeURIComponent(String(url.searchParams.get("url") || "")).toLowerCase();
+      if (target.includes(".m3u8")) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function readJsonBody(req, maxBytes = 64 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -493,9 +518,9 @@ class RepackManager {
 
   resolveIngestUrl(payload) {
     const candidate = normalizeCandidateUrl(payload.sourceCandidate, this.config.playerOrigin);
-    if (candidate) return candidate;
+    if (candidate && isLikelyHlsManifestUrl(candidate)) return candidate;
     const source = normalizeCandidateUrl(payload.sourceUrl, this.config.playerOrigin);
-    if (source) return source;
+    if (source && isLikelyHlsManifestUrl(source)) return source;
     return "";
   }
 
