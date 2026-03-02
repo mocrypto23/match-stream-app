@@ -393,7 +393,7 @@ class RepackJob {
       key: `${this.remotePrefix}/index.m3u8`,
       body: Buffer.from(rewritten, "utf8"),
       contentType: "application/vnd.apple.mpegurl; charset=utf-8",
-      cacheControl: "public, max-age=1, s-maxage=3, stale-while-revalidate=3",
+      cacheControl: "public, max-age=0, s-maxage=1, must-revalidate",
     });
     this.lastPlaylistLatencyMs = Date.now() - startedAt;
     this.lastPublishAt = Date.now();
@@ -717,8 +717,8 @@ function loadConfig() {
     playerOrigin: String(process.env.REPACK_PLAYER_ORIGIN || "https://tf-player.site").trim(),
     repackServers,
     repackProfile: {
-      segmentDurationSec: toInt(process.env.REPACK_SEGMENT_DURATION_SEC, 4, 2),
-      playlistSize: toInt(process.env.REPACK_PLAYLIST_SIZE, 6, 3),
+      segmentDurationSec: toInt(process.env.REPACK_SEGMENT_DURATION_SEC, 2, 2),
+      playlistSize: toInt(process.env.REPACK_PLAYLIST_SIZE, 4, 3),
     },
     r2Endpoint: String(process.env.R2_ENDPOINT || process.env.REPACK_R2_ENDPOINT || "").trim(),
     r2Bucket: String(process.env.R2_BUCKET || process.env.REPACK_R2_BUCKET || "").trim(),
