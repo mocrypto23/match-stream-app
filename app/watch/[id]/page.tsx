@@ -106,6 +106,9 @@ const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const RESOLVE_COOLDOWN_MS = 1500;
 const REPACK_SEED_DEDUPE_WINDOW_MS = 12_000;
 const REPACK_TOKEN_REFRESH_KICK_MS = 16_000;
+const EMBED_FALLBACK_ENABLED = String(process.env.NEXT_PUBLIC_EMBED_FALLBACK_ENABLED || "0").trim() === "1";
+const LIVE_ONLY_PLAYBACK = String(process.env.NEXT_PUBLIC_LIVE_ONLY_PLAYBACK || "1").trim() !== "0";
+const LIVE_STATUS_MAX_AGE_MS = 4 * 60 * 60 * 1000;
 const CANDIDATE_PROBE_TIMEOUT_MS = 6500;
 const FAST_PHASE_PROBE_TIMEOUT_MS = 2200;
 const FAST_PHASE_MAX_PLAYER_PAGES = 5;
@@ -5873,7 +5876,12 @@ export default function WatchPage() {
       server5Source,
       match?.stream_url_6 ?? null,
     ];
-    const allowRepackRead = String(match?.status_key || "").trim().toLowerCase() === "live";
+    const statusKey = String(match?.status_key || "").trim().toLowerCase();
+    const startAtMs = match?.match_start ? new Date(match.match_start).getTime() : NaN;
+    const liveStatusStaleByClock =
+      statusKey === "live" && Number.isFinite(startAtMs) && nowMs - startAtMs > LIVE_STATUS_MAX_AGE_MS;
+    const isLiveMatch = statusKey === "live" && !liveStatusStaleByClock;
+    const allowRepackRead = isLiveMatch;
 
     const out: ServerOption[] = [];
     for (let i = 0; i < 6; i += 1) {
@@ -5887,7 +5895,22 @@ export default function WatchPage() {
       let repackDecisionReason = "not-eligible";
       let repackReadPct = 0;
       let repackBucket = -1;
-      const repackRuntimeBypass = repackBypassServersRef.current.has(n);
+      if (LIVE_ONLY_PLAYBACK && !isLiveMatch) {
+        const label = SERVER_SOURCE_LABELS[n] || `سيرفر ${n}`;
+        out.push({
+          n,
+          label,
+          url: null,
+          fallbackUrl: null,
+          repackActive: false,
+          repackDecisionReason: "match-not-live-hard-stop",
+          repackReadPct: 0,
+          repackBucket: -1,
+          sticky: false,
+        });
+        continue;
+      }
+      const repackRuntimeBypass = EMBED_FALLBACK_ENABLED && repackBypassServersRef.current.has(n);
       if (repackRuntimeBypass && legacyUrl && capability?.repackEligible) {
         repackDecisionReason = "runtime-unavailable";
       } else if (legacyUrl && idNum && allowRepackRead && capability?.repackEligible) {
@@ -5908,7 +5931,7 @@ export default function WatchPage() {
           });
           if (isValidHttpUrl(repackUrl)) {
             url = repackUrl;
-            fallbackUrl = legacyUrl;
+            fallbackUrl = EMBED_FALLBACK_ENABLED ? legacyUrl : null;
             repackActive = true;
           } else {
             repackDecisionReason = "invalid-repack-url";
@@ -5937,7 +5960,7 @@ export default function WatchPage() {
     SERVER_DISPLAY_ORDER.forEach((n, idx) => orderIndex.set(n, idx));
     out.sort((a, b) => (orderIndex.get(a.n) ?? 999) - (orderIndex.get(b.n) ?? 999));
     return out;
-  }, [match, derivedServer3Url, runtimeServer5Url, server3VerifiedAvailable, idNum, runtimeRepackFlags, viewerSessionId, repackBypassVersion]);
+  }, [match, derivedServer3Url, runtimeServer5Url, server3VerifiedAvailable, idNum, runtimeRepackFlags, viewerSessionId, repackBypassVersion, nowMs]);
 
   const validServers = useMemo(() => serverOptions.filter((s) => s.url && isValidHttpUrl(s.url)), [serverOptions]);
   useEffect(() => {
@@ -5994,10 +6017,18 @@ export default function WatchPage() {
   const server5DbUrl = String(match?.stream_url_5 || "").trim();
   const status = (match?.status_key ?? "").toLowerCase();
   const startMs = match?.match_start ? new Date(match.match_start).getTime() : null;
+  const liveStatusStaleByClock =
+    status === "live" &&
+    startMs !== null &&
+    Number.isFinite(startMs) &&
+    nowMs - startMs > LIVE_STATUS_MAX_AGE_MS;
+  const effectiveStatus = liveStatusStaleByClock ? "finished" : status;
   const prematchMs = PREMATCH_OPEN_WINDOW_MINUTES * 60 * 1000;
   const streamOpenMs = startMs !== null && Number.isFinite(startMs) ? startMs - prematchMs : null;
   const hasStartedByTime = startMs !== null && Number.isFinite(startMs) ? nowMs >= startMs - prematchMs : false;
-  const shouldBlockStream = !(status === "live" || status === "finished") && !hasStartedByTime && status === "upcoming";
+  const shouldBlockStream = LIVE_ONLY_PLAYBACK
+    ? effectiveStatus !== "live"
+    : (!(effectiveStatus === "live" || effectiveStatus === "finished") && !hasStartedByTime && effectiveStatus === "upcoming");
 
   useEffect(() => {
     if (!selectedOption) return;
@@ -6230,8 +6261,19 @@ export default function WatchPage() {
       }
       const repackPrimaryOnlyMode =
         isRepackPlaylistUrl(selectedUrl) && !repackBypassServersRef.current.has(selectedServer);
+      if (repackPrimaryOnlyMode && !EMBED_FALLBACK_ENABLED) {
+        applyCandidatesPreservingSelection([selectedUrl]);
+        setResolverError(null);
+        setResolverLoading(false);
+        resolveLockRef.current = false;
+        resetRecoveryState();
+        return;
+      }
       const resolveSourceUrl =
-        repackPrimaryOnlyMode && selectedFallbackUrl && isValidHttpUrl(selectedFallbackUrl)
+        repackPrimaryOnlyMode &&
+        EMBED_FALLBACK_ENABLED &&
+        selectedFallbackUrl &&
+        isValidHttpUrl(selectedFallbackUrl)
           ? selectedFallbackUrl
           : selectedUrl;
       const server5ResolveDeadlineAt = selectedServer === 5 ? Date.now() + SERVER5_RESOLVE_TOTAL_BUDGET_MS : 0;
@@ -7574,6 +7616,12 @@ export default function WatchPage() {
           const idleMs = now - repackLevelChangedAt;
           if (idleMs < REPACK_STALE_PLAYLIST_MAX_IDLE_MS) return;
           if (repackBypassServersRef.current.has(selectedServer)) return;
+          if (!EMBED_FALLBACK_ENABLED) {
+            pushDiag(`repack stale-manifest s${selectedServer} no-fallback`);
+            setPlayerError("تحديث R2 متوقف مؤقتًا... جاري إعادة المحاولة تلقائيًا.");
+            requestSoftRecovery("repack-stale-no-fallback");
+            return;
+          }
 
           pushDiag(`repack stale-manifest s${selectedServer} idle=${idleMs}ms`);
           repackBypassServersRef.current.add(selectedServer);
@@ -7607,6 +7655,15 @@ export default function WatchPage() {
               errorDetails.includes("manifestparsingerror") ||
               errorDetails.includes("levelparsingerror"));
           if (repackManifestUnavailable) {
+            if (!EMBED_FALLBACK_ENABLED) {
+              pushDiag(`repack unavailable no-fallback code=${responseCode || 0} details=${errorDetails || "n/a"}`);
+              setPlayerError("تعذر تحميل R2 الآن... جاري إعادة المحاولة تلقائيًا.");
+              queueTimeout(() => {
+                requestSoftRecovery("repack-unavailable-no-fallback");
+              }, 250);
+              hidePlayerLoading();
+              return;
+            }
             pushDiag(`repack unavailable code=${responseCode || 0} details=${errorDetails || "n/a"}`);
             if (!repackBypassServersRef.current.has(selectedServer)) {
               repackBypassServersRef.current.add(selectedServer);
@@ -7924,9 +7981,11 @@ export default function WatchPage() {
 
   const prettyStart = formatStartTimeAr(match?.match_start);
   const streamOpenLabel = formatTimeOnlyAr(streamOpenMs);
-  const streamStartNotice = streamOpenLabel
-    ? `سيبدأ البث في الساعة ${streamOpenLabel} (قبل ساعة المباراة بنصف ساعة)`
-    : "سيبدأ البث قبل ساعة المباراة بنصف ساعة";
+  const streamStartNotice = LIVE_ONLY_PLAYBACK && effectiveStatus !== "live"
+    ? "البث متاح فقط عندما تكون حالة المباراة LIVE."
+    : (streamOpenLabel
+      ? `سيبدأ البث في الساعة ${streamOpenLabel} (قبل ساعة المباراة بنصف ساعة)`
+      : "سيبدأ البث قبل ساعة المباراة بنصف ساعة");
   const noStreamLabel = selectedUrl ? NO_STREAM_SELECTED_SERVER_MESSAGE : "لا يوجد بث";
   const home = match?.home_team ?? "الفريق الأول";
   const away = match?.away_team ?? "الفريق الثاني";
