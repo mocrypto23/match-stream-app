@@ -7603,7 +7603,9 @@ export default function WatchPage() {
               errorDetails.includes("manifestloaderror") ||
               errorDetails.includes("manifestloadtimeout") ||
               errorDetails.includes("levelloaderror") ||
-              errorDetails.includes("levelloadtimeout"));
+              errorDetails.includes("levelloadtimeout") ||
+              errorDetails.includes("manifestparsingerror") ||
+              errorDetails.includes("levelparsingerror"));
           if (repackManifestUnavailable) {
             pushDiag(`repack unavailable code=${responseCode || 0} details=${errorDetails || "n/a"}`);
             if (!repackBypassServersRef.current.has(selectedServer)) {
