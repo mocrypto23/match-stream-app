@@ -56,6 +56,47 @@ function safeDecodeURIComponent(value) {
   }
 }
 
+function looksLikeNonStreamAssetPath(pathname) {
+  const p = String(pathname || "").toLowerCase();
+  if (!p) return false;
+  return /\.(?:css|js|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf|eot|map|json|xml|txt|pdf)(?:$|\?)/i.test(p);
+}
+
+function looksLikeHlsishUrl(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    const pathname = String(url.pathname || "").toLowerCase();
+    const search = String(url.search || "").toLowerCase();
+    const combined = `${pathname}${search}`;
+    if (looksLikeNonStreamAssetPath(pathname)) return false;
+    if (pathname.endsWith(".m3u8") || combined.includes(".m3u8")) return true;
+    if (
+      pathname.includes("/hls/") ||
+      pathname.includes("/live/") ||
+      pathname.includes("/stream/") ||
+      pathname.includes("/playlist/") ||
+      pathname.includes("/manifest/") ||
+      pathname.includes("/kooora/")
+    ) {
+      return true;
+    }
+    // Some upstreams expose manifest endpoints without .m3u8 extension.
+    // Tokenized/live params are a strong signal that URL is media-like.
+    if (
+      search.includes("token=") ||
+      search.includes("sid=") ||
+      search.includes("nonce=") ||
+      search.includes("ts=") ||
+      search.includes("session")
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function isLikelyHlsManifestUrl(rawUrl) {
   try {
     const url = new URL(String(rawUrl || ""));
@@ -64,8 +105,11 @@ function isLikelyHlsManifestUrl(rawUrl) {
     if (pathname.endsWith(".m3u8")) return true;
     if (`${pathname}${search}`.includes(".m3u8")) return true;
     if (pathname.includes("/api/embed-proxy")) {
-      const target = safeDecodeURIComponent(String(url.searchParams.get("url") || "")).toLowerCase();
-      if (target.includes(".m3u8")) return true;
+      const target = safeDecodeURIComponent(String(url.searchParams.get("url") || ""));
+      if (looksLikeHlsishUrl(target)) return true;
+    }
+    if (looksLikeHlsishUrl(url.toString())) {
+      return true;
     }
     return false;
   } catch {

@@ -5531,7 +5531,27 @@ export default function WatchPage() {
 
   const applyCandidatesPreservingSelection = useCallback((nextCandidates: string[]) => {
     const server = selectedServerRef.current;
-    const prioritized = prioritizeCandidatesByServer(server, nextCandidates);
+    const normalizedCandidates = (() => {
+      const base = dedupeUrls(nextCandidates || []);
+      const repackBypassActive =
+        server >= 1 && server <= 4 && repackBypassServersRef.current.has(server);
+      if (!repackBypassActive) return base;
+      const out: string[] = [];
+      for (const candidate of base) {
+        const raw = String(candidate || "").trim();
+        if (!raw) continue;
+        if (raw.startsWith("/api/embed-proxy?")) {
+          out.push(raw);
+          continue;
+        }
+        const underlying = String(toUnderlyingUrl(raw) || raw).trim();
+        if (!isValidHttpUrl(underlying)) continue;
+        const proxied = toEmbedProxyUrl(underlying, underlying);
+        if (proxied) out.push(proxied);
+      }
+      return dedupeUrls(out);
+    })();
+    const prioritized = prioritizeCandidatesByServer(server, normalizedCandidates);
     const next = filterCandidatesByHealth(server, prioritized);
     const prev = candidatesRef.current;
     const prevIdx = selectedCandidateRef.current;
@@ -6163,6 +6183,16 @@ export default function WatchPage() {
     (async () => {
       if (!selectedUrl || shouldBlockStream) {
         applyCandidatesPreservingSelection([]);
+        setResolverError(null);
+        setResolverLoading(false);
+        resolveLockRef.current = false;
+        resetRecoveryState();
+        return;
+      }
+      const repackPrimaryOnlyMode =
+        isRepackPlaylistUrl(selectedUrl) && !repackBypassServersRef.current.has(selectedServer);
+      if (repackPrimaryOnlyMode) {
+        applyCandidatesPreservingSelection([selectedUrl]);
         setResolverError(null);
         setResolverLoading(false);
         resolveLockRef.current = false;
@@ -7359,7 +7389,13 @@ export default function WatchPage() {
             if (useFastFailover) {
               markCandidateAsBad(selectedServer, selectedHlsUrl, `repack-unavailable-${responseCode || 0}`);
             }
-            moveNext("repack-unavailable");
+            applyCandidatesPreservingSelection([]);
+            selectedCandidateRef.current = 0;
+            setSelectedCandidate(0);
+            setResolverLoading(true);
+            setPlayerError("تعذر تشغيل R2... جاري التحويل تلقائيًا للمصدر الاحتياطي.");
+            scheduleResolveRecovery("repack-runtime-bypass", true);
+            hidePlayerLoading();
             return;
           }
           fatalRetries += 1;
@@ -7546,15 +7582,22 @@ export default function WatchPage() {
           !isRepackPlaylistUrl(fallbackUnderlying) &&
           isValidHttpUrl(fallbackUnderlying);
         if (canSwitchToLegacyFallback) {
-          pushDiag("repack single-source stall -> legacy fallback");
+          pushDiag("repack single-source stall -> runtime bypass");
           trackRepackFallback("stall-single-source", selectedHlsUrl, fallbackCandidate);
+          if (!repackBypassServersRef.current.has(selectedServer)) {
+            repackBypassServersRef.current.add(selectedServer);
+            setRepackBypassVersion((prev) => prev + 1);
+            pushDiag(`repack runtime-bypass s${selectedServer}`);
+          }
           if (useFastFailover) {
             markCandidateAsBad(selectedServer, selectedHlsUrl, "repack-single-source-stall");
           }
-          applyCandidatesPreservingSelection([fallbackCandidate]);
+          applyCandidatesPreservingSelection([]);
           selectedCandidateRef.current = 0;
           setSelectedCandidate(0);
+          setResolverLoading(true);
           setPlayerError("تم التحويل تلقائيًا للمصدر الاحتياطي لضمان استمرارية البث.");
+          scheduleResolveRecovery("repack-stall-runtime-bypass", true);
           hidePlayerLoading();
           freezeTriggered = false;
           stallFreezeCount = 0;
