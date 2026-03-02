@@ -6468,7 +6468,7 @@ export default function WatchPage() {
           setResolverLoading(true);
         }
 
-        if (isServer2Playerv2) {
+        if (isServer2Playerv2 && !repackPrimaryOnlyMode) {
           const stickyFallback = getPlayerv2StickyCandidates(resolveSourceUrl);
           const lightweight = dedupeUrls([...candidatesRef.current, ...fastMerged, ...stickyFallback]);
           applyCandidatesPreservingSelection(lightweight);
