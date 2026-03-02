@@ -176,6 +176,7 @@ class RepackJob {
     this.lastUploadLatencyMs = 0;
     this.lastPlaylistLatencyMs = 0;
     this.remoteHistory = [];
+    this.lastStaleRestartAt = 0;
     this.ffmpegProc = null;
     this.uploadTimer = null;
     this.monitorTimer = null;
@@ -318,6 +319,22 @@ class RepackJob {
       } else {
         this.spawnFfmpeg();
       }
+      return;
+    }
+
+    // If source is unchanged but stream is stale/restarting, force ffmpeg recycle.
+    const now = Date.now();
+    const staleMs = this.manager.config.seedRestartStaleMs;
+    const noPublishYet = !this.lastPublishAt && now - this.createdAt > staleMs;
+    const stalePublish = !!this.lastPublishAt && now - this.lastPublishAt > staleMs;
+    if ((this.state === "restarting" || noPublishYet || stalePublish) && this.ffmpegProc) {
+      this.manager.log("warn", "repack seed-triggered restart", {
+        job: this.key,
+        staleMs: this.lastPublishAt ? now - this.lastPublishAt : now - this.createdAt,
+      });
+      try {
+        this.ffmpegProc.kill("SIGTERM");
+      } catch {}
     }
   }
 
@@ -393,7 +410,7 @@ class RepackJob {
       key: `${this.remotePrefix}/index.m3u8`,
       body: Buffer.from(rewritten, "utf8"),
       contentType: "application/vnd.apple.mpegurl; charset=utf-8",
-      cacheControl: "public, max-age=0, s-maxage=1, must-revalidate",
+      cacheControl: "no-store, no-cache, must-revalidate, max-age=0",
     });
     this.lastPlaylistLatencyMs = Date.now() - startedAt;
     this.lastPublishAt = Date.now();
@@ -491,7 +508,16 @@ class RepackJob {
     }
     const staleMs = this.manager.config.stalePublishMs;
     if (this.lastPublishAt && now - this.lastPublishAt > staleMs) {
-      this.manager.log("warn", "repack stale publish", { job: this.key, staleMs: now - this.lastPublishAt });
+      const staleForMs = now - this.lastPublishAt;
+      this.manager.log("warn", "repack stale publish", { job: this.key, staleMs: staleForMs });
+      const restartCooldownMs = this.manager.config.staleRestartCooldownMs;
+      if (this.ffmpegProc && now - this.lastStaleRestartAt >= restartCooldownMs) {
+        this.lastStaleRestartAt = now;
+        this.manager.log("warn", "repack stale restart", { job: this.key, staleMs: staleForMs });
+        try {
+          this.ffmpegProc.kill("SIGTERM");
+        } catch {}
+      }
     }
   }
 
@@ -709,7 +735,9 @@ function loadConfig() {
     uploadPollMs: toInt(process.env.REPACK_UPLOAD_POLL_MS, 1200, 400),
     // Keep seeded jobs alive long enough for full match windows unless explicitly overridden by env.
     idleStopMs: toInt(process.env.REPACK_IDLE_STOP_MS, 8 * 60 * 60 * 1000, 10_000),
-    stalePublishMs: toInt(process.env.REPACK_STALE_PUBLISH_MS, 25_000, 4000),
+    stalePublishMs: toInt(process.env.REPACK_STALE_PUBLISH_MS, 8_000, 3000),
+    staleRestartCooldownMs: toInt(process.env.REPACK_STALE_RESTART_COOLDOWN_MS, 9_000, 3000),
+    seedRestartStaleMs: toInt(process.env.REPACK_SEED_RESTART_STALE_MS, 7_000, 3000),
     localRetentionMs: toInt(process.env.REPACK_LOCAL_RETENTION_MS, 8 * 60 * 1000, 30_000),
     remoteRetentionMs: toInt(process.env.REPACK_REMOTE_RETENTION_MS, 8 * 60 * 1000, 30_000),
     liveOnly: toBool(process.env.REPACK_LIVE_ONLY, true),
@@ -718,7 +746,7 @@ function loadConfig() {
     repackServers,
     repackProfile: {
       segmentDurationSec: toInt(process.env.REPACK_SEGMENT_DURATION_SEC, 2, 2),
-      playlistSize: toInt(process.env.REPACK_PLAYLIST_SIZE, 4, 3),
+      playlistSize: toInt(process.env.REPACK_PLAYLIST_SIZE, 3, 3),
     },
     r2Endpoint: String(process.env.R2_ENDPOINT || process.env.REPACK_R2_ENDPOINT || "").trim(),
     r2Bucket: String(process.env.R2_BUCKET || process.env.REPACK_R2_BUCKET || "").trim(),

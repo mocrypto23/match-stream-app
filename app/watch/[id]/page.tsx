@@ -84,7 +84,7 @@ type P2PEngineConstructor = new (config?: { core?: { swarmId?: string } }) => P2
 const PREMATCH_OPEN_WINDOW_MINUTES = 30;
 const STALL_FREEZE_MS = 18000;
 const P2P_STALL_FREEZE_MS = 30000;
-const REPACK_STALE_PLAYLIST_MAX_IDLE_MS = 22_000;
+const REPACK_STALE_PLAYLIST_MAX_IDLE_MS = 5_000;
 const P2P_WAITING_RECOVERY_MIN_STALL_MS = 10000;
 const P2P_WAITING_RECOVERY_MAX_BUFFER_AHEAD_S = 0.6;
 const P2P_RECOVERY_THROTTLE_MS = 8000;
@@ -104,6 +104,8 @@ const P2P_PROFILE = (() => {
 })();
 const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const RESOLVE_COOLDOWN_MS = 1500;
+const REPACK_SEED_DEDUPE_WINDOW_MS = 12_000;
+const REPACK_TOKEN_REFRESH_KICK_MS = 16_000;
 const CANDIDATE_PROBE_TIMEOUT_MS = 6500;
 const FAST_PHASE_PROBE_TIMEOUT_MS = 2200;
 const FAST_PHASE_MAX_PLAYER_PAGES = 5;
@@ -135,10 +137,10 @@ const SERVER4_PROBE_TIMEOUT_MS = 12000;
 const SERVER4_FETCH_RETRIES = 1;
 const SERVER4_FETCH_RETRY_DELAY_MS = 220;
 const RESOLVE_RESULT_CACHE_TTL_MS = 75_000;
-const PLAYERV2_RESOLVE_CACHE_TTL_MS = 45_000;
+const PLAYERV2_RESOLVE_CACHE_TTL_MS = 18_000;
 const PLAYERV2_STICKY_CACHE_TTL_MS = 8 * 60_000;
-const PLAYERV2_TOKEN_CACHE_TTL_MS = 120_000;
-const PLAYERV2_TOKEN_STALE_FALLBACK_MS = 15 * 60_000;
+const PLAYERV2_TOKEN_CACHE_TTL_MS = 20_000;
+const PLAYERV2_TOKEN_STALE_FALLBACK_MS = 6_000;
 const SERVER5_SIBLING_DISCOVERY_TTL_MS = 4 * 60_000;
 const PLAYERV2_CACHE_MAX_CANDIDATES = 32;
 const RESOLVE_RESULT_CACHE_MAX = 250;
@@ -5305,7 +5307,7 @@ export default function WatchPage() {
   const server5RefreshInFlightRef = useRef<Promise<string | null> | null>(null);
   const server5PrewarmResolveInFlightRef = useRef<Map<string, Promise<string[]>>>(new Map());
   const server3AutoSwitchWindowRef = useRef<{ windowStart: number; count: number }>({ windowStart: 0, count: 0 });
-  const repackSeedSentRef = useRef<Set<string>>(new Set());
+  const repackSeedSentRef = useRef<Map<string, number>>(new Map());
   const repackBypassServersRef = useRef<Set<number>>(new Set());
   const repackFallbackReasonByServerRef = useRef<Record<number, string>>({});
   const repackCacheStatusByServerRef = useRef<Record<number, string>>({});
@@ -5361,9 +5363,18 @@ export default function WatchPage() {
       if (!sourceCandidate || !sourceUrl) return;
       if (!isValidHttpUrl(candidateUnderlying) || !isValidHttpUrl(sourceUnderlying)) return;
       if (isRepackPlaylistUrl(candidateUnderlying) || isRepackPlaylistUrl(sourceUnderlying)) return;
-      const dedupeKey = `${idNum}:${params.serverId}:${canonicalizeUrl(sourceCandidate) || sourceCandidate}`;
-      if (repackSeedSentRef.current.has(dedupeKey)) return;
-      repackSeedSentRef.current.add(dedupeKey);
+      const dedupeKey = `${idNum}:${params.serverId}:${canonicalizeUrl(sourceUrl) || sourceUrl}|${
+        canonicalizeUrl(sourceCandidate) || sourceCandidate
+      }`;
+      const now = Date.now();
+      for (const [key, sentAt] of repackSeedSentRef.current.entries()) {
+        if (now - sentAt > REPACK_SEED_DEDUPE_WINDOW_MS * 8) {
+          repackSeedSentRef.current.delete(key);
+        }
+      }
+      const lastSentAt = repackSeedSentRef.current.get(dedupeKey) || 0;
+      if (now - lastSentAt < REPACK_SEED_DEDUPE_WINDOW_MS) return;
+      repackSeedSentRef.current.set(dedupeKey, now);
       try {
         const response = await fetch("/api/repack/seed", {
           method: "POST",
@@ -5412,7 +5423,7 @@ export default function WatchPage() {
   }, [match?.id, match?.stream_url_3, derivedServer3Url]);
 
   useEffect(() => {
-    repackSeedSentRef.current = new Set();
+    repackSeedSentRef.current = new Map();
     repackBypassServersRef.current = new Set();
     repackFallbackReasonByServerRef.current = {};
     repackCacheStatusByServerRef.current = {};
@@ -6176,6 +6187,33 @@ export default function WatchPage() {
   }, [candidates.length, selectedCandidate]);
 
   useEffect(() => {
+    if (!idNum || shouldBlockStream) return;
+    if (selectedServer < 1 || selectedServer > 4) return;
+    if (!isRepackPlaylistUrl(selectedUrl)) return;
+    if (repackBypassServersRef.current.has(selectedServer)) return;
+    const fallbackProbe = String(selectedFallbackUrl || "").trim();
+    const needsTokenRefresh =
+      isPlayerv2LikeUrl(fallbackProbe) || /[?&](?:token|sid|nonce|ts)=/i.test(fallbackProbe);
+    if (!needsTokenRefresh) return;
+
+    const timerId = window.setInterval(() => {
+      const now = Date.now();
+      if (resolveLockRef.current) {
+        pendingResolveKickReasonRef.current = "repack-token-refresh";
+        return;
+      }
+      if (now - lastResolveKickRef.current < RESOLVE_COOLDOWN_MS) return;
+      lastResolveKickRef.current = now;
+      setResolveRevision((prev) => prev + 1);
+      pushDiag("resolve bump (repack-token-refresh)");
+    }, REPACK_TOKEN_REFRESH_KICK_MS);
+
+    return () => {
+      window.clearInterval(timerId);
+    };
+  }, [idNum, selectedServer, selectedUrl, selectedFallbackUrl, shouldBlockStream, pushDiag]);
+
+  useEffect(() => {
     let cancel = false;
     const controller = new AbortController();
     const resolveId = activeResolveIdRef.current + 1;
@@ -6192,6 +6230,10 @@ export default function WatchPage() {
       }
       const repackPrimaryOnlyMode =
         isRepackPlaylistUrl(selectedUrl) && !repackBypassServersRef.current.has(selectedServer);
+      const resolveSourceUrl =
+        repackPrimaryOnlyMode && selectedFallbackUrl && isValidHttpUrl(selectedFallbackUrl)
+          ? selectedFallbackUrl
+          : selectedUrl;
       const server5ResolveDeadlineAt = selectedServer === 5 ? Date.now() + SERVER5_RESOLVE_TOTAL_BUDGET_MS : 0;
       const getServer5ResolveBudgetRemainingMs = () =>
         selectedServer === 5 ? Math.max(0, server5ResolveDeadlineAt - Date.now()) : Number.POSITIVE_INFINITY;
@@ -6205,7 +6247,7 @@ export default function WatchPage() {
             seedUrls.push(original);
           }
         } else {
-          seedUrls.push(selectedUrl);
+          seedUrls.push(resolveSourceUrl);
           if (
             !repackPrimaryOnlyMode &&
             selectedFallbackUrl &&
@@ -6233,12 +6275,12 @@ export default function WatchPage() {
         return out;
       })();
       const isServer1Primary = selectedServer === 1;
-      const isServer2Playerv2 = selectedServer === 2 && isPlayerv2LikeUrl(selectedUrl);
-      const isServer3Livehd = selectedServer === 3 && isLivehd77LikeUrl(selectedUrl);
+      const isServer2Playerv2 = selectedServer === 2 && isPlayerv2LikeUrl(resolveSourceUrl);
+      const isServer3Livehd = selectedServer === 3 && isLivehd77LikeUrl(resolveSourceUrl);
       const isServer4Livekora = selectedServer === 4;
-      const disableResolveCache = selectedServer === 3 || selectedServer === 4 || selectedServer === 5;
-      const cachedCandidates = disableResolveCache ? [] : getCachedResolveCandidates(selectedUrl);
-      const stickyCandidates = isServer2Playerv2 ? getPlayerv2StickyCandidates(selectedUrl) : [];
+      const disableResolveCache = selectedServer === 3 || selectedServer === 4 || selectedServer === 5 || repackPrimaryOnlyMode;
+      const cachedCandidates = disableResolveCache ? [] : getCachedResolveCandidates(resolveSourceUrl);
+      const stickyCandidates = isServer2Playerv2 ? getPlayerv2StickyCandidates(resolveSourceUrl) : [];
       let prewarmedServer5Candidates = selectedServer === 5 ? getServer5PrewarmCandidates(selectedUrl) : [];
       if (selectedServer === 5 && !prewarmedServer5Candidates.length) {
         const warmPromise = warmServer5PrewarmCandidates(selectedUrl, "resolve");
@@ -6324,8 +6366,8 @@ export default function WatchPage() {
         const merged = dedupeUrls([...candidatesRef.current, ...incoming]);
         applyCandidatesPreservingSelection(merged);
         setResolverError(null);
-        if (isServer2Playerv2) setPlayerv2StickyCandidates(selectedUrl, merged);
-        if (!disableResolveCache) setCachedResolveCandidates(selectedUrl, merged);
+        if (isServer2Playerv2) setPlayerv2StickyCandidates(resolveSourceUrl, merged);
+        if (!disableResolveCache) setCachedResolveCandidates(resolveSourceUrl, merged);
       };
 
       setResolverError(null);
@@ -6336,7 +6378,7 @@ export default function WatchPage() {
       if (prewarmedServer5Candidates.length) pushDiag(`server5 prewarm hit +${prewarmedServer5Candidates.length}`);
       if (seedCandidates.length) pushDiag(`resolve seed +${seedCandidates.length}`);
       try {
-        const fastResolved = await resolveCandidatesForServer(selectedUrl, controller.signal, {
+        const fastResolved = await resolveCandidatesForServer(resolveSourceUrl, controller.signal, {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
           allowSamePathServVariants: selectedServer === 3 || selectedServer === 4,
@@ -6416,8 +6458,8 @@ export default function WatchPage() {
         } else if (fastMerged.length) {
           hadPlayable = true;
           applyCandidatesPreservingSelection(fastMerged);
-          if (isServer2Playerv2) setPlayerv2StickyCandidates(selectedUrl, fastMerged);
-          if (!disableResolveCache) setCachedResolveCandidates(selectedUrl, fastMerged);
+          if (isServer2Playerv2) setPlayerv2StickyCandidates(resolveSourceUrl, fastMerged);
+          if (!disableResolveCache) setCachedResolveCandidates(resolveSourceUrl, fastMerged);
           setPlayerError(null);
           setResolverError(null);
           resetRecoveryState();
@@ -6427,13 +6469,13 @@ export default function WatchPage() {
         }
 
         if (isServer2Playerv2) {
-          const stickyFallback = getPlayerv2StickyCandidates(selectedUrl);
+          const stickyFallback = getPlayerv2StickyCandidates(resolveSourceUrl);
           const lightweight = dedupeUrls([...candidatesRef.current, ...fastMerged, ...stickyFallback]);
           applyCandidatesPreservingSelection(lightweight);
           if (lightweight.length) {
             hadPlayable = true;
-            setPlayerv2StickyCandidates(selectedUrl, lightweight);
-            if (!disableResolveCache) setCachedResolveCandidates(selectedUrl, lightweight);
+            setPlayerv2StickyCandidates(resolveSourceUrl, lightweight);
+            if (!disableResolveCache) setCachedResolveCandidates(resolveSourceUrl, lightweight);
             setPlayerError(null);
             resetRecoveryState();
             setResolverError(null);
@@ -6459,7 +6501,7 @@ export default function WatchPage() {
             ? Math.min(resolveFetchTimeoutFinal, Math.max(1200, getServer5ResolveBudgetRemainingMs() - 250))
             : resolveFetchTimeoutFinal;
 
-        const finalResolved = await resolveCandidatesForServer(selectedUrl, controller.signal, {
+        const finalResolved = await resolveCandidatesForServer(resolveSourceUrl, controller.signal, {
           playerv2Diag: pushDiag,
           parallelChildConcurrency: RESOLVE_CHILD_CONCURRENCY,
           allowSamePathServVariants: selectedServer === 3 || selectedServer === 4,
@@ -6797,10 +6839,10 @@ export default function WatchPage() {
           if (selectedServer === 5 && merged.length) {
             setServer5PrewarmCandidates(selectedUrl, merged);
           }
-          if (mergedPreferred.length && !disableResolveCache) setCachedResolveCandidates(selectedUrl, mergedPreferred);
+          if (mergedPreferred.length && !disableResolveCache) setCachedResolveCandidates(resolveSourceUrl, mergedPreferred);
           if (!mergedPreferred.length) {
-            const keepPlayerv2Cache = selectedServer === 2 && isPlayerv2LikeUrl(selectedUrl);
-            if (!keepPlayerv2Cache) clearCachedResolveCandidates(selectedUrl);
+            const keepPlayerv2Cache = selectedServer === 2 && isPlayerv2LikeUrl(resolveSourceUrl);
+            if (!keepPlayerv2Cache) clearCachedResolveCandidates(resolveSourceUrl);
             setResolverError(NO_STREAM_SELECTED_SERVER_MESSAGE);
             if (selectedServer !== 3) scheduleResolveRecovery("resolver-empty");
             else resetRecoveryState();
@@ -7431,15 +7473,16 @@ export default function WatchPage() {
         backBufferLength: isServer5Playback ? SERVER5_HLS_BACK_BUFFER_LENGTH : 20,
         maxBufferLength: isServer5Playback
           ? SERVER5_HLS_MAX_BUFFER_LENGTH
-          : (isRepackPlayback ? 10 : (isP2PPlayback ? p2pTuning.maxBufferLength : 18)),
-        maxMaxBufferLength: isServer5Playback ? SERVER5_HLS_MAX_MAX_BUFFER_LENGTH : (isRepackPlayback ? 20 : 40),
+          : (isRepackPlayback ? 6 : (isP2PPlayback ? p2pTuning.maxBufferLength : 18)),
+        maxMaxBufferLength: isServer5Playback ? SERVER5_HLS_MAX_MAX_BUFFER_LENGTH : (isRepackPlayback ? 10 : 40),
         maxBufferSize: isP2PPlayback ? p2pTuning.maxBufferSize : 60 * 1000 * 1000,
         liveSyncDurationCount: isServer5Playback
           ? SERVER5_HLS_LIVE_SYNC_COUNT
           : (isRepackPlayback ? 1 : (isP2PPlayback ? p2pTuning.liveSyncDurationCount : 2)),
         liveMaxLatencyDurationCount: isServer5Playback
           ? SERVER5_HLS_LIVE_MAX_LATENCY_COUNT
-          : (isRepackPlayback ? 3 : (isP2PPlayback ? p2pTuning.liveMaxLatencyDurationCount : 6)),
+          : (isRepackPlayback ? 2 : (isP2PPlayback ? p2pTuning.liveMaxLatencyDurationCount : 6)),
+        maxLiveSyncPlaybackRate: isRepackPlayback ? 1.35 : 1,
         startPosition: -1,
         startFragPrefetch: true,
         maxBufferHole: 1.2,

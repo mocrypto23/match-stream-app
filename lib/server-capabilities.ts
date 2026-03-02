@@ -18,7 +18,7 @@ export type ServerCapability = {
 
 const DEFAULT_REPACK_PROFILE: RepackProfile = {
   segmentDurationSec: 2,
-  playlistSize: 4,
+  playlistSize: 3,
 };
 
 const CAPABILITY_REGISTRY: Record<number, ServerCapability> = {
