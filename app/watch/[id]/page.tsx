@@ -5385,8 +5385,8 @@ export default function WatchPage() {
           body: JSON.stringify({
             matchId: idNum,
             serverId: params.serverId,
-            sourceUrl,
-            sourceCandidate,
+            sourceUrl: sourceUnderlying,
+            sourceCandidate: candidateUnderlying,
             matchStatus: String(match.status_key || ""),
             viewerSessionId,
           }),
