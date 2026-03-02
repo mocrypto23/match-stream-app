@@ -7241,6 +7241,7 @@ export default function WatchPage() {
       playMutedSafely();
     } else if (Hls.isSupported()) {
       const isServer5Playback = selectedServer === 5;
+      const isRepackPlayback = isRepackPlaylistUrl(selectedHlsUrl);
       const baseHlsConfig = {
         enableWorker: true,
         xhrSetup: (xhr: XMLHttpRequest, requestUrl: string) => {
@@ -7255,20 +7256,20 @@ export default function WatchPage() {
             }
           });
         },
-        lowLatencyMode: false,
+        lowLatencyMode: isRepackPlayback,
         capLevelToPlayerSize: true,
         backBufferLength: isServer5Playback ? SERVER5_HLS_BACK_BUFFER_LENGTH : 90,
         maxBufferLength: isServer5Playback
           ? SERVER5_HLS_MAX_BUFFER_LENGTH
-          : (isP2PPlayback ? p2pTuning.maxBufferLength : 60),
-        maxMaxBufferLength: isServer5Playback ? SERVER5_HLS_MAX_MAX_BUFFER_LENGTH : 120,
+          : (isRepackPlayback ? 24 : (isP2PPlayback ? p2pTuning.maxBufferLength : 60)),
+        maxMaxBufferLength: isServer5Playback ? SERVER5_HLS_MAX_MAX_BUFFER_LENGTH : (isRepackPlayback ? 48 : 120),
         maxBufferSize: isP2PPlayback ? p2pTuning.maxBufferSize : 60 * 1000 * 1000,
         liveSyncDurationCount: isServer5Playback
           ? SERVER5_HLS_LIVE_SYNC_COUNT
-          : (isP2PPlayback ? p2pTuning.liveSyncDurationCount : 5),
+          : (isRepackPlayback ? 3 : (isP2PPlayback ? p2pTuning.liveSyncDurationCount : 5)),
         liveMaxLatencyDurationCount: isServer5Playback
           ? SERVER5_HLS_LIVE_MAX_LATENCY_COUNT
-          : (isP2PPlayback ? p2pTuning.liveMaxLatencyDurationCount : 15),
+          : (isRepackPlayback ? 8 : (isP2PPlayback ? p2pTuning.liveMaxLatencyDurationCount : 15)),
         startFragPrefetch: true,
         maxBufferHole: 1.2,
         highBufferWatchdogPeriod: 2,

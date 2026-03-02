@@ -176,6 +176,8 @@ class RepackJob {
       DEFAULT_USER_AGENT,
       "-rw_timeout",
       "15000000",
+      "-live_start_index",
+      "-1",
       "-i",
       this.ingestUrl,
       "-c",
