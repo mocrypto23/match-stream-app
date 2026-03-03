@@ -6795,6 +6795,8 @@ export default function WatchPage() {
               if (!underlying) return false;
               if (isRepackPlaylistUrl(underlying)) return false;
               if (!isValidHttpUrl(underlying)) return false;
+              if (underlying.includes(".mpd")) return false;
+              if (underlying.includes("/dash/") && !underlying.includes(".m3u8")) return false;
               return (
                 underlying.includes(".m3u8") ||
                 /\/hls\/|\/live\/|\/playlist\/|\/manifest\/|\/kooora\//i.test(underlying)

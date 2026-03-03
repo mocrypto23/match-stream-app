@@ -69,6 +69,8 @@ function looksLikeHlsishUrl(rawUrl) {
     const search = String(url.search || "").toLowerCase();
     const combined = `${pathname}${search}`;
     if (looksLikeNonStreamAssetPath(pathname)) return false;
+    if (pathname.endsWith(".mpd") || combined.includes(".mpd")) return false;
+    if (pathname.includes("/dash/") && !pathname.endsWith(".m3u8") && !combined.includes(".m3u8")) return false;
     if (pathname.endsWith(".m3u8") || combined.includes(".m3u8")) return true;
     if (
       pathname.includes("/hls/") ||
@@ -102,6 +104,7 @@ function isLikelyHlsManifestUrl(rawUrl) {
     const url = new URL(String(rawUrl || ""));
     const pathname = String(url.pathname || "").toLowerCase();
     const search = String(url.search || "").toLowerCase();
+    if (pathname.endsWith(".mpd") || `${pathname}${search}`.includes(".mpd")) return false;
     if (pathname.endsWith(".m3u8")) return true;
     if (`${pathname}${search}`.includes(".m3u8")) return true;
     if (pathname.includes("/api/embed-proxy")) {
