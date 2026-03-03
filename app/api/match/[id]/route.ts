@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "../../_supabase";
 import { getRuntimeRepackFlags } from "@/lib/repack-flags";
+import { buildMatchR2Status } from "@/lib/r2-status";
 import { listServerCapabilities } from "@/lib/server-capabilities";
+import { getServerStreamMode } from "@/lib/stream-mode";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -947,6 +949,13 @@ export async function GET(req: Request, ctx: Ctx) {
   }
 
   const repackFlags = getRuntimeRepackFlags();
+  const streamMode = getServerStreamMode();
+  const r2Status = await buildMatchR2Status({
+    mode: streamMode,
+    matchId: Number(payload.id),
+    row: payload,
+    repackBaseUrl: repackFlags.publicBaseUrl,
+  });
   const repackHints = {
     enabled: repackFlags.enabled,
     readPct: repackFlags.readPct,
@@ -968,6 +977,8 @@ export async function GET(req: Request, ctx: Ctx) {
 
   const res = NextResponse.json({
     ...payload,
+    stream_mode: streamMode,
+    r2Status,
     repack: repackHints,
   });
   res.headers.set("Cache-Control", "public, s-maxage=10, stale-while-revalidate=60");

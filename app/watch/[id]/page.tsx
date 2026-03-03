@@ -9,7 +9,10 @@ import {
   isRepackPlaylistUrl,
   shouldUseRepackForViewer,
 } from "@/lib/repack-flags";
+import type { MatchR2Status, R2StatusServerEntry } from "@/lib/r2-status-types";
 import { getServerCapability } from "@/lib/server-capabilities";
+import { getSlotServerIdForUiServer, type UiServerId } from "@/lib/server-source-policy";
+import { getClientStreamMode, isR2StrictMode, type StreamMode } from "@/lib/stream-mode";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -28,6 +31,9 @@ type MatchRow = {
   stream_url_6?: string | null;
   match_start?: string | null;
   status_key?: string | null;
+  stream_mode?: StreamMode;
+  r2Status?: MatchR2Status | null;
+  r2_status?: MatchR2Status | null;
   repack?: {
     enabled?: boolean;
     readPct?: number;
@@ -96,6 +102,8 @@ const P2P_HLSJS_BROWSER_MODULE_URL = "https://esm.sh/p2p-media-loader-hlsjs@2.2.
 const ESM_SH_PROCESS_SHIM_URL = "https://esm.sh/node/process.mjs";
 const P2P_FEATURE_FLAG = String(process.env.NEXT_PUBLIC_P2P_ENABLED || "").trim() === "1";
 const REPACK_FLAGS = getRuntimeRepackFlags();
+const STREAM_MODE = getClientStreamMode();
+const R2_STRICT_MODE = isR2StrictMode(STREAM_MODE);
 const P2P_PROFILE = (() => {
   const raw = String(process.env.NEXT_PUBLIC_P2P_PROFILE || "").trim().toLowerCase();
   if (raw === "max-stability") return "max-stability" as const;
@@ -1266,6 +1274,7 @@ function pickDefaultHlsLevel(levels: Array<{ height?: number }>, preferredHeight
 }
 
 function toEmbedProxyUrl(rawUrl?: string | null, ref?: string) {
+  if (R2_STRICT_MODE) return "";
   const value = String(rawUrl || "").trim();
   if (!value) return "";
   if (isRepackPlaylistUrl(value)) return value;
@@ -5269,6 +5278,7 @@ export default function WatchPage() {
   }, [rawId]);
 
   const [match, setMatch] = useState<MatchRow | null>(null);
+  const [r2Status, setR2Status] = useState<MatchR2Status | null>(null);
   const [viewerSessionId] = useState<string>(() => getOrCreateViewerSessionId());
   const [derivedServer3Url, setDerivedServer3Url] = useState<string | null>(null);
   const [server3DeriveState, setServer3DeriveState] = useState<Server3DeriveState>("idle");
@@ -5468,6 +5478,7 @@ export default function WatchPage() {
     repackRecoveryErrorCountByServerRef.current = {};
     repackPlaybackStartedAtByServerRef.current = {};
     setRepackBypassVersion((prev) => prev + 1);
+    if (R2_STRICT_MODE) setR2Status(null);
   }, [idNum]);
 
   const mergeServer3Provenance = useCallback((incoming?: Map<string, Server3CandidateProvenance>) => {
@@ -5528,12 +5539,12 @@ export default function WatchPage() {
         .map((item) => item.candidate);
     }
     if (server === 2 && base.length > 1) {
-      const withoutSiiir = base.filter((candidate) => !isServer2SiiirRelatedCandidate(candidate));
-      if (withoutSiiir.length && withoutSiiir.length !== base.length) {
-        pushDiag(`server2 drop-siiir=${base.length - withoutSiiir.length}`);
-        base = withoutSiiir;
-      } else if (!withoutSiiir.length && base.length) {
-        pushDiag("server2 drop-siiir fallback-all");
+      const onlySiiir = base.filter((candidate) => isServer2SiiirRelatedCandidate(candidate));
+      if (onlySiiir.length && onlySiiir.length !== base.length) {
+        pushDiag(`server2 drop-non-siiir=${base.length - onlySiiir.length}`);
+        base = onlySiiir;
+      } else if (!onlySiiir.length && base.length) {
+        pushDiag("server2 keep-all no-siiir-hint");
       }
     }
     if (server !== 3 || base.length < 2) return base;
@@ -5724,6 +5735,7 @@ export default function WatchPage() {
         } else {
           const loaded = json as MatchRow;
           setMatch(loaded);
+          setR2Status((loaded.r2Status || loaded.r2_status || null) as MatchR2Status | null);
 
           const loadedId = Number.isFinite(Number(loaded?.id)) ? Number(loaded.id) : null;
           if (loadedId && loadedId !== idNum) {
@@ -5746,6 +5758,11 @@ export default function WatchPage() {
     let cancel = false;
     const controller = new AbortController();
     (async () => {
+      if (R2_STRICT_MODE) {
+        setDerivedServer3Url(null);
+        setServer3DeriveState("idle");
+        return;
+      }
       const explicitServer3 = String(match?.stream_url_3 || "").trim();
       if (explicitServer3 && isValidHttpUrl(explicitServer3)) {
         setDerivedServer3Url(null);
@@ -5838,6 +5855,10 @@ export default function WatchPage() {
     let cancel = false;
     const controller = new AbortController();
     (async () => {
+      if (R2_STRICT_MODE) {
+        setDerivedServerVariants([]);
+        return;
+      }
       const primary = String(match?.stream_url || "").trim();
       if (!primary || !isValidHttpUrl(primary)) {
         setDerivedServerVariants([]);
@@ -5887,8 +5908,41 @@ export default function WatchPage() {
     return () => window.clearInterval(timer);
   }, []);
 
+  const strictR2StatusBySlot = useMemo(() => {
+    const out = new Map<number, R2StatusServerEntry>();
+    const list = r2Status?.servers || [];
+    for (const item of list) out.set(item.slotServer, item);
+    return out;
+  }, [r2Status]);
+
   const serverOptions = useMemo<ServerOption[]>(() => {
     void repackBypassVersion;
+    if (R2_STRICT_MODE) {
+      const out: ServerOption[] = [];
+      for (const uiServer of [1, 2, 3, 4] as const) {
+        const slotServer = getSlotServerIdForUiServer(uiServer as UiServerId);
+        const statusEntry = strictR2StatusBySlot.get(slotServer);
+        const playlistUrl = String(statusEntry?.playlistUrl || "").trim();
+        const readyUrl = statusEntry?.state === "ready" && isValidHttpUrl(playlistUrl) ? playlistUrl : null;
+        const label = SERVER_SOURCE_LABELS[slotServer] || `سيرفر ${slotServer}`;
+        out.push({
+          n: slotServer,
+          label,
+          url: readyUrl,
+          fallbackUrl: null,
+          repackActive: !!readyUrl,
+          repackDecisionReason: statusEntry?.reason || "status-unavailable",
+          repackReadPct: 100,
+          repackBucket: 0,
+          sticky: false,
+        });
+      }
+      const orderIndex = new Map<number, number>();
+      SERVER_DISPLAY_ORDER.forEach((n, idx) => orderIndex.set(n, idx));
+      out.sort((a, b) => (orderIndex.get(a.n) ?? 999) - (orderIndex.get(b.n) ?? 999));
+      return out;
+    }
+
     // Strict isolation: each server only uses its own dedicated URL
     const server3Source = (() => {
       const explicitServer3 = String(match?.stream_url_3 || "").trim();
@@ -6000,7 +6054,7 @@ export default function WatchPage() {
     SERVER_DISPLAY_ORDER.forEach((n, idx) => orderIndex.set(n, idx));
     out.sort((a, b) => (orderIndex.get(a.n) ?? 999) - (orderIndex.get(b.n) ?? 999));
     return out;
-  }, [match, derivedServer3Url, runtimeServer5Url, server3VerifiedAvailable, idNum, runtimeRepackFlags, viewerSessionId, repackBypassVersion, nowMs]);
+  }, [match, derivedServer3Url, runtimeServer5Url, server3VerifiedAvailable, idNum, runtimeRepackFlags, viewerSessionId, repackBypassVersion, nowMs, strictR2StatusBySlot]);
 
   const validServers = useMemo(() => serverOptions.filter((s) => s.url && isValidHttpUrl(s.url)), [serverOptions]);
   useEffect(() => {
@@ -6009,6 +6063,16 @@ export default function WatchPage() {
 
   useEffect(() => {
     setServerHealth(() => {
+      if (R2_STRICT_MODE) {
+        const next: Record<number, ServerHealthState> = {};
+        for (const s of serverOptions) {
+          const statusEntry = strictR2StatusBySlot.get(s.n);
+          if (statusEntry?.state === "ready") next[s.n] = "ok";
+          else if (statusEntry?.state === "warming") next[s.n] = "pending";
+          else next[s.n] = "down";
+        }
+        return next;
+      }
       const next: Record<number, ServerHealthState> = {};
       for (const s of serverOptions) {
         if (s.n === 3) {
@@ -6035,7 +6099,16 @@ export default function WatchPage() {
       }
       return next;
     });
-  }, [serverOptions, server3DeriveState, server3VerifiedAvailable]);
+  }, [serverOptions, server3DeriveState, server3VerifiedAvailable, strictR2StatusBySlot]);
+
+  const visibleServerOptions = useMemo(() => {
+    if (!R2_STRICT_MODE) return serverOptions;
+    if (!r2Status?.servers?.length) return serverOptions;
+    return serverOptions.filter((s) => {
+      const health = serverHealth[s.n] || "down";
+      return health !== "down";
+    });
+  }, [serverOptions, serverHealth, r2Status]);
 
   const handleVideoDoubleClick = useCallback(() => {
     const video = videoRef.current;
@@ -6069,6 +6142,66 @@ export default function WatchPage() {
   const shouldBlockStream = LIVE_ONLY_PLAYBACK
     ? !(effectiveStatus === "live" || (effectiveStatus === "upcoming" && hasStartedByTime))
     : (!(effectiveStatus === "live" || effectiveStatus === "finished") && !hasStartedByTime && effectiveStatus === "upcoming");
+
+  useEffect(() => {
+    if (!R2_STRICT_MODE) return;
+    if (!idNum || !match?.id) return;
+    if (shouldBlockStream) return;
+    let cancel = false;
+    (async () => {
+      try {
+        const response = await fetch("/api/repack/bootstrap", {
+          method: "POST",
+          cache: "no-store",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            matchId: idNum,
+            uiServers: [1, 2, 3, 4],
+          }),
+        });
+        const payload = await response.json().catch(() => null);
+        if (cancel) return;
+        const nextStatus = payload?.r2Status as MatchR2Status | null | undefined;
+        if (nextStatus?.servers?.length) setR2Status(nextStatus);
+      } catch {
+        // Keep current status; polling endpoint will retry.
+      }
+    })();
+    return () => {
+      cancel = true;
+    };
+  }, [idNum, match?.id, shouldBlockStream]);
+
+  useEffect(() => {
+    if (!R2_STRICT_MODE) return;
+    if (!idNum || !match?.id) return;
+    let cancel = false;
+    const refresh = async () => {
+      try {
+        const response = await fetch(`/api/repack/status?matchId=${encodeURIComponent(String(idNum))}`, {
+          method: "GET",
+          cache: "no-store",
+        });
+        if (!response.ok) return;
+        const payload = await response.json().catch(() => null);
+        if (cancel) return;
+        const nextStatus = payload?.r2Status as MatchR2Status | null | undefined;
+        if (nextStatus?.servers?.length) setR2Status(nextStatus);
+      } catch {
+        // no-op
+      }
+    };
+    void refresh();
+    const timerId = window.setInterval(() => {
+      void refresh();
+    }, 8000);
+    return () => {
+      cancel = true;
+      window.clearInterval(timerId);
+    };
+  }, [idNum, match?.id]);
 
   useEffect(() => {
     if (!selectedOption) return;
@@ -6168,6 +6301,7 @@ export default function WatchPage() {
 
   const requestServer5Refresh = useCallback(
     async (reason: "bg" | "click") => {
+      if (R2_STRICT_MODE) return null as string | null;
       if (!idNum) return null as string | null;
       const sourceUrl = String(server5DbUrl || "").trim();
       if (!sourceUrl || !isValidHttpUrl(sourceUrl) || shouldBlockStream) return null;
@@ -6229,6 +6363,7 @@ export default function WatchPage() {
   );
 
   useEffect(() => {
+    if (R2_STRICT_MODE) return;
     if (selectedServer === 5) return;
     if (!server5OptionUrl || !isValidHttpUrl(server5OptionUrl)) return;
     if (shouldBlockStream) return;
@@ -6236,6 +6371,7 @@ export default function WatchPage() {
   }, [requestServer5Refresh, selectedServer, server5OptionUrl, shouldBlockStream]);
 
   useEffect(() => {
+    if (R2_STRICT_MODE) return;
     if (selectedServer !== 5) return;
     if (!server5OptionUrl || !isValidHttpUrl(server5OptionUrl)) return;
     if (shouldBlockStream) return;
@@ -6258,6 +6394,7 @@ export default function WatchPage() {
   }, [candidates.length, selectedCandidate]);
 
   useEffect(() => {
+    if (R2_STRICT_MODE) return;
     if (!idNum || shouldBlockStream) return;
     if (selectedServer < 1 || selectedServer > 4) return;
     if (!isRepackPlaylistUrl(selectedUrl)) return;
@@ -6295,6 +6432,16 @@ export default function WatchPage() {
         applyCandidatesPreservingSelection([]);
         setResolverError(null);
         setResolverLoading(false);
+        resolveLockRef.current = false;
+        resetRecoveryState();
+        return;
+      }
+      if (R2_STRICT_MODE) {
+        const strictCandidates = isValidHttpUrl(selectedUrl) ? [selectedUrl] : [];
+        applyCandidatesPreservingSelection(strictCandidates);
+        setResolverError(strictCandidates.length ? null : NO_STREAM_SELECTED_SERVER_MESSAGE);
+        setResolverLoading(false);
+        if (strictCandidates.length) setPlayerError(null);
         resolveLockRef.current = false;
         resetRecoveryState();
         return;
@@ -8067,12 +8214,12 @@ export default function WatchPage() {
         </div>
 
         <div className="mb-3 flex flex-wrap gap-2">
-          {serverOptions.map((s) => {
+          {visibleServerOptions.map((s) => {
             const hasUrl = !!s.url && isValidHttpUrl(s.url);
             const health: ServerHealthState = serverHealth[s.n] ?? (hasUrl ? "ok" : "down");
             const ok = hasUrl;
             const subtitle =
-              s.n === 3 && health === "pending"
+              health === "pending"
                 ? "جاري التحضير"
                 : (!ok || health === "down" ? "لا يوجد بث" : null);
             return (

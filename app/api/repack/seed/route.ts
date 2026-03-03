@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { getRuntimeRepackFlags } from "@/lib/repack-flags";
+import { isAllowedSourceForSlotServer, isValidHttpUrl } from "@/lib/server-source-policy";
 import { getServerCapability } from "@/lib/server-capabilities";
 
 export const runtime = "nodejs";
@@ -54,6 +55,13 @@ export async function POST(req: Request) {
   }
   if (!flags.repackServers.has(serverId) || flags.forceDisableServers.has(serverId)) {
     return NextResponse.json({ ok: false, skipped: true, reason: "server-flag-disabled" }, { status: 202 });
+  }
+
+  const sourceCandidate = String(payload.sourceCandidate || "").trim();
+  const sourceUrl = String(payload.sourceUrl || "").trim();
+  const upstreamSource = sourceCandidate || sourceUrl;
+  if (!isValidHttpUrl(upstreamSource) || !isAllowedSourceForSlotServer(serverId as 1 | 2 | 3 | 4, upstreamSource)) {
+    return NextResponse.json({ ok: false, skipped: true, reason: "source-not-allowed" }, { status: 202 });
   }
 
   const controller = new AbortController();
