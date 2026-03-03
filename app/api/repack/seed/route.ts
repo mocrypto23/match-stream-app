@@ -12,6 +12,7 @@ type SeedPayload = {
   sourceUrl?: string;
   sourceCandidate?: string;
   matchStatus?: string | null;
+  matchStart?: string | null;
   viewerSessionId?: string | null;
 };
 
@@ -71,6 +72,7 @@ export async function POST(req: Request) {
         sourceUrl: String(payload.sourceUrl || ""),
         sourceCandidate: String(payload.sourceCandidate || ""),
         matchStatus: String(payload.matchStatus || ""),
+        matchStart: String(payload.matchStart || ""),
         viewerSessionId: String(payload.viewerSessionId || ""),
       }),
     });
@@ -103,4 +105,3 @@ export async function POST(req: Request) {
     clearTimeout(timeoutId);
   }
 }
-

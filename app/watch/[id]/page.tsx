@@ -5419,6 +5419,7 @@ export default function WatchPage() {
             sourceUrl: payloadSourceUrl,
             sourceCandidate: payloadCandidate,
             matchStatus: String(match.status_key || ""),
+            matchStart: String(match.match_start || ""),
             viewerSessionId,
           }),
           keepalive: true,
@@ -6382,11 +6383,13 @@ export default function WatchPage() {
             });
         });
       }
-      const initialCandidates = dedupeUrls(
-        [...prewarmedServer5Candidates, ...stickyCandidates, ...cachedCandidates, ...seedCandidates].filter((candidate) =>
-          selectedServer === 5 ? isServer5AuthReadyCandidate(candidate) : true
-        )
-      );
+      const initialCandidates = repackPrimaryOnlyMode
+        ? [selectedUrl]
+        : dedupeUrls(
+          [...prewarmedServer5Candidates, ...stickyCandidates, ...cachedCandidates, ...seedCandidates].filter((candidate) =>
+            selectedServer === 5 ? isServer5AuthReadyCandidate(candidate) : true
+          )
+        );
       const resolveFetchTimeoutFast = isServer3Livehd
         ? LIVEHD77_FETCH_TIMEOUT_FAST_MS
         : isServer4Livekora
@@ -6531,7 +6534,7 @@ export default function WatchPage() {
           }
           // Server 3 is verify-first. Do not start playback from fast (unverified) sources.
           setResolverLoading(true);
-        } else if (fastMerged.length) {
+        } else if (fastMerged.length && !repackPrimaryOnlyMode) {
           hadPlayable = true;
           applyCandidatesPreservingSelection(fastMerged);
           if (isServer2Playerv2) setPlayerv2StickyCandidates(resolveSourceUrl, fastMerged);
@@ -6539,6 +6542,9 @@ export default function WatchPage() {
           setPlayerError(null);
           setResolverError(null);
           resetRecoveryState();
+          setResolverLoading(false);
+        } else if (repackPrimaryOnlyMode) {
+          // Keep playback pinned to R2-only source list while resolver continues in background for seeding.
           setResolverLoading(false);
         } else {
           setResolverLoading(true);
@@ -6862,7 +6868,7 @@ export default function WatchPage() {
             };
             const sourceForSeed = String(selectedFallbackUrl || selectedUrl || "").trim();
             let seedSourceUrl = sourceForSeed;
-            let seedPool = dedupeUrls([...verified, ...mergedRaw, ...initialCandidates]);
+            let seedPool = dedupeUrls([...verified, ...mergedRaw, ...seedCandidates, ...initialCandidates]);
             let seedFrom = pickBestSeedCandidate(seedPool, sourceForSeed);
             if (!seedFrom && repackPrimaryOnlyMode && selectedFallbackUrl && isValidHttpUrl(selectedFallbackUrl)) {
               try {
@@ -6883,54 +6889,6 @@ export default function WatchPage() {
                 pushDiag(`repack seed-resolve s${selectedServer} +${seedResolved.candidates.length}`);
               } catch (e: unknown) {
                 pushDiag(`repack seed-resolve s${selectedServer} fail=${e instanceof Error ? e.message : String(e)}`);
-              }
-            }
-            if (!seedFrom && repackPrimaryOnlyMode) {
-              const selectedKeys = new Set<string>(
-                [
-                  canonicalizeUrl(selectedUrl) || String(selectedUrl || "").trim().toLowerCase(),
-                  canonicalizeUrl(selectedFallbackUrl) || String(selectedFallbackUrl || "").trim().toLowerCase(),
-                ].filter(Boolean)
-              );
-              const alternateSeedSources = dedupeUrls(
-                [
-                  String(match?.stream_url || "").trim(),
-                  String(match?.stream_url_2 || "").trim(),
-                  String(match?.stream_url_3 || "").trim(),
-                  String(match?.stream_url_4 || "").trim(),
-                ].filter((url) => {
-                  const value = String(url || "").trim();
-                  if (!value || !isValidHttpUrl(value)) return false;
-                  const key = canonicalizeUrl(value) || value.toLowerCase();
-                  return !selectedKeys.has(key);
-                })
-              ).slice(0, 3);
-              for (const altSource of alternateSeedSources) {
-                if (seedFrom) break;
-                try {
-                  const altResolved = await resolveCandidatesForServer(altSource, controller.signal, {
-                    playerv2Diag: pushDiag,
-                    parallelChildConcurrency: Math.min(2, RESOLVE_CHILD_CONCURRENCY),
-                    allowSamePathServVariants: selectedServer === 3 || selectedServer === 4,
-                    livehdServPreference: isServer3Livehd ? "prefer0" : "all",
-                    maxPlayerPages: 2,
-                    maxDeepCandidates: 4,
-                    maxPlayerv2Pool: 0,
-                    fetchTimeoutMs: Math.min(resolveFetchTimeoutFast, 3200),
-                    fetchRetries: 0,
-                    fetchRetryDelayMs: 0,
-                  });
-                  seedPool = dedupeUrls([...seedPool, ...altResolved.candidates]);
-                  seedFrom = pickBestSeedCandidate(seedPool, altSource);
-                  if (seedFrom) {
-                    seedSourceUrl = altSource;
-                    pushDiag(`repack seed-alt s${selectedServer} host=${new URL(altSource).hostname} +${altResolved.candidates.length}`);
-                    break;
-                  }
-                  pushDiag(`repack seed-alt s${selectedServer} host=${new URL(altSource).hostname} +0`);
-                } catch (e: unknown) {
-                  pushDiag(`repack seed-alt s${selectedServer} fail=${e instanceof Error ? e.message : String(e)}`);
-                }
               }
             }
             if (seedFrom) {

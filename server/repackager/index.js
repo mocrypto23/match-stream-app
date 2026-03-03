@@ -255,7 +255,7 @@ class RepackJob {
       "-hls_list_size",
       String(this.profile.playlistSize),
       "-hls_flags",
-      "delete_segments+omit_endlist+program_date_time",
+      "delete_segments+omit_endlist+program_date_time+split_by_time",
       "-hls_segment_filename",
       segmentPattern,
       this.playlistPath,
@@ -634,6 +634,7 @@ class RepackManager {
     const matchId = toInt(payload.matchId, NaN, 1);
     const serverId = toInt(payload.serverId, NaN, 1);
     const matchStatus = String(payload.matchStatus || "").trim().toLowerCase();
+    const matchStartMs = Number.parseInt(String(new Date(String(payload.matchStart || "")).getTime()), 10);
     const liveOnly = this.config.liveOnly;
 
     if (!Number.isFinite(matchId) || !Number.isFinite(serverId)) {
@@ -644,9 +645,17 @@ class RepackManager {
       this.metrics.seedRejected += 1;
       return { accepted: false, reason: "server-not-enabled" };
     }
-    if (liveOnly && matchStatus && matchStatus !== "live") {
-      this.metrics.seedRejected += 1;
-      return { accepted: false, reason: "match-not-live" };
+    if (liveOnly && matchStatus) {
+      const now = Date.now();
+      const prematchOpenAt = Number.isFinite(matchStartMs)
+        ? matchStartMs - this.config.prematchOpenWindowMs
+        : Number.NaN;
+      const allowPrematchUpcoming = matchStatus === "upcoming" && Number.isFinite(prematchOpenAt) && now >= prematchOpenAt;
+      const allowLive = matchStatus === "live";
+      if (!allowLive && !allowPrematchUpcoming) {
+        this.metrics.seedRejected += 1;
+        return { accepted: false, reason: "match-not-open" };
+      }
     }
     const ingestUrl = this.resolveIngestUrl(payload);
     if (!isHttpUrl(ingestUrl)) {
@@ -726,6 +735,7 @@ function loadConfig() {
       .map((item) => Number.parseInt(item.trim(), 10))
       .filter((item) => Number.isFinite(item) && item > 0)
   );
+  const prematchOpenWindowMinutes = toInt(process.env.REPACK_PREMATCH_OPEN_WINDOW_MINUTES, 30, 0);
 
   const cfg = {
     bind: String(process.env.REPACK_AGENT_BIND || "127.0.0.1").trim(),
@@ -741,12 +751,13 @@ function loadConfig() {
     localRetentionMs: toInt(process.env.REPACK_LOCAL_RETENTION_MS, 8 * 60 * 1000, 30_000),
     remoteRetentionMs: toInt(process.env.REPACK_REMOTE_RETENTION_MS, 8 * 60 * 1000, 30_000),
     liveOnly: toBool(process.env.REPACK_LIVE_ONLY, true),
+    prematchOpenWindowMs: prematchOpenWindowMinutes * 60 * 1000,
     publicBaseUrl: String(process.env.REPACK_PUBLIC_BASE_URL || "https://r2.tf-player.site/live").trim(),
     playerOrigin: String(process.env.REPACK_PLAYER_ORIGIN || "https://tf-player.site").trim(),
     repackServers,
     repackProfile: {
-      segmentDurationSec: toInt(process.env.REPACK_SEGMENT_DURATION_SEC, 2, 2),
-      playlistSize: toInt(process.env.REPACK_PLAYLIST_SIZE, 3, 3),
+      segmentDurationSec: toInt(process.env.REPACK_SEGMENT_DURATION_SEC, 1, 1),
+      playlistSize: toInt(process.env.REPACK_PLAYLIST_SIZE, 5, 2),
     },
     r2Endpoint: String(process.env.R2_ENDPOINT || process.env.REPACK_R2_ENDPOINT || "").trim(),
     r2Bucket: String(process.env.R2_BUCKET || process.env.REPACK_R2_BUCKET || "").trim(),
