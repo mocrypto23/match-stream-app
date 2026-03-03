@@ -1972,6 +1972,19 @@ function extractYallashootChannelCode(rawSourceUrl: string) {
   return "";
 }
 
+function shouldUseUnderlyingForRepackSeed(value: string) {
+  const raw = String(value || "").trim();
+  if (!raw.startsWith("/api/embed-proxy?")) return false;
+  const underlying = String(toUnderlyingUrl(raw) || "").trim().toLowerCase();
+  if (!underlying || !isValidHttpUrl(underlying)) return false;
+  return (
+    underlying.includes("yallashot.us") ||
+    underlying.includes("yallashoot") ||
+    underlying.includes("/kooora/") ||
+    underlying.includes("playerv2.php")
+  );
+}
+
 function isDirectAccessDeniedHtml(status: number, html: string) {
   const text = String(html || "").toLowerCase();
   if (!text) return false;
@@ -5363,11 +5376,13 @@ export default function WatchPage() {
       const sourceUrl = String(params.sourceUrl || "").trim();
       const candidateUnderlying = toUnderlyingUrl(sourceCandidate) || sourceCandidate;
       const sourceUnderlying = toUnderlyingUrl(sourceUrl) || sourceUrl;
+      const payloadCandidate = shouldUseUnderlyingForRepackSeed(sourceCandidate) ? candidateUnderlying : sourceCandidate;
+      const payloadSourceUrl = shouldUseUnderlyingForRepackSeed(sourceUrl) ? sourceUnderlying : sourceUrl;
       if (!sourceCandidate || !sourceUrl) return;
       if (!isValidHttpUrl(candidateUnderlying) || !isValidHttpUrl(sourceUnderlying)) return;
       if (isRepackPlaylistUrl(candidateUnderlying) || isRepackPlaylistUrl(sourceUnderlying)) return;
-      const dedupeKey = `${idNum}:${params.serverId}:${canonicalizeUrl(sourceUrl) || sourceUrl}|${
-        canonicalizeUrl(sourceCandidate) || sourceCandidate
+      const dedupeKey = `${idNum}:${params.serverId}:${canonicalizeUrl(payloadSourceUrl) || payloadSourceUrl}|${
+        canonicalizeUrl(payloadCandidate) || payloadCandidate
       }`;
       const now = Date.now();
       for (const [key, sentAt] of repackSeedSentRef.current.entries()) {
@@ -5388,8 +5403,8 @@ export default function WatchPage() {
           body: JSON.stringify({
             matchId: idNum,
             serverId: params.serverId,
-            sourceUrl: sourceUnderlying,
-            sourceCandidate: candidateUnderlying,
+            sourceUrl: payloadSourceUrl,
+            sourceCandidate: payloadCandidate,
             matchStatus: String(match.status_key || ""),
             viewerSessionId,
           }),
