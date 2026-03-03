@@ -218,6 +218,8 @@ class RepackJob {
     // Reset mappings to avoid reusing stale remote segment links.
     this.uploadedSegments = new Map();
     this.lastPublishAt = 0;
+    const remoteIndexKey = `${this.remotePrefix}/index.m3u8`;
+    this.manager.deleteObject(remoteIndexKey).catch(() => {});
     try {
       const entries = fs.readdirSync(this.workDir, { withFileTypes: true });
       for (const entry of entries) {

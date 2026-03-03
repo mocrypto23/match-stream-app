@@ -1973,20 +1973,9 @@ function extractYallashootChannelCode(rawSourceUrl: string) {
 }
 
 function shouldUseUnderlyingForRepackSeed(value: string) {
-  const raw = String(value || "").trim();
-  if (!raw.startsWith("/api/embed-proxy?")) return false;
-  const underlying = String(toUnderlyingUrl(raw) || "").trim().toLowerCase();
-  if (!underlying || !isValidHttpUrl(underlying)) return false;
-  const isProtected = underlying.includes("yallashot.us") ||
-    underlying.includes("yallashoot") ||
-    underlying.includes("/kooora/") ||
-    /[?&](?:token|sid|nonce|ts)=/i.test(underlying);
-  if (isProtected) return false;
-  return (
-    underlying.includes("playerv2.php") ||
-    underlying.includes(".m3u8") ||
-    /\/hls\/|\/live\/|\/playlist\/|\/manifest\//i.test(underlying)
-  );
+  void value;
+  // Keep proxy URLs for repack seeding to preserve upstream headers/tokens across all providers.
+  return false;
 }
 
 function isDirectAccessDeniedHtml(status: number, html: string) {
@@ -6907,10 +6896,15 @@ export default function WatchPage() {
               }
             }
             if (seedFrom) {
+              const seedCandidateForAgent = (() => {
+                if (seedFrom.startsWith("/api/embed-proxy?")) return seedFrom;
+                const proxied = toEmbedProxyUrl(seedFrom, seedSourceUrl || sourceForSeed || seedFrom);
+                return proxied || seedFrom;
+              })();
               void requestRepackSeed({
                 serverId: selectedServer,
                 sourceUrl: seedSourceUrl,
-                sourceCandidate: seedFrom,
+                sourceCandidate: seedCandidateForAgent,
               });
             }
           }
