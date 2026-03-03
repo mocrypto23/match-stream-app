@@ -5324,6 +5324,13 @@ export default function WatchPage() {
   const server5PrewarmResolveInFlightRef = useRef<Map<string, Promise<string[]>>>(new Map());
   const server3AutoSwitchWindowRef = useRef<{ windowStart: number; count: number }>({ windowStart: 0, count: 0 });
   const repackSeedSentRef = useRef<Map<string, number>>(new Map());
+  const badRepackSeedCandidatesByServerRef = useRef<Record<number, Set<string>>>({
+    1: new Set<string>(),
+    2: new Set<string>(),
+    3: new Set<string>(),
+    4: new Set<string>(),
+  });
+  const lastRepackSeedCandidateKeyByServerRef = useRef<Record<number, string>>({});
   const repackBypassServersRef = useRef<Set<number>>(new Set());
   const repackFallbackReasonByServerRef = useRef<Record<number, string>>({});
   const repackCacheStatusByServerRef = useRef<Record<number, string>>({});
@@ -5378,9 +5385,15 @@ export default function WatchPage() {
       const sourceUnderlying = toUnderlyingUrl(sourceUrl) || sourceUrl;
       const payloadCandidate = shouldUseUnderlyingForRepackSeed(sourceCandidate) ? candidateUnderlying : sourceCandidate;
       const payloadSourceUrl = shouldUseUnderlyingForRepackSeed(sourceUrl) ? sourceUnderlying : sourceUrl;
+      const payloadCandidateKey = canonicalizeUrl(candidateUnderlying) || String(candidateUnderlying || "").trim().toLowerCase();
       if (!sourceCandidate || !sourceUrl) return;
       if (!isValidHttpUrl(candidateUnderlying) || !isValidHttpUrl(sourceUnderlying)) return;
       if (isRepackPlaylistUrl(candidateUnderlying) || isRepackPlaylistUrl(sourceUnderlying)) return;
+      const badSeedSet = badRepackSeedCandidatesByServerRef.current[params.serverId] || new Set<string>();
+      if (payloadCandidateKey && badSeedSet.has(payloadCandidateKey)) {
+        pushDiag(`repack seed s${params.serverId} skip-bad-candidate`);
+        return;
+      }
       const dedupeKey = `${idNum}:${params.serverId}:${canonicalizeUrl(payloadSourceUrl) || payloadSourceUrl}|${
         canonicalizeUrl(payloadCandidate) || payloadCandidate
       }`;
@@ -5412,6 +5425,9 @@ export default function WatchPage() {
         });
         const body = await response.json().catch(() => null);
         const accepted = Boolean(body?.result?.accepted);
+        if (accepted && payloadCandidateKey) {
+          lastRepackSeedCandidateKeyByServerRef.current[params.serverId] = payloadCandidateKey;
+        }
         pushDiag(`repack seed s${params.serverId} status=${response.status} accepted=${accepted ? 1 : 0}`);
       } catch (error: unknown) {
         pushDiag(`repack seed s${params.serverId} fail=${error instanceof Error ? error.message : String(error)}`);
@@ -5442,6 +5458,13 @@ export default function WatchPage() {
 
   useEffect(() => {
     repackSeedSentRef.current = new Map();
+    badRepackSeedCandidatesByServerRef.current = {
+      1: new Set<string>(),
+      2: new Set<string>(),
+      3: new Set<string>(),
+      4: new Set<string>(),
+    };
+    lastRepackSeedCandidateKeyByServerRef.current = {};
     repackBypassServersRef.current = new Set();
     repackFallbackReasonByServerRef.current = {};
     repackCacheStatusByServerRef.current = {};
@@ -6775,6 +6798,7 @@ export default function WatchPage() {
               const sourceRaw = String(sourceForSeed || "").trim();
               const sourceCanonical = canonicalizeUrl(sourceRaw) || sourceRaw.toLowerCase();
               const nowSec = Math.floor(Date.now() / 1000);
+              const badSeedSet = badRepackSeedCandidatesByServerRef.current[selectedServer] || new Set<string>();
               let sourceHost = "";
               try {
                 sourceHost = new URL(sourceRaw).hostname.toLowerCase();
@@ -6785,6 +6809,8 @@ export default function WatchPage() {
                 if (!isLikelySeedableCandidate(candidate)) continue;
                 const underlyingRaw = String(toUnderlyingUrl(candidate) || candidate || "").trim();
                 const underlying = underlyingRaw.toLowerCase();
+                const seedKey = canonicalizeUrl(underlyingRaw) || underlying;
+                if (seedKey && badSeedSet.has(seedKey)) continue;
                 let score = 0;
                 if (underlying.includes(".m3u8")) score += 140;
                 if (/\/hls\/|\/live\/|\/playlist\/|\/manifest\/|\/kooora\//i.test(underlying)) score += 90;
@@ -7629,8 +7655,21 @@ export default function WatchPage() {
           if (repackBypassServersRef.current.has(selectedServer)) return;
           if (!EMBED_FALLBACK_ENABLED) {
             pushDiag(`repack stale-manifest s${selectedServer} no-fallback`);
+            const failedSeedKey = String(lastRepackSeedCandidateKeyByServerRef.current[selectedServer] || "").trim();
+            if (failedSeedKey) {
+              const badSet = badRepackSeedCandidatesByServerRef.current[selectedServer] || new Set<string>();
+              badSet.add(failedSeedKey);
+              badRepackSeedCandidatesByServerRef.current[selectedServer] = badSet;
+            }
+            if (idNum) {
+              const seedPrefix = `${idNum}:${selectedServer}:`;
+              for (const key of Array.from(repackSeedSentRef.current.keys())) {
+                if (key.startsWith(seedPrefix)) repackSeedSentRef.current.delete(key);
+              }
+            }
             setPlayerError("تحديث R2 متوقف مؤقتًا... جاري إعادة المحاولة تلقائيًا.");
             requestSoftRecovery("repack-stale-no-fallback");
+            scheduleResolveRecovery("repack-stale-no-fallback", true);
             return;
           }
 
@@ -7668,10 +7707,23 @@ export default function WatchPage() {
           if (repackManifestUnavailable) {
             if (!EMBED_FALLBACK_ENABLED) {
               pushDiag(`repack unavailable no-fallback code=${responseCode || 0} details=${errorDetails || "n/a"}`);
+              const failedSeedKey = String(lastRepackSeedCandidateKeyByServerRef.current[selectedServer] || "").trim();
+              if (failedSeedKey) {
+                const badSet = badRepackSeedCandidatesByServerRef.current[selectedServer] || new Set<string>();
+                badSet.add(failedSeedKey);
+                badRepackSeedCandidatesByServerRef.current[selectedServer] = badSet;
+              }
+              if (idNum) {
+                const seedPrefix = `${idNum}:${selectedServer}:`;
+                for (const key of Array.from(repackSeedSentRef.current.keys())) {
+                  if (key.startsWith(seedPrefix)) repackSeedSentRef.current.delete(key);
+                }
+              }
               setPlayerError("تعذر تحميل R2 الآن... جاري إعادة المحاولة تلقائيًا.");
               queueTimeout(() => {
                 requestSoftRecovery("repack-unavailable-no-fallback");
               }, 250);
+              scheduleResolveRecovery("repack-unavailable-no-fallback", true);
               hidePlayerLoading();
               return;
             }
