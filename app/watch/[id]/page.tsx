@@ -1977,11 +1977,15 @@ function shouldUseUnderlyingForRepackSeed(value: string) {
   if (!raw.startsWith("/api/embed-proxy?")) return false;
   const underlying = String(toUnderlyingUrl(raw) || "").trim().toLowerCase();
   if (!underlying || !isValidHttpUrl(underlying)) return false;
-  return (
-    underlying.includes("yallashot.us") ||
+  const isProtected = underlying.includes("yallashot.us") ||
     underlying.includes("yallashoot") ||
     underlying.includes("/kooora/") ||
-    underlying.includes("playerv2.php")
+    /[?&](?:token|sid|nonce|ts)=/i.test(underlying);
+  if (isProtected) return false;
+  return (
+    underlying.includes("playerv2.php") ||
+    underlying.includes(".m3u8") ||
+    /\/hls\/|\/live\/|\/playlist\/|\/manifest\//i.test(underlying)
   );
 }
 
@@ -6822,6 +6826,11 @@ export default function WatchPage() {
                 let score = 0;
                 if (underlying.includes(".m3u8")) score += 140;
                 if (/\/hls\/|\/live\/|\/playlist\/|\/manifest\/|\/kooora\//i.test(underlying)) score += 90;
+                const protectedTarget =
+                  underlying.includes("yallashot.us") ||
+                  underlying.includes("yallashoot") ||
+                  underlying.includes("/kooora/") ||
+                  /[?&](?:token|sid|nonce|ts)=/i.test(underlying);
                 try {
                   const urlObj = new URL(underlyingRaw);
                   const token = String(urlObj.searchParams.get("token") || "").trim();
@@ -6848,6 +6857,10 @@ export default function WatchPage() {
                     if (depth >= 1) score += 60;
                     else score -= 20;
                   } catch { }
+                }
+                if (protectedTarget) {
+                  if (candidate.startsWith("/api/embed-proxy?")) score += 320;
+                  else score -= 650;
                 }
                 const refUrl = getProxyRefUrlFromCandidate(candidate);
                 const refCanonical = canonicalizeUrl(refUrl) || String(refUrl || "").trim().toLowerCase();
