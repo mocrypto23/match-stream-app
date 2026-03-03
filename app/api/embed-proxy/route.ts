@@ -143,7 +143,7 @@ const STREAM_HOST_DIRECT_SUFFIXES = Array.from(
 
 const M3U8_CACHE_TTL_MS = Math.max(
   0,
-  Number.parseInt(process.env.EMBED_PROXY_M3U8_CACHE_TTL_MS || "2500", 10) || 2500
+  Number.parseInt(process.env.EMBED_PROXY_M3U8_CACHE_TTL_MS || "900", 10) || 900
 );
 const M3U8_CACHE_MAX_ENTRIES = Math.max(
   32,
@@ -724,8 +724,14 @@ function rewriteM3u8Manifest(
 
 
 function shouldUseManifestCacheForTarget(target: URL) {
-  const value = `${target.pathname}${target.search}`.toLowerCase();
-  return value.includes(".m3u8");
+  const path = String(target.pathname || "").toLowerCase();
+  const search = String(target.search || "").toLowerCase();
+  const value = `${path}${search}`;
+  if (!value.includes(".m3u8")) return false;
+  // Tokenized manifests are short-lived and can break if cached for even a few seconds.
+  if (/[?&](?:token|sid|nonce|ts)=/i.test(search)) return false;
+  if (value.includes("/kooora/")) return false;
+  return true;
 }
 
 function buildManifestCacheKey(
