@@ -5878,10 +5878,15 @@ export default function WatchPage() {
     ];
     const statusKey = String(match?.status_key || "").trim().toLowerCase();
     const startAtMs = match?.match_start ? new Date(match.match_start).getTime() : NaN;
+    const prematchWindowMs = PREMATCH_OPEN_WINDOW_MINUTES * 60 * 1000;
+    const isPrematchWindowOpen =
+      statusKey === "upcoming" &&
+      Number.isFinite(startAtMs) &&
+      nowMs >= (startAtMs - prematchWindowMs);
     const liveStatusStaleByClock =
       statusKey === "live" && Number.isFinite(startAtMs) && nowMs - startAtMs > LIVE_STATUS_MAX_AGE_MS;
     const isLiveMatch = statusKey === "live" && !liveStatusStaleByClock;
-    const allowRepackRead = isLiveMatch;
+    const allowRepackRead = isLiveMatch || isPrematchWindowOpen;
 
     const out: ServerOption[] = [];
     for (let i = 0; i < 6; i += 1) {
@@ -5895,7 +5900,7 @@ export default function WatchPage() {
       let repackDecisionReason = "not-eligible";
       let repackReadPct = 0;
       let repackBucket = -1;
-      if (LIVE_ONLY_PLAYBACK && !isLiveMatch) {
+      if (LIVE_ONLY_PLAYBACK && !(isLiveMatch || isPrematchWindowOpen)) {
         const label = SERVER_SOURCE_LABELS[n] || `سيرفر ${n}`;
         out.push({
           n,
@@ -5931,7 +5936,7 @@ export default function WatchPage() {
           });
           if (isValidHttpUrl(repackUrl)) {
             url = repackUrl;
-            fallbackUrl = EMBED_FALLBACK_ENABLED ? legacyUrl : null;
+            fallbackUrl = legacyUrl;
             repackActive = true;
           } else {
             repackDecisionReason = "invalid-repack-url";
@@ -6027,7 +6032,7 @@ export default function WatchPage() {
   const streamOpenMs = startMs !== null && Number.isFinite(startMs) ? startMs - prematchMs : null;
   const hasStartedByTime = startMs !== null && Number.isFinite(startMs) ? nowMs >= startMs - prematchMs : false;
   const shouldBlockStream = LIVE_ONLY_PLAYBACK
-    ? effectiveStatus !== "live"
+    ? !(effectiveStatus === "live" || (effectiveStatus === "upcoming" && hasStartedByTime))
     : (!(effectiveStatus === "live" || effectiveStatus === "finished") && !hasStartedByTime && effectiveStatus === "upcoming");
 
   useEffect(() => {
@@ -6261,17 +6266,8 @@ export default function WatchPage() {
       }
       const repackPrimaryOnlyMode =
         isRepackPlaylistUrl(selectedUrl) && !repackBypassServersRef.current.has(selectedServer);
-      if (repackPrimaryOnlyMode && !EMBED_FALLBACK_ENABLED) {
-        applyCandidatesPreservingSelection([selectedUrl]);
-        setResolverError(null);
-        setResolverLoading(false);
-        resolveLockRef.current = false;
-        resetRecoveryState();
-        return;
-      }
       const resolveSourceUrl =
         repackPrimaryOnlyMode &&
-        EMBED_FALLBACK_ENABLED &&
         selectedFallbackUrl &&
         isValidHttpUrl(selectedFallbackUrl)
           ? selectedFallbackUrl
@@ -7860,6 +7856,7 @@ export default function WatchPage() {
         const fallbackCandidate = String(selectedFallbackUrl || "").trim();
         const fallbackUnderlying = String(toUnderlyingUrl(fallbackCandidate) || fallbackCandidate).trim();
         const canSwitchToLegacyFallback =
+          EMBED_FALLBACK_ENABLED &&
           stallFreezeCount >= 2 &&
           isRepackPlaylistUrl(selectedHlsUrl) &&
           !!fallbackCandidate &&
