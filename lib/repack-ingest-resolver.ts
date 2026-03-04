@@ -61,6 +61,8 @@ const DEFAULT_TIMEOUT_MS = 5200;
 const DEFAULT_SEGMENT_TIMEOUT_MS = 2200;
 const DEFAULT_MAX_CANDIDATES = 16;
 const MAX_DYNAMIC_CANDIDATES = 32;
+const DEFAULT_RESOLVER_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 
 function normalizeHttpUrl(raw: unknown) {
   const value = String(raw || "").trim();
@@ -88,6 +90,15 @@ function safeDecodeURIComponent(value: string) {
     return decodeURIComponent(value);
   } catch {
     return value;
+  }
+}
+
+function safeOrigin(value: string) {
+  if (!isValidHttpUrl(value)) return "";
+  try {
+    return new URL(value).origin;
+  } catch {
+    return "";
   }
 }
 
@@ -299,8 +310,10 @@ async function requestPlayerv2Token(input: {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), input.timeoutMs);
   try {
+    const fingerprint = randomAlphaNum(10);
     const body = new URLSearchParams();
     body.set("path", input.pathValue);
+    body.set("fp", fingerprint);
     const response = await fetch(input.tokenEndpoint, {
       method: "POST",
       cache: "no-store",
@@ -309,6 +322,7 @@ async function requestPlayerv2Token(input: {
       headers: {
         "content-type": "application/x-www-form-urlencoded",
         accept: "application/json,text/plain,*/*",
+        "user-agent": DEFAULT_RESOLVER_USER_AGENT,
         origin: (() => {
           try {
             return new URL(input.sourceUrl).origin;
@@ -353,7 +367,10 @@ async function buildPlayerv2Candidates(sourceUrl: string, html: string, timeoutM
 
   const maxPaths = Math.min(4, bootstrap.paths.length);
   for (const rawPath of bootstrap.paths.slice(0, maxPaths)) {
-    const pathValue = String(rawPath || "").trim().replace(/^\/+/, "");
+    const pathValue = String(rawPath || "")
+      .trim()
+      .replace(/^\/+/, "")
+      .replace(/\.m3u8$/i, "");
     if (!pathValue) continue;
     const token = await requestPlayerv2Token({
       tokenEndpoint,
@@ -365,8 +382,11 @@ async function buildPlayerv2Candidates(sourceUrl: string, html: string, timeoutM
     const ts = Math.floor(Date.now() / 1000);
     const nonce = buildPlayerv2Nonce(ts);
     for (const domain of domains.slice(0, 4)) {
-      const finalUrl = `${domain}/${pathValue}?ts=${ts}&nonce=${encodeURIComponent(nonce)}&token=${encodeURIComponent(token.token)}&session_id=${encodeURIComponent(token.sessionId)}`;
-      if (isValidHttpUrl(finalUrl)) out.push(finalUrl);
+      const variants = [`${pathValue}.m3u8`, pathValue];
+      for (const variantPath of variants) {
+        const finalUrl = `${domain}/${variantPath}?ts=${ts}&nonce=${encodeURIComponent(nonce)}&token=${encodeURIComponent(token.token)}&session_id=${encodeURIComponent(token.sessionId)}`;
+        if (isValidHttpUrl(finalUrl)) out.push(finalUrl);
+      }
     }
   }
   return out;
@@ -442,6 +462,7 @@ async function fetchWithTimeout(url: string, timeoutMs: number, headers?: Record
       signal: controller.signal,
       headers: {
         accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/html,*/*",
+        "user-agent": DEFAULT_RESOLVER_USER_AGENT,
         ...(headers || {}),
       },
     });
@@ -466,7 +487,7 @@ async function fetchWithTimeout(url: string, timeoutMs: number, headers?: Record
   }
 }
 
-async function probeSegmentUrl(segmentUrl: string, timeoutMs: number) {
+async function probeSegmentUrl(segmentUrl: string, timeoutMs: number, headers?: Record<string, string>) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -475,6 +496,10 @@ async function probeSegmentUrl(segmentUrl: string, timeoutMs: number) {
       cache: "no-store",
       redirect: "follow",
       signal: controller.signal,
+      headers: {
+        "user-agent": DEFAULT_RESOLVER_USER_AGENT,
+        ...(headers || {}),
+      },
     });
     if (head.ok) return { ok: true, status: head.status };
     if (head.status !== 405) return { ok: false, status: head.status };
@@ -486,6 +511,8 @@ async function probeSegmentUrl(segmentUrl: string, timeoutMs: number) {
       signal: controller.signal,
       headers: {
         range: "bytes=0-1",
+        "user-agent": DEFAULT_RESOLVER_USER_AGENT,
+        ...(headers || {}),
       },
     });
     if (getResp.ok || getResp.status === 206) return { ok: true, status: getResp.status };
@@ -501,8 +528,15 @@ async function probeCandidate(input: {
   candidateUrl: string;
   timeoutMs: number;
   segmentTimeoutMs: number;
+  referrerUrl?: string;
 }): Promise<ProbeResult> {
-  const fetched = await fetchWithTimeout(input.candidateUrl, input.timeoutMs);
+  const fetchHeaders: Record<string, string> = {};
+  const safeReferer = normalizeHttpUrl(input.referrerUrl || "");
+  if (safeReferer) fetchHeaders.referer = safeReferer;
+  const origin = safeOrigin(safeReferer);
+  if (origin) fetchHeaders.origin = origin;
+
+  const fetched = await fetchWithTimeout(input.candidateUrl, input.timeoutMs, fetchHeaders);
   if (!fetched.ok) {
     return {
       ok: false,
@@ -553,7 +587,7 @@ async function probeCandidate(input: {
     };
   }
 
-  const segmentProbe = await probeSegmentUrl(segmentUrl, input.segmentTimeoutMs);
+  const segmentProbe = await probeSegmentUrl(segmentUrl, input.segmentTimeoutMs, fetchHeaders);
   if (!segmentProbe.ok) {
     return {
       ok: false,
@@ -659,6 +693,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       candidateUrl: sourceUrl,
       timeoutMs,
       segmentTimeoutMs,
+      referrerUrl: sourceUrl,
     });
     if (directProbe.ok) {
       return {
@@ -684,6 +719,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       candidateUrl: sourceFetch.finalUrl || sourceUrl,
       timeoutMs,
       segmentTimeoutMs,
+      referrerUrl: sourceFetch.finalUrl || sourceUrl,
     });
     if (servedProbe.ok) {
       const directUrl = sourceFetch.finalUrl || sourceUrl;
@@ -766,6 +802,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       candidateUrl: item.candidateUrl,
       timeoutMs,
       segmentTimeoutMs,
+      referrerUrl: sourceFetch.finalUrl || sourceUrl,
     });
     if (probe.ok) {
       return {
