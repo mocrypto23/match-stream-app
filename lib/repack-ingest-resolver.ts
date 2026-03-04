@@ -239,6 +239,139 @@ function extractCandidatesFromText(text: string, baseUrl: string) {
   return Array.from(out);
 }
 
+function randomAlphaNum(length: number) {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let out = "";
+  for (let idx = 0; idx < length; idx += 1) {
+    out += chars[Math.floor(Math.random() * chars.length)] || "x";
+  }
+  return out;
+}
+
+function buildPlayerv2Nonce(tsSec: number) {
+  return `${randomAlphaNum(4)}${(Math.max(0, tsSec) % 100000).toString(36)}`;
+}
+
+function normalizeDomainPrefix(rawDomain: string, baseUrl: string) {
+  const value = String(rawDomain || "").trim().replace(/\\\//g, "/");
+  if (!value) return "";
+  const normalized = normalizeCandidate(value, baseUrl);
+  if (!normalized) return "";
+  return normalized.replace(/\/+$/, "");
+}
+
+function extractPlayerv2Bootstrap(html: string) {
+  const text = String(html || "");
+  const match = text.match(/window\.tabsConfig\s*=\s*(\{[\s\S]*?\})\s*;/i);
+  if (!match?.[1]) return null as { paths: string[]; activeDomains: string[] } | null;
+  try {
+    const raw = String(match[1] || "").replace(/\\\//g, "/");
+    const parsed = JSON.parse(raw) as {
+      tabs?: Array<{ path?: string; mobile_path?: string }>;
+      activeDomains?: string[];
+    };
+    const paths = new Set<string>();
+    const tabs = Array.isArray(parsed?.tabs) ? parsed.tabs : [];
+    for (const tab of tabs) {
+      const path = String(tab?.path || tab?.mobile_path || "").trim();
+      if (!path) continue;
+      paths.add(path.replace(/^\/+/, ""));
+    }
+    const activeDomains = Array.isArray(parsed?.activeDomains)
+      ? parsed.activeDomains.map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
+    if (!paths.size) return null;
+    return {
+      paths: Array.from(paths),
+      activeDomains,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function requestPlayerv2Token(input: {
+  tokenEndpoint: string;
+  pathValue: string;
+  timeoutMs: number;
+  sourceUrl: string;
+}) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), input.timeoutMs);
+  try {
+    const body = new URLSearchParams();
+    body.set("path", input.pathValue);
+    const response = await fetch(input.tokenEndpoint, {
+      method: "POST",
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        accept: "application/json,text/plain,*/*",
+        origin: (() => {
+          try {
+            return new URL(input.sourceUrl).origin;
+          } catch {
+            return "";
+          }
+        })(),
+        referer: input.sourceUrl,
+      },
+      body,
+    });
+    if (!response.ok) return null as { token: string; sessionId: string } | null;
+    const payload = (await response.json().catch(() => null)) as { token?: string; session_id?: string } | null;
+    const token = String(payload?.token || "").trim();
+    const sessionId = String(payload?.session_id || "").trim();
+    if (!token || !sessionId) return null;
+    return { token, sessionId };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function buildPlayerv2Candidates(sourceUrl: string, html: string, timeoutMs: number) {
+  const bootstrap = extractPlayerv2Bootstrap(html);
+  if (!bootstrap) return [] as string[];
+  const out: string[] = [];
+
+  let tokenEndpoint = "";
+  try {
+    const source = new URL(sourceUrl);
+    tokenEndpoint = new URL("/playerv2.php?action=generate_token", `${source.protocol}//${source.host}`).toString();
+  } catch {
+    return [] as string[];
+  }
+
+  const domains = bootstrap.activeDomains.length
+    ? bootstrap.activeDomains.map((item) => normalizeDomainPrefix(item, sourceUrl)).filter(Boolean)
+    : [normalizeDomainPrefix(sourceUrl, sourceUrl)];
+  if (!domains.length) return [] as string[];
+
+  const maxPaths = Math.min(4, bootstrap.paths.length);
+  for (const rawPath of bootstrap.paths.slice(0, maxPaths)) {
+    const pathValue = String(rawPath || "").trim().replace(/^\/+/, "");
+    if (!pathValue) continue;
+    const token = await requestPlayerv2Token({
+      tokenEndpoint,
+      pathValue,
+      timeoutMs: Math.max(1200, timeoutMs),
+      sourceUrl,
+    });
+    if (!token) continue;
+    const ts = Math.floor(Date.now() / 1000);
+    const nonce = buildPlayerv2Nonce(ts);
+    for (const domain of domains.slice(0, 4)) {
+      const finalUrl = `${domain}/${pathValue}?ts=${ts}&nonce=${encodeURIComponent(nonce)}&token=${encodeURIComponent(token.token)}&session_id=${encodeURIComponent(token.sessionId)}`;
+      if (isValidHttpUrl(finalUrl)) out.push(finalUrl);
+    }
+  }
+  return out;
+}
+
 function buildInternalEmbedProxyUrl(input: { sourceUrl: string; requestOrigin: string; referrerUrl?: string | null }) {
   if (!isValidHttpUrl(input.requestOrigin)) return "";
   const params = new URLSearchParams();
@@ -580,6 +713,15 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
   pushCandidateUnique(candidateSeed, seen, sourceFetch.finalUrl || sourceUrl);
   if (sourceFetch.body) {
     for (const candidate of extractCandidatesFromText(sourceFetch.body, sourceFetch.finalUrl || sourceUrl)) {
+      pushCandidateUnique(candidateSeed, seen, candidate);
+    }
+
+    const playerv2Candidates = await buildPlayerv2Candidates(
+      sourceFetch.finalUrl || sourceUrl,
+      sourceFetch.body,
+      Math.min(timeoutMs, 2600)
+    );
+    for (const candidate of playerv2Candidates) {
       pushCandidateUnique(candidateSeed, seen, candidate);
     }
   }
