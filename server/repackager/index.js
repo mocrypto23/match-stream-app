@@ -1083,7 +1083,18 @@ class RepackManager {
     }
 
     const preflight = await this.preflightIngest(ingestUrl, ingest.ingestMode, ingest.ingestHeaders);
-    if (!preflight.ok) {
+    const upstreamProbe = payload?.probeEvidence || null;
+    const upstreamProbePlaylistStatus = Number.parseInt(String(upstreamProbe?.playlistStatus || 0), 10) || 0;
+    const upstreamProbeSegmentStatus = Number.parseInt(String(upstreamProbe?.segmentStatus || 0), 10) || 0;
+    const canBypass403Preflight =
+      !preflight.ok &&
+      preflight.reason === "http-403" &&
+      ingest.ingestVerified === true &&
+      upstreamProbePlaylistStatus >= 200 &&
+      upstreamProbePlaylistStatus < 300 &&
+      upstreamProbeSegmentStatus >= 200 &&
+      upstreamProbeSegmentStatus < 300;
+    if (!preflight.ok && !canBypass403Preflight) {
       this.metrics.seedPreflightFailed += 1;
       const reason = `preflight-failed:${preflight.reason}`;
       this.noteSeedReject(reason);
@@ -1096,6 +1107,14 @@ class RepackManager {
         ingestHeaders: ingest.ingestHeaders,
         preflight: preflight.evidence,
       };
+    }
+    if (canBypass403Preflight) {
+      this.log("warn", "repack preflight bypassed for verified ingest", {
+        matchId,
+        serverId,
+        ingestUrl,
+        reason: preflight.reason,
+      });
     }
 
     let job = existingJob || this.jobs.get(key);
@@ -1133,7 +1152,7 @@ class RepackManager {
       ingestMode: ingest.ingestMode,
       ingestVerified: ingest.ingestVerified,
       ingestHeaders: ingest.ingestHeaders,
-      preflight: preflight.evidence,
+      preflight: canBypass403Preflight ? upstreamProbe : preflight.evidence,
     };
   }
 
