@@ -605,17 +605,75 @@ async function probeCandidate(input: {
     };
   }
 
-  const segmentProbe = await probeSegmentUrl(segmentUrl, input.segmentTimeoutMs, fetchHeaders);
+  let finalSegmentUrl = segmentUrl;
+  let finalPlaylistStatus = fetched.status;
+  let finalContentType = fetched.contentType;
+  if (looksLikeHlsManifestUrl(segmentUrl)) {
+    const childFetched = await fetchWithTimeout(segmentUrl, input.timeoutMs, fetchHeaders);
+    if (!childFetched.ok) {
+      return {
+        ok: false,
+        reason: `variant-http-${childFetched.status || 0}`,
+        evidence: {
+          playlistUrl: childFetched.finalUrl || segmentUrl,
+          segmentUrl: null,
+          playlistStatus: childFetched.status || 0,
+          segmentStatus: 0,
+          contentType: childFetched.contentType,
+        },
+        extraCandidates: [],
+      };
+    }
+    const childManifestLike = isLikelyManifestResponse(
+      childFetched.contentType,
+      childFetched.body,
+      childFetched.finalUrl || segmentUrl
+    );
+    if (!childManifestLike) {
+      return {
+        ok: false,
+        reason: "variant-non-manifest",
+        evidence: {
+          playlistUrl: childFetched.finalUrl || segmentUrl,
+          segmentUrl: null,
+          playlistStatus: childFetched.status || 0,
+          segmentStatus: 0,
+          contentType: childFetched.contentType,
+        },
+        extraCandidates: [],
+      };
+    }
+    const childSegment = parseLastSegmentUrl(childFetched.finalUrl || segmentUrl, childFetched.body);
+    if (!childSegment) {
+      return {
+        ok: false,
+        reason: "variant-empty",
+        evidence: {
+          playlistUrl: childFetched.finalUrl || segmentUrl,
+          segmentUrl: null,
+          playlistStatus: childFetched.status || 0,
+          segmentStatus: 0,
+          contentType: childFetched.contentType,
+        },
+        extraCandidates: [],
+      };
+    }
+    finalSegmentUrl = childSegment;
+    finalPlaylistStatus = childFetched.status || fetched.status;
+    finalContentType = childFetched.contentType || fetched.contentType;
+  }
+
+  const segmentProbe = await probeSegmentUrl(finalSegmentUrl, input.segmentTimeoutMs, fetchHeaders);
   if (!segmentProbe.ok) {
     return {
       ok: false,
       reason: `segment-http-${segmentProbe.status || 0}`,
       evidence: {
         playlistUrl: fetched.finalUrl || input.candidateUrl,
-        segmentUrl,
-        playlistStatus: fetched.status,
+        segmentUrl: finalSegmentUrl,
+        playlistStatus: finalPlaylistStatus,
         segmentStatus: segmentProbe.status || 0,
-        contentType: fetched.contentType,
+        contentType: finalContentType,
       },
       extraCandidates: [],
     };
@@ -626,10 +684,10 @@ async function probeCandidate(input: {
     reason: "manifest+segment-ok",
     evidence: {
       playlistUrl: fetched.finalUrl || input.candidateUrl,
-      segmentUrl,
-      playlistStatus: fetched.status,
+      segmentUrl: finalSegmentUrl,
+      playlistStatus: finalPlaylistStatus,
       segmentStatus: segmentProbe.status,
-      contentType: fetched.contentType,
+      contentType: finalContentType,
     },
     extraCandidates: [],
   };
