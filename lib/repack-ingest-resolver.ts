@@ -422,15 +422,33 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
     const pathname = String(u.pathname || "").toLowerCase();
     const search = String(u.search || "").toLowerCase();
     const combined = `${pathname}${search}`;
+    const isYallashotKoooraDirect =
+      (u.hostname.toLowerCase().endsWith(".yallashot.us") || u.hostname.toLowerCase() === "yallashot.us") &&
+      pathname.includes("/kooora/");
+
     if (looksLikeNonStreamAssetPath(pathname)) return Number.NEGATIVE_INFINITY;
     if (combined.includes(".mpd")) return Number.NEGATIVE_INFINITY;
 
     if (combined.includes(".m3u8")) score += 220;
-    if (pathname.includes("/api/embed-proxy")) score -= 70;
+    if (pathname.includes("/api/embed-proxy")) {
+      score -= 20;
+      const target = safeDecodeURIComponent(String(u.searchParams.get("url") || "").trim());
+      if (isValidHttpUrl(target)) {
+        try {
+          const tu = new URL(target);
+          const tPath = String(tu.pathname || "").toLowerCase();
+          const tHost = tu.hostname.toLowerCase();
+          if ((tHost.endsWith(".yallashot.us") || tHost === "yallashot.us") && tPath.includes("/kooora/")) {
+            score += 240;
+          }
+        } catch {}
+      }
+    }
     if (pathname.includes("/hls/") || pathname.includes("/live/") || pathname.includes("/manifest/")) score += 80;
     if (search.includes("token=") || search.includes("session") || search.includes("playlist")) score += 45;
     if (u.hostname.toLowerCase() === sourceHost) score += 28;
     if (u.hostname.toLowerCase().endsWith(`.${sourceHost}`)) score += 18;
+    if (isYallashotKoooraDirect && (search.includes("token=") || search.includes("session_id="))) score -= 140;
   } catch {
     return Number.NEGATIVE_INFINITY;
   }
@@ -764,6 +782,24 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
   for (const nested of extractCandidatesFromQueryParams(sourceUrl)) {
     const normalized = normalizeCandidate(nested, sourceUrl);
     if (normalized) pushCandidateUnique(candidateSeed, seen, normalized);
+  }
+
+  for (const candidate of [...candidateSeed]) {
+    if (!isValidHttpUrl(candidate) || !requestOrigin) continue;
+    try {
+      const candidateUrl = new URL(candidate);
+      const host = candidateUrl.hostname.toLowerCase();
+      const pathname = String(candidateUrl.pathname || "").toLowerCase();
+      const isYallashotKooora =
+        (host.endsWith(".yallashot.us") || host === "yallashot.us") && pathname.includes("/kooora/");
+      if (!isYallashotKooora) continue;
+      const proxyWrapped = buildInternalEmbedProxyUrl({
+        sourceUrl: candidate,
+        requestOrigin,
+        referrerUrl: sourceFetch.finalUrl || sourceUrl,
+      });
+      if (proxyWrapped) pushCandidateUnique(candidateSeed, seen, proxyWrapped);
+    } catch {}
   }
 
   const internalProxy = buildInternalEmbedProxyUrl({
