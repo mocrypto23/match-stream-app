@@ -169,6 +169,36 @@ function normalizeIngestMode(rawMode, ingestUrl) {
   return detectIngestUrlKind(ingestUrl);
 }
 
+function normalizeHeaderValue(raw) {
+  const value = String(raw || "")
+    .replace(/[\r\n]+/g, " ")
+    .trim();
+  return value || "";
+}
+
+function normalizeIngestHeaders(rawHeaders, fallbackSourceUrl = "") {
+  const sourceFallback = String(fallbackSourceUrl || "").trim();
+  const refererInput =
+    normalizeHeaderValue(rawHeaders?.referer || rawHeaders?.referrer || rawHeaders?.Referer) || sourceFallback;
+  const referer = isHttpUrl(refererInput) ? refererInput : "";
+  const originInput = normalizeHeaderValue(rawHeaders?.origin || rawHeaders?.Origin);
+  const origin = originInput || (referer ? (() => {
+    try {
+      return new URL(referer).origin;
+    } catch {
+      return "";
+    }
+  })() : "");
+  const userAgent = normalizeHeaderValue(
+    rawHeaders?.["user-agent"] || rawHeaders?.userAgent || rawHeaders?.UserAgent || DEFAULT_USER_AGENT
+  );
+  return {
+    referer: referer || "",
+    origin: origin || "",
+    "user-agent": userAgent || DEFAULT_USER_AGENT,
+  };
+}
+
 function parseLastSegmentFromManifest(playlistUrl, manifestText) {
   const lines = String(manifestText || "").split(/\r?\n/);
   for (let idx = lines.length - 1; idx >= 0; idx -= 1) {
@@ -182,7 +212,7 @@ function parseLastSegmentFromManifest(playlistUrl, manifestText) {
   return "";
 }
 
-async function probeSegmentUrl(segmentUrl, timeoutMs) {
+async function probeSegmentUrl(segmentUrl, timeoutMs, headers = {}) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -191,6 +221,10 @@ async function probeSegmentUrl(segmentUrl, timeoutMs) {
       cache: "no-store",
       redirect: "follow",
       signal: controller.signal,
+      headers: {
+        "user-agent": DEFAULT_USER_AGENT,
+        ...(headers || {}),
+      },
     });
     if (head.ok) return { ok: true, status: head.status };
     if (head.status !== 405) return { ok: false, status: head.status };
@@ -202,6 +236,8 @@ async function probeSegmentUrl(segmentUrl, timeoutMs) {
       signal: controller.signal,
       headers: {
         range: "bytes=0-1",
+        "user-agent": DEFAULT_USER_AGENT,
+        ...(headers || {}),
       },
     });
     if (getResp.ok || getResp.status === 206) return { ok: true, status: getResp.status };
@@ -254,6 +290,7 @@ class RepackJob {
     this.matchId = input.matchId;
     this.serverId = input.serverId;
     this.ingestUrl = input.ingestUrl;
+    this.ingestHeaders = normalizeIngestHeaders(input.ingestHeaders, input.ingestUrl);
     this.workDir = input.workDir;
     this.remotePrefix = input.remotePrefix.replace(/\/+$/, "");
     this.profile = input.profile;
@@ -342,17 +379,30 @@ class RepackJob {
     this.resetEncoderRunState();
     const ffmpegBin = this.manager.config.ffmpegBin;
     const segmentPattern = path.join(this.workDir, "seg-%08d.ts");
+    const ingestHeaders = normalizeIngestHeaders(this.ingestHeaders, this.ingestUrl);
+    const ffUserAgent = normalizeHeaderValue(ingestHeaders["user-agent"]) || DEFAULT_USER_AGENT;
+    const ffExtraHeaders = [];
+    if (ingestHeaders.origin) ffExtraHeaders.push(`Origin: ${ingestHeaders.origin}`);
+    if (ingestHeaders.referer) ffExtraHeaders.push(`Referer: ${ingestHeaders.referer}`);
     const args = [
       "-nostdin",
       "-hide_banner",
       "-loglevel",
       "warning",
       "-user_agent",
-      DEFAULT_USER_AGENT,
+      ffUserAgent,
       "-rw_timeout",
       "15000000",
       "-live_start_index",
       "-1",
+    ];
+    if (ingestHeaders.referer) {
+      args.push("-referer", ingestHeaders.referer);
+    }
+    if (ffExtraHeaders.length) {
+      args.push("-headers", `${ffExtraHeaders.join("\r\n")}\r\n`);
+    }
+    args.push(
       "-i",
       this.ingestUrl,
       "-c",
@@ -367,8 +417,8 @@ class RepackJob {
       "delete_segments+omit_endlist+program_date_time+split_by_time",
       "-hls_segment_filename",
       segmentPattern,
-      this.playlistPath,
-    ];
+      this.playlistPath
+    );
     this.lastSpawnAt = Date.now();
     this.state = "starting";
 
@@ -454,6 +504,15 @@ class RepackJob {
   touchSeed(ingestUrl, opts = {}) {
     this.lastSeedAt = Date.now();
     const forceRestart = Boolean(opts.forceRestart);
+    const nextHeaders = normalizeIngestHeaders(opts.ingestHeaders || this.ingestHeaders, ingestUrl || this.ingestUrl);
+    const headersChanged =
+      normalizeHeaderValue(nextHeaders.referer) !== normalizeHeaderValue(this.ingestHeaders?.referer) ||
+      normalizeHeaderValue(nextHeaders.origin) !== normalizeHeaderValue(this.ingestHeaders?.origin) ||
+      normalizeHeaderValue(nextHeaders["user-agent"]) !== normalizeHeaderValue(this.ingestHeaders?.["user-agent"]);
+    if (headersChanged) {
+      this.ingestHeaders = nextHeaders;
+    }
+
     if (ingestUrl && ingestUrl !== this.ingestUrl) {
       this.ingestUrl = ingestUrl;
       this.consecutiveStartFailures = 0;
@@ -467,6 +526,13 @@ class RepackJob {
       } else {
         this.spawnFfmpeg();
       }
+      return;
+    }
+    if (headersChanged && this.ffmpegProc) {
+      this.manager.log("info", "repack source headers updated", { job: this.key });
+      try {
+        this.ffmpegProc.kill("SIGTERM");
+      } catch {}
       return;
     }
     if (this.state === "degraded" || forceRestart) {
@@ -708,6 +774,11 @@ class RepackJob {
       state: this.state,
       ingestUrl: this.ingestUrl,
       ingestUrlKind: detectIngestUrlKind(this.ingestUrl),
+      ingestHeaders: {
+        referer: normalizeHeaderValue(this.ingestHeaders?.referer) || "",
+        origin: normalizeHeaderValue(this.ingestHeaders?.origin) || "",
+        userAgentSet: Boolean(normalizeHeaderValue(this.ingestHeaders?.["user-agent"])),
+      },
       createdAt: this.createdAt,
       lastSeedAt: this.lastSeedAt,
       lastPublishAt: this.lastPublishAt,
@@ -821,12 +892,14 @@ class RepackManager {
 
   resolveIngestPayload(payload) {
     const ingestVerified = payload?.ingestVerified === true;
+    const ingestHeaders = normalizeIngestHeaders(payload?.ingestHeaders, payload?.sourceUrl);
     const explicitIngest = normalizeCandidateUrl(payload?.ingestUrl, this.config.playerOrigin);
     if (explicitIngest && ingestVerified && isHttpUrl(explicitIngest)) {
       return {
         ingestUrl: explicitIngest,
         ingestMode: normalizeIngestMode(payload.ingestMode, explicitIngest),
         ingestVerified: true,
+        ingestHeaders,
       };
     }
 
@@ -836,6 +909,7 @@ class RepackManager {
         ingestUrl: candidate,
         ingestMode: normalizeIngestMode(payload.ingestMode, candidate),
         ingestVerified,
+        ingestHeaders,
       };
     }
 
@@ -845,6 +919,7 @@ class RepackManager {
         ingestUrl: source,
         ingestMode: normalizeIngestMode(payload.ingestMode, source),
         ingestVerified,
+        ingestHeaders,
       };
     }
 
@@ -852,23 +927,28 @@ class RepackManager {
       ingestUrl: "",
       ingestMode: "none",
       ingestVerified,
+      ingestHeaders,
     };
   }
 
-  async preflightIngest(ingestUrl, ingestMode) {
+  async preflightIngest(ingestUrl, ingestMode, ingestHeaders = {}) {
     const timeoutMs = this.config.preflightTimeoutMs;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    const headers = normalizeIngestHeaders(ingestHeaders, ingestUrl);
+    const requestHeaders = {
+      accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
+      "user-agent": headers["user-agent"] || DEFAULT_USER_AGENT,
+    };
+    if (headers.referer) requestHeaders.referer = headers.referer;
+    if (headers.origin) requestHeaders.origin = headers.origin;
     try {
       const response = await fetch(ingestUrl, {
         method: "GET",
         cache: "no-store",
         redirect: "follow",
         signal: controller.signal,
-        headers: {
-          accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
-          "user-agent": DEFAULT_USER_AGENT,
-        },
+        headers: requestHeaders,
       });
       const body = await response.text();
       const contentType = String(response.headers.get("content-type") || "").toLowerCase();
@@ -900,7 +980,11 @@ class RepackManager {
         return { ok: false, reason: "manifest-empty", evidence: evidenceBase };
       }
 
-      const segmentProbe = await probeSegmentUrl(segmentUrl, Math.max(900, Math.floor(timeoutMs * 0.85)));
+      const segmentProbe = await probeSegmentUrl(
+        segmentUrl,
+        Math.max(900, Math.floor(timeoutMs * 0.85)),
+        requestHeaders
+      );
       if (!segmentProbe.ok) {
         return {
           ok: false,
@@ -998,7 +1082,7 @@ class RepackManager {
       return { accepted: false, reason: "invalid-ingest-url", ingestMode: ingest.ingestMode };
     }
 
-    const preflight = await this.preflightIngest(ingestUrl, ingest.ingestMode);
+    const preflight = await this.preflightIngest(ingestUrl, ingest.ingestMode, ingest.ingestHeaders);
     if (!preflight.ok) {
       this.metrics.seedPreflightFailed += 1;
       const reason = `preflight-failed:${preflight.reason}`;
@@ -1009,6 +1093,7 @@ class RepackManager {
         ingestUrl,
         ingestMode: ingest.ingestMode,
         ingestVerified: ingest.ingestVerified,
+        ingestHeaders: ingest.ingestHeaders,
         preflight: preflight.evidence,
       };
     }
@@ -1022,6 +1107,7 @@ class RepackManager {
         matchId,
         serverId,
         ingestUrl,
+        ingestHeaders: ingest.ingestHeaders,
         workDir,
         remotePrefix,
         profile: this.config.repackProfile,
@@ -1036,7 +1122,7 @@ class RepackManager {
         ingestMode: ingest.ingestMode,
       });
     } else {
-      job.touchSeed(ingestUrl, { forceRestart });
+      job.touchSeed(ingestUrl, { forceRestart, ingestHeaders: ingest.ingestHeaders });
     }
     this.metrics.seedAccepted += 1;
     return {
@@ -1046,6 +1132,7 @@ class RepackManager {
       ingestUrl,
       ingestMode: ingest.ingestMode,
       ingestVerified: ingest.ingestVerified,
+      ingestHeaders: ingest.ingestHeaders,
       preflight: preflight.evidence,
     };
   }

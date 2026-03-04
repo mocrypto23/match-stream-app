@@ -28,6 +28,8 @@ import {
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+const DEFAULT_INGEST_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 
 type BootstrapRequest = {
   matchId?: number;
@@ -123,6 +125,11 @@ async function postSeedToAgent(payload: {
   ingestUrl: string;
   ingestMode: RepackIngestMode;
   ingestVerified: boolean;
+  ingestHeaders: {
+    referer?: string;
+    origin?: string;
+    "user-agent"?: string;
+  };
   probeEvidence: RepackIngestResolution["probeEvidence"];
   matchStatus: string;
   matchStart: string;
@@ -165,6 +172,23 @@ async function postSeedToAgent(payload: {
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+function buildIngestHeaders(sourceUrl: string) {
+  const referer = isValidHttpUrl(sourceUrl) ? sourceUrl : "";
+  const origin = (() => {
+    if (!referer) return "";
+    try {
+      return new URL(referer).origin;
+    } catch {
+      return "";
+    }
+  })();
+  return {
+    referer: referer || undefined,
+    origin: origin || undefined,
+    "user-agent": DEFAULT_INGEST_USER_AGENT,
+  };
 }
 
 export async function POST(req: Request) {
@@ -366,6 +390,7 @@ export async function POST(req: Request) {
       ingestUrl: ingest.ingestUrl,
       ingestMode: ingest.mode,
       ingestVerified: ingest.resolver.resolverState === "ok",
+      ingestHeaders: buildIngestHeaders(sourceUrl),
       probeEvidence: ingest.probeEvidence,
       matchStatus: String(row.status_key || ""),
       matchStart: String(row.match_start || ""),
