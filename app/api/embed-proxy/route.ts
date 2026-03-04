@@ -617,7 +617,21 @@ function rewriteM3u8Manifest(
   passQuery?: URLSearchParams | null
 ) {
   const nextDepth = Math.min(MAX_PROXY_DEPTH, depth + 1);
-  const childReferrer = referrerForChildren || baseUrl;
+  const childReferrer = (() => {
+    let resolved = referrerForChildren || baseUrl;
+    try {
+      const base = new URL(baseUrl);
+      const host = normalizeHost(base.hostname);
+      const pathname = String(base.pathname || "").toLowerCase();
+      const isYallashotKooora =
+        (host === "yallashot.us" || host.endsWith(".yallashot.us")) && pathname.includes("/kooora/");
+      if (isYallashotKooora) {
+        // Some tokenized yallashot streams require referer chaining per-level manifest.
+        resolved = baseUrl;
+      }
+    } catch {}
+    return resolved;
+  })();
   const inheritEasybroadcastAuth = (rawChildAbsoluteUrl: string) => {
     try {
       const child = new URL(rawChildAbsoluteUrl);
