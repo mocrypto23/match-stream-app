@@ -13,6 +13,7 @@ import type { MatchR2Status, R2StatusServerEntry } from "@/lib/r2-status-types";
 import { getServerCapability } from "@/lib/server-capabilities";
 import { getSlotServerIdForUiServer, type UiServerId } from "@/lib/server-source-policy";
 import { getClientStreamMode, isR2StrictMode, type StreamMode } from "@/lib/stream-mode";
+import { computeMatchWindowState, getMatchWindowConfig, parseMatchStartMs } from "@/lib/match-window";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -88,7 +89,6 @@ type P2PEngineInstance = {
 };
 type P2PEngineConstructor = new (config?: { core?: { swarmId?: string } }) => P2PEngineInstance;
 
-const PREMATCH_OPEN_WINDOW_MINUTES = 30;
 const STALL_FREEZE_MS = 18000;
 const P2P_STALL_FREEZE_MS = 30000;
 const REPACK_STALE_PLAYLIST_MAX_IDLE_MS = 5_000;
@@ -106,6 +106,7 @@ const REPACK_FLAGS = getRuntimeRepackFlags();
 const STREAM_MODE = getClientStreamMode();
 const R2_STRICT_MODE = isR2StrictMode(STREAM_MODE);
 const LEGACY_STRICT_MODE = STREAM_MODE === "legacy_strict";
+const MATCH_WINDOW_CONFIG = getMatchWindowConfig();
 const P2P_PROFILE = (() => {
   const raw = String(process.env.NEXT_PUBLIC_P2P_PROFILE || "").trim().toLowerCase();
   if (raw === "max-stability") return "max-stability" as const;
@@ -121,7 +122,6 @@ const REPACK_TOKEN_REFRESH_KICK_MS = 16_000;
 const EMBED_FALLBACK_ENABLED = String(process.env.NEXT_PUBLIC_EMBED_FALLBACK_ENABLED || "0").trim() === "1";
 const LIVE_ONLY_PLAYBACK = String(process.env.NEXT_PUBLIC_LIVE_ONLY_PLAYBACK || "1").trim() !== "0";
 const FORCE_REPACK_READ = String(process.env.NEXT_PUBLIC_FORCE_REPACK_READ || "0").trim() === "1";
-const LIVE_STATUS_MAX_AGE_MS = 3 * 60 * 60 * 1000;
 const CANDIDATE_PROBE_TIMEOUT_MS = 6500;
 const FAST_PHASE_PROBE_TIMEOUT_MS = 2200;
 const FAST_PHASE_MAX_PLAYER_PAGES = 5;
@@ -6043,6 +6043,17 @@ export default function WatchPage() {
     return () => window.clearInterval(timer);
   }, []);
 
+  const matchStartMs = useMemo(() => parseMatchStartMs(match?.match_start), [match?.match_start]);
+  const matchWindow = useMemo(
+    () =>
+      computeMatchWindowState({
+        matchStartMs,
+        nowMs,
+        config: MATCH_WINDOW_CONFIG,
+      }),
+    [matchStartMs, nowMs]
+  );
+
   const strictR2StatusBySlot = useMemo(() => {
     const out = new Map<number, R2StatusServerEntry>();
     const list = r2Status?.servers || [];
@@ -6100,17 +6111,8 @@ export default function WatchPage() {
       server5Source,
       match?.stream_url_6 ?? null,
     ];
-    const statusKey = String(match?.status_key || "").trim().toLowerCase();
-    const startAtMs = match?.match_start ? new Date(match.match_start).getTime() : NaN;
-    const prematchWindowMs = PREMATCH_OPEN_WINDOW_MINUTES * 60 * 1000;
-    const isPrematchWindowOpen =
-      statusKey === "upcoming" &&
-      Number.isFinite(startAtMs) &&
-      nowMs >= (startAtMs - prematchWindowMs);
-    const liveStatusStaleByClock =
-      statusKey === "live" && Number.isFinite(startAtMs) && nowMs - startAtMs > LIVE_STATUS_MAX_AGE_MS;
-    const isLiveMatch = statusKey === "live" && !liveStatusStaleByClock;
-    const allowRepackRead = FORCE_REPACK_READ || isLiveMatch || isPrematchWindowOpen;
+    const allowByWindow = matchWindow.inWindow;
+    const allowRepackRead = FORCE_REPACK_READ || allowByWindow;
 
     const out: ServerOption[] = [];
     for (let i = 0; i < 6; i += 1) {
@@ -6124,7 +6126,7 @@ export default function WatchPage() {
       let repackDecisionReason = "not-eligible";
       let repackReadPct = 0;
       let repackBucket = -1;
-      if (LIVE_ONLY_PLAYBACK && !(isLiveMatch || isPrematchWindowOpen)) {
+      if (LIVE_ONLY_PLAYBACK && !allowByWindow) {
         const label = SERVER_SOURCE_LABELS[n] || `سيرفر ${n}`;
         out.push({
           n,
@@ -6132,7 +6134,7 @@ export default function WatchPage() {
           url: null,
           fallbackUrl: null,
           repackActive: false,
-          repackDecisionReason: "match-not-live-hard-stop",
+          repackDecisionReason: "match-outside-window-hard-stop",
           repackReadPct: 0,
           repackBucket: -1,
           sticky: false,
@@ -6193,7 +6195,7 @@ export default function WatchPage() {
     SERVER_DISPLAY_ORDER.forEach((n, idx) => orderIndex.set(n, idx));
     out.sort((a, b) => (orderIndex.get(a.n) ?? 999) - (orderIndex.get(b.n) ?? 999));
     return out;
-  }, [match, derivedServer3Url, runtimeServer5Url, server3VerifiedAvailable, idNum, runtimeRepackFlags, viewerSessionId, repackBypassVersion, nowMs, strictR2StatusBySlot]);
+  }, [match, derivedServer3Url, runtimeServer5Url, server3VerifiedAvailable, idNum, runtimeRepackFlags, viewerSessionId, repackBypassVersion, matchWindow.inWindow, strictR2StatusBySlot]);
 
   const validServers = useMemo(() => serverOptions.filter((s) => s.url && isValidHttpUrl(s.url)), [serverOptions]);
   useEffect(() => {
@@ -6267,20 +6269,8 @@ export default function WatchPage() {
   const selectedFallbackUrl = selectedOption?.fallbackUrl ?? "";
   const server5OptionUrl = serverOptions.find((s) => s.n === 5)?.url ?? "";
   const server5DbUrl = String(match?.stream_url_5 || "").trim();
-  const status = (match?.status_key ?? "").toLowerCase();
-  const startMs = match?.match_start ? new Date(match.match_start).getTime() : null;
-  const liveStatusStaleByClock =
-    status === "live" &&
-    startMs !== null &&
-    Number.isFinite(startMs) &&
-    nowMs - startMs > LIVE_STATUS_MAX_AGE_MS;
-  const effectiveStatus = liveStatusStaleByClock ? "finished" : status;
-  const prematchMs = PREMATCH_OPEN_WINDOW_MINUTES * 60 * 1000;
-  const streamOpenMs = startMs !== null && Number.isFinite(startMs) ? startMs - prematchMs : null;
-  const hasStartedByTime = startMs !== null && Number.isFinite(startMs) ? nowMs >= startMs - prematchMs : false;
-  const shouldBlockStream = LIVE_ONLY_PLAYBACK
-    ? !(effectiveStatus === "live" || (effectiveStatus === "upcoming" && hasStartedByTime))
-    : (!(effectiveStatus === "live" || effectiveStatus === "finished") && !hasStartedByTime && effectiveStatus === "upcoming");
+  const streamOpenMs = matchWindow.openAtMs;
+  const shouldBlockStream = LIVE_ONLY_PLAYBACK ? !matchWindow.inWindow : false;
 
   useEffect(() => {
     if (!R2_STRICT_MODE) return;
@@ -8325,11 +8315,23 @@ export default function WatchPage() {
 
   const prettyStart = formatStartTimeAr(match?.match_start);
   const streamOpenLabel = formatTimeOnlyAr(streamOpenMs);
-  const streamStartNotice = LIVE_ONLY_PLAYBACK && effectiveStatus !== "live"
-    ? "البث متاح فقط عندما تكون حالة المباراة LIVE."
-    : (streamOpenLabel
-      ? `سيبدأ البث في الساعة ${streamOpenLabel} (قبل ساعة المباراة بنصف ساعة)`
-      : "سيبدأ البث قبل ساعة المباراة بنصف ساعة");
+  const streamStartNotice = (() => {
+    if (!LIVE_ONLY_PLAYBACK) {
+      return streamOpenLabel
+        ? `سيبدأ البث في الساعة ${streamOpenLabel} (قبل ساعة المباراة بنصف ساعة)`
+        : "سيبدأ البث قبل ساعة المباراة بنصف ساعة";
+    }
+    if (!matchWindow.hasStart) return "البث غير متاح لأن موعد المباراة غير محدد.";
+    if (matchWindow.openAtMs !== null && nowMs < matchWindow.openAtMs) {
+      return streamOpenLabel
+        ? `سيبدأ البث في الساعة ${streamOpenLabel} (قبل ساعة المباراة بنصف ساعة)`
+        : "سيبدأ البث قبل ساعة المباراة بنصف ساعة";
+    }
+    if (matchWindow.closeAtMs !== null && nowMs > matchWindow.closeAtMs) {
+      return "انتهت نافذة البث لهذه المباراة.";
+    }
+    return "البث غير متاح حاليًا.";
+  })();
   const noStreamLabel = selectedUrl ? NO_STREAM_SELECTED_SERVER_MESSAGE : "لا يوجد بث";
   const home = match?.home_team ?? "الفريق الأول";
   const away = match?.away_team ?? "الفريق الثاني";

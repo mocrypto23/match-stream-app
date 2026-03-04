@@ -31,6 +31,35 @@ function toBool(raw, fallback = false) {
   return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
+function parseMatchStartMs(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return null;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function computeMatchWindowState(matchStartMs, config, nowMs = Date.now()) {
+  const startAtMs = Number.isFinite(matchStartMs) ? Number(matchStartMs) : null;
+  if (!startAtMs) {
+    return {
+      hasStart: false,
+      startAtMs: null,
+      openAtMs: null,
+      closeAtMs: null,
+      inWindow: false,
+    };
+  }
+  const openAtMs = startAtMs - config.prematchOpenWindowMs;
+  const closeAtMs = startAtMs + config.matchDurationMs + config.postmatchGraceMs;
+  return {
+    hasStart: true,
+    startAtMs,
+    openAtMs,
+    closeAtMs,
+    inWindow: nowMs >= openAtMs && nowMs <= closeAtMs,
+  };
+}
+
 function isHttpUrl(value) {
   try {
     const u = new URL(String(value || ""));
@@ -601,6 +630,7 @@ class RepackManager {
   constructor(config) {
     this.config = config;
     this.jobs = new Map();
+    this.finishedSeenAtByJob = new Map();
     this.startedAt = Date.now();
     this.metrics = {
       seedRequests: 0,
@@ -619,6 +649,18 @@ class RepackManager {
         secretAccessKey: config.r2SecretAccessKey,
       },
     });
+  }
+
+  noteFinishedSeenAt(jobKey, isFinished, nowMs) {
+    if (!jobKey) return null;
+    if (!isFinished) {
+      this.finishedSeenAtByJob.delete(jobKey);
+      return null;
+    }
+    const existing = this.finishedSeenAtByJob.get(jobKey);
+    if (Number.isFinite(existing)) return Number(existing);
+    this.finishedSeenAtByJob.set(jobKey, nowMs);
+    return nowMs;
   }
 
   log(level, message, extra = {}) {
@@ -672,7 +714,7 @@ class RepackManager {
     const matchId = toInt(payload.matchId, NaN, 1);
     const serverId = toInt(payload.serverId, NaN, 1);
     const matchStatus = String(payload.matchStatus || "").trim().toLowerCase();
-    const matchStartMs = Number.parseInt(String(new Date(String(payload.matchStart || "")).getTime()), 10);
+    const matchStartMs = parseMatchStartMs(payload.matchStart);
     const liveOnly = this.config.liveOnly;
 
     if (!Number.isFinite(matchId) || !Number.isFinite(serverId)) {
@@ -683,16 +725,37 @@ class RepackManager {
       this.metrics.seedRejected += 1;
       return { accepted: false, reason: "server-not-enabled" };
     }
-    if (liveOnly && matchStatus) {
-      const now = Date.now();
-      const prematchOpenAt = Number.isFinite(matchStartMs)
-        ? matchStartMs - this.config.prematchOpenWindowMs
-        : Number.NaN;
-      const allowPrematchUpcoming = matchStatus === "upcoming" && Number.isFinite(prematchOpenAt) && now >= prematchOpenAt;
-      const allowLive = matchStatus === "live";
-      if (!allowLive && !allowPrematchUpcoming) {
+    const key = `m${matchId}:s${serverId}`;
+    const nowMs = Date.now();
+    const windowState = computeMatchWindowState(matchStartMs, this.config, nowMs);
+    if (liveOnly) {
+      if (!windowState.hasStart) {
         this.metrics.seedRejected += 1;
-        return { accepted: false, reason: "match-not-open" };
+        return { accepted: false, reason: "missing-match-start" };
+      }
+      if (!windowState.inWindow) {
+        this.metrics.seedRejected += 1;
+        return { accepted: false, reason: "match-outside-window" };
+      }
+    }
+    const seenFinishedAt = this.noteFinishedSeenAt(key, matchStatus === "finished", nowMs);
+    const existingJob = this.jobs.get(key);
+    if (this.config.earlyStopOnFinished && seenFinishedAt !== null) {
+      const finishedStableForMs = Math.max(0, nowMs - seenFinishedAt);
+      const finishedDebounced = finishedStableForMs >= this.config.finishedDebounceMs;
+      const sourceFailTrend = existingJob?.consecutiveSourceErrors || 0;
+      if (finishedDebounced && sourceFailTrend >= this.config.earlyStopSegmentFailStreak) {
+        if (existingJob) {
+          await existingJob.stop();
+          this.jobs.delete(key);
+        }
+        this.metrics.seedRejected += 1;
+        return {
+          accepted: false,
+          reason: "early-stop-finished+segment-fail",
+          finishedStableForMs,
+          sourceFailTrend,
+        };
       }
     }
     const ingestUrl = this.resolveIngestUrl(payload);
@@ -701,8 +764,7 @@ class RepackManager {
       return { accepted: false, reason: "invalid-ingest-url" };
     }
 
-    const key = `m${matchId}:s${serverId}`;
-    let job = this.jobs.get(key);
+    let job = existingJob || this.jobs.get(key);
     if (!job) {
       const workDir = path.join(this.config.workRoot, `m${matchId}`, `s${serverId}`);
       const remotePrefix = `live/m${matchId}/s${serverId}`;
@@ -735,6 +797,7 @@ class RepackManager {
       await job.stop();
     }
     this.jobs.clear();
+    this.finishedSeenAtByJob.clear();
   }
 
   diag() {
@@ -760,6 +823,12 @@ class RepackManager {
         bind: this.config.bind,
         port: this.config.port,
         liveOnly: this.config.liveOnly,
+        prematchOpenWindowMs: this.config.prematchOpenWindowMs,
+        matchDurationMs: this.config.matchDurationMs,
+        postmatchGraceMs: this.config.postmatchGraceMs,
+        earlyStopOnFinished: this.config.earlyStopOnFinished,
+        finishedDebounceMs: this.config.finishedDebounceMs,
+        earlyStopSegmentFailStreak: this.config.earlyStopSegmentFailStreak,
         repackServers: Array.from(this.config.repackServers).sort((a, b) => a - b),
         r2Bucket: this.config.r2Bucket,
         publicBaseUrl: this.config.publicBaseUrl,
@@ -779,6 +848,9 @@ function loadConfig() {
       .filter((item) => Number.isFinite(item) && item > 0)
   );
   const prematchOpenWindowMinutes = toInt(process.env.REPACK_PREMATCH_OPEN_WINDOW_MINUTES, 30, 0);
+  const matchDurationMinutes = toInt(process.env.REPACK_MATCH_DURATION_MINUTES, 180, 1);
+  const postmatchGraceMinutes = toInt(process.env.REPACK_POSTMATCH_GRACE_MINUTES, 15, 0);
+  const finishedDebounceMinutes = toInt(process.env.REPACK_FINISHED_DEBOUNCE_MINUTES, 5, 0);
 
   const cfg = {
     bind: String(process.env.REPACK_AGENT_BIND || "127.0.0.1").trim(),
@@ -795,6 +867,11 @@ function loadConfig() {
     remoteRetentionMs: toInt(process.env.REPACK_REMOTE_RETENTION_MS, 8 * 60 * 1000, 30_000),
     liveOnly: toBool(process.env.REPACK_LIVE_ONLY, true),
     prematchOpenWindowMs: prematchOpenWindowMinutes * 60 * 1000,
+    matchDurationMs: matchDurationMinutes * 60 * 1000,
+    postmatchGraceMs: postmatchGraceMinutes * 60 * 1000,
+    earlyStopOnFinished: toBool(process.env.REPACK_EARLY_STOP_ON_FINISHED, false),
+    finishedDebounceMs: finishedDebounceMinutes * 60 * 1000,
+    earlyStopSegmentFailStreak: toInt(process.env.REPACK_EARLY_STOP_SEGMENT_FAIL_STREAK, 4, 1),
     publicBaseUrl: String(process.env.REPACK_PUBLIC_BASE_URL || "https://r2.tf-player.site/live").trim(),
     playerOrigin: String(process.env.REPACK_PLAYER_ORIGIN || "https://tf-player.site").trim(),
     repackServers,

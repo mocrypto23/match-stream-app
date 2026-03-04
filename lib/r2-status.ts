@@ -10,6 +10,7 @@ import {
 import type { MatchR2Status, R2ServerState, R2StatusServerEntry } from "./r2-status-types";
 import { getRepackSeedRuntimeState } from "./repack-runtime-state";
 import type { StreamMode } from "./stream-mode";
+import { computeMatchWindowState, getMatchWindowConfig, parseMatchStartMs } from "./match-window";
 
 const DEFAULT_R2_PROBE_TIMEOUT_MS = 2400;
 const DEFAULT_SEGMENT_PROBE_TIMEOUT_MS = 1700;
@@ -22,6 +23,8 @@ type StreamRowFields = {
   stream_url_2?: string | null;
   stream_url_3?: string | null;
   stream_url_4?: string | null;
+  match_start?: string | null;
+  status_key?: string | null;
 };
 
 type SequenceState = {
@@ -39,6 +42,8 @@ type PlaylistProbeResult = {
 };
 
 const sequenceStateByPlaylist = new Map<string, SequenceState>();
+const finishedSeenAtByMatchSlot = new Map<string, number>();
+const segmentFailStateByMatchSlot = new Map<string, { count: number; lastSeenAt: number }>();
 
 function nowIso(now = Date.now()) {
   return new Date(now).toISOString();
@@ -48,6 +53,36 @@ function trimSequenceState(nowMs: number) {
   for (const [key, value] of sequenceStateByPlaylist.entries()) {
     if (nowMs - value.lastSeenAt > SEQUENCE_STATE_TTL_MS) sequenceStateByPlaylist.delete(key);
   }
+}
+
+function trimEarlyStopState(nowMs: number) {
+  for (const [key, seenAt] of finishedSeenAtByMatchSlot.entries()) {
+    if (nowMs - seenAt > SEQUENCE_STATE_TTL_MS) finishedSeenAtByMatchSlot.delete(key);
+  }
+  for (const [key, value] of segmentFailStateByMatchSlot.entries()) {
+    if (nowMs - value.lastSeenAt > SEQUENCE_STATE_TTL_MS) segmentFailStateByMatchSlot.delete(key);
+  }
+}
+
+function noteSegmentProbeFailure(matchSlotKey: string, failed: boolean, nowMs: number) {
+  trimEarlyStopState(nowMs);
+  const prev = segmentFailStateByMatchSlot.get(matchSlotKey) || { count: 0, lastSeenAt: nowMs };
+  const next = failed
+    ? {
+        count: prev.count + 1,
+        lastSeenAt: nowMs,
+      }
+    : {
+        count: 0,
+        lastSeenAt: nowMs,
+      };
+  segmentFailStateByMatchSlot.set(matchSlotKey, next);
+  return next.count;
+}
+
+function clearEarlyStopState(matchSlotKey: string) {
+  finishedSeenAtByMatchSlot.delete(matchSlotKey);
+  segmentFailStateByMatchSlot.delete(matchSlotKey);
 }
 
 function parseMediaSequence(playlistBody: string) {
@@ -228,6 +263,16 @@ export async function buildMatchR2Status(input: {
   const mode = input.mode;
   const matchId = Number.parseInt(String(input.matchId || 0), 10);
   const nowMs = Date.now();
+  const statusKey = String(input.row.status_key || "").trim().toLowerCase();
+  const matchWindowConfig = getMatchWindowConfig();
+  const matchStartMs = parseMatchStartMs(input.row.match_start);
+  const matchWindow = computeMatchWindowState({
+    matchStartMs,
+    nowMs,
+    config: matchWindowConfig,
+  });
+  const shouldEarlyStopFinished = matchWindowConfig.earlyStopOnFinished && statusKey === "finished";
+  const finishedDebounceMs = Math.max(0, matchWindowConfig.finishedDebounceMinutes * 60 * 1000);
   const probeTimeoutMs = Math.max(600, Number.parseInt(String(input.probeTimeoutMs || DEFAULT_R2_PROBE_TIMEOUT_MS), 10));
   const segmentProbeTimeoutMs = Math.max(
     600,
@@ -238,15 +283,18 @@ export async function buildMatchR2Status(input: {
     Number.parseInt(String(process.env.R2_STATUS_STALE_SEQUENCE_GUARD_MS || DEFAULT_STALE_SEQUENCE_GUARD_MS), 10)
   );
   const shouldProbeR2 = mode === "r2_strict";
+  trimEarlyStopState(nowMs);
 
   const servers = await Promise.all(
     UI_SERVER_IDS.map(async (uiServer): Promise<R2StatusServerEntry> => {
       const slotServer = getSlotServerIdForUiServer(uiServer);
+      const matchSlotKey = `m${matchId}:s${slotServer}`;
       const sourceUrl = getSlotSourceUrlFromRow(input.row, slotServer) || "";
       const hasSource = isValidHttpUrl(sourceUrl);
       const sourceAllowed = hasSource ? isAllowedSourceForSlotServer(slotServer, sourceUrl) : false;
       const playlistUrl = buildR2PlaylistUrlForSlot(input.repackBaseUrl, matchId, slotServer);
       if (!hasSource || !sourceAllowed || !playlistUrl) {
+        clearEarlyStopState(matchSlotKey);
         return {
           uiServer,
           slotServer,
@@ -260,6 +308,7 @@ export async function buildMatchR2Status(input: {
       }
 
       if (!shouldProbeR2) {
+        clearEarlyStopState(matchSlotKey);
         return {
           uiServer,
           slotServer,
@@ -272,8 +321,50 @@ export async function buildMatchR2Status(input: {
         };
       }
 
+      if (!matchWindow.inWindow) {
+        clearEarlyStopState(matchSlotKey);
+        return {
+          uiServer,
+          slotServer,
+          state: "down",
+          playlistUrl,
+          segmentProbe: "unknown",
+          lastSequenceAgeMs: null,
+          reason: "blocked-outside-window",
+          updatedAt: nowIso(nowMs),
+        };
+      }
+
+      let finishedSeenAt: number | null = null;
+      if (shouldEarlyStopFinished) {
+        const existingSeenAt = finishedSeenAtByMatchSlot.get(matchSlotKey);
+        finishedSeenAt = Number.isFinite(existingSeenAt) ? Number(existingSeenAt) : nowMs;
+        if (!Number.isFinite(existingSeenAt)) {
+          finishedSeenAtByMatchSlot.set(matchSlotKey, finishedSeenAt);
+        }
+      } else {
+        finishedSeenAtByMatchSlot.delete(matchSlotKey);
+      }
+
       const probed = await probeR2Playlist(playlistUrl, Math.max(probeTimeoutMs, segmentProbeTimeoutMs));
       const sequenceAgeMs = noteSequenceAndGetAgeMs(playlistUrl, probed.mediaSequence, nowMs);
+      const consecutiveSegmentFails = noteSegmentProbeFailure(matchSlotKey, probed.segmentProbe === "fail", nowMs);
+      const finishedDebounced =
+        shouldEarlyStopFinished &&
+        finishedSeenAt !== null &&
+        nowMs - finishedSeenAt >= finishedDebounceMs;
+      if (finishedDebounced && consecutiveSegmentFails >= matchWindowConfig.earlyStopSegmentFailStreak) {
+        return {
+          uiServer,
+          slotServer,
+          state: "down",
+          playlistUrl,
+          segmentProbe: probed.segmentProbe,
+          lastSequenceAgeMs: sequenceAgeMs,
+          reason: "early-stop-finished+segment-fail",
+          updatedAt: nowIso(nowMs),
+        };
+      }
       const isStaleSequence =
         probed.state === "ready" &&
         Number.isFinite(sequenceAgeMs) &&
@@ -299,7 +390,7 @@ export async function buildMatchR2Status(input: {
         slotServer,
         state: seeded.state,
         playlistUrl,
-        segmentProbe: "fail",
+        segmentProbe: isStaleSequence ? "ok" : probed.segmentProbe,
         lastSequenceAgeMs: sequenceAgeMs,
         reason: isStaleSequence ? `${seeded.reason}:age=${sequenceAgeMs}` : seeded.reason,
         updatedAt: nowIso(nowMs),

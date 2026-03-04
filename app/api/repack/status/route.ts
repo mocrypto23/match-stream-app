@@ -10,6 +10,8 @@ export const dynamic = "force-dynamic";
 
 type MatchStatusRow = {
   id: number;
+  match_start?: string | null;
+  status_key?: string | null;
   stream_url?: string | null;
   stream_url_2?: string | null;
   stream_url_3?: string | null;
@@ -24,7 +26,7 @@ function toInt(raw: unknown) {
 async function fetchMatchStatusRow(matchId: number) {
   const { data, error } = await supabaseAdmin
     .from("match-stream-app")
-    .select("id,stream_url,stream_url_2,stream_url_3,stream_url_4")
+    .select("id,match_start,status_key,stream_url,stream_url_2,stream_url_3,stream_url_4")
     .eq("id", matchId)
     .maybeSingle();
   return {
@@ -61,4 +63,3 @@ export async function GET(req: Request) {
     seedRuntime: listRepackSeedRuntimeStateForMatch(matchId),
   });
 }
-
