@@ -42,7 +42,7 @@ next-env.d.ts
 
 
 # Diagnostics
-diag/
+/diag/
 debug.png
 
 # Env files
