@@ -663,9 +663,41 @@ function rewriteM3u8Manifest(
     }
   };
 
+  const inheritYallashotKoooraAuth = (rawChildAbsoluteUrl: string) => {
+    try {
+      const child = new URL(rawChildAbsoluteUrl);
+      const parent = new URL(baseUrl);
+      const childHost = normalizeHost(child.hostname);
+      const parentHost = normalizeHost(parent.hostname);
+      const childPath = String(child.pathname || "").toLowerCase();
+      const parentPath = String(parent.pathname || "").toLowerCase();
+      const isYallashotPair =
+        (childHost === "yallashot.us" || childHost.endsWith(".yallashot.us")) &&
+        (parentHost === "yallashot.us" || parentHost.endsWith(".yallashot.us")) &&
+        (childPath.includes("/kooora/") || parentPath.includes("/kooora/"));
+      if (!isYallashotPair) return rawChildAbsoluteUrl;
+
+      const token = String(parent.searchParams.get("token") || "").trim();
+      const sessionId = String(parent.searchParams.get("session_id") || "").trim();
+      if (!token || !sessionId) return rawChildAbsoluteUrl;
+      if (!child.searchParams.get("token")) child.searchParams.set("token", token);
+      if (!child.searchParams.get("session_id")) child.searchParams.set("session_id", sessionId);
+
+      const ts = String(parent.searchParams.get("ts") || "").trim();
+      const nonce = String(parent.searchParams.get("nonce") || "").trim();
+      if (ts && !child.searchParams.get("ts")) child.searchParams.set("ts", ts);
+      if (nonce && !child.searchParams.get("nonce")) child.searchParams.set("nonce", nonce);
+      return child.toString();
+    } catch {
+      return rawChildAbsoluteUrl;
+    }
+  };
+
   const toProxyUri = (raw: string) => {
     const absoluteRaw = toAbsoluteUrl(raw, baseUrl);
-    const absolute = absoluteRaw ? inheritEasybroadcastAuth(absoluteRaw) : null;
+    const absolute = absoluteRaw
+      ? inheritYallashotKoooraAuth(inheritEasybroadcastAuth(absoluteRaw))
+      : null;
     if (!absolute) return raw;
     if (isBlockedAbsoluteUrl(absolute)) return raw;
     return buildProxyUrl(absolute, nextDepth, childReferrer, passQuery);
