@@ -2,18 +2,29 @@ import { NextResponse } from "next/server";
 import { supabaseAdmin } from "../../_supabase";
 import { getRuntimeRepackFlags } from "@/lib/repack-flags";
 import { buildMatchR2Status } from "@/lib/r2-status";
-import { setRepackSeedRuntimeState } from "@/lib/repack-runtime-state";
+import {
+  noteRepackBootstrapOutcome,
+  noteRepackBootstrapRequest,
+  setRepackSeedRuntimeState,
+  type RepackResolverState,
+} from "@/lib/repack-runtime-state";
 import {
   UI_SERVER_IDS,
   getSlotServerIdForUiServer,
   getSlotSourceUrlFromRow,
   isAllowedSourceForSlotServer,
   isValidHttpUrl,
+  type SlotServerId,
   type UiServerId,
 } from "@/lib/server-source-policy";
 import { getServerCapability } from "@/lib/server-capabilities";
 import { getServerStreamMode } from "@/lib/stream-mode";
-import { resolveRepackIngestUrl, type RepackIngestMode } from "@/lib/repack-ingest-resolver";
+import {
+  resolveRepackIngestUrl,
+  type RepackIngestMode,
+  type RepackIngestResolverDiag,
+  type RepackIngestResolution,
+} from "@/lib/repack-ingest-resolver";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -31,6 +42,24 @@ type MatchSeedRow = {
   stream_url_2?: string | null;
   stream_url_3?: string | null;
   stream_url_4?: string | null;
+};
+
+type ResolverSummary = RepackIngestResolverDiag;
+
+type BootstrapServerResult = {
+  uiServer: UiServerId;
+  slotServer: SlotServerId;
+  accepted: boolean;
+  reason: string;
+  statusCode: number;
+  sourceUrl: string | null;
+  resolver: ResolverSummary;
+  ingest: {
+    mode: RepackIngestMode;
+    reason: string;
+    ingestUrl: string | null;
+  };
+  probeEvidence: RepackIngestResolution["probeEvidence"];
 };
 
 function toInt(raw: unknown) {
@@ -62,6 +91,18 @@ function sanitizeUiServers(raw: unknown) {
   return accepted.size ? Array.from(accepted) : [...UI_SERVER_IDS];
 }
 
+function fallbackResolver(reason: string, resolverState: RepackResolverState = "unknown"): ResolverSummary {
+  return {
+    stage: "done",
+    candidatesFound: 0,
+    candidatesProbed: 0,
+    selectedCandidate: null,
+    selectedKind: "none",
+    rejectReason: reason,
+    resolverState,
+  };
+}
+
 async function fetchMatchSeedRow(matchId: number) {
   const { data, error } = await supabaseAdmin
     .from("match-stream-app")
@@ -79,11 +120,15 @@ async function postSeedToAgent(payload: {
   serverId: number;
   sourceUrl: string;
   sourceCandidate: string;
+  ingestUrl: string;
+  ingestMode: RepackIngestMode;
+  ingestVerified: boolean;
+  probeEvidence: RepackIngestResolution["probeEvidence"];
   matchStatus: string;
   matchStart: string;
 }) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 2800);
+  const timeoutId = setTimeout(() => controller.abort(), 3400);
   try {
     const upstream = await fetch(localAgentUrl("/seed"), {
       method: "POST",
@@ -123,6 +168,7 @@ async function postSeedToAgent(payload: {
 }
 
 export async function POST(req: Request) {
+  noteRepackBootstrapRequest();
   const payload = await readJson(req);
   const matchId = toInt(payload.matchId);
   if (!Number.isFinite(matchId) || matchId <= 0) {
@@ -143,147 +189,143 @@ export async function POST(req: Request) {
   if (!row) return NextResponse.json({ ok: false, error: "match-not-found" }, { status: 404 });
 
   const uiServers = sanitizeUiServers(payload.uiServers);
-  const results: Array<{
-    uiServer: UiServerId;
-    slotServer: number;
-    accepted: boolean;
-    reason: string;
-    statusCode: number;
-    sourceUrl: string | null;
-    ingest: {
-      mode: RepackIngestMode;
-      reason: string;
-      ingestUrl: string | null;
-    };
-  }> = [];
+  const results: BootstrapServerResult[] = [];
+
+  const pushResult = (input: BootstrapServerResult) => {
+    const resolverState = input.resolver.resolverState || "unknown";
+    const resolveReason = String(input.resolver.rejectReason || input.ingest.reason || input.reason || "unknown").trim();
+    setRepackSeedRuntimeState(matchId, input.slotServer, {
+      accepted: input.accepted,
+      reason: String(input.reason || "unknown").trim() || "unknown",
+      statusCode: Number(input.statusCode || 0),
+      resolverState,
+      resolveReason,
+      ingestMode: String(input.ingest.mode || "none"),
+      ingestUrl: input.ingest.ingestUrl || null,
+    });
+    noteRepackBootstrapOutcome({
+      accepted: input.accepted,
+      reason: input.reason,
+      resolverState,
+    });
+    results.push(input);
+  };
 
   for (const uiServer of uiServers) {
     const slotServer = getSlotServerIdForUiServer(uiServer);
     const sourceUrl = String(getSlotSourceUrlFromRow(row, slotServer) || "").trim();
+
     if (mode !== "r2_strict") {
-      setRepackSeedRuntimeState(matchId, slotServer, {
-        accepted: false,
-        reason: "mode-not-r2-strict",
-        statusCode: 202,
-      });
-      results.push({
+      pushResult({
         uiServer,
         slotServer,
         accepted: false,
         reason: "mode-not-r2-strict",
         statusCode: 202,
         sourceUrl: sourceUrl || null,
+        resolver: fallbackResolver("mode-not-r2-strict"),
         ingest: {
           mode: "none",
           reason: "mode-not-r2-strict",
           ingestUrl: null,
         },
+        probeEvidence: null,
       });
       continue;
     }
+
     if (!sourceUrl || !isValidHttpUrl(sourceUrl)) {
-      setRepackSeedRuntimeState(matchId, slotServer, {
-        accepted: false,
-        reason: "missing-source",
-        statusCode: 202,
-      });
-      results.push({
+      pushResult({
         uiServer,
         slotServer,
         accepted: false,
         reason: "missing-source",
         statusCode: 202,
         sourceUrl: sourceUrl || null,
+        resolver: fallbackResolver("missing-source", "missing-source"),
         ingest: {
           mode: "none",
           reason: "missing-source",
           ingestUrl: null,
         },
+        probeEvidence: null,
       });
       continue;
     }
+
     if (!isAllowedSourceForSlotServer(slotServer, sourceUrl)) {
-      setRepackSeedRuntimeState(matchId, slotServer, {
-        accepted: false,
-        reason: "source-not-allowed",
-        statusCode: 202,
-      });
-      results.push({
+      pushResult({
         uiServer,
         slotServer,
         accepted: false,
         reason: "source-not-allowed",
         statusCode: 202,
         sourceUrl,
+        resolver: fallbackResolver("source-not-allowed"),
         ingest: {
           mode: "none",
           reason: "source-not-allowed",
           ingestUrl: null,
         },
+        probeEvidence: null,
       });
       continue;
     }
+
     const capability = getServerCapability(slotServer);
     if (!capability?.repackEligible) {
-      setRepackSeedRuntimeState(matchId, slotServer, {
-        accepted: false,
-        reason: "server-not-eligible",
-        statusCode: 202,
-      });
-      results.push({
+      pushResult({
         uiServer,
         slotServer,
         accepted: false,
         reason: "server-not-eligible",
         statusCode: 202,
         sourceUrl,
+        resolver: fallbackResolver("server-not-eligible"),
         ingest: {
           mode: "none",
           reason: "server-not-eligible",
           ingestUrl: null,
         },
+        probeEvidence: null,
       });
       continue;
     }
+
     if (!repackFlags.enabled) {
-      setRepackSeedRuntimeState(matchId, slotServer, {
-        accepted: false,
-        reason: "repack-disabled",
-        statusCode: 202,
-      });
-      results.push({
+      pushResult({
         uiServer,
         slotServer,
         accepted: false,
         reason: "repack-disabled",
         statusCode: 202,
         sourceUrl,
+        resolver: fallbackResolver("repack-disabled"),
         ingest: {
           mode: "none",
           reason: "repack-disabled",
           ingestUrl: null,
         },
+        probeEvidence: null,
       });
       continue;
     }
+
     if (!repackFlags.repackServers.has(slotServer) || repackFlags.forceDisableServers.has(slotServer)) {
-      setRepackSeedRuntimeState(matchId, slotServer, {
-        accepted: false,
-        reason: "server-flag-disabled",
-        statusCode: 202,
-      });
-      results.push({
+      pushResult({
         uiServer,
         slotServer,
         accepted: false,
         reason: "server-flag-disabled",
         statusCode: 202,
         sourceUrl,
+        resolver: fallbackResolver("server-flag-disabled"),
         ingest: {
           mode: "none",
           reason: "server-flag-disabled",
           ingestUrl: null,
         },
+        probeEvidence: null,
       });
       continue;
     }
@@ -292,25 +334,26 @@ export async function POST(req: Request) {
       sourceUrl,
       requestOrigin,
       referrerUrl: sourceUrl,
+      timeoutMs: Number.parseInt(String(process.env.REPACK_RESOLVE_TIMEOUT_MS || "8000"), 10) || 8000,
+      maxCandidates: Number.parseInt(String(process.env.REPACK_RESOLVE_MAX_CANDIDATES || "16"), 10) || 16,
     });
+
     if (!ingest.ingestUrl || !isValidHttpUrl(ingest.ingestUrl)) {
-      setRepackSeedRuntimeState(matchId, slotServer, {
-        accepted: false,
-        reason: `invalid-ingest-url:${ingest.reason}`,
-        statusCode: 202,
-      });
-      results.push({
+      const rejectReason = `invalid-ingest-url:${ingest.reason}`;
+      pushResult({
         uiServer,
         slotServer,
         accepted: false,
-        reason: "invalid-ingest-url",
+        reason: rejectReason,
         statusCode: 202,
         sourceUrl,
+        resolver: ingest.resolver,
         ingest: {
           mode: ingest.mode,
           reason: ingest.reason,
           ingestUrl: ingest.ingestUrl || null,
         },
+        probeEvidence: ingest.probeEvidence,
       });
       continue;
     }
@@ -320,28 +363,31 @@ export async function POST(req: Request) {
       serverId: slotServer,
       sourceUrl,
       sourceCandidate: ingest.ingestUrl,
+      ingestUrl: ingest.ingestUrl,
+      ingestMode: ingest.mode,
+      ingestVerified: ingest.resolver.resolverState === "ok",
+      probeEvidence: ingest.probeEvidence,
       matchStatus: String(row.status_key || ""),
       matchStart: String(row.match_start || ""),
     });
+
     const accepted = Boolean(upstream.body?.accepted);
     const reason = String(upstream.body?.reason || (accepted ? "ok" : "seed-rejected"));
-    setRepackSeedRuntimeState(matchId, slotServer, {
-      accepted,
-      reason,
-      statusCode: upstream.status,
-    });
-    results.push({
+
+    pushResult({
       uiServer,
       slotServer,
       accepted,
       reason,
       statusCode: upstream.status,
       sourceUrl,
+      resolver: ingest.resolver,
       ingest: {
         mode: ingest.mode,
         reason: ingest.reason,
         ingestUrl: ingest.ingestUrl,
       },
+      probeEvidence: ingest.probeEvidence,
     });
   }
 

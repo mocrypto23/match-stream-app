@@ -163,6 +163,56 @@ function detectIngestUrlKind(rawUrl) {
   }
 }
 
+function normalizeIngestMode(rawMode, ingestUrl) {
+  const mode = String(rawMode || "").trim().toLowerCase();
+  if (mode === "direct_m3u8" || mode === "backend_proxy_ingest") return mode;
+  return detectIngestUrlKind(ingestUrl);
+}
+
+function parseLastSegmentFromManifest(playlistUrl, manifestText) {
+  const lines = String(manifestText || "").split(/\r?\n/);
+  for (let idx = lines.length - 1; idx >= 0; idx -= 1) {
+    const raw = String(lines[idx] || "").trim();
+    if (!raw || raw.startsWith("#")) continue;
+    try {
+      const abs = new URL(raw, playlistUrl).toString();
+      if (isHttpUrl(abs)) return abs;
+    } catch {}
+  }
+  return "";
+}
+
+async function probeSegmentUrl(segmentUrl, timeoutMs) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const head = await fetch(segmentUrl, {
+      method: "HEAD",
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (head.ok) return { ok: true, status: head.status };
+    if (head.status !== 405) return { ok: false, status: head.status };
+
+    const getResp = await fetch(segmentUrl, {
+      method: "GET",
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        range: "bytes=0-1",
+      },
+    });
+    if (getResp.ok || getResp.status === 206) return { ok: true, status: getResp.status };
+    return { ok: false, status: getResp.status };
+  } catch {
+    return { ok: false, status: 0 };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 function readJsonBody(req, maxBytes = 64 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -232,6 +282,10 @@ class RepackJob {
     this.lastFfmpegExitAt = 0;
     this.lastFfmpegExitCode = null;
     this.lastFfmpegExitSignal = null;
+    this.lastSpawnAt = 0;
+    this.consecutiveStartFailures = 0;
+    this.degradedReason = "";
+    this.degradedAt = 0;
   }
 
   get key() {
@@ -265,8 +319,10 @@ class RepackJob {
     // Reset mappings to avoid reusing stale remote segment links.
     this.uploadedSegments = new Map();
     this.lastPublishAt = 0;
-    const remoteIndexKey = `${this.remotePrefix}/index.m3u8`;
-    this.manager.deleteObject(remoteIndexKey).catch(() => {});
+    if (this.consecutiveStartFailures >= this.manager.config.deleteRemoteIndexAfterStartFailures) {
+      const remoteIndexKey = `${this.remotePrefix}/index.m3u8`;
+      this.manager.deleteObject(remoteIndexKey).catch(() => {});
+    }
     try {
       const entries = fs.readdirSync(this.workDir, { withFileTypes: true });
       for (const entry of entries) {
@@ -282,6 +338,7 @@ class RepackJob {
   }
 
   spawnFfmpeg() {
+    if (this.state === "stopped") return;
     this.resetEncoderRunState();
     const ffmpegBin = this.manager.config.ffmpegBin;
     const segmentPattern = path.join(this.workDir, "seg-%08d.ts");
@@ -312,6 +369,8 @@ class RepackJob {
       segmentPattern,
       this.playlistPath,
     ];
+    this.lastSpawnAt = Date.now();
+    this.state = "starting";
 
     this.ffmpegProc = spawn(ffmpegBin, args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -354,20 +413,68 @@ class RepackJob {
       this.lastFfmpegExitCode = Number.isFinite(code) ? code : null;
       this.lastFfmpegExitSignal = signal || null;
       if (this.state === "stopped") return;
+
+      const now = Date.now();
+      const exitedQuickly = !this.lastPublishAt || now - this.lastSpawnAt <= this.manager.config.startFailureWindowMs;
+      if (exitedQuickly) {
+        this.consecutiveStartFailures += 1;
+      } else {
+        this.consecutiveStartFailures = 0;
+      }
+
+      const overFailureLimit = this.consecutiveStartFailures >= this.manager.config.maxConsecutiveStartFailures;
+      if (overFailureLimit) {
+        this.state = "degraded";
+        this.degradedReason = "ffmpeg-restart-loop";
+        this.degradedAt = now;
+        this.manager.log("error", "repack degraded", {
+          job: this.key,
+          reason: this.degradedReason,
+          consecutiveStartFailures: this.consecutiveStartFailures,
+        });
+        return;
+      }
+
+      const retryDelayMs = exitedQuickly
+        ? Math.min(
+            this.manager.config.startFailureMaxBackoffMs,
+            this.manager.config.startFailureBaseBackoffMs * Math.pow(2, Math.max(0, this.consecutiveStartFailures - 1))
+          )
+        : 1400;
       this.state = "restarting";
       setTimeout(() => {
         if (this.state === "stopped") return;
+        if (this.state === "degraded") return;
         this.spawnFfmpeg();
         this.state = "running";
-      }, 1400);
+      }, retryDelayMs);
     });
   }
 
-  touchSeed(ingestUrl) {
+  touchSeed(ingestUrl, opts = {}) {
     this.lastSeedAt = Date.now();
+    const forceRestart = Boolean(opts.forceRestart);
     if (ingestUrl && ingestUrl !== this.ingestUrl) {
       this.ingestUrl = ingestUrl;
+      this.consecutiveStartFailures = 0;
+      this.degradedReason = "";
+      this.degradedAt = 0;
       this.manager.log("info", "repack source updated", { job: this.key });
+      if (this.ffmpegProc) {
+        try {
+          this.ffmpegProc.kill("SIGTERM");
+        } catch {}
+      } else {
+        this.spawnFfmpeg();
+      }
+      return;
+    }
+    if (this.state === "degraded" || forceRestart) {
+      this.consecutiveStartFailures = 0;
+      this.degradedReason = "";
+      this.degradedAt = 0;
+      this.state = "starting";
+      this.manager.log("info", "repack degraded recovery requested", { job: this.key, forceRestart });
       if (this.ffmpegProc) {
         try {
           this.ffmpegProc.kill("SIGTERM");
@@ -613,6 +720,9 @@ class RepackJob {
             signal: this.lastFfmpegExitSignal,
           }
         : null,
+      consecutiveStartFailures: this.consecutiveStartFailures,
+      degradedAt: this.degradedAt || null,
+      degradedReason: this.degradedReason || null,
       sourceReadErrors: this.sourceReadErrors,
       consecutiveSourceErrors: this.consecutiveSourceErrors,
       consecutiveUploadErrors: this.consecutiveUploadErrors,
@@ -636,6 +746,8 @@ class RepackManager {
       seedRequests: 0,
       seedAccepted: 0,
       seedRejected: 0,
+      seedRejectedByReason: {},
+      seedPreflightFailed: 0,
       uploadErrors: 0,
       lastError: "",
     };
@@ -701,12 +813,133 @@ class RepackManager {
     }
   }
 
-  resolveIngestUrl(payload) {
-    const candidate = normalizeCandidateUrl(payload.sourceCandidate, this.config.playerOrigin);
-    if (candidate && isLikelyHlsManifestUrl(candidate)) return candidate;
-    const source = normalizeCandidateUrl(payload.sourceUrl, this.config.playerOrigin);
-    if (source && isLikelyHlsManifestUrl(source)) return source;
-    return "";
+  noteSeedReject(reason) {
+    const key = String(reason || "unknown").trim() || "unknown";
+    this.metrics.seedRejected += 1;
+    this.metrics.seedRejectedByReason[key] = (this.metrics.seedRejectedByReason[key] || 0) + 1;
+  }
+
+  resolveIngestPayload(payload) {
+    const ingestVerified = payload?.ingestVerified === true;
+    const explicitIngest = normalizeCandidateUrl(payload?.ingestUrl, this.config.playerOrigin);
+    if (explicitIngest && ingestVerified && isHttpUrl(explicitIngest)) {
+      return {
+        ingestUrl: explicitIngest,
+        ingestMode: normalizeIngestMode(payload.ingestMode, explicitIngest),
+        ingestVerified: true,
+      };
+    }
+
+    const candidate = normalizeCandidateUrl(payload?.sourceCandidate, this.config.playerOrigin);
+    if (candidate && isLikelyHlsManifestUrl(candidate)) {
+      return {
+        ingestUrl: candidate,
+        ingestMode: normalizeIngestMode(payload.ingestMode, candidate),
+        ingestVerified,
+      };
+    }
+
+    const source = normalizeCandidateUrl(payload?.sourceUrl, this.config.playerOrigin);
+    if (source && isLikelyHlsManifestUrl(source)) {
+      return {
+        ingestUrl: source,
+        ingestMode: normalizeIngestMode(payload.ingestMode, source),
+        ingestVerified,
+      };
+    }
+
+    return {
+      ingestUrl: "",
+      ingestMode: "none",
+      ingestVerified,
+    };
+  }
+
+  async preflightIngest(ingestUrl, ingestMode) {
+    const timeoutMs = this.config.preflightTimeoutMs;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(ingestUrl, {
+        method: "GET",
+        cache: "no-store",
+        redirect: "follow",
+        signal: controller.signal,
+        headers: {
+          accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
+          "user-agent": DEFAULT_USER_AGENT,
+        },
+      });
+      const body = await response.text();
+      const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+      const finalUrl = response.url || ingestUrl;
+      const evidenceBase = {
+        ingestMode,
+        ingestUrl,
+        finalUrl,
+        playlistStatus: response.status,
+        segmentStatus: 0,
+        contentType,
+        segmentUrl: null,
+      };
+
+      if (!response.ok) {
+        return { ok: false, reason: `http-${response.status}`, evidence: evidenceBase };
+      }
+      const looksLikeManifest =
+        body.includes("#EXTM3U") ||
+        contentType.includes("application/vnd.apple.mpegurl") ||
+        contentType.includes("application/x-mpegurl") ||
+        (looksLikeHlsishUrl(finalUrl) && /#EXTINF:|#EXT-X-TARGETDURATION|#EXT-X-MEDIA-SEQUENCE/i.test(body));
+      if (!looksLikeManifest) {
+        return { ok: false, reason: "non-manifest", evidence: evidenceBase };
+      }
+
+      const segmentUrl = parseLastSegmentFromManifest(finalUrl, body);
+      if (!segmentUrl) {
+        return { ok: false, reason: "manifest-empty", evidence: evidenceBase };
+      }
+
+      const segmentProbe = await probeSegmentUrl(segmentUrl, Math.max(900, Math.floor(timeoutMs * 0.85)));
+      if (!segmentProbe.ok) {
+        return {
+          ok: false,
+          reason: `segment-http-${segmentProbe.status || 0}`,
+          evidence: {
+            ...evidenceBase,
+            segmentUrl,
+            segmentStatus: segmentProbe.status || 0,
+          },
+        };
+      }
+
+      return {
+        ok: true,
+        reason: "preflight-ok",
+        evidence: {
+          ...evidenceBase,
+          segmentUrl,
+          segmentStatus: segmentProbe.status,
+        },
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: "fetch-failed",
+        evidence: {
+          ingestMode,
+          ingestUrl,
+          finalUrl: ingestUrl,
+          playlistStatus: 0,
+          segmentStatus: 0,
+          contentType: "",
+          segmentUrl: null,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      };
+    } finally {
+      clearTimeout(timeoutId);
+    }
   }
 
   async seed(payload) {
@@ -718,11 +951,11 @@ class RepackManager {
     const liveOnly = this.config.liveOnly;
 
     if (!Number.isFinite(matchId) || !Number.isFinite(serverId)) {
-      this.metrics.seedRejected += 1;
+      this.noteSeedReject("invalid-input");
       return { accepted: false, reason: "invalid-input" };
     }
     if (!this.config.repackServers.has(serverId)) {
-      this.metrics.seedRejected += 1;
+      this.noteSeedReject("server-not-enabled");
       return { accepted: false, reason: "server-not-enabled" };
     }
     const key = `m${matchId}:s${serverId}`;
@@ -730,11 +963,11 @@ class RepackManager {
     const windowState = computeMatchWindowState(matchStartMs, this.config, nowMs);
     if (liveOnly) {
       if (!windowState.hasStart) {
-        this.metrics.seedRejected += 1;
+        this.noteSeedReject("missing-match-start");
         return { accepted: false, reason: "missing-match-start" };
       }
       if (!windowState.inWindow) {
-        this.metrics.seedRejected += 1;
+        this.noteSeedReject("match-outside-window");
         return { accepted: false, reason: "match-outside-window" };
       }
     }
@@ -749,7 +982,7 @@ class RepackManager {
           await existingJob.stop();
           this.jobs.delete(key);
         }
-        this.metrics.seedRejected += 1;
+        this.noteSeedReject("early-stop-finished+segment-fail");
         return {
           accepted: false,
           reason: "early-stop-finished+segment-fail",
@@ -758,13 +991,30 @@ class RepackManager {
         };
       }
     }
-    const ingestUrl = this.resolveIngestUrl(payload);
+    const ingest = this.resolveIngestPayload(payload || {});
+    const ingestUrl = ingest.ingestUrl;
     if (!isHttpUrl(ingestUrl)) {
-      this.metrics.seedRejected += 1;
-      return { accepted: false, reason: "invalid-ingest-url" };
+      this.noteSeedReject("invalid-ingest-url");
+      return { accepted: false, reason: "invalid-ingest-url", ingestMode: ingest.ingestMode };
+    }
+
+    const preflight = await this.preflightIngest(ingestUrl, ingest.ingestMode);
+    if (!preflight.ok) {
+      this.metrics.seedPreflightFailed += 1;
+      const reason = `preflight-failed:${preflight.reason}`;
+      this.noteSeedReject(reason);
+      return {
+        accepted: false,
+        reason,
+        ingestUrl,
+        ingestMode: ingest.ingestMode,
+        ingestVerified: ingest.ingestVerified,
+        preflight: preflight.evidence,
+      };
     }
 
     let job = existingJob || this.jobs.get(key);
+    const forceRestart = Boolean(job && job.state === "degraded");
     if (!job) {
       const workDir = path.join(this.config.workRoot, `m${matchId}`, `s${serverId}`);
       const remotePrefix = `live/m${matchId}/s${serverId}`;
@@ -783,12 +1033,21 @@ class RepackManager {
         matchId,
         serverId,
         source: ingestUrl,
+        ingestMode: ingest.ingestMode,
       });
     } else {
-      job.touchSeed(ingestUrl);
+      job.touchSeed(ingestUrl, { forceRestart });
     }
     this.metrics.seedAccepted += 1;
-    return { accepted: true, reason: "ok", jobKey: key, ingestUrl };
+    return {
+      accepted: true,
+      reason: "ok",
+      jobKey: key,
+      ingestUrl,
+      ingestMode: ingest.ingestMode,
+      ingestVerified: ingest.ingestVerified,
+      preflight: preflight.evidence,
+    };
   }
 
   async stopAll() {
@@ -829,6 +1088,10 @@ class RepackManager {
         earlyStopOnFinished: this.config.earlyStopOnFinished,
         finishedDebounceMs: this.config.finishedDebounceMs,
         earlyStopSegmentFailStreak: this.config.earlyStopSegmentFailStreak,
+        preflightTimeoutMs: this.config.preflightTimeoutMs,
+        maxConsecutiveStartFailures: this.config.maxConsecutiveStartFailures,
+        startFailureBaseBackoffMs: this.config.startFailureBaseBackoffMs,
+        startFailureMaxBackoffMs: this.config.startFailureMaxBackoffMs,
         repackServers: Array.from(this.config.repackServers).sort((a, b) => a - b),
         r2Bucket: this.config.r2Bucket,
         publicBaseUrl: this.config.publicBaseUrl,
@@ -872,6 +1135,12 @@ function loadConfig() {
     earlyStopOnFinished: toBool(process.env.REPACK_EARLY_STOP_ON_FINISHED, false),
     finishedDebounceMs: finishedDebounceMinutes * 60 * 1000,
     earlyStopSegmentFailStreak: toInt(process.env.REPACK_EARLY_STOP_SEGMENT_FAIL_STREAK, 4, 1),
+    preflightTimeoutMs: toInt(process.env.REPACK_AGENT_PREFLIGHT_TIMEOUT_MS, 2200, 900),
+    maxConsecutiveStartFailures: toInt(process.env.REPACK_AGENT_MAX_START_FAILURES, 6, 2),
+    startFailureBaseBackoffMs: toInt(process.env.REPACK_START_FAILURE_BASE_BACKOFF_MS, 2000, 300),
+    startFailureMaxBackoffMs: toInt(process.env.REPACK_START_FAILURE_MAX_BACKOFF_MS, 20000, 1200),
+    startFailureWindowMs: toInt(process.env.REPACK_START_FAILURE_WINDOW_MS, 4500, 800),
+    deleteRemoteIndexAfterStartFailures: toInt(process.env.REPACK_DELETE_REMOTE_INDEX_AFTER_START_FAILURES, 3, 1),
     publicBaseUrl: String(process.env.REPACK_PUBLIC_BASE_URL || "https://r2.tf-player.site/live").trim(),
     playerOrigin: String(process.env.REPACK_PLAYER_ORIGIN || "https://tf-player.site").trim(),
     repackServers,

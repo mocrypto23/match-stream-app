@@ -236,20 +236,34 @@ async function probeR2Playlist(playlistUrl: string, timeoutMs: number): Promise<
 function resolveStateFromRecentSeed(matchId: number, slotServer: SlotServerId, probeReason: string, nowMs: number) {
   const seedState = getRepackSeedRuntimeState(matchId, slotServer);
   if (!seedState) {
-    return { state: "down" as R2ServerState, reason: probeReason };
+    return {
+      state: "down" as R2ServerState,
+      reason: probeReason,
+      resolverState: "unknown" as const,
+      resolveReason: probeReason,
+    };
   }
   if (nowMs - seedState.updatedAt > DEFAULT_SEED_WARMING_WINDOW_MS) {
-    return { state: "down" as R2ServerState, reason: probeReason };
+    return {
+      state: "down" as R2ServerState,
+      reason: probeReason,
+      resolverState: "unknown" as const,
+      resolveReason: probeReason,
+    };
   }
   if (seedState.accepted) {
     return {
       state: "warming" as R2ServerState,
       reason: `seed-accepted:${seedState.reason || "ok"}`,
+      resolverState: seedState.resolverState || ("ok" as const),
+      resolveReason: seedState.resolveReason || "seed-accepted",
     };
   }
   return {
     state: "down" as R2ServerState,
     reason: `seed-rejected:${seedState.reason || probeReason}`,
+    resolverState: seedState.resolverState || ("unknown" as const),
+    resolveReason: seedState.resolveReason || seedState.reason || probeReason,
   };
 }
 
@@ -302,6 +316,8 @@ export async function buildMatchR2Status(input: {
           playlistUrl,
           segmentProbe: "unknown",
           lastSequenceAgeMs: null,
+          resolverState: !hasSource ? "missing-source" : "unknown",
+          resolveReason: !hasSource ? "missing-source" : !sourceAllowed ? "source-not-allowed" : "invalid-match-id",
           reason: !hasSource ? "missing-source" : !sourceAllowed ? "source-not-allowed" : "invalid-match-id",
           updatedAt: nowIso(nowMs),
         };
@@ -316,6 +332,8 @@ export async function buildMatchR2Status(input: {
           playlistUrl,
           segmentProbe: "unknown",
           lastSequenceAgeMs: null,
+          resolverState: "ok",
+          resolveReason: "legacy-mode",
           reason: "legacy-mode",
           updatedAt: nowIso(nowMs),
         };
@@ -330,6 +348,8 @@ export async function buildMatchR2Status(input: {
           playlistUrl,
           segmentProbe: "unknown",
           lastSequenceAgeMs: null,
+          resolverState: "unknown",
+          resolveReason: "blocked-outside-window",
           reason: "blocked-outside-window",
           updatedAt: nowIso(nowMs),
         };
@@ -361,6 +381,8 @@ export async function buildMatchR2Status(input: {
           playlistUrl,
           segmentProbe: probed.segmentProbe,
           lastSequenceAgeMs: sequenceAgeMs,
+          resolverState: "probe-failed",
+          resolveReason: "early-stop-finished+segment-fail",
           reason: "early-stop-finished+segment-fail",
           updatedAt: nowIso(nowMs),
         };
@@ -378,6 +400,8 @@ export async function buildMatchR2Status(input: {
           playlistUrl,
           segmentProbe: "ok",
           lastSequenceAgeMs: sequenceAgeMs,
+          resolverState: "ok",
+          resolveReason: "ok",
           reason: probed.reason,
           updatedAt: nowIso(nowMs),
         };
@@ -385,6 +409,14 @@ export async function buildMatchR2Status(input: {
 
       const fallbackReason = isStaleSequence ? "r2-sequence-stale" : probed.reason;
       const seeded = resolveStateFromRecentSeed(matchId, slotServer, fallbackReason, nowMs);
+      const fallbackResolverState =
+        seeded.resolverState === "unknown" && probed.segmentProbe === "fail"
+          ? "probe-failed"
+          : seeded.resolverState;
+      const fallbackResolveReason =
+        seeded.resolverState === "unknown" && probed.segmentProbe === "fail"
+          ? probed.reason
+          : seeded.resolveReason;
       return {
         uiServer,
         slotServer,
@@ -392,6 +424,8 @@ export async function buildMatchR2Status(input: {
         playlistUrl,
         segmentProbe: isStaleSequence ? "ok" : probed.segmentProbe,
         lastSequenceAgeMs: sequenceAgeMs,
+        resolverState: fallbackResolverState,
+        resolveReason: fallbackResolveReason,
         reason: isStaleSequence ? `${seeded.reason}:age=${sequenceAgeMs}` : seeded.reason,
         updatedAt: nowIso(nowMs),
       };

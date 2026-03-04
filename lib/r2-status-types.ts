@@ -10,6 +10,8 @@ export type R2StatusServerEntry = {
   playlistUrl: string | null;
   segmentProbe: "ok" | "fail" | "unknown";
   lastSequenceAgeMs: number | null;
+  resolverState: "ok" | "no-candidate" | "probe-failed" | "missing-source" | "unknown";
+  resolveReason: string;
   reason: string;
   updatedAt: string;
 };

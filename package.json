@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "repackager:start": "node server/repackager/index.js",
+    "repack-prewarm:start": "node server/prewarm/index.js",
     "lint": "eslint",
     "cleanup:server-slots": "node scripts/cleanup-server-slot-mismatch.js"
   },

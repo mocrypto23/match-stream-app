@@ -5276,10 +5276,29 @@ function buildR2StatusSignature(status: MatchR2Status | null | undefined) {
         item.playlistUrl || "",
         item.segmentProbe || "unknown",
         Number.isFinite(Number(item.lastSequenceAgeMs)) ? Number(item.lastSequenceAgeMs) : "na",
+        item.resolverState || "unknown",
+        item.resolveReason || "",
       ].join("|")
     )
     .join(";");
   return `${status.mode}|${servers}`;
+}
+
+function getStrictServerSubtitle(entry: R2StatusServerEntry | undefined, health: ServerHealthState, hasUrl: boolean) {
+  if (entry?.state === "ready") return "جاهز";
+  if (entry?.state === "warming" || health === "pending") return "جاري التحضير";
+
+  const reasonBlob = `${String(entry?.reason || "")}|${String(entry?.resolveReason || "")}`.toLowerCase();
+  if (reasonBlob.includes("blocked-outside-window")) return "خارج نافذة البث";
+  if (reasonBlob.includes("missing-source")) return "لا يوجد مصدر";
+  if (reasonBlob.includes("source-not-allowed")) return "مصدر غير مسموح";
+  if (reasonBlob.includes("no-ingest-candidate") || reasonBlob.includes("resolver-no-candidate")) return "فشل استخراج";
+  if (reasonBlob.includes("probe-failed") || reasonBlob.includes("segment-http") || reasonBlob.includes("r2-segment")) {
+    return "فشل فحص المصدر";
+  }
+  if (reasonBlob.includes("early-stop-finished")) return "انتهى البث";
+  if (hasUrl) return "جاهز";
+  return "لا يوجد بث";
 }
 
 function mergeR2StatusIfChanged(prev: MatchR2Status | null, next: MatchR2Status | null) {
@@ -6242,14 +6261,7 @@ export default function WatchPage() {
     });
   }, [serverOptions, server3DeriveState, server3VerifiedAvailable, strictR2StatusBySlot]);
 
-  const visibleServerOptions = useMemo(() => {
-    if (!R2_STRICT_MODE) return serverOptions;
-    if (!r2Status?.servers?.length) return serverOptions;
-    return serverOptions.filter((s) => {
-      const health = serverHealth[s.n] || "down";
-      return health !== "down";
-    });
-  }, [serverOptions, serverHealth, r2Status]);
+  const visibleServerOptions = useMemo(() => serverOptions, [serverOptions]);
 
   const handleVideoDoubleClick = useCallback(() => {
     const video = videoRef.current;
@@ -8370,8 +8382,10 @@ export default function WatchPage() {
             const hasUrl = !!s.url && isValidHttpUrl(s.url);
             const health: ServerHealthState = serverHealth[s.n] ?? (hasUrl ? "ok" : "down");
             const ok = hasUrl;
-            const subtitle =
-              health === "pending"
+            const strictEntry = R2_STRICT_MODE ? strictR2StatusBySlot.get(s.n) : undefined;
+            const subtitle = R2_STRICT_MODE
+              ? getStrictServerSubtitle(strictEntry, health, ok)
+              : health === "pending"
                 ? "جاري التحضير"
                 : (!ok || health === "down" ? "لا يوجد بث" : null);
             return (
