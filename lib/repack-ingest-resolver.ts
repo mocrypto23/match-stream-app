@@ -77,9 +77,10 @@ function pickBestDirectHlsCandidate(candidates: string[]) {
   let bestScore = Number.NEGATIVE_INFINITY;
   for (const candidate of candidates) {
     if (!isValidHttpUrl(candidate)) continue;
+    if (!looksLikeHlsManifestUrl(candidate)) continue;
     let score = 0;
     if (candidate.includes(".m3u8")) score += 120;
-    if (looksLikeHlsManifestUrl(candidate)) score += 80;
+    score += 80;
     if (candidate.includes("/api/embed-proxy?")) score -= 300;
     if (score > bestScore) {
       bestScore = score;
