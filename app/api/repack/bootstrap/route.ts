@@ -199,11 +199,27 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, error: "invalid-match-id" }, { status: 400 });
   }
   const requestOrigin = (() => {
-    try {
-      return new URL(req.url).origin;
-    } catch {
-      return "";
+    const forwardedProto = String(req.headers.get("x-forwarded-proto") || "").trim().toLowerCase();
+    const forwardedHost = String(req.headers.get("x-forwarded-host") || "").trim().toLowerCase();
+    if (forwardedProto && forwardedHost) {
+      const origin = `${forwardedProto}://${forwardedHost}`;
+      if (isValidHttpUrl(origin)) return origin;
     }
+    const host = String(req.headers.get("host") || "").trim().toLowerCase();
+    if (host) {
+      const proto = forwardedProto === "https" ? "https" : "http";
+      const origin = `${proto}://${host}`;
+      if (isValidHttpUrl(origin) && !/localhost|127\.0\.0\.1/.test(origin)) return origin;
+    }
+    const configuredOrigin = String(
+      process.env.PUBLIC_APP_ORIGIN || process.env.NEXT_PUBLIC_APP_ORIGIN || process.env.NEXT_PUBLIC_SITE_URL || ""
+    ).trim();
+    if (configuredOrigin && isValidHttpUrl(configuredOrigin)) return configuredOrigin;
+    try {
+      const fallback = new URL(req.url).origin;
+      if (isValidHttpUrl(fallback)) return fallback;
+    } catch {}
+    return "https://tf-player.site";
   })();
 
   const mode = getServerStreamMode();
