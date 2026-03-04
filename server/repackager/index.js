@@ -120,6 +120,20 @@ function isLikelyHlsManifestUrl(rawUrl) {
   }
 }
 
+function detectIngestUrlKind(rawUrl) {
+  const value = String(rawUrl || "").trim();
+  if (!value) return "none";
+  try {
+    const u = new URL(value);
+    const pathname = String(u.pathname || "").toLowerCase();
+    if (pathname.includes("/api/embed-proxy")) return "backend_proxy_ingest";
+    if (isLikelyHlsManifestUrl(value)) return "direct_m3u8";
+    return "other";
+  } catch {
+    return "other";
+  }
+}
+
 function readJsonBody(req, maxBytes = 64 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -170,6 +184,7 @@ class RepackJob {
     this.lastPublishAt = 0;
     this.lastErrorAt = 0;
     this.sourceReadErrors = 0;
+    this.consecutiveSourceErrors = 0;
     this.consecutiveUploadErrors = 0;
     this.uploadedSegments = new Map();
     this.remoteSeq = 0;
@@ -185,6 +200,9 @@ class RepackJob {
     this.monitorTimer = null;
     this.stdoutLog = [];
     this.stderrLog = [];
+    this.lastFfmpegExitAt = 0;
+    this.lastFfmpegExitCode = null;
+    this.lastFfmpegExitSignal = null;
   }
 
   get key() {
@@ -290,6 +308,7 @@ class RepackJob {
         lower.includes("404")
       ) {
         this.sourceReadErrors += 1;
+        this.consecutiveSourceErrors += 1;
         this.lastErrorAt = Date.now();
       }
     });
@@ -302,6 +321,9 @@ class RepackJob {
       });
       this.ffmpegProc = null;
       this.lastErrorAt = Date.now();
+      this.lastFfmpegExitAt = Date.now();
+      this.lastFfmpegExitCode = Number.isFinite(code) ? code : null;
+      this.lastFfmpegExitSignal = signal || null;
       if (this.state === "stopped") return;
       this.state = "restarting";
       setTimeout(() => {
@@ -421,6 +443,7 @@ class RepackJob {
     this.lastPublishAt = Date.now();
     this.totalPlaylistPublishes += 1;
     this.consecutiveUploadErrors = 0;
+    this.consecutiveSourceErrors = 0;
   }
 
   async syncPlaylist() {
@@ -548,11 +571,21 @@ class RepackJob {
       serverId: this.serverId,
       state: this.state,
       ingestUrl: this.ingestUrl,
+      ingestUrlKind: detectIngestUrlKind(this.ingestUrl),
       createdAt: this.createdAt,
       lastSeedAt: this.lastSeedAt,
       lastPublishAt: this.lastPublishAt,
+      lastPublishAgeMs: this.lastPublishAt ? Math.max(0, Date.now() - this.lastPublishAt) : null,
       lastErrorAt: this.lastErrorAt,
+      lastFfmpegExit: this.lastFfmpegExitAt
+        ? {
+            at: this.lastFfmpegExitAt,
+            code: this.lastFfmpegExitCode,
+            signal: this.lastFfmpegExitSignal,
+          }
+        : null,
       sourceReadErrors: this.sourceReadErrors,
+      consecutiveSourceErrors: this.consecutiveSourceErrors,
       consecutiveUploadErrors: this.consecutiveUploadErrors,
       totalPlaylistPublishes: this.totalPlaylistPublishes,
       totalSegmentUploads: this.totalSegmentUploads,
@@ -710,7 +743,12 @@ class RepackManager {
     for (const job of jobs) {
       perServer[String(job.serverId)] = {
         repack_on: job.state === "running" || job.state === "restarting",
-        fallback_reason_top: job.consecutiveUploadErrors > 0 ? "upload-errors" : "none",
+        fallback_reason_top:
+          job.consecutiveSourceErrors > 0
+            ? "source-errors"
+            : job.consecutiveUploadErrors > 0
+              ? "upload-errors"
+              : "none",
         cache_status_mix: "n/a",
         stall_rate: "n/a",
       };

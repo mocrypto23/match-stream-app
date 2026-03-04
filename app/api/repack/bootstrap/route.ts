@@ -13,6 +13,7 @@ import {
 } from "@/lib/server-source-policy";
 import { getServerCapability } from "@/lib/server-capabilities";
 import { getServerStreamMode } from "@/lib/stream-mode";
+import { resolveRepackIngestUrl, type RepackIngestMode } from "@/lib/repack-ingest-resolver";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -127,6 +128,13 @@ export async function POST(req: Request) {
   if (!Number.isFinite(matchId) || matchId <= 0) {
     return NextResponse.json({ ok: false, error: "invalid-match-id" }, { status: 400 });
   }
+  const requestOrigin = (() => {
+    try {
+      return new URL(req.url).origin;
+    } catch {
+      return "";
+    }
+  })();
 
   const mode = getServerStreamMode();
   const repackFlags = getRuntimeRepackFlags();
@@ -142,6 +150,11 @@ export async function POST(req: Request) {
     reason: string;
     statusCode: number;
     sourceUrl: string | null;
+    ingest: {
+      mode: RepackIngestMode;
+      reason: string;
+      ingestUrl: string | null;
+    };
   }> = [];
 
   for (const uiServer of uiServers) {
@@ -160,6 +173,11 @@ export async function POST(req: Request) {
         reason: "mode-not-r2-strict",
         statusCode: 202,
         sourceUrl: sourceUrl || null,
+        ingest: {
+          mode: "none",
+          reason: "mode-not-r2-strict",
+          ingestUrl: null,
+        },
       });
       continue;
     }
@@ -176,6 +194,11 @@ export async function POST(req: Request) {
         reason: "missing-source",
         statusCode: 202,
         sourceUrl: sourceUrl || null,
+        ingest: {
+          mode: "none",
+          reason: "missing-source",
+          ingestUrl: null,
+        },
       });
       continue;
     }
@@ -192,6 +215,11 @@ export async function POST(req: Request) {
         reason: "source-not-allowed",
         statusCode: 202,
         sourceUrl,
+        ingest: {
+          mode: "none",
+          reason: "source-not-allowed",
+          ingestUrl: null,
+        },
       });
       continue;
     }
@@ -209,6 +237,11 @@ export async function POST(req: Request) {
         reason: "server-not-eligible",
         statusCode: 202,
         sourceUrl,
+        ingest: {
+          mode: "none",
+          reason: "server-not-eligible",
+          ingestUrl: null,
+        },
       });
       continue;
     }
@@ -225,6 +258,11 @@ export async function POST(req: Request) {
         reason: "repack-disabled",
         statusCode: 202,
         sourceUrl,
+        ingest: {
+          mode: "none",
+          reason: "repack-disabled",
+          ingestUrl: null,
+        },
       });
       continue;
     }
@@ -241,6 +279,38 @@ export async function POST(req: Request) {
         reason: "server-flag-disabled",
         statusCode: 202,
         sourceUrl,
+        ingest: {
+          mode: "none",
+          reason: "server-flag-disabled",
+          ingestUrl: null,
+        },
+      });
+      continue;
+    }
+
+    const ingest = await resolveRepackIngestUrl({
+      sourceUrl,
+      requestOrigin,
+      referrerUrl: sourceUrl,
+    });
+    if (!ingest.ingestUrl || !isValidHttpUrl(ingest.ingestUrl)) {
+      setRepackSeedRuntimeState(matchId, slotServer, {
+        accepted: false,
+        reason: `invalid-ingest-url:${ingest.reason}`,
+        statusCode: 202,
+      });
+      results.push({
+        uiServer,
+        slotServer,
+        accepted: false,
+        reason: "invalid-ingest-url",
+        statusCode: 202,
+        sourceUrl,
+        ingest: {
+          mode: ingest.mode,
+          reason: ingest.reason,
+          ingestUrl: ingest.ingestUrl || null,
+        },
       });
       continue;
     }
@@ -249,7 +319,7 @@ export async function POST(req: Request) {
       matchId,
       serverId: slotServer,
       sourceUrl,
-      sourceCandidate: sourceUrl,
+      sourceCandidate: ingest.ingestUrl,
       matchStatus: String(row.status_key || ""),
       matchStart: String(row.match_start || ""),
     });
@@ -267,6 +337,11 @@ export async function POST(req: Request) {
       reason,
       statusCode: upstream.status,
       sourceUrl,
+      ingest: {
+        mode: ingest.mode,
+        reason: ingest.reason,
+        ingestUrl: ingest.ingestUrl,
+      },
     });
   }
 
@@ -285,4 +360,3 @@ export async function POST(req: Request) {
     r2Status,
   });
 }
-

@@ -8,6 +8,8 @@ export type R2StatusServerEntry = {
   slotServer: SlotServerId;
   state: R2ServerState;
   playlistUrl: string | null;
+  segmentProbe: "ok" | "fail" | "unknown";
+  lastSequenceAgeMs: number | null;
   reason: string;
   updatedAt: string;
 };
@@ -17,4 +19,3 @@ export type MatchR2Status = {
   servers: R2StatusServerEntry[];
   updatedAt: string;
 };
-

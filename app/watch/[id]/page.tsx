@@ -67,6 +67,7 @@ type ServerOption = {
   sticky?: boolean;
 };
 type ServerHealthState = "ok" | "down" | "pending";
+type StrictRecoveryState = "healthy" | "retrying" | "breaker_open";
 
 const SERVER_SOURCE_LABELS: Record<number, string> = {
   1: "سيرفر 4 ",
@@ -104,6 +105,7 @@ const P2P_FEATURE_FLAG = String(process.env.NEXT_PUBLIC_P2P_ENABLED || "").trim(
 const REPACK_FLAGS = getRuntimeRepackFlags();
 const STREAM_MODE = getClientStreamMode();
 const R2_STRICT_MODE = isR2StrictMode(STREAM_MODE);
+const LEGACY_STRICT_MODE = STREAM_MODE === "legacy_strict";
 const P2P_PROFILE = (() => {
   const raw = String(process.env.NEXT_PUBLIC_P2P_PROFILE || "").trim().toLowerCase();
   if (raw === "max-stability") return "max-stability" as const;
@@ -111,6 +113,8 @@ const P2P_PROFILE = (() => {
   return "balanced" as const;
 })();
 const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
+const STRICT_R2_BACKOFF_MS = [2000, 4000, 8000] as const;
+const STRICT_R2_BREAKER_OPEN_MS = 25_000;
 const RESOLVE_COOLDOWN_MS = 1500;
 const REPACK_SEED_DEDUPE_WINDOW_MS = 12_000;
 const REPACK_TOKEN_REFRESH_KICK_MS = 16_000;
@@ -5259,6 +5263,30 @@ async function expandCandidatesWithManifestVariants(
   return dedupeUrls([...base, ...extras]);
 }
 
+function buildR2StatusSignature(status: MatchR2Status | null | undefined) {
+  if (!status?.servers?.length) return "none";
+  const servers = [...status.servers]
+    .sort((a, b) => a.slotServer - b.slotServer)
+    .map((item) =>
+      [
+        item.uiServer,
+        item.slotServer,
+        item.state,
+        item.reason || "",
+        item.playlistUrl || "",
+        item.segmentProbe || "unknown",
+        Number.isFinite(Number(item.lastSequenceAgeMs)) ? Number(item.lastSequenceAgeMs) : "na",
+      ].join("|")
+    )
+    .join(";");
+  return `${status.mode}|${servers}`;
+}
+
+function mergeR2StatusIfChanged(prev: MatchR2Status | null, next: MatchR2Status | null) {
+  if (!next) return prev;
+  return buildR2StatusSignature(prev) === buildR2StatusSignature(next) ? prev : next;
+}
+
 export default function WatchPage() {
   const params = useParams();
   const router = useRouter();
@@ -5298,6 +5326,8 @@ export default function WatchPage() {
   const [resolveRevision, setResolveRevision] = useState(0);
   const [playerLoading, setPlayerLoading] = useState(false);
   const [playerError, setPlayerError] = useState<string | null>(null);
+  const [strictRecoveryState, setStrictRecoveryState] = useState<StrictRecoveryState>("healthy");
+  const [strictBreakerUntilMs, setStrictBreakerUntilMs] = useState<number | null>(null);
   const [serverHealth, setServerHealth] = useState<Record<number, ServerHealthState>>({});
   const [diagLogs, setDiagLogs] = useState<string[]>([]);
   const [isTfPlayerHost, setIsTfPlayerHost] = useState(false);
@@ -5307,6 +5337,10 @@ export default function WatchPage() {
   const selectedServerRef = useRef(4);
   const recoveryTimerRef = useRef<number | null>(null);
   const recoveryAttemptRef = useRef(0);
+  const strictRetryStepRef = useRef(0);
+  const strictRecoveryTimerRef = useRef<number | null>(null);
+  const strictBreakerTimerRef = useRef<number | null>(null);
+  const strictRecoveryStateRef = useRef<StrictRecoveryState>("healthy");
   const lastResolveKickRef = useRef(0);
   const resolveLockRef = useRef(false);
   const pendingResolveKickReasonRef = useRef<string | null>(null);
@@ -5316,6 +5350,8 @@ export default function WatchPage() {
   const userPausedRef = useRef(false);
   const ignorePauseTrackingRef = useRef(false);
   const stallTimerRef = useRef<number | null>(null);
+  const lastDiagLineRef = useRef<string>("");
+  const lastDiagAtRef = useRef(0);
   const badCandidateKeysByServerRef = useRef<Record<number, Set<string>>>({
     1: new Set<string>(),
     3: new Set<string>(),
@@ -5352,12 +5388,19 @@ export default function WatchPage() {
 
   const diagEnabled = searchParams.get("diag") === "1";
   useEffect(() => {
+    strictRecoveryStateRef.current = strictRecoveryState;
+  }, [strictRecoveryState]);
+  useEffect(() => {
     if (typeof window === "undefined") return;
     const host = String(window.location.hostname || "").toLowerCase();
     setIsTfPlayerHost(host === "tf-player.site" || host.endsWith(".tf-player.site"));
   }, []);
   const pushDiag = useCallback((line: string) => {
     if (!diagEnabled) return;
+    const now = Date.now();
+    if (R2_STRICT_MODE && line === lastDiagLineRef.current && now - lastDiagAtRef.current < 2500) return;
+    lastDiagLineRef.current = line;
+    lastDiagAtRef.current = now;
     setDiagLogs((prev) => [line, ...prev].slice(0, 120));
   }, [diagEnabled]);
 
@@ -5378,6 +5421,7 @@ export default function WatchPage() {
 
   const requestRepackSeed = useCallback(
     async (params: { serverId: number; sourceUrl: string; sourceCandidate: string }) => {
+      if (!R2_STRICT_MODE) return;
       if (!idNum || !match) return;
       const capability = getServerCapability(params.serverId);
       if (!capability?.repackEligible) return;
@@ -5477,6 +5521,18 @@ export default function WatchPage() {
     repackStallCountByServerRef.current = {};
     repackRecoveryErrorCountByServerRef.current = {};
     repackPlaybackStartedAtByServerRef.current = {};
+    if (strictRecoveryTimerRef.current !== null) {
+      clearTimeout(strictRecoveryTimerRef.current);
+      strictRecoveryTimerRef.current = null;
+    }
+    if (strictBreakerTimerRef.current !== null) {
+      clearTimeout(strictBreakerTimerRef.current);
+      strictBreakerTimerRef.current = null;
+    }
+    strictRetryStepRef.current = 0;
+    strictRecoveryStateRef.current = "healthy";
+    setStrictRecoveryState("healthy");
+    setStrictBreakerUntilMs(null);
     setRepackBypassVersion((prev) => prev + 1);
     if (R2_STRICT_MODE) setR2Status(null);
   }, [idNum]);
@@ -5655,11 +5711,27 @@ export default function WatchPage() {
     }
   }, []);
 
+  const clearStrictRecoveryTimers = useCallback(() => {
+    if (strictRecoveryTimerRef.current !== null) {
+      clearTimeout(strictRecoveryTimerRef.current);
+      strictRecoveryTimerRef.current = null;
+    }
+    if (strictBreakerTimerRef.current !== null) {
+      clearTimeout(strictBreakerTimerRef.current);
+      strictBreakerTimerRef.current = null;
+    }
+  }, []);
+
   const resetRecoveryState = useCallback(() => {
     recoveryAttemptRef.current = 0;
     pendingResolveKickReasonRef.current = null;
     clearRecoveryTimer();
-  }, [clearRecoveryTimer]);
+    clearStrictRecoveryTimers();
+    strictRetryStepRef.current = 0;
+    strictRecoveryStateRef.current = "healthy";
+    setStrictRecoveryState("healthy");
+    setStrictBreakerUntilMs(null);
+  }, [clearRecoveryTimer, clearStrictRecoveryTimers]);
 
   const bumpResolveRevision = useCallback((reason: string) => {
     if (resolveLockRef.current) {
@@ -5680,6 +5752,48 @@ export default function WatchPage() {
   const scheduleResolveRecovery = useCallback(
     (reason: string, immediate = false) => {
       clearRecoveryTimer();
+      if (R2_STRICT_MODE) {
+        if (strictRecoveryStateRef.current === "breaker_open") return;
+        if (strictRecoveryTimerRef.current !== null) return;
+        const step = strictRetryStepRef.current;
+        if (step >= STRICT_R2_BACKOFF_MS.length) {
+          const breakerUntil = Date.now() + STRICT_R2_BREAKER_OPEN_MS;
+          clearStrictRecoveryTimers();
+          strictRecoveryStateRef.current = "breaker_open";
+          setStrictRecoveryState("breaker_open");
+          setStrictBreakerUntilMs(breakerUntil);
+          strictRetryStepRef.current = STRICT_R2_BACKOFF_MS.length;
+          applyCandidatesPreservingSelection([]);
+          setResolverError(NO_STREAM_SELECTED_SERVER_MESSAGE);
+          setPlayerError("تعذر تشغيل R2 الآن. تم إيقاف المحاولات مؤقتًا، اضغط إعادة المحاولة.");
+          pushDiag(`strict breaker open (${reason})`);
+          strictBreakerTimerRef.current = window.setTimeout(() => {
+            strictBreakerTimerRef.current = null;
+            strictRetryStepRef.current = 0;
+            strictRecoveryStateRef.current = "healthy";
+            setStrictRecoveryState("healthy");
+            setStrictBreakerUntilMs(null);
+          }, STRICT_R2_BREAKER_OPEN_MS);
+          return;
+        }
+
+        const delay = STRICT_R2_BACKOFF_MS[step];
+        strictRetryStepRef.current = step + 1;
+        strictRecoveryStateRef.current = "retrying";
+        setStrictRecoveryState("retrying");
+        setPlayerError(`تعذر تشغيل R2 مؤقتًا... إعادة المحاولة خلال ${Math.ceil(delay / 1000)} ثانية.`);
+        pushDiag(`strict retry ${strictRetryStepRef.current}/${STRICT_R2_BACKOFF_MS.length} in ${delay}ms (${reason})`);
+        strictRecoveryTimerRef.current = window.setTimeout(() => {
+          strictRecoveryTimerRef.current = null;
+          if (strictRecoveryStateRef.current === "breaker_open") return;
+          if (bumpResolveRevision(`${reason}:strict-retry`)) return;
+          if (resolveLockRef.current && !pendingResolveKickReasonRef.current) {
+            pendingResolveKickReasonRef.current = `${reason}:pending`;
+            pushDiag(`resolve pending (${reason})`);
+          }
+        }, delay);
+        return;
+      }
       if (resolveLockRef.current) {
         if (!pendingResolveKickReasonRef.current) {
           pendingResolveKickReasonRef.current = `${reason}:pending`;
@@ -5702,18 +5816,38 @@ export default function WatchPage() {
         }
       }, delay);
     },
-    [bumpResolveRevision, clearRecoveryTimer, pushDiag]
+    [applyCandidatesPreservingSelection, bumpResolveRevision, clearRecoveryTimer, clearStrictRecoveryTimers, pushDiag]
   );
 
   useEffect(() => {
     return () => {
       clearRecoveryTimer();
+      clearStrictRecoveryTimers();
       if (stallTimerRef.current !== null) {
         clearInterval(stallTimerRef.current);
         stallTimerRef.current = null;
       }
     };
-  }, [clearRecoveryTimer]);
+  }, [clearRecoveryTimer, clearStrictRecoveryTimers]);
+
+  const strictBreakerRemainingSec = useMemo(() => {
+    if (strictRecoveryState !== "breaker_open" || !strictBreakerUntilMs) return 0;
+    return Math.max(0, Math.ceil((strictBreakerUntilMs - Date.now()) / 1000));
+  }, [strictBreakerUntilMs, strictRecoveryState, nowMs]);
+
+  const handleStrictRetryNow = useCallback(() => {
+    if (!R2_STRICT_MODE) return;
+    clearStrictRecoveryTimers();
+    strictRetryStepRef.current = 0;
+    strictRecoveryStateRef.current = "healthy";
+    setStrictRecoveryState("healthy");
+    setStrictBreakerUntilMs(null);
+    setResolverError(null);
+    setPlayerError(null);
+    lastResolveKickRef.current = 0;
+    setResolveRevision((prev) => prev + 1);
+    pushDiag("strict manual-retry");
+  }, [clearStrictRecoveryTimers, pushDiag]);
 
   useEffect(() => {
     let cancel = false;
@@ -5735,7 +5869,8 @@ export default function WatchPage() {
         } else {
           const loaded = json as MatchRow;
           setMatch(loaded);
-          setR2Status((loaded.r2Status || loaded.r2_status || null) as MatchR2Status | null);
+          const nextStatus = (loaded.r2Status || loaded.r2_status || null) as MatchR2Status | null;
+          setR2Status((prev) => mergeR2StatusIfChanged(prev, nextStatus));
 
           const loadedId = Number.isFinite(Number(loaded?.id)) ? Number(loaded.id) : null;
           if (loadedId && loadedId !== idNum) {
@@ -6004,35 +6139,39 @@ export default function WatchPage() {
         });
         continue;
       }
-      const repackRuntimeBypass = EMBED_FALLBACK_ENABLED && repackBypassServersRef.current.has(n);
-      if (repackRuntimeBypass && legacyUrl && capability?.repackEligible) {
-        repackDecisionReason = "runtime-unavailable";
-      } else if (legacyUrl && idNum && allowRepackRead && capability?.repackEligible) {
-        const decision = shouldUseRepackForViewer({
-          flags: runtimeRepackFlags,
-          serverId: n,
-          matchId: idNum,
-          viewerSessionId,
-        });
-        repackDecisionReason = decision.reason;
-        repackReadPct = decision.readPct;
-        repackBucket = decision.bucket;
-        if (decision.useRepack) {
-          const repackUrl = buildRepackPlaylistUrl({
-            baseUrl: runtimeRepackFlags.publicBaseUrl,
-            matchId: idNum,
+      if (LEGACY_STRICT_MODE) {
+        if (legacyUrl && capability?.repackEligible) repackDecisionReason = "legacy-strict-no-r2";
+      } else {
+        const repackRuntimeBypass = EMBED_FALLBACK_ENABLED && repackBypassServersRef.current.has(n);
+        if (repackRuntimeBypass && legacyUrl && capability?.repackEligible) {
+          repackDecisionReason = "runtime-unavailable";
+        } else if (legacyUrl && idNum && allowRepackRead && capability?.repackEligible) {
+          const decision = shouldUseRepackForViewer({
+            flags: runtimeRepackFlags,
             serverId: n,
+            matchId: idNum,
+            viewerSessionId,
           });
-          if (isValidHttpUrl(repackUrl)) {
-            url = repackUrl;
-            fallbackUrl = legacyUrl;
-            repackActive = true;
-          } else {
-            repackDecisionReason = "invalid-repack-url";
+          repackDecisionReason = decision.reason;
+          repackReadPct = decision.readPct;
+          repackBucket = decision.bucket;
+          if (decision.useRepack) {
+            const repackUrl = buildRepackPlaylistUrl({
+              baseUrl: runtimeRepackFlags.publicBaseUrl,
+              matchId: idNum,
+              serverId: n,
+            });
+            if (isValidHttpUrl(repackUrl)) {
+              url = repackUrl;
+              fallbackUrl = legacyUrl;
+              repackActive = true;
+            } else {
+              repackDecisionReason = "invalid-repack-url";
+            }
           }
+        } else if (legacyUrl && capability?.repackEligible && !allowRepackRead) {
+          repackDecisionReason = "match-not-live";
         }
-      } else if (legacyUrl && capability?.repackEligible && !allowRepackRead) {
-        repackDecisionReason = "match-not-live";
       }
       const label = SERVER_SOURCE_LABELS[n] || `سيرفر ${n}`;
       // Smart Guard: Only allow sticky if config says so AND the URL looks safe (no tokens)
@@ -6164,7 +6303,9 @@ export default function WatchPage() {
         const payload = await response.json().catch(() => null);
         if (cancel) return;
         const nextStatus = payload?.r2Status as MatchR2Status | null | undefined;
-        if (nextStatus?.servers?.length) setR2Status(nextStatus);
+        if (nextStatus?.servers?.length) {
+          setR2Status((prev) => mergeR2StatusIfChanged(prev, nextStatus));
+        }
       } catch {
         // Keep current status; polling endpoint will retry.
       }
@@ -6179,6 +6320,7 @@ export default function WatchPage() {
     if (!idNum || !match?.id) return;
     let cancel = false;
     const refresh = async () => {
+      if (typeof document !== "undefined" && document.hidden) return;
       try {
         const response = await fetch(`/api/repack/status?matchId=${encodeURIComponent(String(idNum))}`, {
           method: "GET",
@@ -6188,7 +6330,9 @@ export default function WatchPage() {
         const payload = await response.json().catch(() => null);
         if (cancel) return;
         const nextStatus = payload?.r2Status as MatchR2Status | null | undefined;
-        if (nextStatus?.servers?.length) setR2Status(nextStatus);
+        if (nextStatus?.servers?.length) {
+          setR2Status((prev) => mergeR2StatusIfChanged(prev, nextStatus));
+        }
       } catch {
         // no-op
       }
@@ -6196,7 +6340,7 @@ export default function WatchPage() {
     void refresh();
     const timerId = window.setInterval(() => {
       void refresh();
-    }, 8000);
+    }, 15000);
     return () => {
       cancel = true;
       window.clearInterval(timerId);
@@ -6437,13 +6581,19 @@ export default function WatchPage() {
         return;
       }
       if (R2_STRICT_MODE) {
+        if (strictRecoveryStateRef.current === "breaker_open") {
+          applyCandidatesPreservingSelection([]);
+          setResolverError(NO_STREAM_SELECTED_SERVER_MESSAGE);
+          setResolverLoading(false);
+          resolveLockRef.current = false;
+          return;
+        }
         const strictCandidates = isValidHttpUrl(selectedUrl) ? [selectedUrl] : [];
         applyCandidatesPreservingSelection(strictCandidates);
         setResolverError(strictCandidates.length ? null : NO_STREAM_SELECTED_SERVER_MESSAGE);
         setResolverLoading(false);
         if (strictCandidates.length) setPlayerError(null);
         resolveLockRef.current = false;
-        resetRecoveryState();
         return;
       }
       const repackPrimaryOnlyMode =
@@ -8301,6 +8451,22 @@ export default function WatchPage() {
 
         {resolverError ? <div className="mt-2 text-xs text-red-200 bg-red-900/20 border border-red-700/40 rounded-lg px-3 py-2">{resolverError}</div> : null}
         {playerError ? <div className="mt-2 text-xs text-amber-200 bg-amber-900/20 border border-amber-700/40 rounded-lg px-3 py-2">{playerError}</div> : null}
+        {R2_STRICT_MODE && strictRecoveryState === "breaker_open" ? (
+          <div className="mt-2 text-xs text-blue-100 bg-blue-900/20 border border-blue-700/40 rounded-lg px-3 py-3 flex items-center justify-between gap-3">
+            <div>
+              <div className="font-bold">R2 Circuit Breaker مفتوح مؤقتًا.</div>
+              <div className="text-blue-200/90">
+                {strictBreakerRemainingSec > 0 ? `إعادة المحاولة التلقائية بعد ${strictBreakerRemainingSec} ثانية.` : "يمكنك إعادة المحاولة الآن."}
+              </div>
+            </div>
+            <button
+              onClick={handleStrictRetryNow}
+              className="rounded-md border border-blue-500/70 bg-blue-900/40 hover:bg-blue-800/50 px-3 py-1.5 font-bold text-blue-50"
+            >
+              إعادة المحاولة الآن
+            </button>
+          </div>
+        ) : null}
 
         {diagEnabled ? (
           <div className="mt-3 rounded-xl border border-amber-700/40 bg-[#16130a] p-3">
