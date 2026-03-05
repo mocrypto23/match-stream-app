@@ -675,7 +675,9 @@ class RepackJob {
       key: remoteKey,
       body: fileBody,
       contentType: "video/mp2t",
-      cacheControl: "public, max-age=30, s-maxage=120, stale-while-revalidate=30",
+      // Segment object names are unique and immutable, so long edge caching is safe
+      // and significantly reduces repeated Class B reads on R2.
+      cacheControl: "public, max-age=3600, s-maxage=86400, immutable",
     });
 
     this.lastUploadLatencyMs = Date.now() - startedAt;
