@@ -390,6 +390,25 @@ export async function buildMatchR2Status(input: {
       const probed = await probeR2Playlist(playlistUrl, Math.max(probeTimeoutMs, segmentProbeTimeoutMs));
       const sequenceAgeMs = noteSequenceAndGetAgeMs(playlistUrl, probed.mediaSequence, nowMs);
       const consecutiveSegmentFails = noteSegmentProbeFailure(matchSlotKey, probed.segmentProbe === "fail", nowMs);
+      const recentSeedState = getRepackSeedRuntimeState(matchId, slotServer);
+      const recentSeedRejected =
+        !!recentSeedState &&
+        !recentSeedState.accepted &&
+        nowMs - recentSeedState.updatedAt <= DEFAULT_SEED_WARMING_WINDOW_MS;
+      if (recentSeedRejected) {
+        return {
+          uiServer,
+          slotServer,
+          state: "down",
+          playlistUrl,
+          segmentProbe: probed.segmentProbe,
+          lastSequenceAgeMs: sequenceAgeMs,
+          resolverState: recentSeedState?.resolverState || "unknown",
+          resolveReason: recentSeedState?.resolveReason || recentSeedState?.reason || "seed-rejected",
+          reason: `seed-rejected:${recentSeedState?.reason || "unknown"}`,
+          updatedAt: nowIso(nowMs),
+        };
+      }
       const finishedDebounced =
         shouldEarlyStopFinished &&
         finishedSeenAt !== null &&
