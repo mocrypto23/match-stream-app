@@ -57,6 +57,13 @@ type ProbeResult = {
   extraCandidates: string[];
 };
 
+type RankedCandidate = {
+  candidateUrl: string;
+  score: number;
+  mode: RepackIngestMode;
+  referrerUrl: string;
+};
+
 const DEFAULT_TIMEOUT_MS = 5200;
 const DEFAULT_SEGMENT_TIMEOUT_MS = 2200;
 const DEFAULT_MAX_CANDIDATES = 16;
@@ -843,7 +850,7 @@ function pushCandidateUnique(list: string[], seen: Set<string>, candidateUrl: st
   list.push(candidateUrl);
 }
 
-function rankCandidates(candidates: string[], sourceUrl: string, maxCandidates: number) {
+function rankCandidates(candidates: string[], sourceUrl: string, maxCandidates: number, referrerUrl: string) {
   const sourceHost = (() => {
     try {
       return new URL(sourceUrl).hostname.toLowerCase();
@@ -857,6 +864,7 @@ function rankCandidates(candidates: string[], sourceUrl: string, maxCandidates: 
       candidateUrl,
       score: scoreCandidate(candidateUrl, sourceHost),
       mode: classifyMode(candidateUrl),
+      referrerUrl: normalizeHttpUrl(referrerUrl) || candidateUrl,
     }))
     .filter((item) => Number.isFinite(item.score) && item.score > Number.NEGATIVE_INFINITY)
     .sort((a, b) => b.score - a.score)
@@ -1033,7 +1041,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
   });
   if (internalProxy) pushCandidateUnique(candidateSeed, seen, internalProxy);
 
-  const rankedSeed = rankCandidates(candidateSeed, sourceUrl, maxCandidates);
+  const rankedSeed = rankCandidates(candidateSeed, sourceUrl, maxCandidates, sourceFetch.finalUrl || sourceUrl);
   if (!rankedSeed.length) {
     return emptyResolution("no-ingest-candidate", {
       stage: "candidate-probe",
@@ -1044,7 +1052,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     });
   }
 
-  const pending = [...rankedSeed];
+  const pending: RankedCandidate[] = [...rankedSeed];
   const seenProbeKeys = new Set<string>();
   let candidatesProbed = 0;
   let lastProbeReason = "probe-failed";
@@ -1058,7 +1066,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     seenProbeKeys.add(key);
 
     candidatesProbed += 1;
-    const referrerPool = buildProbeReferrerPool(item.candidateUrl, sourceFetch.finalUrl || sourceUrl);
+    const referrerPool = buildProbeReferrerPool(item.candidateUrl, item.referrerUrl || sourceFetch.finalUrl || sourceUrl);
     const aggregatedExtraCandidates: string[] = [];
     let finalProbe: ProbeResult | null = null;
 
@@ -1106,7 +1114,12 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       if (extraPool.length >= MAX_DYNAMIC_CANDIDATES) break;
     }
     if (!extraPool.length) continue;
-    const rankedExtra = rankCandidates(extraPool, sourceUrl, Math.max(2, maxCandidates - candidatesProbed));
+    const rankedExtra = rankCandidates(
+      extraPool,
+      sourceUrl,
+      Math.max(2, maxCandidates - candidatesProbed),
+      finalProbe.evidence?.playlistUrl || item.referrerUrl || item.candidateUrl
+    );
     pending.push(...rankedExtra);
   }
 
