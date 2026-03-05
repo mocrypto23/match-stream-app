@@ -994,10 +994,31 @@ function rankCandidates(candidates: string[], sourceUrl: string, maxCandidates: 
     .slice(0, maxCandidates);
 }
 
+function extractEmbedProxyReferrer(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return "";
+  try {
+    const u = new URL(rawUrl);
+    const pathname = String(u.pathname || "").toLowerCase();
+    if (!pathname.includes("/api/embed-proxy")) return "";
+    const refRaw = safeDecodeURIComponent(String(u.searchParams.get("ref") || "").trim());
+    if (isValidHttpUrl(refRaw)) return refRaw;
+    const targetRaw = safeDecodeURIComponent(String(u.searchParams.get("url") || "").trim());
+    if (isValidHttpUrl(targetRaw)) return targetRaw;
+    return "";
+  } catch {
+    return "";
+  }
+}
+
 function buildProbeReferrerPool(candidateUrl: string, sourceReferrer: string) {
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const raw of [candidateUrl, sourceReferrer]) {
+  for (const raw of [
+    extractEmbedProxyReferrer(candidateUrl),
+    candidateUrl,
+    extractEmbedProxyReferrer(sourceReferrer),
+    sourceReferrer,
+  ]) {
     const value = normalizeHttpUrl(raw);
     if (!value) continue;
     const key = canonicalizeUrl(value) || value.toLowerCase();
