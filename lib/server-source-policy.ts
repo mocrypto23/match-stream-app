@@ -97,6 +97,18 @@ function unwrapEmbedProxyTarget(rawUrl: string) {
   return isValidHttpUrl(current) ? current : "";
 }
 
+function extractEmbedProxyReferrer(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return "";
+  try {
+    const parsed = new URL(rawUrl);
+    if (!String(parsed.pathname || "").toLowerCase().includes("/api/embed-proxy")) return "";
+    const ref = String(parsed.searchParams.get("ref") || "").trim();
+    return isValidHttpUrl(ref) ? ref : "";
+  } catch {
+    return "";
+  }
+}
+
 export function isValidHttpUrl(raw: unknown): raw is string {
   if (typeof raw !== "string") return false;
   try {
@@ -156,6 +168,11 @@ export function isIngestCandidateAlignedWithSlotServer(input: {
   if (!isValidHttpUrl(ingestUrl)) return false;
 
   const allowlist = getSlotHostAllowlist(slotServerId);
+  const proxyEmbeddedRef = extractEmbedProxyReferrer(ingestUrl);
+  if (proxyEmbeddedRef) {
+    const proxyRefHost = extractHost(proxyEmbeddedRef);
+    if (!proxyRefHost || !hostMatchesAnySuffix(proxyRefHost, allowlist)) return false;
+  }
   const targetUrl = unwrapEmbedProxyTarget(ingestUrl) || ingestUrl;
   const targetHost = extractHost(targetUrl);
   if (!targetHost) return false;
