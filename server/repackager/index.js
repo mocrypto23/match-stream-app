@@ -212,6 +212,18 @@ function parseLastSegmentFromManifest(playlistUrl, manifestText) {
   return "";
 }
 
+function parseTargetDurationSecFromPlaylistLines(lines) {
+  for (const line of lines || []) {
+    const raw = String(line || "").trim();
+    if (!raw) continue;
+    const match = raw.match(/^#EXT-X-TARGETDURATION:(\d+(?:\.\d+)?)/i);
+    if (!match || !match[1]) continue;
+    const n = Number.parseFloat(match[1]);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 0;
+}
+
 async function probeSegmentUrl(segmentUrl, timeoutMs, headers = {}) {
   const baseHeaders = {
     "user-agent": DEFAULT_USER_AGENT,
@@ -320,6 +332,7 @@ class RepackJob {
     this.lastStaleRestartAt = 0;
     this.lastLocalSegmentFingerprint = "";
     this.lastLocalSegmentChangedAt = 0;
+    this.lastObservedTargetDurationSec = 0;
     this.ffmpegProc = null;
     this.uploadTimer = null;
     this.monitorTimer = null;
@@ -358,6 +371,14 @@ class RepackJob {
     }, pollMs);
     this.monitorTimer = setInterval(() => this.healthSweep(), 2500);
     this.state = "running";
+  }
+
+  getAdaptiveStaleMs(baseMs, multiplier = 3) {
+    const safeBase = Math.max(2000, Number(baseMs) || 0);
+    const targetDurationSec = Number(this.lastObservedTargetDurationSec || 0);
+    if (!Number.isFinite(targetDurationSec) || targetDurationSec <= 0) return safeBase;
+    const derived = Math.round(targetDurationSec * 1000 * multiplier + 2000);
+    return Math.max(safeBase, Math.min(120_000, derived));
   }
 
   resetEncoderRunState() {
@@ -448,7 +469,7 @@ class RepackJob {
       "-hls_list_size",
       String(this.profile.playlistSize),
       "-hls_flags",
-      "delete_segments+omit_endlist+program_date_time+split_by_time",
+      "delete_segments+append_list+omit_endlist+program_date_time+temp_file",
       "-hls_segment_filename",
       segmentPattern,
       this.playlistPath
@@ -587,12 +608,14 @@ class RepackJob {
 
     // If source is unchanged but stream is stale/restarting, force ffmpeg recycle.
     const now = Date.now();
-    const staleMs = this.manager.config.seedRestartStaleMs;
+    const staleMs = this.getAdaptiveStaleMs(this.manager.config.seedRestartStaleMs, 3);
     const noPublishYet = !this.lastPublishAt && now - this.createdAt > staleMs;
     const stalePublish = !!this.lastPublishAt && now - this.lastPublishAt > staleMs;
-    if ((this.state === "restarting" || noPublishYet || stalePublish) && this.ffmpegProc) {
+    const recentlySpawned = this.lastSpawnAt && now - this.lastSpawnAt < Math.max(5000, Math.floor(staleMs * 0.4));
+    if ((this.state === "restarting" || noPublishYet || stalePublish) && this.ffmpegProc && !recentlySpawned) {
       this.manager.log("warn", "repack seed-triggered restart", {
         job: this.key,
+        staleThresholdMs: staleMs,
         staleMs: this.lastPublishAt ? now - this.lastPublishAt : now - this.createdAt,
       });
       try {
@@ -730,6 +753,8 @@ class RepackJob {
       return;
     }
     const { lines, segmentLines } = this.parsePlaylist(playlistRaw);
+    const targetDurationSec = parseTargetDurationSecFromPlaylistLines(lines);
+    if (targetDurationSec > 0) this.lastObservedTargetDurationSec = targetDurationSec;
     if (!segmentLines.length) return;
     const now = Date.now();
     const localFingerprint = segmentLines.slice(-3).join("|");
@@ -738,8 +763,9 @@ class RepackJob {
       this.lastLocalSegmentChangedAt = now;
     } else {
       const staleForMs = this.lastLocalSegmentChangedAt ? now - this.lastLocalSegmentChangedAt : 0;
+      const staleInputThresholdMs = this.getAdaptiveStaleMs(this.manager.config.staleInputSequenceMs, 4);
       if (
-        staleForMs > this.manager.config.staleInputSequenceMs &&
+        staleForMs > staleInputThresholdMs &&
         this.ffmpegProc &&
         now - this.lastStaleRestartAt >= this.manager.config.staleRestartCooldownMs
       ) {
@@ -747,6 +773,8 @@ class RepackJob {
         this.manager.log("warn", "repack local-segments-stale", {
           job: this.key,
           staleMs: staleForMs,
+          staleThresholdMs: staleInputThresholdMs,
+          targetDurationSec: this.lastObservedTargetDurationSec || 0,
         });
         try {
           this.ffmpegProc.kill("SIGTERM");
@@ -831,14 +859,23 @@ class RepackJob {
       this.stop();
       return;
     }
-    const staleMs = this.manager.config.stalePublishMs;
+    const staleMs = this.getAdaptiveStaleMs(this.manager.config.stalePublishMs, 3);
     if (this.lastPublishAt && now - this.lastPublishAt > staleMs) {
       const staleForMs = now - this.lastPublishAt;
-      this.manager.log("warn", "repack stale publish", { job: this.key, staleMs: staleForMs });
+      this.manager.log("warn", "repack stale publish", {
+        job: this.key,
+        staleMs: staleForMs,
+        staleThresholdMs: staleMs,
+        targetDurationSec: this.lastObservedTargetDurationSec || 0,
+      });
       const restartCooldownMs = this.manager.config.staleRestartCooldownMs;
       if (this.ffmpegProc && now - this.lastStaleRestartAt >= restartCooldownMs) {
         this.lastStaleRestartAt = now;
-        this.manager.log("warn", "repack stale restart", { job: this.key, staleMs: staleForMs });
+        this.manager.log("warn", "repack stale restart", {
+          job: this.key,
+          staleMs: staleForMs,
+          staleThresholdMs: staleMs,
+        });
         try {
           this.ffmpegProc.kill("SIGTERM");
         } catch {}
@@ -878,6 +915,7 @@ class RepackJob {
       lastSeedAt: this.lastSeedAt,
       lastPublishAt: this.lastPublishAt,
       lastPublishAgeMs: this.lastPublishAt ? Math.max(0, Date.now() - this.lastPublishAt) : null,
+      lastObservedTargetDurationSec: this.lastObservedTargetDurationSec || null,
       lastErrorAt: this.lastErrorAt,
       lastFfmpegExit: this.lastFfmpegExitAt
         ? {

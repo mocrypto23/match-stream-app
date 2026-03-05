@@ -12,6 +12,7 @@ import {
   UI_SERVER_IDS,
   getSlotServerIdForUiServer,
   getSlotSourceUrlFromRow,
+  isIngestCandidateAlignedWithSlotServer,
   isAllowedSourceForSlotServer,
   isValidHttpUrl,
   type SlotServerId,
@@ -433,6 +434,14 @@ export async function POST(req: Request) {
       referrerUrl: sourceUrl,
       timeoutMs: Math.max(8000, Number.parseInt(String(process.env.REPACK_RESOLVE_TIMEOUT_MS || "10000"), 10) || 10000),
       maxCandidates: Math.max(48, Number.parseInt(String(process.env.REPACK_RESOLVE_MAX_CANDIDATES || "16"), 10) || 16),
+      allowCandidate: ({ candidateUrl, referrerUrl }) =>
+        isIngestCandidateAlignedWithSlotServer({
+          slotServerId: slotServer,
+          sourceUrl,
+          ingestUrl: candidateUrl,
+          probeReferrerUrl: referrerUrl,
+          probePlaylistUrl: candidateUrl,
+        }),
     });
 
     if (!ingest.ingestUrl || !isValidHttpUrl(ingest.ingestUrl)) {
@@ -449,6 +458,36 @@ export async function POST(req: Request) {
           mode: ingest.mode,
           reason: ingest.reason,
           ingestUrl: ingest.ingestUrl || null,
+        },
+        probeEvidence: ingest.probeEvidence,
+      });
+      continue;
+    }
+
+    const alignedIngest = isIngestCandidateAlignedWithSlotServer({
+      slotServerId: slotServer,
+      sourceUrl,
+      ingestUrl: ingest.ingestUrl,
+      probeReferrerUrl: ingest.probeEvidence?.referrerUrl || null,
+      probePlaylistUrl: ingest.probeEvidence?.playlistUrl || null,
+    });
+    if (!alignedIngest) {
+      pushResult({
+        uiServer,
+        slotServer,
+        accepted: false,
+        reason: "ingest-source-mismatch",
+        statusCode: 202,
+        sourceUrl,
+        resolver: {
+          ...ingest.resolver,
+          rejectReason: "ingest-source-mismatch",
+          resolverState: "probe-failed",
+        },
+        ingest: {
+          mode: ingest.mode,
+          reason: "ingest-source-mismatch",
+          ingestUrl: ingest.ingestUrl,
         },
         probeEvidence: ingest.probeEvidence,
       });

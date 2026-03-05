@@ -41,6 +41,7 @@ type ResolveRepackIngestInput = {
   referrerUrl?: string | null;
   timeoutMs?: number;
   maxCandidates?: number;
+  allowCandidate?: (input: { candidateUrl: string; referrerUrl: string }) => boolean;
 };
 
 type FetchResult = {
@@ -1042,6 +1043,22 @@ function pushCandidateUnique(list: string[], seen: Set<string>, candidateUrl: st
   list.push(candidateUrl);
 }
 
+function isCandidateAllowedByPolicy(
+  allowCandidate: ResolveRepackIngestInput["allowCandidate"],
+  candidateUrl: string,
+  referrerUrl: string
+) {
+  if (typeof allowCandidate !== "function") return true;
+  try {
+    return allowCandidate({
+      candidateUrl,
+      referrerUrl,
+    });
+  } catch {
+    return false;
+  }
+}
+
 function rankCandidates(candidates: string[], sourceUrl: string, maxCandidates: number, referrerUrl: string) {
   const sourceHost = (() => {
     try {
@@ -1166,13 +1183,14 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
   });
 
   if (looksLikeHlsManifestUrl(sourceUrl)) {
+    const allowedDirectSource = isCandidateAllowedByPolicy(input.allowCandidate, sourceUrl, sourceUrl);
     const directProbe = await probeCandidate({
       candidateUrl: sourceUrl,
       timeoutMs,
       segmentTimeoutMs,
       referrerUrl: sourceUrl,
     });
-    if (directProbe.ok) {
+    if (directProbe.ok && allowedDirectSource) {
       return {
         mode: classifyMode(sourceUrl),
         ingestUrl: sourceUrl,
@@ -1192,14 +1210,16 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
   }
 
   if (sourceFetch.ok && isLikelyManifestResponse(sourceFetch.contentType, sourceFetch.body, sourceFetch.finalUrl || sourceUrl)) {
+    const servedUrl = sourceFetch.finalUrl || sourceUrl;
+    const allowedServedSource = isCandidateAllowedByPolicy(input.allowCandidate, servedUrl, servedUrl);
     const servedProbe = await probeCandidate({
-      candidateUrl: sourceFetch.finalUrl || sourceUrl,
+      candidateUrl: servedUrl,
       timeoutMs,
       segmentTimeoutMs,
-      referrerUrl: sourceFetch.finalUrl || sourceUrl,
+      referrerUrl: servedUrl,
     });
-    if (servedProbe.ok) {
-      const directUrl = sourceFetch.finalUrl || sourceUrl;
+    if (servedProbe.ok && allowedServedSource) {
+      const directUrl = servedUrl;
       return {
         mode: classifyMode(directUrl),
         ingestUrl: directUrl,
@@ -1288,17 +1308,20 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
   if (internalProxy) pushCandidateUnique(candidateSeed, seen, internalProxy);
 
   const rankedSeed = rankCandidates(candidateSeed, sourceUrl, maxCandidates, sourceFetch.finalUrl || sourceUrl);
-  if (!rankedSeed.length) {
+  const policyFilteredSeed = rankedSeed.filter((item) =>
+    isCandidateAllowedByPolicy(input.allowCandidate, item.candidateUrl, item.referrerUrl)
+  );
+  if (!policyFilteredSeed.length) {
     return emptyResolution("no-ingest-candidate", {
       stage: "candidate-probe",
-      candidatesFound: 0,
+      candidatesFound: rankedSeed.length,
       candidatesProbed: 0,
       rejectReason: "no-ingest-candidate",
       resolverState: "no-candidate",
     });
   }
 
-  const pending: RankedCandidate[] = [...rankedSeed];
+  const pending: RankedCandidate[] = [...policyFilteredSeed];
   const seenProbeKeys = new Set<string>();
   let candidatesProbed = 0;
   let lastProbeReason = "probe-failed";
@@ -1307,6 +1330,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
   while (pending.length && candidatesProbed < maxCandidates) {
     const item = pending.shift();
     if (!item) continue;
+    if (!isCandidateAllowedByPolicy(input.allowCandidate, item.candidateUrl, item.referrerUrl)) continue;
     const key = canonicalizeUrl(item.candidateUrl) || item.candidateUrl.toLowerCase();
     if (!key || seenProbeKeys.has(key)) continue;
     seenProbeKeys.add(key);
@@ -1354,6 +1378,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     const pushImmediateManifest = (candidateUrl: string, referrerUrl: string) => {
       const key = canonicalizeUrl(candidateUrl) || candidateUrl.toLowerCase();
       if (!key || seenProbeKeys.has(key) || seen.has(key)) return;
+      if (!isCandidateAllowedByPolicy(input.allowCandidate, candidateUrl, referrerUrl)) return;
       seen.add(key);
       immediateManifestExtras.push({
         candidateUrl,
@@ -1366,6 +1391,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     for (const extra of aggregatedExtraCandidates) {
       const normalized = normalizeCandidate(extra, item.candidateUrl);
       if (!normalized) continue;
+      if (!isCandidateAllowedByPolicy(input.allowCandidate, normalized, item.referrerUrl || item.candidateUrl)) continue;
       const extraKey = canonicalizeUrl(normalized) || normalized.toLowerCase();
       if (!extraKey || seenProbeKeys.has(extraKey) || seen.has(extraKey)) continue;
       if (looksLikeHlsManifestUrl(normalized)) {

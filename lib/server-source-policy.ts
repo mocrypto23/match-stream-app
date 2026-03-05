@@ -54,6 +54,49 @@ function normalizeHost(host: string) {
   return String(host || "").trim().toLowerCase().replace(/\.$/, "");
 }
 
+function safeDecodeURIComponent(value: string) {
+  try {
+    return decodeURIComponent(String(value || ""));
+  } catch {
+    return String(value || "");
+  }
+}
+
+function extractHost(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return "";
+  try {
+    return normalizeHost(new URL(rawUrl).hostname);
+  } catch {
+    return "";
+  }
+}
+
+function findSlotServerByHost(hostname: string): SlotServerId | null {
+  const host = normalizeHost(hostname);
+  if (!host) return null;
+  for (const slotServerId of SLOT_SERVER_IDS) {
+    if (hostMatchesAnySuffix(host, getSlotHostAllowlist(slotServerId))) return slotServerId;
+  }
+  return null;
+}
+
+function unwrapEmbedProxyTarget(rawUrl: string) {
+  let current = String(rawUrl || "").trim();
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!isValidHttpUrl(current)) return "";
+    try {
+      const parsed = new URL(current);
+      if (!String(parsed.pathname || "").toLowerCase().includes("/api/embed-proxy")) return parsed.toString();
+      const target = safeDecodeURIComponent(String(parsed.searchParams.get("url") || "").trim());
+      if (!isValidHttpUrl(target)) return "";
+      current = target;
+    } catch {
+      return "";
+    }
+  }
+  return isValidHttpUrl(current) ? current : "";
+}
+
 export function isValidHttpUrl(raw: unknown): raw is string {
   if (typeof raw !== "string") return false;
   try {
@@ -99,6 +142,43 @@ export function isAllowedSourceForSlotServer(slotServerId: SlotServerId, rawUrl:
   }
 }
 
+export function isIngestCandidateAlignedWithSlotServer(input: {
+  slotServerId: SlotServerId;
+  sourceUrl: string;
+  ingestUrl: string;
+  probeReferrerUrl?: string | null;
+  probePlaylistUrl?: string | null;
+}) {
+  const { slotServerId } = input;
+  const sourceUrl = String(input.sourceUrl || "").trim();
+  const ingestUrl = String(input.ingestUrl || "").trim();
+  if (!isAllowedSourceForSlotServer(slotServerId, sourceUrl)) return false;
+  if (!isValidHttpUrl(ingestUrl)) return false;
+
+  const allowlist = getSlotHostAllowlist(slotServerId);
+  const targetUrl = unwrapEmbedProxyTarget(ingestUrl) || ingestUrl;
+  const targetHost = extractHost(targetUrl);
+  if (!targetHost) return false;
+
+  if (hostMatchesAnySuffix(targetHost, allowlist)) return true;
+
+  const targetMappedSlot = findSlotServerByHost(targetHost);
+  if (targetMappedSlot && targetMappedSlot !== slotServerId) return false;
+
+  const referrerPool = [
+    String(input.probeReferrerUrl || "").trim(),
+    String(input.probePlaylistUrl || "").trim(),
+    sourceUrl,
+  ].filter((value) => isValidHttpUrl(value));
+  const hasOwnReferrer = referrerPool.some((refUrl) => {
+    const refHost = extractHost(refUrl);
+    return !!refHost && hostMatchesAnySuffix(refHost, allowlist);
+  });
+  if (!hasOwnReferrer) return false;
+
+  return true;
+}
+
 export function getSlotSourceUrlFromRow(row: StreamRowFields, slotServerId: SlotServerId) {
   if (slotServerId === 1) return String(row.stream_url || "").trim() || null;
   if (slotServerId === 2) return String(row.stream_url_2 || "").trim() || null;
@@ -112,4 +192,3 @@ export function buildR2PlaylistUrlForSlot(baseUrl: string, matchId: number, slot
   if (!normalizedBase) return null;
   return `${normalizedBase}/m${matchId}/s${slotServerId}/index.m3u8`;
 }
-
