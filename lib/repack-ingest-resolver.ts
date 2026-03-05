@@ -66,8 +66,8 @@ type RankedCandidate = {
 
 const DEFAULT_TIMEOUT_MS = 5200;
 const DEFAULT_SEGMENT_TIMEOUT_MS = 2200;
-const DEFAULT_MAX_CANDIDATES = 16;
-const MAX_DYNAMIC_CANDIDATES = 32;
+const DEFAULT_MAX_CANDIDATES = 32;
+const MAX_DYNAMIC_CANDIDATES = 64;
 const DEFAULT_RESOLVER_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 
@@ -163,12 +163,19 @@ function hostMatchesSuffix(hostname: string, suffixes: string[]) {
   return suffixes.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
 }
 
-function isKnownNoiseCandidateUrl(rawUrl: string) {
+function isKnownNoiseCandidateUrl(rawUrl: string, depth = 0): boolean {
+  if (depth > 2) return false;
   if (!isValidHttpUrl(rawUrl)) return true;
   try {
     const u = new URL(rawUrl);
     const host = u.hostname.toLowerCase();
     const pathname = String(u.pathname || "").toLowerCase();
+    if (pathname.includes("/api/embed-proxy")) {
+      const targetRaw = safeDecodeURIComponent(String(u.searchParams.get("url") || "").trim());
+      if (!targetRaw) return true;
+      if (!isValidHttpUrl(targetRaw)) return true;
+      return isKnownNoiseCandidateUrl(targetRaw, depth + 1);
+    }
     if (hostMatchesSuffix(host, NOISE_HOST_SUFFIXES)) return true;
     if (looksLikeNonStreamAssetPath(pathname)) return true;
     if (pathname === "/" && !u.search) {
@@ -934,8 +941,12 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       DEFAULT_SEGMENT_TIMEOUT_MS
   );
   const maxCandidates = Math.max(
-    4,
-    Math.min(64, Number.parseInt(String(input.maxCandidates || process.env.REPACK_RESOLVE_MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES), 10) || DEFAULT_MAX_CANDIDATES)
+    8,
+    Math.min(
+      96,
+      Number.parseInt(String(input.maxCandidates || process.env.REPACK_RESOLVE_MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES), 10) ||
+        DEFAULT_MAX_CANDIDATES
+    )
   );
 
   const sourceUrl = normalizeHttpUrl(input.sourceUrl);
