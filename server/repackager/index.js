@@ -8,7 +8,13 @@ const fsp = require("fs/promises");
 const path = require("path");
 const { spawn } = require("child_process");
 const dotenv = require("dotenv");
-const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+const {
+  S3Client,
+  PutObjectCommand,
+  DeleteObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectsCommand,
+} = require("@aws-sdk/client-s3");
 
 dotenv.config({ path: path.join(process.cwd(), ".env.local") });
 
@@ -926,6 +932,22 @@ class RepackJob {
       } catch {}
       this.ffmpegProc = null;
     }
+    if (this.manager.config.purgeRemoteOnStop) {
+      try {
+        const purge = await this.manager.purgePrefix(this.remotePrefix, this.manager.config.purgeStopMaxKeys);
+        this.manager.log("info", "repack remote-purge on-stop", {
+          job: this.key,
+          deleted: purge.deleted,
+          scanned: purge.scanned,
+          truncated: purge.truncated,
+        });
+      } catch (error) {
+        this.manager.log("warn", "repack remote-purge failed", {
+          job: this.key,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
   }
 
   toDiag() {
@@ -1045,6 +1067,79 @@ class RepackManager {
       this.metrics.lastError = error instanceof Error ? error.message : String(error);
       throw error;
     }
+  }
+
+  async deleteObjects(keys) {
+    const safe = Array.isArray(keys) ? keys.filter(Boolean) : [];
+    if (!safe.length) return;
+    for (let idx = 0; idx < safe.length; idx += 1000) {
+      const chunk = safe.slice(idx, idx + 1000);
+      try {
+        await this.s3.send(
+          new DeleteObjectsCommand({
+            Bucket: this.config.r2Bucket,
+            Delete: {
+              Objects: chunk.map((key) => ({ Key: key })),
+              Quiet: true,
+            },
+          })
+        );
+      } catch (error) {
+        this.metrics.uploadErrors += 1;
+        this.metrics.lastError = error instanceof Error ? error.message : String(error);
+        throw error;
+      }
+    }
+  }
+
+  async purgePrefix(prefix, maxKeys = 20_000) {
+    const normalized = String(prefix || "")
+      .replace(/^\/+/, "")
+      .replace(/\/+$/, "");
+    if (!normalized) return { deleted: 0, scanned: 0, truncated: false };
+    const rootPrefix = `${normalized}/`;
+    let continuationToken = undefined;
+    let deleted = 0;
+    let scanned = 0;
+    let truncated = false;
+
+    while (true) {
+      const remainingBudget = Math.max(0, maxKeys - scanned);
+      if (remainingBudget <= 0) {
+        truncated = true;
+        break;
+      }
+      const listMax = Math.max(1, Math.min(1000, remainingBudget));
+      let listed;
+      try {
+        listed = await this.s3.send(
+          new ListObjectsV2Command({
+            Bucket: this.config.r2Bucket,
+            Prefix: rootPrefix,
+            ContinuationToken: continuationToken,
+            MaxKeys: listMax,
+          })
+        );
+      } catch (error) {
+        this.metrics.uploadErrors += 1;
+        this.metrics.lastError = error instanceof Error ? error.message : String(error);
+        throw error;
+      }
+
+      const keys = (listed.Contents || [])
+        .map((item) => String(item?.Key || "").trim())
+        .filter(Boolean);
+      scanned += keys.length;
+      if (keys.length) {
+        await this.deleteObjects(keys);
+        deleted += keys.length;
+      }
+
+      if (!listed.IsTruncated || !listed.NextContinuationToken) break;
+      continuationToken = listed.NextContinuationToken;
+    }
+
+    return { deleted, scanned, truncated };
   }
 
   noteSeedReject(reason) {
@@ -1358,6 +1453,12 @@ class RepackManager {
         finishedDebounceMs: this.config.finishedDebounceMs,
         earlyStopSegmentFailStreak: this.config.earlyStopSegmentFailStreak,
         preflightTimeoutMs: this.config.preflightTimeoutMs,
+        uploadPollMs: this.config.uploadPollMs,
+        playlistPublishMinIntervalMs: this.config.playlistPublishMinIntervalMs,
+        localRetentionMs: this.config.localRetentionMs,
+        remoteRetentionMs: this.config.remoteRetentionMs,
+        purgeRemoteOnStop: this.config.purgeRemoteOnStop,
+        purgeStopMaxKeys: this.config.purgeStopMaxKeys,
         maxConsecutiveStartFailures: this.config.maxConsecutiveStartFailures,
         startFailureBaseBackoffMs: this.config.startFailureBaseBackoffMs,
         startFailureMaxBackoffMs: this.config.startFailureMaxBackoffMs,
@@ -1402,6 +1503,8 @@ function loadConfig() {
     seedRestartStaleMs: toInt(process.env.REPACK_SEED_RESTART_STALE_MS, 7_000, 3000),
     localRetentionMs: toInt(process.env.REPACK_LOCAL_RETENTION_MS, 8 * 60 * 1000, 30_000),
     remoteRetentionMs: toInt(process.env.REPACK_REMOTE_RETENTION_MS, 8 * 60 * 1000, 30_000),
+    purgeRemoteOnStop: toBool(process.env.REPACK_PURGE_REMOTE_ON_STOP, true),
+    purgeStopMaxKeys: toInt(process.env.REPACK_PURGE_STOP_MAX_KEYS, 30_000, 1000),
     liveOnly: toBool(process.env.REPACK_LIVE_ONLY, true),
     prematchOpenWindowMs: prematchOpenWindowMinutes * 60 * 1000,
     matchDurationMs: matchDurationMinutes * 60 * 1000,
