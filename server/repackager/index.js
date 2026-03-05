@@ -304,6 +304,7 @@ class RepackJob {
     this.consecutiveUploadErrors = 0;
     this.uploadedSegments = new Map();
     this.remoteSeq = 0;
+    this.lastPlaylistMediaSeq = 0;
     this.totalPlaylistPublishes = 0;
     this.totalSegmentUploads = 0;
     this.totalSegmentBytes = 0;
@@ -612,6 +613,7 @@ class RepackJob {
     this.uploadedSegments.set(localName, {
       remoteName,
       remoteKey,
+      remoteSeq: this.remoteSeq,
       uploadedAt: Date.now(),
       bytes: stat.size,
       localSignature,
@@ -626,14 +628,52 @@ class RepackJob {
 
   async uploadPlaylist(lines) {
     const startedAt = Date.now();
-    const rewritten = lines
-      .map((line) => {
-        const trimmed = String(line || "").trim();
-        if (!trimmed || trimmed.startsWith("#")) return line;
-        const mapped = this.uploadedSegments.get(trimmed);
-        return mapped ? mapped.remoteName : line;
-      })
-      .join("\n");
+    const rewrittenLines = [];
+    const activeRemoteSeq = [];
+    let mediaSeqLineIndex = -1;
+    for (const line of lines) {
+      const rawLine = String(line || "");
+      const trimmed = rawLine.trim();
+      if (/^#EXT-X-MEDIA-SEQUENCE:/i.test(trimmed)) {
+        mediaSeqLineIndex = rewrittenLines.length;
+        rewrittenLines.push(rawLine);
+        continue;
+      }
+      if (!trimmed || trimmed.startsWith("#")) {
+        rewrittenLines.push(rawLine);
+        continue;
+      }
+      const mapped = this.uploadedSegments.get(trimmed);
+      if (mapped) {
+        rewrittenLines.push(mapped.remoteName);
+        if (Number.isFinite(mapped.remoteSeq) && mapped.remoteSeq > 0) {
+          activeRemoteSeq.push(mapped.remoteSeq);
+        }
+        continue;
+      }
+      rewrittenLines.push(rawLine);
+    }
+
+    if (activeRemoteSeq.length) {
+      let mediaSequence = Math.min(...activeRemoteSeq);
+      if (!Number.isFinite(mediaSequence) || mediaSequence < 1) mediaSequence = 1;
+      if (this.lastPlaylistMediaSeq > 0 && mediaSequence < this.lastPlaylistMediaSeq) {
+        mediaSequence = this.lastPlaylistMediaSeq;
+      }
+      this.lastPlaylistMediaSeq = mediaSequence;
+      const seqLine = `#EXT-X-MEDIA-SEQUENCE:${mediaSequence}`;
+      if (mediaSeqLineIndex >= 0) {
+        rewrittenLines[mediaSeqLineIndex] = seqLine;
+      } else {
+        let insertAt = rewrittenLines.findIndex((line) => /^#EXT-X-TARGETDURATION:/i.test(String(line || "").trim()));
+        if (insertAt < 0) insertAt = rewrittenLines.findIndex((line) => /^#EXT-X-VERSION:/i.test(String(line || "").trim()));
+        if (insertAt < 0) insertAt = rewrittenLines.findIndex((line) => /^#EXTM3U$/i.test(String(line || "").trim()));
+        if (insertAt >= 0) rewrittenLines.splice(insertAt + 1, 0, seqLine);
+        else rewrittenLines.unshift(seqLine);
+      }
+    }
+
+    const rewritten = rewrittenLines.join("\n");
 
     await this.manager.putObject({
       key: `${this.remotePrefix}/index.m3u8`,

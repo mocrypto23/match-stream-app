@@ -241,6 +241,15 @@ function isLikelyManifestResponse(contentType: string, body: string, url: string
   return false;
 }
 
+function shouldExtractCandidatesFromBody(contentType: string, body: string) {
+  if (!body) return false;
+  const ct = String(contentType || "").toLowerCase();
+  if (isLikelyHtmlResponse(ct, body)) return true;
+  if (ct.includes("javascript") || ct.includes("ecmascript")) return true;
+  if (ct.includes("text/plain") || ct.includes("application/json")) return true;
+  return /^[\s\[{("']*(?:https?:\/\/|var\s+|const\s+|let\s+|function\b)/i.test(String(body || ""));
+}
+
 function extractCandidatesFromQueryParams(rawUrl: string) {
   if (!isValidHttpUrl(rawUrl)) return [] as string[];
   const out: string[] = [];
@@ -254,6 +263,82 @@ function extractCandidatesFromQueryParams(rawUrl: string) {
       if (decoded && decoded !== value) out.push(decoded);
     }
   } catch {}
+  return out;
+}
+
+function decodeMaybeBase64Url(raw: string, baseUrl: string) {
+  const token = String(raw || "")
+    .trim()
+    .replace(/\\x3d/gi, "=")
+    .replace(/\s+/g, "");
+  if (!token || token.length < 20 || token.length > 8000) return "";
+  if (!/^[A-Za-z0-9+/=]+$/.test(token)) return "";
+  if (token.length % 4 !== 0) return "";
+  try {
+    const decoded = Buffer.from(token, "base64").toString("utf8").trim();
+    return normalizeCandidate(decoded, baseUrl);
+  } catch {
+    return "";
+  }
+}
+
+function extractBase64ManifestCandidates(text: string, baseUrl: string) {
+  const out = new Set<string>();
+  const pushDecoded = (raw: string) => {
+    const candidate = decodeMaybeBase64Url(raw, baseUrl);
+    if (!candidate || !isValidHttpUrl(candidate)) return;
+    out.add(candidate);
+  };
+
+  const albaControlRe = /AlbaPlayerControl\s*\(\s*['"]([A-Za-z0-9+/=]{20,})['"]\s*,/gi;
+  for (const match of text.matchAll(albaControlRe)) {
+    pushDecoded(String(match[1] || ""));
+  }
+
+  const atobRe = /atob\(\s*['"]([A-Za-z0-9+/=]{20,})['"]\s*\)/gi;
+  for (const match of text.matchAll(atobRe)) {
+    pushDecoded(String(match[1] || ""));
+  }
+
+  const longBase64Re = /['"]([A-Za-z0-9+/=]{40,})['"]/g;
+  for (const match of text.matchAll(longBase64Re)) {
+    pushDecoded(String(match[1] || ""));
+    if (out.size >= 24) break;
+  }
+
+  return Array.from(out);
+}
+
+function decodeTokenInBase(raw: string, base: number) {
+  if (!raw || base < 2 || base > 62) return -1;
+  const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let value = 0;
+  for (const ch of raw) {
+    const idx = alphabet.indexOf(ch);
+    if (idx < 0 || idx >= base) return -1;
+    value = value * base + idx;
+  }
+  return Number.isFinite(value) ? value : -1;
+}
+
+function unpackDeanPackerPayloads(text: string) {
+  const out: string[] = [];
+  const packedEvalRe =
+    /eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\('((?:\\'|[^'])*)',\s*(\d+),\s*(\d+),\s*'((?:\\'|[^'])*)'\.split\('\|'\),\s*0,\s*\{\}\)\)/gi;
+  for (const match of text.matchAll(packedEvalRe)) {
+    const payload = String(match[1] || "").replace(/\\'/g, "'");
+    const base = Number.parseInt(String(match[2] || "0"), 10);
+    const count = Number.parseInt(String(match[3] || "0"), 10);
+    const dict = String(match[4] || "").replace(/\\'/g, "'").split("|");
+    if (!payload || !Number.isFinite(base) || base < 2 || base > 62 || !Number.isFinite(count) || count <= 0) continue;
+    const unpacked = payload.replace(/\b[0-9A-Za-z]+\b/g, (token) => {
+      const idx = decodeTokenInBase(token, base);
+      if (idx >= 0 && idx < count && idx < dict.length && dict[idx]) return dict[idx] || token;
+      return token;
+    });
+    if (unpacked) out.push(unpacked);
+    if (out.length >= 8) break;
+  }
   return out;
 }
 
@@ -297,6 +382,10 @@ function extractCandidatesFromText(text: string, baseUrl: string) {
     push(match[1]);
   }
 
+  for (const candidate of extractBase64ManifestCandidates(normalized, baseUrl)) {
+    push(candidate);
+  }
+
   const jsonFieldRe =
     /"(?:file|source|src|hls|url|stream|playlist|streamUrl|stream_url)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/gi;
   for (const match of html.matchAll(jsonFieldRe)) {
@@ -312,6 +401,18 @@ function extractCandidatesFromText(text: string, baseUrl: string) {
   const dynamicAlbaManifestCandidates = extractAlbaDynamicManifestCandidates(normalized, baseUrl);
   for (const candidate of dynamicAlbaManifestCandidates) {
     push(candidate);
+  }
+
+  for (const unpacked of unpackDeanPackerPayloads(normalized)) {
+    for (const match of unpacked.matchAll(absoluteUrlRe)) {
+      push(match[0]);
+    }
+    for (const match of unpacked.matchAll(fieldRe)) {
+      push(match[1]);
+    }
+    for (const candidate of extractBase64ManifestCandidates(unpacked, baseUrl)) {
+      push(candidate);
+    }
   }
 
   return Array.from(out);
@@ -743,7 +844,7 @@ async function probeCandidate(input: {
 
   const manifestLike = isLikelyManifestResponse(fetched.contentType, fetched.body, fetched.finalUrl || input.candidateUrl);
   if (!manifestLike) {
-    const extraCandidates = isLikelyHtmlResponse(fetched.contentType, fetched.body)
+    const extraCandidates = shouldExtractCandidatesFromBody(fetched.contentType, fetched.body)
       ? extractCandidatesFromText(fetched.body, fetched.finalUrl || input.candidateUrl)
       : [];
     return {
