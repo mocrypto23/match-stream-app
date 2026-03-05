@@ -91,7 +91,12 @@ type P2PEngineConstructor = new (config?: { core?: { swarmId?: string } }) => P2
 
 const STALL_FREEZE_MS = 18000;
 const P2P_STALL_FREEZE_MS = 30000;
-const REPACK_STALE_PLAYLIST_MAX_IDLE_MS = 5_000;
+const REPACK_STALE_PLAYLIST_MAX_IDLE_MS = 12_000;
+const REPACK_STALE_PROGRESS_GUARD_MS = 9_000;
+const REPACK_HLS_MAX_BUFFER_LENGTH = 12;
+const REPACK_HLS_MAX_MAX_BUFFER_LENGTH = 20;
+const REPACK_HLS_LIVE_SYNC_COUNT = 2;
+const REPACK_HLS_LIVE_MAX_LATENCY_COUNT = 5;
 const P2P_WAITING_RECOVERY_MIN_STALL_MS = 10000;
 const P2P_WAITING_RECOVERY_MAX_BUFFER_AHEAD_S = 0.6;
 const P2P_RECOVERY_THROTTLE_MS = 8000;
@@ -7849,15 +7854,19 @@ export default function WatchPage() {
         backBufferLength: isServer5Playback ? SERVER5_HLS_BACK_BUFFER_LENGTH : 20,
         maxBufferLength: isServer5Playback
           ? SERVER5_HLS_MAX_BUFFER_LENGTH
-          : (isRepackPlayback ? 6 : (isP2PPlayback ? p2pTuning.maxBufferLength : 18)),
-        maxMaxBufferLength: isServer5Playback ? SERVER5_HLS_MAX_MAX_BUFFER_LENGTH : (isRepackPlayback ? 10 : 40),
+          : (isRepackPlayback ? REPACK_HLS_MAX_BUFFER_LENGTH : (isP2PPlayback ? p2pTuning.maxBufferLength : 18)),
+        maxMaxBufferLength: isServer5Playback
+          ? SERVER5_HLS_MAX_MAX_BUFFER_LENGTH
+          : (isRepackPlayback ? REPACK_HLS_MAX_MAX_BUFFER_LENGTH : 40),
         maxBufferSize: isP2PPlayback ? p2pTuning.maxBufferSize : 60 * 1000 * 1000,
         liveSyncDurationCount: isServer5Playback
           ? SERVER5_HLS_LIVE_SYNC_COUNT
-          : (isRepackPlayback ? 1 : (isP2PPlayback ? p2pTuning.liveSyncDurationCount : 2)),
+          : (isRepackPlayback ? REPACK_HLS_LIVE_SYNC_COUNT : (isP2PPlayback ? p2pTuning.liveSyncDurationCount : 2)),
         liveMaxLatencyDurationCount: isServer5Playback
           ? SERVER5_HLS_LIVE_MAX_LATENCY_COUNT
-          : (isRepackPlayback ? 2 : (isP2PPlayback ? p2pTuning.liveMaxLatencyDurationCount : 6)),
+          : (isRepackPlayback
+            ? REPACK_HLS_LIVE_MAX_LATENCY_COUNT
+            : (isP2PPlayback ? p2pTuning.liveMaxLatencyDurationCount : 6)),
         maxLiveSyncPlaybackRate: isRepackPlayback ? 1.35 : 1,
         startPosition: -1,
         startFragPrefetch: true,
@@ -7922,6 +7931,8 @@ export default function WatchPage() {
           }
           const idleMs = now - repackLevelChangedAt;
           if (idleMs < REPACK_STALE_PLAYLIST_MAX_IDLE_MS) return;
+          const sinceProgressMs = now - lastProgressAtRef.current;
+          if (sinceProgressMs < REPACK_STALE_PROGRESS_GUARD_MS) return;
           if (repackBypassServersRef.current.has(selectedServer)) return;
           if (!EMBED_FALLBACK_ENABLED) {
             pushDiag(`repack stale-manifest s${selectedServer} no-fallback`);

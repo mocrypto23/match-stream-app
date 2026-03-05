@@ -128,6 +128,51 @@ function looksLikeNonStreamAssetPath(pathname: string) {
   );
 }
 
+const NOISE_HOST_SUFFIXES = [
+  "ogp.me",
+  "schema.org",
+  "gmpg.org",
+  "w3.org",
+  "w3schools.com",
+  "gravatar.com",
+  "facebook.com",
+  "twitter.com",
+  "instagram.com",
+  "youtube.com",
+  "ytimg.com",
+  "tiktok.com",
+  "googletagmanager.com",
+  "google-analytics.com",
+  "histats.com",
+  "boldgrid.com",
+  "wprediscache.com",
+  "jsdelivr.net",
+  "cloudflareinsights.com",
+];
+
+function hostMatchesSuffix(hostname: string, suffixes: string[]) {
+  const host = String(hostname || "").trim().toLowerCase().replace(/\.$/, "");
+  if (!host) return false;
+  return suffixes.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
+}
+
+function isKnownNoiseCandidateUrl(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return true;
+  try {
+    const u = new URL(rawUrl);
+    const host = u.hostname.toLowerCase();
+    const pathname = String(u.pathname || "").toLowerCase();
+    if (hostMatchesSuffix(host, NOISE_HOST_SUFFIXES)) return true;
+    if (looksLikeNonStreamAssetPath(pathname)) return true;
+    if (pathname === "/" && !u.search) {
+      if (!/live|stream|player|hls|playlist|m3u8|albaplayer|playerv2/i.test(host)) return true;
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
 function looksLikeHlsManifestUrl(raw: string) {
   if (!isValidHttpUrl(raw)) return false;
   try {
@@ -154,6 +199,7 @@ function looksLikeHlsManifestUrl(raw: string) {
     if (
       search.includes("token=") ||
       search.includes("session") ||
+      search.includes("stream=") ||
       search.includes("playlist") ||
       search.includes("m3u8")
     ) {
@@ -231,12 +277,13 @@ function extractCandidatesFromText(text: string, baseUrl: string) {
     push(match[1]);
   }
 
-  const fieldRe = /(?:file|source|src|hls|url|stream|playlist)\s*[:=]\s*["']([^"']+)["']/gi;
+  const fieldRe = /(?:file|source|src|hls|url|stream|playlist|streamurl|stream_url)\s*[:=]\s*["']([^"']+)["']/gi;
   for (const match of normalized.matchAll(fieldRe)) {
     push(match[1]);
   }
 
-  const jsonFieldRe = /"(?:file|source|src|hls|url|stream|playlist)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/gi;
+  const jsonFieldRe =
+    /"(?:file|source|src|hls|url|stream|playlist|streamUrl|stream_url)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/gi;
   for (const match of html.matchAll(jsonFieldRe)) {
     const decoded = safeDecodeURIComponent(String(match[1] || "").replace(/\\\//g, "/"));
     push(decoded);
@@ -245,6 +292,59 @@ function extractCandidatesFromText(text: string, baseUrl: string) {
   const embedProxyPathRe = /\/api\/embed-proxy\?[^\s"'<>`\\)]+/gi;
   for (const match of normalized.matchAll(embedProxyPathRe)) {
     push(match[0]);
+  }
+
+  const dynamicAlbaManifestCandidates = extractAlbaDynamicManifestCandidates(normalized, baseUrl);
+  for (const candidate of dynamicAlbaManifestCandidates) {
+    push(candidate);
+  }
+
+  return Array.from(out);
+}
+
+function extractAlbaDynamicManifestCandidates(text: string, baseUrl: string) {
+  const out = new Set<string>();
+  const sourceHost = (() => {
+    try {
+      return new URL(baseUrl).hostname.toLowerCase();
+    } catch {
+      return "";
+    }
+  })();
+  const sourceSubdomain = (() => {
+    const parts = sourceHost.split(".").filter(Boolean);
+    if (parts.length < 3) return "";
+    return parts[0] || "";
+  })();
+
+  const domainPool = new Set<string>();
+  const domainListRe = /\bD\s*=\s*\[([^\]]+)\]/gi;
+  for (const match of text.matchAll(domainListRe)) {
+    const block = String(match[1] || "");
+    for (const token of block.matchAll(/["']([^"']+)["']/g)) {
+      const host = String(token[1] || "").trim().toLowerCase();
+      if (!host || !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(host)) continue;
+      domainPool.add(host);
+    }
+  }
+
+  if (!domainPool.size || !sourceSubdomain) return [] as string[];
+
+  const pathPool = new Set<string>();
+  const hlsPathRe = /\/hls\/[a-z0-9_-]+\/live\/index\.m3u8/gi;
+  for (const match of text.matchAll(hlsPathRe)) {
+    const path = String(match[0] || "").trim();
+    if (!path) continue;
+    pathPool.add(path.startsWith("/") ? path : `/${path}`);
+  }
+  if (!pathPool.size) return [] as string[];
+
+  for (const domain of domainPool) {
+    for (const path of pathPool) {
+      const candidate = `https://${sourceSubdomain}.${domain}${path}`;
+      if (!isValidHttpUrl(candidate)) continue;
+      out.add(candidate);
+    }
   }
 
   return Array.from(out);
@@ -416,6 +516,7 @@ function classifyMode(rawUrl: string): RepackIngestMode {
 
 function scoreCandidate(rawUrl: string, sourceHost: string) {
   if (!isValidHttpUrl(rawUrl)) return Number.NEGATIVE_INFINITY;
+  if (isKnownNoiseCandidateUrl(rawUrl)) return Number.NEGATIVE_INFINITY;
   let score = 0;
   try {
     const u = new URL(rawUrl);
@@ -445,6 +546,12 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
       }
     }
     if (pathname.includes("/hls/") || pathname.includes("/live/") || pathname.includes("/manifest/")) score += 80;
+    if (pathname.includes("/albaplayer/")) score += 56;
+    if (pathname.includes("/player/")) score += 60;
+    if (pathname.includes("/go.php")) score += 48;
+    if (pathname.includes("/chtv/")) score += 52;
+    if (search.includes("serv=")) score += 26;
+    if (search.includes("stream=")) score += 34;
     if (search.includes("token=") || search.includes("session") || search.includes("playlist")) score += 45;
     if (u.hostname.toLowerCase() === sourceHost) score += 28;
     if (u.hostname.toLowerCase().endsWith(`.${sourceHost}`)) score += 18;
@@ -721,6 +828,30 @@ function rankCandidates(candidates: string[], sourceUrl: string, maxCandidates: 
     .slice(0, maxCandidates);
 }
 
+function buildProbeReferrerPool(candidateUrl: string, sourceReferrer: string) {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [candidateUrl, sourceReferrer]) {
+    const value = normalizeHttpUrl(raw);
+    if (!value) continue;
+    const key = canonicalizeUrl(value) || value.toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(value);
+  }
+  return out;
+}
+
+function pickBetterProbeFailure(current: ProbeResult | null, next: ProbeResult) {
+  if (!current) return next;
+  const currentStatus = Number(current.evidence?.playlistStatus || 0);
+  const nextStatus = Number(next.evidence?.playlistStatus || 0);
+  if (current.reason === "non-manifest" && next.reason !== "non-manifest") return next;
+  if (nextStatus > currentStatus) return next;
+  if (!current.evidence?.segmentStatus && !!next.evidence?.segmentStatus) return next;
+  return current;
+}
+
 function emptyResolution(reason: string, resolver: Partial<RepackIngestResolverDiag>): RepackIngestResolution {
   return {
     mode: "none",
@@ -892,36 +1023,45 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     seenProbeKeys.add(key);
 
     candidatesProbed += 1;
-    const probe = await probeCandidate({
-      candidateUrl: item.candidateUrl,
-      timeoutMs,
-      segmentTimeoutMs,
-      referrerUrl: sourceFetch.finalUrl || sourceUrl,
-    });
-    if (probe.ok) {
-      return {
-        mode: item.mode,
-        ingestUrl: item.candidateUrl,
-        reason: item.mode === "backend_proxy_ingest" ? "resolved-proxy-candidate" : "resolved-direct-candidate",
-        resolver: {
-          stage: "done",
-          candidatesFound: rankedSeed.length,
-          candidatesProbed,
-          selectedCandidate: item.candidateUrl,
-          selectedKind: item.mode,
-          rejectReason: "",
-          resolverState: "ok",
-        },
-        probeEvidence: probe.evidence,
-      };
+    const referrerPool = buildProbeReferrerPool(item.candidateUrl, sourceFetch.finalUrl || sourceUrl);
+    const aggregatedExtraCandidates: string[] = [];
+    let finalProbe: ProbeResult | null = null;
+
+    for (const referrerUrl of referrerPool) {
+      const probe = await probeCandidate({
+        candidateUrl: item.candidateUrl,
+        timeoutMs,
+        segmentTimeoutMs,
+        referrerUrl,
+      });
+      if (probe.ok) {
+        return {
+          mode: item.mode,
+          ingestUrl: item.candidateUrl,
+          reason: item.mode === "backend_proxy_ingest" ? "resolved-proxy-candidate" : "resolved-direct-candidate",
+          resolver: {
+            stage: "done",
+            candidatesFound: rankedSeed.length,
+            candidatesProbed,
+            selectedCandidate: item.candidateUrl,
+            selectedKind: item.mode,
+            rejectReason: "",
+            resolverState: "ok",
+          },
+          probeEvidence: probe.evidence,
+        };
+      }
+      finalProbe = pickBetterProbeFailure(finalProbe, probe);
+      if (probe.extraCandidates.length) aggregatedExtraCandidates.push(...probe.extraCandidates);
     }
 
-    lastProbeReason = probe.reason || "probe-failed";
-    lastEvidence = probe.evidence;
-    if (!probe.extraCandidates.length) continue;
+    if (!finalProbe) continue;
+    lastProbeReason = finalProbe.reason || "probe-failed";
+    lastEvidence = finalProbe.evidence;
+    if (!aggregatedExtraCandidates.length) continue;
 
     const extraPool: string[] = [];
-    for (const extra of probe.extraCandidates) {
+    for (const extra of aggregatedExtraCandidates) {
       const normalized = normalizeCandidate(extra, item.candidateUrl);
       if (!normalized) continue;
       const extraKey = canonicalizeUrl(normalized) || normalized.toLowerCase();
