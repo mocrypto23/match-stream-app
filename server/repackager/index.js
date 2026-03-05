@@ -318,6 +318,8 @@ class RepackJob {
     this.lastPlaylistLatencyMs = 0;
     this.remoteHistory = [];
     this.lastStaleRestartAt = 0;
+    this.lastLocalSegmentFingerprint = "";
+    this.lastLocalSegmentChangedAt = 0;
     this.ffmpegProc = null;
     this.uploadTimer = null;
     this.monitorTimer = null;
@@ -363,6 +365,8 @@ class RepackJob {
     // Reset mappings to avoid reusing stale remote segment links.
     this.uploadedSegments = new Map();
     this.lastPublishAt = 0;
+    this.lastLocalSegmentFingerprint = "";
+    this.lastLocalSegmentChangedAt = 0;
     if (this.consecutiveStartFailures >= this.manager.config.deleteRemoteIndexAfterStartFailures) {
       const remoteIndexKey = `${this.remotePrefix}/index.m3u8`;
       this.manager.deleteObject(remoteIndexKey).catch(() => {});
@@ -727,6 +731,28 @@ class RepackJob {
     }
     const { lines, segmentLines } = this.parsePlaylist(playlistRaw);
     if (!segmentLines.length) return;
+    const now = Date.now();
+    const localFingerprint = segmentLines.slice(-3).join("|");
+    if (!this.lastLocalSegmentFingerprint || this.lastLocalSegmentFingerprint !== localFingerprint) {
+      this.lastLocalSegmentFingerprint = localFingerprint;
+      this.lastLocalSegmentChangedAt = now;
+    } else {
+      const staleForMs = this.lastLocalSegmentChangedAt ? now - this.lastLocalSegmentChangedAt : 0;
+      if (
+        staleForMs > this.manager.config.staleInputSequenceMs &&
+        this.ffmpegProc &&
+        now - this.lastStaleRestartAt >= this.manager.config.staleRestartCooldownMs
+      ) {
+        this.lastStaleRestartAt = now;
+        this.manager.log("warn", "repack local-segments-stale", {
+          job: this.key,
+          staleMs: staleForMs,
+        });
+        try {
+          this.ffmpegProc.kill("SIGTERM");
+        } catch {}
+      }
+    }
 
     for (const segmentName of segmentLines) {
       const localPath = path.join(this.workDir, segmentName);
@@ -1267,6 +1293,9 @@ class RepackManager {
         maxConsecutiveStartFailures: this.config.maxConsecutiveStartFailures,
         startFailureBaseBackoffMs: this.config.startFailureBaseBackoffMs,
         startFailureMaxBackoffMs: this.config.startFailureMaxBackoffMs,
+        staleInputSequenceMs: this.config.staleInputSequenceMs,
+        segmentDurationSec: this.config.repackProfile.segmentDurationSec,
+        playlistSize: this.config.repackProfile.playlistSize,
         repackServers: Array.from(this.config.repackServers).sort((a, b) => a - b),
         r2Bucket: this.config.r2Bucket,
         publicBaseUrl: this.config.publicBaseUrl,
@@ -1300,6 +1329,7 @@ function loadConfig() {
     idleStopMs: toInt(process.env.REPACK_IDLE_STOP_MS, 8 * 60 * 60 * 1000, 10_000),
     stalePublishMs: toInt(process.env.REPACK_STALE_PUBLISH_MS, 8_000, 3000),
     staleRestartCooldownMs: toInt(process.env.REPACK_STALE_RESTART_COOLDOWN_MS, 9_000, 3000),
+    staleInputSequenceMs: toInt(process.env.REPACK_STALE_INPUT_SEQUENCE_MS, 15_000, 5000),
     seedRestartStaleMs: toInt(process.env.REPACK_SEED_RESTART_STALE_MS, 7_000, 3000),
     localRetentionMs: toInt(process.env.REPACK_LOCAL_RETENTION_MS, 8 * 60 * 1000, 30_000),
     remoteRetentionMs: toInt(process.env.REPACK_REMOTE_RETENTION_MS, 8 * 60 * 1000, 30_000),
