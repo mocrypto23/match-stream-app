@@ -124,6 +124,7 @@ const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const STRICT_R2_BACKOFF_MS = [2000, 4000, 8000] as const;
 const STRICT_R2_BREAKER_OPEN_MS = 25_000;
 const STRICT_R2_READY_URL_GRACE_MS = 45_000;
+const NETWORK_FATAL_WINDOW_MS = 12_000;
 const RESOLVE_COOLDOWN_MS = 1500;
 const REPACK_SEED_DEDUPE_WINDOW_MS = 12_000;
 const REPACK_TOKEN_REFRESH_KICK_MS = 16_000;
@@ -5375,7 +5376,7 @@ export default function WatchPage() {
     3: new Set<string>(),
     5: new Set<string>(),
   });
-  const networkFatalCountByCandidateRef = useRef<Map<string, number>>(new Map());
+  const networkFatalCountByCandidateRef = useRef<Map<string, { count: number; at: number }>>(new Map());
   const server3ProvenanceRef = useRef<Map<string, Server3CandidateProvenance>>(new Map());
   const lastFastFailoverAtByServerRef = useRef<Record<number, number>>({ 1: 0, 3: 0, 5: 0 });
   const server5RefreshInFlightRef = useRef<Promise<string | null> | null>(null);
@@ -8138,13 +8139,31 @@ export default function WatchPage() {
           }
           pushDiag(`fatal ${data.type} ${String(data.details)} retry=${fatalRetries}`);
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR && currentCandidateKey) {
-            const prev = networkFatalCountByCandidateRef.current.get(currentCandidateKey) || 0;
-            const next = prev + 1;
-            networkFatalCountByCandidateRef.current.set(currentCandidateKey, next);
-            const fastFailoverThreshold = selectedServer === 5 ? 3 : 2;
+            const now = Date.now();
+            const prevState = networkFatalCountByCandidateRef.current.get(currentCandidateKey);
+            const next =
+              prevState && now - prevState.at <= NETWORK_FATAL_WINDOW_MS ? prevState.count + 1 : 1;
+            networkFatalCountByCandidateRef.current.set(currentCandidateKey, { count: next, at: now });
+            const strictSingleCandidate = R2_STRICT_MODE && candidatesRef.current.length <= 1;
+            if (strictSingleCandidate) {
+              const progressedRecently =
+                !video.paused &&
+                video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+                now - lastProgressAtRef.current <= 2500;
+              if (progressedRecently) {
+                pushDiag(`strict-single hold source network=${next}`);
+                return;
+              }
+              setPlayerError("انقطاع مؤقت بالشبكة... جاري إعادة المزامنة");
+              queueTimeout(() => {
+                requestSoftRecovery("network-strict-single");
+              }, Math.min(2800, 900 + next * 450));
+              pushDiag(`strict-single recover network=${next}`);
+              return;
+            }
+            const fastFailoverThreshold = selectedServer === 5 ? 3 : (R2_STRICT_MODE ? 4 : 2);
             if (useFastFailover && next >= fastFailoverThreshold) {
               if (selectedServer === 5) {
-                const now = Date.now();
                 const lastFastFailoverAt = lastFastFailoverAtByServerRef.current[5] || 0;
                 if (now - lastFastFailoverAt < SERVER5_FAST_FAILOVER_COOLDOWN_MS) {
                   pushDiag("fast-failover server5 cooldown");

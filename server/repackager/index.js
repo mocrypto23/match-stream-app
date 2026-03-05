@@ -345,6 +345,8 @@ class RepackJob {
     this.consecutiveStartFailures = 0;
     this.degradedReason = "";
     this.degradedAt = 0;
+    this.pendingHardReset = false;
+    this.pendingDiscontinuity = false;
   }
 
   get key() {
@@ -381,17 +383,16 @@ class RepackJob {
     return Math.max(safeBase, Math.min(120_000, derived));
   }
 
-  resetEncoderRunState() {
-    // ffmpeg may restart and reuse local names (seg-00000001.ts ...).
-    // Reset mappings to avoid reusing stale remote segment links.
-    this.uploadedSegments = new Map();
-    this.lastPublishAt = 0;
+  resetEncoderRunState({ hardReset = false } = {}) {
     this.lastLocalSegmentFingerprint = "";
     this.lastLocalSegmentChangedAt = 0;
-    if (this.consecutiveStartFailures >= this.manager.config.deleteRemoteIndexAfterStartFailures) {
-      const remoteIndexKey = `${this.remotePrefix}/index.m3u8`;
-      this.manager.deleteObject(remoteIndexKey).catch(() => {});
-    }
+    if (!hardReset) return;
+    // Hard reset is reserved for first boot or source switch only.
+    // Normal restarts preserve state to avoid playback gaps.
+    this.uploadedSegments = new Map();
+    this.lastPublishAt = 0;
+    this.lastPlaylistMediaSeq = 0;
+    this.pendingDiscontinuity = false;
     try {
       const entries = fs.readdirSync(this.workDir, { withFileTypes: true });
       for (const entry of entries) {
@@ -408,7 +409,12 @@ class RepackJob {
 
   spawnFfmpeg() {
     if (this.state === "stopped") return;
-    this.resetEncoderRunState();
+    const hardReset = this.pendingHardReset || !this.lastPublishAt;
+    this.pendingHardReset = false;
+    if (!hardReset && this.lastPublishAt) {
+      this.pendingDiscontinuity = true;
+    }
+    this.resetEncoderRunState({ hardReset });
     const ffmpegBin = this.manager.config.ffmpegBin;
     const segmentPattern = path.join(this.workDir, "seg-%08d.ts");
     const ingestHeaders = normalizeIngestHeaders(this.ingestHeaders, this.ingestUrl);
@@ -570,6 +576,7 @@ class RepackJob {
 
     if (ingestUrl && ingestUrl !== this.ingestUrl) {
       this.ingestUrl = ingestUrl;
+      this.pendingHardReset = true;
       this.consecutiveStartFailures = 0;
       this.degradedReason = "";
       this.degradedAt = 0;
@@ -687,6 +694,7 @@ class RepackJob {
     const rewrittenLines = [];
     const activeRemoteSeq = [];
     let mediaSeqLineIndex = -1;
+    let insertedDiscontinuity = false;
     for (const line of lines) {
       const rawLine = String(line || "");
       const trimmed = rawLine.trim();
@@ -701,6 +709,10 @@ class RepackJob {
       }
       const mapped = this.uploadedSegments.get(trimmed);
       if (mapped) {
+        if (this.pendingDiscontinuity && !insertedDiscontinuity) {
+          rewrittenLines.push("#EXT-X-DISCONTINUITY");
+          insertedDiscontinuity = true;
+        }
         rewrittenLines.push(mapped.remoteName);
         if (Number.isFinite(mapped.remoteSeq) && mapped.remoteSeq > 0) {
           activeRemoteSeq.push(mapped.remoteSeq);
@@ -739,6 +751,9 @@ class RepackJob {
     });
     this.lastPlaylistLatencyMs = Date.now() - startedAt;
     this.lastPublishAt = Date.now();
+    if (insertedDiscontinuity) {
+      this.pendingDiscontinuity = false;
+    }
     this.totalPlaylistPublishes += 1;
     this.consecutiveUploadErrors = 0;
     this.consecutiveSourceErrors = 0;
