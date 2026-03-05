@@ -505,6 +505,28 @@ function buildPlayerv2Nonce(tsSec: number) {
   return `${randomAlphaNum(4)}${(Math.max(0, tsSec) % 100000).toString(36)}`;
 }
 
+function buildPlayerv2ChannelFallbackCandidates(sourceUrl: string) {
+  try {
+    const u = new URL(sourceUrl);
+    const pathname = String(u.pathname || "").toLowerCase();
+    if (!pathname.includes("/playerv2.php")) return [] as string[];
+    const matchRaw = String(u.searchParams.get("match") || "").trim();
+    const num = Number.parseInt((matchRaw.match(/\d+/) || [])[0] || "", 10);
+    if (!Number.isFinite(num) || num <= 0) return [] as string[];
+    const channel = `ch${num}`;
+    const hosts = [
+      "aaa.yallaliveshoot.online",
+      "aaa.yallaliveshoot.info",
+      "aaa.yallashoooootlive.online",
+      "aaa.yallashoooootlive.info",
+      "aaa.kora-live-live.info",
+    ];
+    return hosts.map((host) => `https://${host}/hls/${channel}/live/index.m3u8`);
+  } catch {
+    return [] as string[];
+  }
+}
+
 function normalizeDomainPrefix(rawDomain: string, baseUrl: string) {
   const value = String(rawDomain || "").trim().replace(/\\\//g, "/");
   if (!value) return "";
@@ -611,6 +633,10 @@ async function buildPlayerv2Candidates(sourceUrl: string, html: string, timeoutM
   if (!bootstrap) return [] as string[];
   const out: string[] = [];
 
+  for (const fallbackCandidate of buildPlayerv2ChannelFallbackCandidates(sourceUrl)) {
+    if (isValidHttpUrl(fallbackCandidate)) out.push(fallbackCandidate);
+  }
+
   for (const candidate of bootstrap.randomCandidates.slice(0, 20)) {
     const normalized = normalizeCandidate(candidate, sourceUrl);
     if (!normalized) continue;
@@ -654,7 +680,15 @@ async function buildPlayerv2Candidates(sourceUrl: string, html: string, timeoutM
       }
     }
   }
-  return out;
+  const deduped = new Set<string>();
+  const result: string[] = [];
+  for (const candidate of out) {
+    const key = canonicalizeUrl(candidate) || candidate.toLowerCase();
+    if (!key || deduped.has(key)) continue;
+    deduped.add(key);
+    result.push(candidate);
+  }
+  return result;
 }
 
 function buildInternalEmbedProxyUrl(input: { sourceUrl: string; requestOrigin: string; referrerUrl?: string | null }) {
