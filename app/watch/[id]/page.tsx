@@ -5293,19 +5293,9 @@ function buildR2StatusSignature(status: MatchR2Status | null | undefined) {
 }
 
 function getStrictServerSubtitle(entry: R2StatusServerEntry | undefined, health: ServerHealthState, hasUrl: boolean) {
-  if (entry?.state === "ready") return "جاهز";
+  if (entry?.state === "ready") return "مباشر";
   if (entry?.state === "warming" || health === "pending") return "جاري التحضير";
-
-  const reasonBlob = `${String(entry?.reason || "")}|${String(entry?.resolveReason || "")}`.toLowerCase();
-  if (reasonBlob.includes("blocked-outside-window")) return "خارج نافذة البث";
-  if (reasonBlob.includes("missing-source")) return "لا يوجد مصدر";
-  if (reasonBlob.includes("source-not-allowed")) return "مصدر غير مسموح";
-  if (reasonBlob.includes("no-ingest-candidate") || reasonBlob.includes("resolver-no-candidate")) return "فشل استخراج";
-  if (reasonBlob.includes("probe-failed") || reasonBlob.includes("segment-http") || reasonBlob.includes("r2-segment")) {
-    return "فشل فحص المصدر";
-  }
-  if (reasonBlob.includes("early-stop-finished")) return "انتهى البث";
-  if (hasUrl) return "جاهز";
+  if (entry?.state === "down" || health === "down" || !hasUrl) return "لا يوجد بث";
   return "لا يوجد بث";
 }
 
@@ -5415,7 +5405,12 @@ export default function WatchPage() {
     return new Set<number>(picked);
   }, [runtimeRepackFlags]);
 
-  const diagEnabled = searchParams.get("diag") === "1";
+  const diagQueryEnabled = searchParams.get("diag") === "1";
+  const [diagVisible, setDiagVisible] = useState(diagQueryEnabled);
+  const effectiveDiagEnabled = diagQueryEnabled || diagVisible;
+  useEffect(() => {
+    if (diagQueryEnabled) setDiagVisible(true);
+  }, [diagQueryEnabled]);
   useEffect(() => {
     strictRecoveryStateRef.current = strictRecoveryState;
   }, [strictRecoveryState]);
@@ -5425,13 +5420,13 @@ export default function WatchPage() {
     setIsTfPlayerHost(host === "tf-player.site" || host.endsWith(".tf-player.site"));
   }, []);
   const pushDiag = useCallback((line: string) => {
-    if (!diagEnabled) return;
+    if (!effectiveDiagEnabled) return;
     const now = Date.now();
     if (R2_STRICT_MODE && line === lastDiagLineRef.current && now - lastDiagAtRef.current < 2500) return;
     lastDiagLineRef.current = line;
     lastDiagAtRef.current = now;
     setDiagLogs((prev) => [line, ...prev].slice(0, 120));
-  }, [diagEnabled]);
+  }, [effectiveDiagEnabled]);
 
   const reportRepackPlaybackDiag = useCallback(
     (context: string, serverId: number, playlistUrl: string) => {
@@ -5784,6 +5779,21 @@ export default function WatchPage() {
     (reason: string, immediate = false) => {
       clearRecoveryTimer();
       if (R2_STRICT_MODE) {
+        const video = videoRef.current;
+        const suppressTransientUi =
+          !!video &&
+          !video.paused &&
+          !video.seeking &&
+          !userPausedRef.current &&
+          video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+          Date.now() - lastProgressAtRef.current <= 2500 &&
+          /(repack|network|media|stall|unavailable|fatal)/i.test(String(reason || ""));
+        if (suppressTransientUi) {
+          setPlayerError((prev) => (prev ? null : prev));
+          setStrictPlaybackDiag((prev) => (prev ? null : prev));
+          pushDiag(`strict recovery suppressed (${reason})`);
+          return;
+        }
         if (strictRecoveryStateRef.current === "breaker_open") return;
         if (strictRecoveryTimerRef.current !== null) return;
         const step = strictRetryStepRef.current;
@@ -7802,7 +7812,7 @@ export default function WatchPage() {
         requestSoftRecovery("waiting-p2p");
       }
     };
-    const onPlaying = () => {
+          const onPlaying = () => {
       if (cancel) return;
       userPausedRef.current = false;
       if (selectedServer === 3) {
@@ -7816,24 +7826,29 @@ export default function WatchPage() {
         const existing = getServer5PrewarmCandidates(selectedUrl);
         setServer5PrewarmCandidates(selectedUrl, [selectedHlsUrl, ...existing]);
       }
-      resetRecoveryState();
-      if (selectedServer !== 5 || hasServer5VisualStart()) hidePlayerLoading();
-      setPlayerError(null);
-      setResolverError(null);
-      if (useFastFailover) clearCandidateFailureMarks(selectedServer, selectedHlsUrl);
-      scheduleAutoAudioSync();
-    };
+            resetRecoveryState();
+            if (selectedServer !== 5 || hasServer5VisualStart()) hidePlayerLoading();
+            setPlayerError(null);
+            if (R2_STRICT_MODE) setStrictPlaybackDiag((prev) => (prev ? null : prev));
+            setResolverError(null);
+            if (useFastFailover) clearCandidateFailureMarks(selectedServer, selectedHlsUrl);
+            scheduleAutoAudioSync();
+          };
     const onTimeUpdate = () => {
       markProgress();
       const server5HasVisual = selectedServer === 5 && hasServer5VisualStart();
       if (server5HasVisual) markServer5VisualStart();
-      const nonServer5Ready = selectedServer !== 5 && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA;
-      if (!video.paused && (nonServer5Ready || server5HasVisual)) {
-        hidePlayerLoading();
-      }
-      const progressed = Number(video.currentTime);
-      if (Number.isFinite(progressed) && progressed > 0.2) {
-        userPausedRef.current = false;
+            const nonServer5Ready = selectedServer !== 5 && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA;
+            if (!video.paused && (nonServer5Ready || server5HasVisual)) {
+              hidePlayerLoading();
+            }
+            if (R2_STRICT_MODE && !video.paused && (nonServer5Ready || server5HasVisual)) {
+              setPlayerError((prev) => (prev ? null : prev));
+              setStrictPlaybackDiag((prev) => (prev ? null : prev));
+            }
+            const progressed = Number(video.currentTime);
+            if (Number.isFinite(progressed) && progressed > 0.2) {
+              userPausedRef.current = false;
         scheduleAutoAudioSync();
       }
     };
@@ -8465,8 +8480,8 @@ export default function WatchPage() {
             const health: ServerHealthState = serverHealth[s.n] ?? (hasUrl ? "ok" : "down");
             const ok = hasUrl;
             const selected = selectedServer === s.n;
-            const canSelect = R2_STRICT_MODE ? true : ok;
             const strictEntry = R2_STRICT_MODE ? strictR2StatusBySlot.get(s.n) : undefined;
+            const canSelect = R2_STRICT_MODE ? strictEntry?.state === "ready" : ok;
             const subtitle = R2_STRICT_MODE
               ? getStrictServerSubtitle(strictEntry, health, ok)
               : health === "pending"
@@ -8491,9 +8506,23 @@ export default function WatchPage() {
               </button>
             );
           })}
+          {R2_STRICT_MODE ? (
+            <button
+              type="button"
+              onClick={() => setDiagVisible((prev) => !prev)}
+              className={[
+                "px-3 py-2 rounded-xl font-black text-xs border transition-all",
+                effectiveDiagEnabled
+                  ? "bg-amber-900/30 text-amber-200 border-amber-700/50"
+                  : "bg-[#121212] text-gray-300 border-gray-800 hover:border-amber-700/50",
+              ].join(" ")}
+            >
+              {effectiveDiagEnabled ? "إخفاء التشخيص" : "إظهار التشخيص"}
+            </button>
+          ) : null}
         </div>
 
-        {R2_STRICT_MODE && strictPlaybackDiag ? (
+        {R2_STRICT_MODE && effectiveDiagEnabled && strictPlaybackDiag ? (
           <div className="mb-3 rounded-xl border border-yellow-800/40 bg-yellow-500/10 px-3 py-2 text-[11px] font-semibold text-yellow-200">
             تشخيص R2: {strictPlaybackDiag}
           </div>
@@ -8556,7 +8585,10 @@ export default function WatchPage() {
         </div>
 
         {resolverError ? <div className="mt-2 text-xs text-red-200 bg-red-900/20 border border-red-700/40 rounded-lg px-3 py-2">{resolverError}</div> : null}
-        {playerError ? <div className="mt-2 text-xs text-amber-200 bg-amber-900/20 border border-amber-700/40 rounded-lg px-3 py-2">{playerError}</div> : null}
+        {playerError &&
+        (!R2_STRICT_MODE || effectiveDiagEnabled || Date.now() - lastProgressAtRef.current > 3500) ? (
+          <div className="mt-2 text-xs text-amber-200 bg-amber-900/20 border border-amber-700/40 rounded-lg px-3 py-2">{playerError}</div>
+        ) : null}
         {R2_STRICT_MODE && strictRecoveryState === "breaker_open" ? (
           <div className="mt-2 text-xs text-blue-100 bg-blue-900/20 border border-blue-700/40 rounded-lg px-3 py-3 flex items-center justify-between gap-3">
             <div>
@@ -8574,7 +8606,7 @@ export default function WatchPage() {
           </div>
         ) : null}
 
-        {diagEnabled ? (
+        {effectiveDiagEnabled ? (
           <div className="mt-3 rounded-xl border border-amber-700/40 bg-[#16130a] p-3">
             <div className="max-h-48 overflow-auto text-[11px] text-amber-100/90 whitespace-pre-wrap leading-5">
               {diagLogs.length ? diagLogs.join("\n") : "No diag events yet."}
