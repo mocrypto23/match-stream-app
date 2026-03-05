@@ -245,7 +245,7 @@ export async function POST(req: Request) {
   }
   const resolverRequestOrigin = (() => {
     const configured = String(
-      process.env.REPACK_INTERNAL_PLAYER_ORIGIN || process.env.INTERNAL_APP_ORIGIN || process.env.REPACK_PLAYER_ORIGIN || ""
+      process.env.REPACK_INTERNAL_PLAYER_ORIGIN || process.env.INTERNAL_APP_ORIGIN || ""
     ).trim();
     if (configured && isValidHttpUrl(configured)) return configured.replace(/\/+$/, "");
     const appPort = Number.parseInt(String(process.env.PORT || "3000"), 10) || 3000;
