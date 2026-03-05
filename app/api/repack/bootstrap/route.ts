@@ -243,28 +243,13 @@ export async function POST(req: Request) {
   if (!Number.isFinite(matchId) || matchId <= 0) {
     return NextResponse.json({ ok: false, error: "invalid-match-id" }, { status: 400 });
   }
-  const requestOrigin = (() => {
-    const forwardedProto = String(req.headers.get("x-forwarded-proto") || "").trim().toLowerCase();
-    const forwardedHost = String(req.headers.get("x-forwarded-host") || "").trim().toLowerCase();
-    if (forwardedProto && forwardedHost) {
-      const origin = `${forwardedProto}://${forwardedHost}`;
-      if (isValidHttpUrl(origin)) return origin;
-    }
-    const host = String(req.headers.get("host") || "").trim().toLowerCase();
-    if (host) {
-      const proto = forwardedProto === "https" ? "https" : "http";
-      const origin = `${proto}://${host}`;
-      if (isValidHttpUrl(origin) && !/localhost|127\.0\.0\.1/.test(origin)) return origin;
-    }
-    const configuredOrigin = String(
-      process.env.PUBLIC_APP_ORIGIN || process.env.NEXT_PUBLIC_APP_ORIGIN || process.env.NEXT_PUBLIC_SITE_URL || ""
+  const resolverRequestOrigin = (() => {
+    const configured = String(
+      process.env.REPACK_INTERNAL_PLAYER_ORIGIN || process.env.INTERNAL_APP_ORIGIN || process.env.REPACK_PLAYER_ORIGIN || ""
     ).trim();
-    if (configuredOrigin && isValidHttpUrl(configuredOrigin)) return configuredOrigin;
-    try {
-      const fallback = new URL(req.url).origin;
-      if (isValidHttpUrl(fallback)) return fallback;
-    } catch {}
-    return "https://tf-player.site";
+    if (configured && isValidHttpUrl(configured)) return configured.replace(/\/+$/, "");
+    const appPort = Number.parseInt(String(process.env.PORT || "3000"), 10) || 3000;
+    return `http://127.0.0.1:${appPort}`;
   })();
 
   const mode = getServerStreamMode();
@@ -418,7 +403,7 @@ export async function POST(req: Request) {
 
     const ingest = await resolveRepackIngestUrl({
       sourceUrl,
-      requestOrigin,
+      requestOrigin: resolverRequestOrigin,
       referrerUrl: sourceUrl,
       timeoutMs: Number.parseInt(String(process.env.REPACK_RESOLVE_TIMEOUT_MS || "8000"), 10) || 8000,
       maxCandidates: Number.parseInt(String(process.env.REPACK_RESOLVE_MAX_CANDIDATES || "16"), 10) || 16,
