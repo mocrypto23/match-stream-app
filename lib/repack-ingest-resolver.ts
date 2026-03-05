@@ -195,6 +195,7 @@ function looksLikeHlsManifestUrl(raw: string) {
     const search = String(u.search || "").toLowerCase();
     const combined = `${pathname}${search}`;
     if (looksLikeNonStreamAssetPath(pathname)) return false;
+    if (/\.(?:ts|m4s|m4a|mp4|aac|mp3|vtt)(?:$|[?#])/i.test(pathname)) return false;
     if (combined.includes(".mpd")) return false;
     if (combined.includes(".m3u8")) return true;
     if (pathname.includes("/api/embed-proxy")) {
