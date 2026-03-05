@@ -720,7 +720,7 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
       score += 40;
       const target = safeDecodeURIComponent(String(u.searchParams.get("url") || "").trim());
       if (isValidHttpUrl(target)) {
-        if (looksLikeHlsManifestUrl(target)) score += 120;
+        if (looksLikeHlsManifestUrl(target)) score += 180;
         try {
           const tu = new URL(target);
           const tPath = String(tu.pathname || "").toLowerCase();
@@ -728,8 +728,14 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
           if ((tHost.endsWith(".yallashot.us") || tHost === "yallashot.us") && tPath.includes("/kooora/")) {
             score += 240;
           }
+          if ((tHost === "showchop.net" || tHost.endsWith(".showchop.net")) && tPath.includes("/embed/")) score += 180;
+          if (tu.port === "8443" && tPath.includes(".m3u8")) score += 240;
+          if (tHost.endsWith(".58103793.net") || tHost.endsWith(".77911050.net")) score += 180;
+          if (tPath.includes("/albaplayer/") && !looksLikeHlsManifestUrl(target)) score -= 220;
         } catch {}
       }
+      if (search.includes("depth=2") || search.includes("depth=3") || search.includes("depth=4")) score -= 45;
+      if (search.includes("stable=1")) score += 22;
     }
     if (pathname.includes("/hls/") || pathname.includes("/live/") || pathname.includes("/manifest/")) score += 80;
     if (pathname.includes("/albaplayer/")) score += 160;
@@ -739,6 +745,11 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
     if (search.includes("serv=")) score += 26;
     if (search.includes("stream=")) score += 34;
     if (search.includes("token=") || search.includes("session") || search.includes("playlist")) score += 45;
+    if (u.port === "8443" && combined.includes(".m3u8")) score += 210;
+    if (u.hostname.toLowerCase().endsWith(".58103793.net") || u.hostname.toLowerCase().endsWith(".77911050.net")) score += 170;
+    if ((u.hostname.toLowerCase() === "showchop.net" || u.hostname.toLowerCase().endsWith(".showchop.net")) && pathname.includes("/embed/")) {
+      score += 140;
+    }
     if (u.hostname.toLowerCase() === sourceHost) score += 28;
     if (u.hostname.toLowerCase().endsWith(`.${sourceHost}`)) score += 18;
     if (u.hostname.toLowerCase() === sourceHost && !hasStreamishPath && !combined.includes("serv=")) score -= 45;
@@ -1052,6 +1063,16 @@ function buildProbeReferrerPool(candidateUrl: string, sourceReferrer: string) {
   return out;
 }
 
+function isEmbedProxyCandidateUrl(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    const pathname = String(new URL(rawUrl).pathname || "").toLowerCase();
+    return pathname.includes("/api/embed-proxy");
+  } catch {
+    return false;
+  }
+}
+
 function pickBetterProbeFailure(current: ProbeResult | null, next: ProbeResult) {
   if (!current) return next;
   const currentStatus = Number(current.evidence?.playlistStatus || 0);
@@ -1293,24 +1314,55 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     lastEvidence = finalProbe.evidence;
     if (!aggregatedExtraCandidates.length) continue;
 
+    const immediateManifestExtras: RankedCandidate[] = [];
     const extraPool: string[] = [];
+    const pushImmediateManifest = (candidateUrl: string, referrerUrl: string) => {
+      const key = canonicalizeUrl(candidateUrl) || candidateUrl.toLowerCase();
+      if (!key || seenProbeKeys.has(key) || seen.has(key)) return;
+      seen.add(key);
+      immediateManifestExtras.push({
+        candidateUrl,
+        score: Number.MAX_SAFE_INTEGER - immediateManifestExtras.length,
+        mode: classifyMode(candidateUrl),
+        referrerUrl: normalizeHttpUrl(referrerUrl) || candidateUrl,
+      });
+    };
+
     for (const extra of aggregatedExtraCandidates) {
       const normalized = normalizeCandidate(extra, item.candidateUrl);
       if (!normalized) continue;
       const extraKey = canonicalizeUrl(normalized) || normalized.toLowerCase();
       if (!extraKey || seenProbeKeys.has(extraKey) || seen.has(extraKey)) continue;
+      if (looksLikeHlsManifestUrl(normalized)) {
+        pushImmediateManifest(normalized, finalProbe.evidence?.playlistUrl || item.referrerUrl || item.candidateUrl);
+        if (requestOrigin && !isEmbedProxyCandidateUrl(normalized)) {
+          const proxiedManifest = buildInternalEmbedProxyUrl({
+            sourceUrl: normalized,
+            requestOrigin,
+            referrerUrl: finalProbe.evidence?.playlistUrl || item.referrerUrl || sourceFetch.finalUrl || sourceUrl,
+          });
+          if (proxiedManifest) {
+            pushImmediateManifest(proxiedManifest, finalProbe.evidence?.playlistUrl || item.referrerUrl || item.candidateUrl);
+          }
+        }
+        if (immediateManifestExtras.length >= 8) continue;
+      }
       seen.add(extraKey);
       extraPool.push(normalized);
       if (extraPool.length >= MAX_DYNAMIC_CANDIDATES) break;
     }
-    if (!extraPool.length) continue;
-    const rankedExtra = rankCandidates(
-      extraPool,
-      sourceUrl,
-      Math.max(2, maxCandidates - candidatesProbed),
-      finalProbe.evidence?.playlistUrl || item.referrerUrl || item.candidateUrl
-    );
-    pending.push(...rankedExtra);
+    if (immediateManifestExtras.length) {
+      pending.unshift(...immediateManifestExtras);
+    }
+    if (extraPool.length) {
+      const rankedExtra = rankCandidates(
+        extraPool,
+        sourceUrl,
+        Math.max(2, maxCandidates - candidatesProbed),
+        finalProbe.evidence?.playlistUrl || item.referrerUrl || item.candidateUrl
+      );
+      pending.push(...rankedExtra);
+    }
   }
 
   const resolverState: RepackResolverState = rankedSeed.length ? "probe-failed" : "no-candidate";
