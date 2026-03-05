@@ -13,9 +13,9 @@ import type { StreamMode } from "./stream-mode";
 import { computeMatchWindowState, getMatchWindowConfig, parseMatchStartMs } from "./match-window";
 
 const DEFAULT_R2_PROBE_TIMEOUT_MS = 2400;
-const DEFAULT_SEGMENT_PROBE_TIMEOUT_MS = 1700;
+const DEFAULT_SEGMENT_PROBE_TIMEOUT_MS = 3200;
 const DEFAULT_SEED_WARMING_WINDOW_MS = 120_000;
-const DEFAULT_STALE_SEQUENCE_GUARD_MS = 12_000;
+const DEFAULT_STALE_SEQUENCE_GUARD_MS = 30_000;
 const SEQUENCE_STATE_TTL_MS = 10 * 60 * 1000;
 
 type StreamRowFields = {
@@ -42,6 +42,7 @@ type PlaylistProbeResult = {
 };
 
 const sequenceStateByPlaylist = new Map<string, SequenceState>();
+const staleSequenceCountByPlaylist = new Map<string, { count: number; lastSeenAt: number }>();
 const finishedSeenAtByMatchSlot = new Map<string, number>();
 const segmentFailStateByMatchSlot = new Map<string, { count: number; lastSeenAt: number }>();
 
@@ -52,6 +53,9 @@ function nowIso(now = Date.now()) {
 function trimSequenceState(nowMs: number) {
   for (const [key, value] of sequenceStateByPlaylist.entries()) {
     if (nowMs - value.lastSeenAt > SEQUENCE_STATE_TTL_MS) sequenceStateByPlaylist.delete(key);
+  }
+  for (const [key, value] of staleSequenceCountByPlaylist.entries()) {
+    if (nowMs - value.lastSeenAt > SEQUENCE_STATE_TTL_MS) staleSequenceCountByPlaylist.delete(key);
   }
 }
 
@@ -106,35 +110,40 @@ function parseLastSegmentUrl(playlistUrl: string, playlistBody: string) {
 }
 
 async function probeSegmentUrl(segmentUrl: string, timeoutMs: number) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const head = await fetch(segmentUrl, {
-      method: "HEAD",
-      cache: "no-store",
-      redirect: "follow",
-      signal: controller.signal,
-    });
-    if (head.ok) return { ok: true, reason: "r2-segment-ok" };
-    if (head.status !== 405) {
-      return { ok: false, reason: `r2-segment-http-${head.status}` };
+  const runTimedFetch = async (method: "HEAD" | "GET", headers?: HeadersInit) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(segmentUrl, {
+        method,
+        cache: "no-store",
+        redirect: "follow",
+        signal: controller.signal,
+        headers,
+      });
+      return response;
+    } finally {
+      clearTimeout(timeoutId);
     }
-    const getResp = await fetch(segmentUrl, {
-      method: "GET",
-      cache: "no-store",
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        range: "bytes=0-1",
-      },
-    });
-    if (getResp.ok || getResp.status === 206) return { ok: true, reason: "r2-segment-ok" };
-    return { ok: false, reason: `r2-segment-http-${getResp.status}` };
-  } catch {
-    return { ok: false, reason: "r2-segment-fetch-failed" };
-  } finally {
-    clearTimeout(timeoutId);
+  };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const head = await runTimedFetch("HEAD");
+      if (head.ok) return { ok: true, reason: "r2-segment-ok" };
+      if (head.status === 405 || head.status === 403 || head.status === 401) {
+        const getResp = await runTimedFetch("GET", { range: "bytes=0-1" });
+        if (getResp.ok || getResp.status === 206) return { ok: true, reason: "r2-segment-ok" };
+        if (attempt === 0 && (getResp.status >= 500 || getResp.status === 429)) continue;
+        return { ok: false, reason: `r2-segment-http-${getResp.status}` };
+      }
+      if (attempt === 0 && (head.status >= 500 || head.status === 429)) continue;
+      return { ok: false, reason: `r2-segment-http-${head.status}` };
+    } catch {
+      if (attempt === 0) continue;
+      return { ok: false, reason: "r2-segment-fetch-failed" };
+    }
   }
+  return { ok: false, reason: "r2-segment-fetch-failed" };
 }
 
 function noteSequenceAndGetAgeMs(playlistUrl: string, mediaSequence: number | null, nowMs: number) {
@@ -154,6 +163,18 @@ function noteSequenceAndGetAgeMs(playlistUrl: string, mediaSequence: number | nu
   prev.lastSeenAt = nowMs;
   sequenceStateByPlaylist.set(key, prev);
   return Math.max(0, nowMs - prev.changedAt);
+}
+
+function noteStaleSequenceCount(playlistUrl: string, isStale: boolean, nowMs: number) {
+  trimSequenceState(nowMs);
+  const key = String(playlistUrl || "").trim();
+  if (!key) return 0;
+  const prev = staleSequenceCountByPlaylist.get(key) || { count: 0, lastSeenAt: nowMs };
+  const next = isStale
+    ? { count: prev.count + 1, lastSeenAt: nowMs }
+    : { count: 0, lastSeenAt: nowMs };
+  staleSequenceCountByPlaylist.set(key, next);
+  return next.count;
 }
 
 async function probeR2Playlist(playlistUrl: string, timeoutMs: number): Promise<PlaylistProbeResult> {
@@ -254,7 +275,7 @@ function resolveStateFromRecentSeed(matchId: number, slotServer: SlotServerId, p
   if (seedState.accepted) {
     return {
       state: "warming" as R2ServerState,
-      reason: `seed-accepted:${seedState.reason || "ok"}`,
+      reason: `seed-accepted:${seedState.reason || "ok"}:${probeReason}`,
       resolverState: seedState.resolverState || ("ok" as const),
       resolveReason: seedState.resolveReason || "seed-accepted",
     };
@@ -392,7 +413,9 @@ export async function buildMatchR2Status(input: {
         Number.isFinite(sequenceAgeMs) &&
         sequenceAgeMs !== null &&
         sequenceAgeMs > staleSequenceGuardMs;
-      if (probed.state === "ready" && !isStaleSequence) {
+      const staleSequenceCount = noteStaleSequenceCount(playlistUrl, isStaleSequence, nowMs);
+      const staleSequenceConfirmed = isStaleSequence && staleSequenceCount >= 2;
+      if (probed.state === "ready" && !staleSequenceConfirmed) {
         return {
           uiServer,
           slotServer,
@@ -407,7 +430,7 @@ export async function buildMatchR2Status(input: {
         };
       }
 
-      const fallbackReason = isStaleSequence ? "r2-sequence-stale" : probed.reason;
+      const fallbackReason = staleSequenceConfirmed ? "r2-sequence-stale" : probed.reason;
       const seeded = resolveStateFromRecentSeed(matchId, slotServer, fallbackReason, nowMs);
       const fallbackResolverState =
         seeded.resolverState === "unknown" && probed.segmentProbe === "fail"
@@ -422,11 +445,11 @@ export async function buildMatchR2Status(input: {
         slotServer,
         state: seeded.state,
         playlistUrl,
-        segmentProbe: isStaleSequence ? "ok" : probed.segmentProbe,
+        segmentProbe: staleSequenceConfirmed ? "ok" : probed.segmentProbe,
         lastSequenceAgeMs: sequenceAgeMs,
         resolverState: fallbackResolverState,
         resolveReason: fallbackResolveReason,
-        reason: isStaleSequence ? `${seeded.reason}:age=${sequenceAgeMs}` : seeded.reason,
+        reason: staleSequenceConfirmed ? `${seeded.reason}:age=${sequenceAgeMs}` : seeded.reason,
         updatedAt: nowIso(nowMs),
       };
     })

@@ -91,8 +91,8 @@ type P2PEngineConstructor = new (config?: { core?: { swarmId?: string } }) => P2
 
 const STALL_FREEZE_MS = 18000;
 const P2P_STALL_FREEZE_MS = 30000;
-const REPACK_STALE_PLAYLIST_MAX_IDLE_MS = 12_000;
-const REPACK_STALE_PROGRESS_GUARD_MS = 9_000;
+const REPACK_STALE_PLAYLIST_MAX_IDLE_MS = 20_000;
+const REPACK_STALE_PROGRESS_GUARD_MS = 14_000;
 const REPACK_HLS_MAX_BUFFER_LENGTH = 18;
 const REPACK_HLS_MAX_MAX_BUFFER_LENGTH = 30;
 const REPACK_HLS_LIVE_SYNC_COUNT = 3;
@@ -123,6 +123,7 @@ const P2P_PROFILE = (() => {
 const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const STRICT_R2_BACKOFF_MS = [2000, 4000, 8000] as const;
 const STRICT_R2_BREAKER_OPEN_MS = 25_000;
+const STRICT_R2_READY_URL_GRACE_MS = 45_000;
 const RESOLVE_COOLDOWN_MS = 1500;
 const REPACK_SEED_DEDUPE_WINDOW_MS = 12_000;
 const REPACK_TOKEN_REFRESH_KICK_MS = 16_000;
@@ -5352,6 +5353,7 @@ export default function WatchPage() {
   const [resolveRevision, setResolveRevision] = useState(0);
   const [playerLoading, setPlayerLoading] = useState(false);
   const [playerError, setPlayerError] = useState<string | null>(null);
+  const [strictPlaybackDiag, setStrictPlaybackDiag] = useState<string | null>(null);
   const [strictRecoveryState, setStrictRecoveryState] = useState<StrictRecoveryState>("healthy");
   const [strictBreakerUntilMs, setStrictBreakerUntilMs] = useState<number | null>(null);
   const [serverHealth, setServerHealth] = useState<Record<number, ServerHealthState>>({});
@@ -5403,6 +5405,7 @@ export default function WatchPage() {
   const repackStallCountByServerRef = useRef<Record<number, number>>({});
   const repackRecoveryErrorCountByServerRef = useRef<Record<number, number>>({});
   const repackPlaybackStartedAtByServerRef = useRef<Record<number, number>>({});
+  const strictLastReadyUrlByServerRef = useRef<Record<number, { url: string; updatedAt: number }>>({});
 
   const runtimeRepackFlags = useMemo(() => buildClientRepackFlags(match?.repack ?? null), [match?.repack]);
   const p2pEnabledServerSet = useMemo(() => {
@@ -5525,6 +5528,7 @@ export default function WatchPage() {
     if (selectedServer !== 3) {
       server3AutoSwitchWindowRef.current = { windowStart: 0, count: 0 };
     }
+    if (R2_STRICT_MODE) setStrictPlaybackDiag(null);
   }, [selectedServer]);
 
   useEffect(() => {
@@ -5534,6 +5538,7 @@ export default function WatchPage() {
 
   useEffect(() => {
     repackSeedSentRef.current = new Map();
+    strictLastReadyUrlByServerRef.current = {};
     badRepackSeedCandidatesByServerRef.current = {
       1: new Set<string>(),
       2: new Set<string>(),
@@ -6223,8 +6228,29 @@ export default function WatchPage() {
     return out;
   }, [match, derivedServer3Url, runtimeServer5Url, server3VerifiedAvailable, idNum, runtimeRepackFlags, viewerSessionId, repackBypassVersion, matchWindow.inWindow, strictR2StatusBySlot]);
 
+  useEffect(() => {
+    if (!R2_STRICT_MODE) return;
+    const now = Date.now();
+    const next = { ...strictLastReadyUrlByServerRef.current };
+    for (const option of serverOptions) {
+      if (option.url && isValidHttpUrl(option.url)) {
+        next[option.n] = {
+          url: option.url,
+          updatedAt: now,
+        };
+      }
+    }
+    for (const [key, value] of Object.entries(next)) {
+      if (!value?.url || now - value.updatedAt > STRICT_R2_READY_URL_GRACE_MS * 2) {
+        delete next[Number(key)];
+      }
+    }
+    strictLastReadyUrlByServerRef.current = next;
+  }, [serverOptions]);
+
   const validServers = useMemo(() => serverOptions.filter((s) => s.url && isValidHttpUrl(s.url)), [serverOptions]);
   useEffect(() => {
+    if (R2_STRICT_MODE) return;
     if (!validServers.some((s) => s.n === selectedServer) && validServers.length) setSelectedServer(validServers[0].n);
   }, [validServers, selectedServer]);
 
@@ -6282,9 +6308,18 @@ export default function WatchPage() {
     }
   }, []);
 
-  const selectedOption = validServers.find((s) => s.n === selectedServer);
+  const selectedOption = serverOptions.find((s) => s.n === selectedServer);
   const selectedServerLabel = selectedOption?.label || SERVER_SOURCE_LABELS[selectedServer] || `سيرفر ${selectedServer}`;
-  const selectedUrl = selectedOption?.url ?? "";
+  const selectedStrictStatus = R2_STRICT_MODE ? strictR2StatusBySlot.get(selectedServer) : undefined;
+  const selectedReadyUrl = selectedOption?.url ?? "";
+  const cachedStrictReady = strictLastReadyUrlByServerRef.current[selectedServer];
+  const canReuseStrictCachedUrl =
+    R2_STRICT_MODE &&
+    !selectedReadyUrl &&
+    !!cachedStrictReady?.url &&
+    Date.now() - cachedStrictReady.updatedAt <= STRICT_R2_READY_URL_GRACE_MS &&
+    (selectedStrictStatus?.state === "warming" || selectedStrictStatus?.state === "ready");
+  const selectedUrl = canReuseStrictCachedUrl ? String(cachedStrictReady?.url || "") : selectedReadyUrl;
   const selectedFallbackUrl = selectedOption?.fallbackUrl ?? "";
   const server5OptionUrl = serverOptions.find((s) => s.n === 5)?.url ?? "";
   const server5DbUrl = String(match?.stream_url_5 || "").trim();
@@ -7726,6 +7761,7 @@ export default function WatchPage() {
     let fatalRetries = 0;
     let repackLevelFingerprint = "";
     let repackLevelChangedAt = Date.now();
+    let lastLevelStartSn: number | null = null;
     let nativeStartupReported = false;
     const onLoaded = () => {
       if (cancel) return;
@@ -7911,6 +7947,9 @@ export default function WatchPage() {
             seedRepackFromCurrentPlayback();
           }
           reportRepackPlaybackDiag("manifest", selectedServer, selectedHlsUrl);
+          if (R2_STRICT_MODE) {
+            setStrictPlaybackDiag((prev) => (prev === null ? prev : null));
+          }
           playMutedSafely();
         });
         instance.on(Hls.Events.LEVEL_LOADED, (_event, data) => {
@@ -7918,8 +7957,16 @@ export default function WatchPage() {
           if (!isRepackPlaylistUrl(selectedHlsUrl)) return;
           const details = (data as { details?: { startSN?: number; endSN?: number; fragments?: Array<{ relurl?: string; url?: string }> } })
             ?.details;
-          let fingerprint = "";
           const startSN = Number(details?.startSN);
+          if (Number.isFinite(startSN)) {
+            if (lastLevelStartSn !== null && startSN < lastLevelStartSn && R2_STRICT_MODE) {
+              const driftMsg = `sequence-backtrack ${lastLevelStartSn} -> ${startSN}`;
+              setStrictPlaybackDiag((prev) => (prev === driftMsg ? prev : driftMsg));
+              pushDiag(`strict diag ${driftMsg}`);
+            }
+            lastLevelStartSn = startSN;
+          }
+          let fingerprint = "";
           const endSN = Number(details?.endSN);
           if (Number.isFinite(startSN) || Number.isFinite(endSN)) {
             fingerprint = `${Number.isFinite(startSN) ? startSN : "na"}:${Number.isFinite(endSN) ? endSN : "na"}`;
@@ -7961,11 +8008,15 @@ export default function WatchPage() {
             }
             if (staleErrCount >= 3) {
               setPlayerError("تحديث R2 متوقف مؤقتًا... جاري إعادة المحاولة تلقائيًا.");
+            } else if (staleErrCount >= 2) {
+              setPlayerError("تذبذب مؤقت في تحديث R2... جاري التثبيت.");
             } else {
               setPlayerError(null);
             }
             requestSoftRecovery("repack-stale-no-fallback");
-            scheduleResolveRecovery("repack-stale-no-fallback", true);
+            if (staleErrCount >= 2) {
+              scheduleResolveRecovery("repack-stale-no-fallback", true);
+            }
             return;
           }
 
@@ -8019,13 +8070,17 @@ export default function WatchPage() {
               }
               if (unavailableErrCount >= 3) {
                 setPlayerError("تعذر تحميل R2 الآن... جاري إعادة المحاولة تلقائيًا.");
+              } else if (unavailableErrCount >= 2) {
+                setPlayerError("انقطاع مؤقت في R2... جاري التثبيت.");
               } else {
                 setPlayerError(null);
               }
               queueTimeout(() => {
                 requestSoftRecovery("repack-unavailable-no-fallback");
               }, 250);
-              scheduleResolveRecovery("repack-unavailable-no-fallback", true);
+              if (unavailableErrCount >= 2) {
+                scheduleResolveRecovery("repack-unavailable-no-fallback", true);
+              }
               hidePlayerLoading();
               return;
             }
@@ -8048,6 +8103,13 @@ export default function WatchPage() {
             return;
           }
           fatalRetries += 1;
+          if (R2_STRICT_MODE) {
+            const responseCode = Number((data as { response?: { code?: number } })?.response?.code || 0);
+            const diagMessage = `fatal ${String(data.type || "unknown")} / ${String(data.details || "unknown")}${
+              responseCode ? ` / http ${responseCode}` : ""
+            }`;
+            setStrictPlaybackDiag((prev) => (prev === diagMessage ? prev : diagMessage));
+          }
           pushDiag(`fatal ${data.type} ${String(data.details)} retry=${fatalRetries}`);
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR && currentCandidateKey) {
             const prev = networkFatalCountByCandidateRef.current.get(currentCandidateKey) || 0;
@@ -8402,6 +8464,8 @@ export default function WatchPage() {
             const hasUrl = !!s.url && isValidHttpUrl(s.url);
             const health: ServerHealthState = serverHealth[s.n] ?? (hasUrl ? "ok" : "down");
             const ok = hasUrl;
+            const selected = selectedServer === s.n;
+            const canSelect = R2_STRICT_MODE ? true : ok;
             const strictEntry = R2_STRICT_MODE ? strictR2StatusBySlot.get(s.n) : undefined;
             const subtitle = R2_STRICT_MODE
               ? getStrictServerSubtitle(strictEntry, health, ok)
@@ -8411,13 +8475,13 @@ export default function WatchPage() {
             return (
               <button
                 key={s.n}
-                onClick={() => ok && setSelectedServer(s.n)}
-                disabled={!ok}
+                onClick={() => canSelect && setSelectedServer(s.n)}
+                disabled={!canSelect}
                 className={[
                   "px-4 py-2 rounded-xl font-black text-sm border transition-all min-w-[108px] text-center",
-                  selectedServer === s.n && ok
+                  selected
                     ? "bg-blue-600/20 text-blue-300 border-blue-600/50"
-                    : ok
+                    : canSelect
                       ? "bg-[#121212] text-gray-200 border-gray-800 hover:border-blue-600/40"
                       : "bg-[#0f0f0f] text-gray-500 border-gray-900 cursor-not-allowed",
                 ].join(" ")}
@@ -8428,6 +8492,12 @@ export default function WatchPage() {
             );
           })}
         </div>
+
+        {R2_STRICT_MODE && strictPlaybackDiag ? (
+          <div className="mb-3 rounded-xl border border-yellow-800/40 bg-yellow-500/10 px-3 py-2 text-[11px] font-semibold text-yellow-200">
+            تشخيص R2: {strictPlaybackDiag}
+          </div>
+        ) : null}
 
         {candidateGroups.length > 0 ? (
           <div className="mb-3 rounded-2xl border border-blue-800/30 bg-[#0f1520] p-4">

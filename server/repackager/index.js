@@ -213,40 +213,46 @@ function parseLastSegmentFromManifest(playlistUrl, manifestText) {
 }
 
 async function probeSegmentUrl(segmentUrl, timeoutMs, headers = {}) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const head = await fetch(segmentUrl, {
-      method: "HEAD",
-      cache: "no-store",
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        "user-agent": DEFAULT_USER_AGENT,
-        ...(headers || {}),
-      },
-    });
-    if (head.ok) return { ok: true, status: head.status };
-    if (head.status !== 405) return { ok: false, status: head.status };
-
-    const getResp = await fetch(segmentUrl, {
-      method: "GET",
-      cache: "no-store",
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        range: "bytes=0-1",
-        "user-agent": DEFAULT_USER_AGENT,
-        ...(headers || {}),
-      },
-    });
-    if (getResp.ok || getResp.status === 206) return { ok: true, status: getResp.status };
-    return { ok: false, status: getResp.status };
-  } catch {
-    return { ok: false, status: 0 };
-  } finally {
-    clearTimeout(timeoutId);
+  const baseHeaders = {
+    "user-agent": DEFAULT_USER_AGENT,
+    ...(headers || {}),
+  };
+  const runTimedFetch = async (method, extraHeaders = {}) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(segmentUrl, {
+        method,
+        cache: "no-store",
+        redirect: "follow",
+        signal: controller.signal,
+        headers: {
+          ...baseHeaders,
+          ...(extraHeaders || {}),
+        },
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const head = await runTimedFetch("HEAD");
+      if (head.ok) return { ok: true, status: head.status };
+      if (head.status === 405 || head.status === 403 || head.status === 401) {
+        const getResp = await runTimedFetch("GET", { range: "bytes=0-1" });
+        if (getResp.ok || getResp.status === 206) return { ok: true, status: getResp.status };
+        if (attempt === 0 && (getResp.status >= 500 || getResp.status === 429)) continue;
+        return { ok: false, status: getResp.status };
+      }
+      if (attempt === 0 && (head.status >= 500 || head.status === 429)) continue;
+      return { ok: false, status: head.status };
+    } catch {
+      if (attempt === 0) continue;
+      return { ok: false, status: 0 };
+    }
   }
+  return { ok: false, status: 0 };
 }
 
 function readJsonBody(req, maxBytes = 64 * 1024) {
@@ -394,6 +400,22 @@ class RepackJob {
       ffUserAgent,
       "-rw_timeout",
       "15000000",
+      "-reconnect",
+      "1",
+      "-reconnect_streamed",
+      "1",
+      "-reconnect_at_eof",
+      "1",
+      "-reconnect_on_network_error",
+      "1",
+      "-reconnect_delay_max",
+      "2",
+      "-analyzeduration",
+      "10000000",
+      "-probesize",
+      "10000000",
+      "-fflags",
+      "+discardcorrupt",
       "-live_start_index",
       "-1",
     ];
@@ -406,6 +428,13 @@ class RepackJob {
     args.push(
       "-i",
       this.ingestUrl,
+      "-ignore_unknown",
+      "-map",
+      "0:v:0?",
+      "-map",
+      "0:a:0?",
+      "-sn",
+      "-dn",
       "-c",
       "copy",
       "-f",
