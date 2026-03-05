@@ -328,7 +328,7 @@ function extractAlbaDynamicManifestCandidates(text: string, baseUrl: string) {
     }
   }
 
-  if (!domainPool.size || !sourceSubdomain) return [] as string[];
+  if (!domainPool.size) return [] as string[];
 
   const pathPool = new Set<string>();
   const hlsPathRe = /\/hls\/[a-z0-9_-]+\/live\/index\.m3u8/gi;
@@ -339,11 +339,36 @@ function extractAlbaDynamicManifestCandidates(text: string, baseUrl: string) {
   }
   if (!pathPool.size) return [] as string[];
 
-  for (const domain of domainPool) {
-    for (const path of pathPool) {
-      const candidate = `https://${sourceSubdomain}.${domain}${path}`;
-      if (!isValidHttpUrl(candidate)) continue;
-      out.add(candidate);
+  const subdomainPool = new Set<string>();
+  if (sourceSubdomain) subdomainPool.add(sourceSubdomain);
+
+  const computeRotatingSubdomain = (tsMs: number) => {
+    let v = Math.floor(tsMs / 144e5) + Math.floor((tsMs / 864e5) * 1.5);
+    let length = (v % 7) + 6;
+    const chars = "abcdefghijklmnopqrstuvwxyz";
+    let outValue = "";
+    while (length > 0) {
+      outValue += chars[v % 26] || "a";
+      v = Math.floor(v / 26);
+      length -= 1;
+    }
+    return outValue;
+  };
+  const now = Date.now();
+  for (const offsetHours of [-12, 0, 12]) {
+    const dynamic = computeRotatingSubdomain(now + offsetHours * 60 * 60 * 1000);
+    if (dynamic) subdomainPool.add(dynamic);
+  }
+
+  if (!subdomainPool.size) return [] as string[];
+
+  for (const sub of subdomainPool) {
+    for (const domain of domainPool) {
+      for (const path of pathPool) {
+        const candidate = `https://${sub}.${domain}${path}`;
+        if (!isValidHttpUrl(candidate)) continue;
+        out.add(candidate);
+      }
     }
   }
 
@@ -529,6 +554,14 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
 
     if (looksLikeNonStreamAssetPath(pathname)) return Number.NEGATIVE_INFINITY;
     if (combined.includes(".mpd")) return Number.NEGATIVE_INFINITY;
+    const hasStreamishPath =
+      pathname.includes("/hls/") ||
+      pathname.includes("/live/") ||
+      pathname.includes("/manifest/") ||
+      pathname.includes("/albaplayer/") ||
+      pathname.includes("/player/") ||
+      pathname.includes("/go.php") ||
+      pathname.includes("/chtv/");
 
     if (combined.includes(".m3u8")) score += 220;
     if (pathname.includes("/api/embed-proxy")) {
@@ -546,7 +579,7 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
       }
     }
     if (pathname.includes("/hls/") || pathname.includes("/live/") || pathname.includes("/manifest/")) score += 80;
-    if (pathname.includes("/albaplayer/")) score += 56;
+    if (pathname.includes("/albaplayer/")) score += 160;
     if (pathname.includes("/player/")) score += 60;
     if (pathname.includes("/go.php")) score += 48;
     if (pathname.includes("/chtv/")) score += 52;
@@ -555,6 +588,8 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
     if (search.includes("token=") || search.includes("session") || search.includes("playlist")) score += 45;
     if (u.hostname.toLowerCase() === sourceHost) score += 28;
     if (u.hostname.toLowerCase().endsWith(`.${sourceHost}`)) score += 18;
+    if (u.hostname.toLowerCase() === sourceHost && !hasStreamishPath && !combined.includes("serv=")) score -= 45;
+    if (pathname.startsWith("/matches/") || pathname.startsWith("/home_")) score -= 65;
     if (isYallashotKoooraDirect && (search.includes("token=") || search.includes("session_id="))) score -= 140;
   } catch {
     return Number.NEGATIVE_INFINITY;
