@@ -608,7 +608,7 @@ class RepackJob {
 
     // If source is unchanged but stream is stale/restarting, force ffmpeg recycle.
     const now = Date.now();
-    const staleMs = this.getAdaptiveStaleMs(this.manager.config.seedRestartStaleMs, 3);
+    const staleMs = this.getAdaptiveStaleMs(this.manager.config.seedRestartStaleMs, 8);
     const noPublishYet = !this.lastPublishAt && now - this.createdAt > staleMs;
     const stalePublish = !!this.lastPublishAt && now - this.lastPublishAt > staleMs;
     const recentlySpawned = this.lastSpawnAt && now - this.lastSpawnAt < Math.max(5000, Math.floor(staleMs * 0.4));
@@ -763,7 +763,7 @@ class RepackJob {
       this.lastLocalSegmentChangedAt = now;
     } else {
       const staleForMs = this.lastLocalSegmentChangedAt ? now - this.lastLocalSegmentChangedAt : 0;
-      const staleInputThresholdMs = this.getAdaptiveStaleMs(this.manager.config.staleInputSequenceMs, 4);
+      const staleInputThresholdMs = this.getAdaptiveStaleMs(this.manager.config.staleInputSequenceMs, 12);
       if (
         staleForMs > staleInputThresholdMs &&
         this.ffmpegProc &&
@@ -859,7 +859,7 @@ class RepackJob {
       this.stop();
       return;
     }
-    const staleMs = this.getAdaptiveStaleMs(this.manager.config.stalePublishMs, 3);
+    const staleMs = this.getAdaptiveStaleMs(this.manager.config.stalePublishMs, 8);
     if (this.lastPublishAt && now - this.lastPublishAt > staleMs) {
       const staleForMs = now - this.lastPublishAt;
       this.manager.log("warn", "repack stale publish", {
