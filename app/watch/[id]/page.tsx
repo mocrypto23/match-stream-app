@@ -5407,9 +5407,9 @@ export default function WatchPage() {
 
   const diagQueryEnabled = searchParams.get("diag") === "1";
   const [diagVisible, setDiagVisible] = useState(diagQueryEnabled);
-  const effectiveDiagEnabled = diagQueryEnabled || diagVisible;
+  const effectiveDiagEnabled = diagVisible;
   useEffect(() => {
-    if (diagQueryEnabled) setDiagVisible(true);
+    setDiagVisible(diagQueryEnabled);
   }, [diagQueryEnabled]);
   useEffect(() => {
     strictRecoveryStateRef.current = strictRecoveryState;
@@ -6263,6 +6263,17 @@ export default function WatchPage() {
     if (R2_STRICT_MODE) return;
     if (!validServers.some((s) => s.n === selectedServer) && validServers.length) setSelectedServer(validServers[0].n);
   }, [validServers, selectedServer]);
+  useEffect(() => {
+    if (!R2_STRICT_MODE) return;
+    const readyServers = serverOptions.filter((s) => {
+      if (!s.url || !isValidHttpUrl(s.url)) return false;
+      const entry = strictR2StatusBySlot.get(s.n);
+      return entry?.state === "ready";
+    });
+    if (!readyServers.length) return;
+    if (readyServers.some((s) => s.n === selectedServer)) return;
+    setSelectedServer(readyServers[0].n);
+  }, [serverOptions, selectedServer, strictR2StatusBySlot]);
 
   useEffect(() => {
     setServerHealth(() => {
@@ -8506,7 +8517,7 @@ export default function WatchPage() {
               </button>
             );
           })}
-          {R2_STRICT_MODE ? (
+          {R2_STRICT_MODE && diagQueryEnabled ? (
             <button
               type="button"
               onClick={() => setDiagVisible((prev) => !prev)}
