@@ -31,6 +31,7 @@ export type RepackIngestResolution = {
     playlistStatus: number;
     segmentStatus: number;
     contentType: string;
+    referrerUrl?: string | null;
   } | null;
 };
 
@@ -1302,7 +1303,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
             rejectReason: "",
             resolverState: "ok",
           },
-          probeEvidence: probe.evidence,
+          probeEvidence: probe.evidence ? { ...probe.evidence, referrerUrl } : null,
         };
       }
       finalProbe = pickBetterProbeFailure(finalProbe, probe);

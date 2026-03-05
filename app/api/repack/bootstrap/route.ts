@@ -234,9 +234,15 @@ function extractEmbedProxyReferrer(rawUrl: string) {
   }
 }
 
-function buildIngestHeaders(input: { sourceUrl: string; ingestUrl: string; probePlaylistUrl?: string | null }) {
+function buildIngestHeaders(input: {
+  sourceUrl: string;
+  ingestUrl: string;
+  probePlaylistUrl?: string | null;
+  probeReferrerUrl?: string | null;
+}) {
   const referer =
     [
+      isValidHttpUrl(String(input.probeReferrerUrl || "").trim()) ? String(input.probeReferrerUrl || "").trim() : "",
       isValidHttpUrl(String(input.probePlaylistUrl || "").trim()) ? String(input.probePlaylistUrl || "").trim() : "",
       extractEmbedProxyReferrer(input.ingestUrl),
       isValidHttpUrl(input.sourceUrl) ? input.sourceUrl : "",
@@ -461,6 +467,7 @@ export async function POST(req: Request) {
         sourceUrl,
         ingestUrl: ingest.ingestUrl,
         probePlaylistUrl: ingest.probeEvidence?.playlistUrl || null,
+        probeReferrerUrl: ingest.probeEvidence?.referrerUrl || null,
       }),
       probeEvidence: ingest.probeEvidence,
       matchStatus: String(row.status_key || ""),
