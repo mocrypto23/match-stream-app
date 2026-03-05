@@ -592,9 +592,10 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
 
     if (combined.includes(".m3u8")) score += 220;
     if (pathname.includes("/api/embed-proxy")) {
-      score -= 20;
+      score += 40;
       const target = safeDecodeURIComponent(String(u.searchParams.get("url") || "").trim());
       if (isValidHttpUrl(target)) {
+        if (looksLikeHlsManifestUrl(target)) score += 120;
         try {
           const tu = new URL(target);
           const tPath = String(tu.pathname || "").toLowerCase();
