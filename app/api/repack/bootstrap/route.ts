@@ -405,8 +405,8 @@ export async function POST(req: Request) {
       sourceUrl,
       requestOrigin: resolverRequestOrigin,
       referrerUrl: sourceUrl,
-      timeoutMs: Number.parseInt(String(process.env.REPACK_RESOLVE_TIMEOUT_MS || "8000"), 10) || 8000,
-      maxCandidates: Number.parseInt(String(process.env.REPACK_RESOLVE_MAX_CANDIDATES || "16"), 10) || 16,
+      timeoutMs: Math.max(8000, Number.parseInt(String(process.env.REPACK_RESOLVE_TIMEOUT_MS || "10000"), 10) || 10000),
+      maxCandidates: Math.max(48, Number.parseInt(String(process.env.REPACK_RESOLVE_MAX_CANDIDATES || "16"), 10) || 16),
     });
 
     if (!ingest.ingestUrl || !isValidHttpUrl(ingest.ingestUrl)) {

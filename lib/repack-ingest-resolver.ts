@@ -515,12 +515,14 @@ function normalizeDomainPrefix(rawDomain: string, baseUrl: string) {
 function extractPlayerv2Bootstrap(html: string) {
   const text = String(html || "");
   const match = text.match(/window\.tabsConfig\s*=\s*(\{[\s\S]*?\})\s*;/i);
-  if (!match?.[1]) return null as { paths: string[]; activeDomains: string[] } | null;
+  if (!match?.[1]) return null as { paths: string[]; activeDomains: string[]; randomCandidates: string[] } | null;
   try {
     const raw = String(match[1] || "").replace(/\\\//g, "/");
     const parsed = JSON.parse(raw) as {
       tabs?: Array<{ path?: string; mobile_path?: string }>;
       activeDomains?: string[];
+      random_links?: string[];
+      random_pools?: Record<string, string[]>;
     };
     const paths = new Set<string>();
     const tabs = Array.isArray(parsed?.tabs) ? parsed.tabs : [];
@@ -532,10 +534,25 @@ function extractPlayerv2Bootstrap(html: string) {
     const activeDomains = Array.isArray(parsed?.activeDomains)
       ? parsed.activeDomains.map((item) => String(item || "").trim()).filter(Boolean)
       : [];
+    const randomCandidates = new Set<string>();
+    const randomLinks = Array.isArray(parsed?.random_links) ? parsed.random_links : [];
+    for (const item of randomLinks) {
+      const value = String(item || "").trim();
+      if (value) randomCandidates.add(value);
+    }
+    const randomPools = parsed?.random_pools && typeof parsed.random_pools === "object" ? parsed.random_pools : {};
+    for (const entries of Object.values(randomPools)) {
+      if (!Array.isArray(entries)) continue;
+      for (const item of entries) {
+        const value = String(item || "").trim();
+        if (value) randomCandidates.add(value);
+      }
+    }
     if (!paths.size) return null;
     return {
       paths: Array.from(paths),
       activeDomains,
+      randomCandidates: Array.from(randomCandidates),
     };
   } catch {
     return null;
@@ -592,6 +609,12 @@ async function buildPlayerv2Candidates(sourceUrl: string, html: string, timeoutM
   const bootstrap = extractPlayerv2Bootstrap(html);
   if (!bootstrap) return [] as string[];
   const out: string[] = [];
+
+  for (const candidate of bootstrap.randomCandidates.slice(0, 20)) {
+    const normalized = normalizeCandidate(candidate, sourceUrl);
+    if (!normalized) continue;
+    out.push(normalized);
+  }
 
   let tokenEndpoint = "";
   try {
