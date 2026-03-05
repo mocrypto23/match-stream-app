@@ -535,6 +535,19 @@ function buildInternalEmbedProxyUrl(input: { sourceUrl: string; requestOrigin: s
   return `${String(input.requestOrigin || "").replace(/\/+$/, "")}/api/embed-proxy?${params.toString()}`;
 }
 
+function isLikelyAlbaLandingUrl(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    const u = new URL(rawUrl);
+    const pathname = String(u.pathname || "").toLowerCase();
+    if (!pathname.includes("/albaplayer/")) return false;
+    if (pathname.includes(".m3u8")) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function classifyMode(rawUrl: string): RepackIngestMode {
   if (!isValidHttpUrl(rawUrl)) return "none";
   try {
@@ -1014,6 +1027,25 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
   for (const nested of extractCandidatesFromQueryParams(sourceUrl)) {
     const normalized = normalizeCandidate(nested, sourceUrl);
     if (normalized) pushCandidateUnique(candidateSeed, seen, normalized);
+  }
+
+  const albaLandingCandidates = candidateSeed.filter((candidate) => isLikelyAlbaLandingUrl(candidate)).slice(0, 5);
+  for (const albaLandingUrl of albaLandingCandidates) {
+    const albaFetched = await fetchWithTimeout(albaLandingUrl, Math.min(timeoutMs, 2600), {
+      referer: sourceFetch.finalUrl || sourceUrl,
+    });
+    if (!albaFetched.ok || !isLikelyHtmlResponse(albaFetched.contentType, albaFetched.body)) continue;
+    const albaReferrer = albaFetched.finalUrl || albaLandingUrl;
+    for (const derived of extractCandidatesFromText(albaFetched.body, albaReferrer)) {
+      pushCandidateUnique(candidateSeed, seen, derived);
+      if (!requestOrigin || !isValidHttpUrl(derived)) continue;
+      const proxied = buildInternalEmbedProxyUrl({
+        sourceUrl: derived,
+        requestOrigin,
+        referrerUrl: albaReferrer,
+      });
+      if (proxied) pushCandidateUnique(candidateSeed, seen, proxied);
+    }
   }
 
   for (const candidate of [...candidateSeed]) {
