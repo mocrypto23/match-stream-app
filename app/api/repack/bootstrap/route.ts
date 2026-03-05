@@ -219,8 +219,28 @@ async function postSeedToAgent(payload: {
   }
 }
 
-function buildIngestHeaders(sourceUrl: string) {
-  const referer = isValidHttpUrl(sourceUrl) ? sourceUrl : "";
+function extractEmbedProxyReferrer(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return "";
+  try {
+    const u = new URL(rawUrl);
+    if (!String(u.pathname || "").toLowerCase().includes("/api/embed-proxy")) return "";
+    const ref = String(u.searchParams.get("ref") || "").trim();
+    if (isValidHttpUrl(ref)) return ref;
+    const target = String(u.searchParams.get("url") || "").trim();
+    if (isValidHttpUrl(target)) return target;
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+function buildIngestHeaders(input: { sourceUrl: string; ingestUrl: string; probePlaylistUrl?: string | null }) {
+  const referer =
+    [
+      isValidHttpUrl(String(input.probePlaylistUrl || "").trim()) ? String(input.probePlaylistUrl || "").trim() : "",
+      extractEmbedProxyReferrer(input.ingestUrl),
+      isValidHttpUrl(input.sourceUrl) ? input.sourceUrl : "",
+    ].find(Boolean) || "";
   const origin = (() => {
     if (!referer) return "";
     try {
@@ -437,7 +457,11 @@ export async function POST(req: Request) {
       ingestUrl: ingest.ingestUrl,
       ingestMode: ingest.mode,
       ingestVerified: ingest.resolver.resolverState === "ok",
-      ingestHeaders: buildIngestHeaders(sourceUrl),
+      ingestHeaders: buildIngestHeaders({
+        sourceUrl,
+        ingestUrl: ingest.ingestUrl,
+        probePlaylistUrl: ingest.probeEvidence?.playlistUrl || null,
+      }),
       probeEvidence: ingest.probeEvidence,
       matchStatus: String(row.status_key || ""),
       matchStart: String(row.match_start || ""),
