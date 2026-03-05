@@ -328,6 +328,7 @@ class RepackJob {
     this.totalSegmentBytes = 0;
     this.lastUploadLatencyMs = 0;
     this.lastPlaylistLatencyMs = 0;
+    this.lastPublishedPlaylistFingerprint = "";
     this.remoteHistory = [];
     this.lastStaleRestartAt = 0;
     this.lastLocalSegmentFingerprint = "";
@@ -392,6 +393,7 @@ class RepackJob {
     this.uploadedSegments = new Map();
     this.lastPublishAt = 0;
     this.lastPlaylistMediaSeq = 0;
+    this.lastPublishedPlaylistFingerprint = "";
     this.pendingDiscontinuity = false;
     try {
       const entries = fs.readdirSync(this.workDir, { withFileTypes: true });
@@ -817,7 +819,20 @@ class RepackJob {
       if (!this.uploadedSegments.has(segmentName)) return;
     }
 
-    await this.uploadPlaylist(lines);
+    const publishFingerprint = segmentLines
+      .map((segmentName) => this.uploadedSegments.get(segmentName)?.remoteName || segmentName)
+      .join("|");
+    const publishNow = Date.now();
+    const sinceLastPublishMs = this.lastPublishAt ? Math.max(0, publishNow - this.lastPublishAt) : Number.MAX_SAFE_INTEGER;
+    const shouldPublishPlaylist =
+      this.pendingDiscontinuity ||
+      publishFingerprint !== this.lastPublishedPlaylistFingerprint ||
+      sinceLastPublishMs >= this.manager.config.playlistPublishMinIntervalMs;
+
+    if (shouldPublishPlaylist) {
+      await this.uploadPlaylist(lines);
+      this.lastPublishedPlaylistFingerprint = publishFingerprint;
+    }
     await this.cleanupLocal(segmentLines);
     await this.cleanupRemote(segmentLines);
   }
@@ -1378,6 +1393,7 @@ function loadConfig() {
     ffmpegBin: String(process.env.REPACK_FFMPEG_BIN || "ffmpeg").trim(),
     workRoot: String(process.env.REPACK_WORK_ROOT || "/tmp/tf-repack").trim(),
     uploadPollMs: toInt(process.env.REPACK_UPLOAD_POLL_MS, 1200, 400),
+    playlistPublishMinIntervalMs: toInt(process.env.REPACK_PLAYLIST_PUBLISH_MIN_INTERVAL_MS, 1900, 500),
     // Keep seeded jobs alive long enough for full match windows unless explicitly overridden by env.
     idleStopMs: toInt(process.env.REPACK_IDLE_STOP_MS, 8 * 60 * 60 * 1000, 10_000),
     stalePublishMs: toInt(process.env.REPACK_STALE_PUBLISH_MS, 8_000, 3000),
