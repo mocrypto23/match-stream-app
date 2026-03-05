@@ -69,6 +69,51 @@ function toInt(raw: unknown) {
   return Number.isFinite(value) ? value : NaN;
 }
 
+async function maybeHydrateSlotSourceUrl(slotServer: SlotServerId, rawSourceUrl: string) {
+  const sourceUrl = String(rawSourceUrl || "").trim();
+  if (!sourceUrl || !isValidHttpUrl(sourceUrl)) return sourceUrl;
+  if (slotServer !== 1) return sourceUrl;
+
+  let isBeinMatchPage = false;
+  try {
+    const u = new URL(sourceUrl);
+    const host = u.hostname.toLowerCase();
+    const pathname = String(u.pathname || "").toLowerCase();
+    isBeinMatchPage = (host === "bein-live.com" || host.endsWith(".bein-live.com")) && pathname.includes("/matches/");
+  } catch {}
+  if (!isBeinMatchPage) return sourceUrl;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 2800);
+  try {
+    const response = await fetch(sourceUrl, {
+      method: "GET",
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "user-agent": DEFAULT_INGEST_USER_AGENT,
+        accept: "text/html,application/xhtml+xml,*/*",
+      },
+    });
+    if (!response.ok) return sourceUrl;
+    const html = await response.text();
+    const normalized = String(html || "").replace(/\\u002f/gi, "/").replace(/\\\//g, "/").replace(/&amp;/gi, "&");
+    const matches = normalized.match(/https?:\/\/[^\s"'<>]+\/albaplayer\/[^\s"'<>]+/gi) || [];
+    for (const candidateRaw of matches) {
+      const candidate = String(candidateRaw || "").trim();
+      if (!candidate || !isValidHttpUrl(candidate)) continue;
+      if (!isAllowedSourceForSlotServer(slotServer, candidate)) continue;
+      return candidate;
+    }
+    return sourceUrl;
+  } catch {
+    return sourceUrl;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 function localAgentUrl(pathname: string) {
   const port = Number.parseInt(String(process.env.REPACK_AGENT_PORT || "3400"), 10) || 3400;
   const bind = String(process.env.REPACK_AGENT_BIND || "127.0.0.1").trim() || "127.0.0.1";
@@ -253,7 +298,8 @@ export async function POST(req: Request) {
 
   for (const uiServer of uiServers) {
     const slotServer = getSlotServerIdForUiServer(uiServer);
-    const sourceUrl = String(getSlotSourceUrlFromRow(row, slotServer) || "").trim();
+    const rawSourceUrl = String(getSlotSourceUrlFromRow(row, slotServer) || "").trim();
+    const sourceUrl = await maybeHydrateSlotSourceUrl(slotServer, rawSourceUrl);
 
     if (mode !== "r2_strict") {
       pushResult({
