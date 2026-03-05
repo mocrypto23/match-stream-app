@@ -93,10 +93,12 @@ const STALL_FREEZE_MS = 18000;
 const P2P_STALL_FREEZE_MS = 30000;
 const REPACK_STALE_PLAYLIST_MAX_IDLE_MS = 12_000;
 const REPACK_STALE_PROGRESS_GUARD_MS = 9_000;
-const REPACK_HLS_MAX_BUFFER_LENGTH = 12;
-const REPACK_HLS_MAX_MAX_BUFFER_LENGTH = 20;
-const REPACK_HLS_LIVE_SYNC_COUNT = 2;
-const REPACK_HLS_LIVE_MAX_LATENCY_COUNT = 5;
+const REPACK_HLS_MAX_BUFFER_LENGTH = 18;
+const REPACK_HLS_MAX_MAX_BUFFER_LENGTH = 30;
+const REPACK_HLS_LIVE_SYNC_COUNT = 3;
+const REPACK_HLS_LIVE_MAX_LATENCY_COUNT = 9;
+const REPACK_HLS_WAITING_RECOVERY_MIN_STALL_MS = 5000;
+const REPACK_HLS_WAITING_RECOVERY_MAX_BUFFER_AHEAD_S = 0.8;
 const P2P_WAITING_RECOVERY_MIN_STALL_MS = 10000;
 const P2P_WAITING_RECOVERY_MAX_BUFFER_AHEAD_S = 0.6;
 const P2P_RECOVERY_THROTTLE_MS = 8000;
@@ -7614,7 +7616,9 @@ export default function WatchPage() {
     const requestSoftRecovery = (reason = "generic") => {
       if (userPausedRef.current) return;
       const now = Date.now();
-      const recoveryThrottleMs = isP2PPlayback ? P2P_RECOVERY_THROTTLE_MS : 3000;
+      const recoveryThrottleMs = isP2PPlayback
+        ? P2P_RECOVERY_THROTTLE_MS
+        : (isRepackPlaylistUrl(selectedHlsUrl) ? 5000 : 3000);
       if (now - lastRecoveryAttemptAt < recoveryThrottleMs) return;
       const currentTime = Number(video.currentTime);
       if (
@@ -7743,12 +7747,17 @@ export default function WatchPage() {
       if (cancel) return;
       const server5RecentProgress = selectedServer === 5 && Date.now() - lastProgressAtRef.current < 2500;
       if (!server5RecentProgress && video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) showPlayerLoadingDelayed();
-      if (!isP2PPlayback) {
-        requestSoftRecovery("waiting");
-        return;
-      }
       const stalledFor = Date.now() - lastProgressAtRef.current;
       const bufferedAhead = getBufferedAheadSeconds();
+      if (!isP2PPlayback) {
+        if (
+          stalledFor >= REPACK_HLS_WAITING_RECOVERY_MIN_STALL_MS &&
+          bufferedAhead <= REPACK_HLS_WAITING_RECOVERY_MAX_BUFFER_AHEAD_S
+        ) {
+          requestSoftRecovery("waiting");
+        }
+        return;
+      }
       if (
         stalledFor >= P2P_WAITING_RECOVERY_MIN_STALL_MS &&
         video.readyState <= HTMLMediaElement.HAVE_CURRENT_DATA &&
@@ -7849,7 +7858,7 @@ export default function WatchPage() {
             }
           });
         },
-        lowLatencyMode: isRepackPlayback,
+        lowLatencyMode: false,
         capLevelToPlayerSize: false,
         backBufferLength: isServer5Playback ? SERVER5_HLS_BACK_BUFFER_LENGTH : 20,
         maxBufferLength: isServer5Playback
@@ -7867,7 +7876,7 @@ export default function WatchPage() {
           : (isRepackPlayback
             ? REPACK_HLS_LIVE_MAX_LATENCY_COUNT
             : (isP2PPlayback ? p2pTuning.liveMaxLatencyDurationCount : 6)),
-        maxLiveSyncPlaybackRate: isRepackPlayback ? 1.35 : 1,
+        maxLiveSyncPlaybackRate: 1,
         startPosition: -1,
         startFragPrefetch: true,
         maxBufferHole: 1.2,
