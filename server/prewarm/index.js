@@ -260,6 +260,26 @@ async function runCycle(config) {
   }
 
   const responses = await mapLimit(targets, config.concurrency, async (item) => {
+    const statusResponse = await fetchJson(
+      `${config.origin}/api/repack/status?matchId=${encodeURIComponent(String(item.matchId))}`,
+      config.httpTimeoutMs
+    );
+    const statusServers = Array.isArray(statusResponse?.body?.r2Status?.servers) ? statusResponse.body.r2Status.servers : [];
+    const pendingUiServers = item.uiServers.filter((uiServer) => {
+      const entry = statusServers.find((server) => Number(server?.uiServer) === Number(uiServer));
+      return entry?.state !== "ready";
+    });
+    if (!pendingUiServers.length) {
+      return {
+        ok: true,
+        status: 200,
+        body: {
+          skipped: true,
+          reason: "already-ready",
+          results: [],
+        },
+      };
+    }
     return fetchJson(`${config.origin}/api/repack/bootstrap`, config.httpTimeoutMs, {
       method: "POST",
       headers: {
@@ -267,16 +287,21 @@ async function runCycle(config) {
       },
       body: JSON.stringify({
         matchId: item.matchId,
-        uiServers: item.uiServers,
+        uiServers: pendingUiServers,
       }),
     });
   });
 
   let accepted = 0;
   let rejected = 0;
+  let skippedReady = 0;
   const rejectReasons = {};
 
   for (const response of responses) {
+    if (response?.body?.skipped && response?.body?.reason === "already-ready") {
+      skippedReady += 1;
+      continue;
+    }
     const results = Array.isArray(response?.body?.results) ? response.body.results : [];
     for (const item of results) {
       if (item?.accepted) {
@@ -294,6 +319,7 @@ async function runCycle(config) {
     targets: targets.length,
     accepted,
     rejected,
+    skippedReady,
     rejectReasons,
     durationMs: Date.now() - startedAt,
   });

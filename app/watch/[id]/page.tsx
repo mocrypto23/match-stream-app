@@ -11,7 +11,7 @@ import {
 } from "@/lib/repack-flags";
 import type { MatchR2Status, R2StatusServerEntry } from "@/lib/r2-status-types";
 import { getServerCapability } from "@/lib/server-capabilities";
-import { getSlotServerIdForUiServer, getUiServerIdForSlotServer, type UiServerId } from "@/lib/server-source-policy";
+import { getSlotServerIdForUiServer, type UiServerId } from "@/lib/server-source-policy";
 import { getClientStreamMode, isR2StrictMode, type StreamMode } from "@/lib/stream-mode";
 import { computeMatchWindowState, getMatchWindowConfig, parseMatchStartMs } from "@/lib/match-window";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
@@ -124,6 +124,7 @@ const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
 const STRICT_R2_BACKOFF_MS = [2000, 4000, 8000] as const;
 const STRICT_R2_BREAKER_OPEN_MS = 25_000;
 const STRICT_R2_READY_URL_GRACE_MS = 45_000;
+const STRICT_BOOTSTRAP_RECENT_WINDOW_MS = 20_000;
 const NETWORK_FATAL_WINDOW_MS = 12_000;
 const RESOLVE_COOLDOWN_MS = 1500;
 const REPACK_SEED_DEDUPE_WINDOW_MS = 12_000;
@@ -6403,6 +6404,20 @@ export default function WatchPage() {
     async (uiServer: UiServerId, signal: AbortSignal) => {
       if (!idNum) return;
       const slotServer = getSlotServerIdForUiServer(uiServer);
+      const statusEntry = strictR2StatusBySlot.get(slotServer);
+      const playlistUrl = String(statusEntry?.playlistUrl || "").trim();
+      const statusUpdatedAtMs = Number.parseInt(String(new Date(statusEntry?.updatedAt || "").getTime()), 10);
+      const hasRecentStatus = Number.isFinite(statusUpdatedAtMs) && Date.now() - statusUpdatedAtMs < STRICT_BOOTSTRAP_RECENT_WINDOW_MS;
+      if (statusEntry?.state === "ready" && isValidHttpUrl(playlistUrl)) {
+        markStrictBootstrapPending([slotServer], false);
+        markStrictBootstrapAttempted([slotServer]);
+        return;
+      }
+      if (statusEntry?.state === "warming" && hasRecentStatus) {
+        markStrictBootstrapPending([slotServer], false);
+        markStrictBootstrapAttempted([slotServer]);
+        return;
+      }
       if (!strictSourcePresentBySlot[slotServer]) {
         markStrictBootstrapPending([slotServer], false);
         markStrictBootstrapAttempted([slotServer]);
@@ -6437,7 +6452,7 @@ export default function WatchPage() {
         }
       }
     },
-    [idNum, markStrictBootstrapAttempted, markStrictBootstrapPending, strictSourcePresentBySlot]
+    [idNum, markStrictBootstrapAttempted, markStrictBootstrapPending, strictR2StatusBySlot, strictSourcePresentBySlot]
   );
 
   useEffect(() => {
@@ -6445,17 +6460,14 @@ export default function WatchPage() {
     if (!idNum || !match?.id) return;
     if (shouldBlockStream) return;
     const controller = new AbortController();
-    const preferredUiServer = getUiServerIdForSlotServer(selectedServer as 1 | 2 | 3 | 4);
-    const orderedUiServers = ([preferredUiServer, 1, 2, 3, 4] as UiServerId[]).filter(
-      (value, idx, arr) => arr.indexOf(value) === idx
-    );
+    const orderedUiServers = [1, 2, 3, 4] as UiServerId[];
     for (const uiServer of orderedUiServers) {
       void bootstrapStrictUiServer(uiServer, controller.signal);
     }
     return () => {
       controller.abort();
     };
-  }, [bootstrapStrictUiServer, idNum, match?.id, selectedServer, shouldBlockStream]);
+  }, [bootstrapStrictUiServer, idNum, match?.id, shouldBlockStream]);
 
   useEffect(() => {
     if (!R2_STRICT_MODE) return;
