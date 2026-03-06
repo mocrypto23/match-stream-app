@@ -862,7 +862,7 @@ async function probeSegmentUrl(segmentUrl: string, timeoutMs: number, headers?: 
       },
     });
     if (head.ok) return { ok: true, status: head.status };
-    if (head.status !== 405) return { ok: false, status: head.status };
+    if (![401, 403, 405, 406].includes(head.status)) return { ok: false, status: head.status };
 
     const getResp = await fetch(segmentUrl, {
       method: "GET",
@@ -882,6 +882,10 @@ async function probeSegmentUrl(segmentUrl: string, timeoutMs: number, headers?: 
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+function shouldRetryProtectedCandidateViaProxy(reason: string) {
+  return /^(?:playlist|segment|variant)-http-(?:0|401|403|406)$/i.test(String(reason || "").trim());
 }
 
 async function probeCandidate(input: {
@@ -1371,6 +1375,30 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     if (!finalProbe) continue;
     lastProbeReason = finalProbe.reason || "probe-failed";
     lastEvidence = finalProbe.evidence;
+    if (
+      requestOrigin &&
+      item.mode !== "backend_proxy_ingest" &&
+      !isEmbedProxyCandidateUrl(item.candidateUrl) &&
+      shouldRetryProtectedCandidateViaProxy(lastProbeReason)
+    ) {
+      const proxiedCandidate = buildInternalEmbedProxyUrl({
+        sourceUrl: item.candidateUrl,
+        requestOrigin,
+        referrerUrl: finalProbe.evidence?.playlistUrl || item.referrerUrl || sourceFetch.finalUrl || sourceUrl,
+      });
+      if (proxiedCandidate) {
+        const proxyKey = canonicalizeUrl(proxiedCandidate) || proxiedCandidate.toLowerCase();
+        if (proxyKey && !seenProbeKeys.has(proxyKey) && !seen.has(proxyKey)) {
+          seen.add(proxyKey);
+          pending.unshift({
+            candidateUrl: proxiedCandidate,
+            score: item.score + 500,
+            mode: "backend_proxy_ingest",
+            referrerUrl: normalizeHttpUrl(finalProbe.evidence?.playlistUrl || item.referrerUrl || sourceUrl) || sourceUrl,
+          });
+        }
+      }
+    }
     if (!aggregatedExtraCandidates.length) continue;
 
     const immediateManifestExtras: RankedCandidate[] = [];

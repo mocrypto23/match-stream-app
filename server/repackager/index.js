@@ -393,6 +393,22 @@ class RepackJob {
   resetEncoderRunState({ hardReset = false } = {}) {
     this.lastLocalSegmentFingerprint = "";
     this.lastLocalSegmentChangedAt = 0;
+    try {
+      const entries = fs.readdirSync(this.workDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const name = String(entry.name || "").toLowerCase();
+        const shouldDelete =
+          name === "index.m3u8" ||
+          name === "index.m3u8.tmp" ||
+          name.endsWith(".ts") ||
+          /^seg-\d+\.ts\.tmp$/i.test(name);
+        if (!shouldDelete) continue;
+        try {
+          fs.unlinkSync(path.join(this.workDir, entry.name));
+        } catch {}
+      }
+    } catch {}
     if (!hardReset) return;
     // Hard reset is reserved for first boot or source switch only.
     // Normal restarts preserve state to avoid playback gaps.
@@ -401,18 +417,6 @@ class RepackJob {
     this.lastPlaylistMediaSeq = 0;
     this.lastPublishedPlaylistFingerprint = "";
     this.pendingDiscontinuity = false;
-    try {
-      const entries = fs.readdirSync(this.workDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (!entry.isFile()) continue;
-        const name = String(entry.name || "").toLowerCase();
-        if (name === "index.m3u8" || name.endsWith(".ts")) {
-          try {
-            fs.unlinkSync(path.join(this.workDir, entry.name));
-          } catch {}
-        }
-      }
-    } catch {}
   }
 
   spawnFfmpeg() {
@@ -483,7 +487,7 @@ class RepackJob {
       "-hls_list_size",
       String(this.profile.playlistSize),
       "-hls_flags",
-      "delete_segments+append_list+omit_endlist+program_date_time+temp_file",
+      "delete_segments+omit_endlist+program_date_time+temp_file",
       "-hls_segment_filename",
       segmentPattern,
       this.playlistPath
