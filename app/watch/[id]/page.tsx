@@ -11,7 +11,7 @@ import {
 } from "@/lib/repack-flags";
 import type { MatchR2Status, R2StatusServerEntry } from "@/lib/r2-status-types";
 import { getServerCapability } from "@/lib/server-capabilities";
-import { getSlotServerIdForUiServer, type UiServerId } from "@/lib/server-source-policy";
+import { getSlotServerIdForUiServer, getUiServerIdForSlotServer, type UiServerId } from "@/lib/server-source-policy";
 import { getClientStreamMode, isR2StrictMode, type StreamMode } from "@/lib/stream-mode";
 import { computeMatchWindowState, getMatchWindowConfig, parseMatchStartMs } from "@/lib/match-window";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
@@ -5293,11 +5293,21 @@ function buildR2StatusSignature(status: MatchR2Status | null | undefined) {
   return `${status.mode}|${servers}`;
 }
 
-function getStrictServerSubtitle(entry: R2StatusServerEntry | undefined, health: ServerHealthState, hasUrl: boolean) {
+function getStrictServerSubtitle(
+  entry: R2StatusServerEntry | undefined,
+  health: ServerHealthState,
+  hasUrl: boolean,
+  hasSource: boolean,
+  bootstrapPending: boolean,
+  bootstrapAttempted: boolean
+) {
   if (entry?.state === "ready") return "مباشر";
+  if (!hasSource) return "لا يوجد بث";
+  if (!bootstrapAttempted || bootstrapPending) return "جاري التحضير";
   if (entry?.state === "warming" || health === "pending") return "جاري التحضير";
+  if (entry?.resolverState === "missing-source" || entry?.resolverState === "no-candidate") return "لا يوجد بث";
   if (entry?.state === "down" || health === "down" || !hasUrl) return "لا يوجد بث";
-  return "لا يوجد بث";
+  return "جاري التحضير";
 }
 
 function mergeR2StatusIfChanged(prev: MatchR2Status | null, next: MatchR2Status | null) {
@@ -5333,6 +5343,8 @@ export default function WatchPage() {
   const [loading, setLoading] = useState(true);
   const [errMsg, setErrMsg] = useState<string | null>(null);
   const [hlsInstance, setHlsInstance] = useState<Hls | null>(null);
+  const [strictBootstrapPendingBySlot, setStrictBootstrapPendingBySlot] = useState<Record<number, boolean>>({});
+  const [strictBootstrapAttemptedBySlot, setStrictBootstrapAttemptedBySlot] = useState<Record<number, boolean>>({});
 
   const [selectedServer, setSelectedServer] = useState(4);
   const [runtimeServer5Url, setRuntimeServer5Url] = useState<string | null>(null);
@@ -6103,6 +6115,19 @@ export default function WatchPage() {
     return out;
   }, [r2Status]);
 
+  const strictSourcePresentBySlot = useMemo<Record<number, boolean>>(() => {
+    const slot1 = isValidHttpUrl(String(match?.stream_url || "").trim());
+    const slot2 = isValidHttpUrl(String(match?.stream_url_2 || "").trim());
+    const slot3 = isValidHttpUrl(String(match?.stream_url_3 || "").trim());
+    const slot4 = isValidHttpUrl(String(match?.stream_url_4 || "").trim());
+    return {
+      1: slot1,
+      2: slot2,
+      3: slot3,
+      4: slot4,
+    };
+  }, [match?.stream_url, match?.stream_url_2, match?.stream_url_3, match?.stream_url_4]);
+
   const serverOptions = useMemo<ServerOption[]>(() => {
     void repackBypassVersion;
     if (R2_STRICT_MODE) {
@@ -6349,37 +6374,88 @@ export default function WatchPage() {
   const shouldBlockStream = LIVE_ONLY_PLAYBACK ? !matchWindow.inWindow : false;
 
   useEffect(() => {
-    if (!R2_STRICT_MODE) return;
-    if (!idNum || !match?.id) return;
-    if (shouldBlockStream) return;
-    let cancel = false;
-    (async () => {
+    setStrictBootstrapPendingBySlot({});
+    setStrictBootstrapAttemptedBySlot({});
+  }, [idNum]);
+
+  const markStrictBootstrapPending = useCallback((slotServers: number[], pending: boolean) => {
+    setStrictBootstrapPendingBySlot((prev) => {
+      const next = { ...prev };
+      for (const slotServer of slotServers) {
+        if (pending) next[slotServer] = true;
+        else delete next[slotServer];
+      }
+      return next;
+    });
+  }, []);
+
+  const markStrictBootstrapAttempted = useCallback((slotServers: number[]) => {
+    setStrictBootstrapAttemptedBySlot((prev) => {
+      const next = { ...prev };
+      for (const slotServer of slotServers) {
+        next[slotServer] = true;
+      }
+      return next;
+    });
+  }, []);
+
+  const bootstrapStrictUiServer = useCallback(
+    async (uiServer: UiServerId, signal: AbortSignal) => {
+      if (!idNum) return;
+      const slotServer = getSlotServerIdForUiServer(uiServer);
+      if (!strictSourcePresentBySlot[slotServer]) {
+        markStrictBootstrapPending([slotServer], false);
+        markStrictBootstrapAttempted([slotServer]);
+        return;
+      }
+      markStrictBootstrapPending([slotServer], true);
       try {
         const response = await fetch("/api/repack/bootstrap", {
           method: "POST",
           cache: "no-store",
+          signal,
           headers: {
             "content-type": "application/json",
           },
           body: JSON.stringify({
             matchId: idNum,
-            uiServers: [1, 2, 3, 4],
+            uiServers: [uiServer],
           }),
         });
         const payload = await response.json().catch(() => null);
-        if (cancel) return;
+        if (signal.aborted) return;
         const nextStatus = payload?.r2Status as MatchR2Status | null | undefined;
         if (nextStatus?.servers?.length) {
           setR2Status((prev) => mergeR2StatusIfChanged(prev, nextStatus));
         }
       } catch {
         // Keep current status; polling endpoint will retry.
+      } finally {
+        if (!signal.aborted) {
+          markStrictBootstrapPending([slotServer], false);
+          markStrictBootstrapAttempted([slotServer]);
+        }
       }
-    })();
+    },
+    [idNum, markStrictBootstrapAttempted, markStrictBootstrapPending, strictSourcePresentBySlot]
+  );
+
+  useEffect(() => {
+    if (!R2_STRICT_MODE) return;
+    if (!idNum || !match?.id) return;
+    if (shouldBlockStream) return;
+    const controller = new AbortController();
+    const preferredUiServer = getUiServerIdForSlotServer(selectedServer as 1 | 2 | 3 | 4);
+    const orderedUiServers = ([preferredUiServer, 1, 2, 3, 4] as UiServerId[]).filter(
+      (value, idx, arr) => arr.indexOf(value) === idx
+    );
+    for (const uiServer of orderedUiServers) {
+      void bootstrapStrictUiServer(uiServer, controller.signal);
+    }
     return () => {
-      cancel = true;
+      controller.abort();
     };
-  }, [idNum, match?.id, shouldBlockStream]);
+  }, [bootstrapStrictUiServer, idNum, match?.id, selectedServer, shouldBlockStream]);
 
   useEffect(() => {
     if (!R2_STRICT_MODE) return;
@@ -6404,14 +6480,15 @@ export default function WatchPage() {
       }
     };
     void refresh();
+    const hasPendingBootstrap = Object.keys(strictBootstrapPendingBySlot).length > 0;
     const timerId = window.setInterval(() => {
       void refresh();
-    }, 15000);
+    }, hasPendingBootstrap ? 2500 : 15000);
     return () => {
       cancel = true;
       window.clearInterval(timerId);
     };
-  }, [idNum, match?.id]);
+  }, [idNum, match?.id, strictBootstrapPendingBySlot]);
 
   useEffect(() => {
     if (!selectedOption) return;
@@ -7958,8 +8035,9 @@ export default function WatchPage() {
           if (cancel) return;
           const defaultLevel = pickDefaultHlsLevel(instance.levels || []);
           if (defaultLevel >= 0) {
-            // Hls.js quality switch API is implemented via mutable property assignment.
-            instance.currentLevel = defaultLevel;
+            // Start around 480p for faster first paint while keeping ABR on Auto.
+            instance.startLevel = defaultLevel;
+            instance.nextAutoLevel = defaultLevel;
           }
           markProgress();
           resetRecoveryState();
@@ -8512,8 +8590,11 @@ export default function WatchPage() {
             const selected = selectedServer === s.n;
             const strictEntry = R2_STRICT_MODE ? strictR2StatusBySlot.get(s.n) : undefined;
             const canSelect = R2_STRICT_MODE ? strictEntry?.state === "ready" : ok;
+            const slotHasSource = !!strictSourcePresentBySlot[s.n];
+            const bootstrapPending = !!strictBootstrapPendingBySlot[s.n];
+            const bootstrapAttempted = !!strictBootstrapAttemptedBySlot[s.n];
             const subtitle = R2_STRICT_MODE
-              ? getStrictServerSubtitle(strictEntry, health, ok)
+              ? getStrictServerSubtitle(strictEntry, health, ok, slotHasSource, bootstrapPending, bootstrapAttempted)
               : health === "pending"
                 ? "جاري التحضير"
                 : (!ok || health === "down" ? "لا يوجد بث" : null);

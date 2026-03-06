@@ -3,6 +3,15 @@ import { supabaseAdmin } from "../../_supabase";
 import { getRuntimeRepackFlags } from "@/lib/repack-flags";
 import { buildMatchR2Status } from "@/lib/r2-status";
 import { listServerCapabilities } from "@/lib/server-capabilities";
+import { computeMatchWindowState, getMatchWindowConfig, parseMatchStartMs } from "@/lib/match-window";
+import {
+  getSlotServerIdForUiServer,
+  getUiServerIdForSlotServer,
+  getSlotSourceUrlFromRow,
+  isValidHttpUrl as isAllowedBootstrapSourceUrl,
+  type SlotServerId,
+  type UiServerId,
+} from "@/lib/server-source-policy";
 import { getServerStreamMode } from "@/lib/stream-mode";
 
 export const runtime = "nodejs";
@@ -41,6 +50,8 @@ const SERVER5_REFRESH_CACHE_TTL_MS = 90_000;
 const SERVER5_REFRESH_PREMATCH_WINDOW_MS = 90 * 60 * 1000;
 const SERVER5_REFRESH_POSTMATCH_WINDOW_MS = 3 * 60 * 60 * 1000;
 const DUPLICATE_SIBLING_START_WINDOW_MS = 6 * 60 * 60 * 1000;
+const MATCH_BOOTSTRAP_PRIME_TTL_MS = 10_000;
+const MATCH_BOOTSTRAP_PRIME_TIMEOUT_MS = 1_200;
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 
@@ -57,6 +68,7 @@ type Server5RefreshCacheEntry = {
 };
 const streamResolveCache = new Map<string, StreamResolveEntry>();
 const server5RefreshCache = new Map<string, Server5RefreshCacheEntry>();
+const matchBootstrapPrimeCache = new Map<string, number>();
 
 const NON_STREAM_FILE_RE =
   /\.(?:css|js|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|eot|ico|json|map|xml|mp4|webm|ts|m4s|mpd)(?:[?#]|$)/i;
@@ -538,6 +550,81 @@ function setServer5RefreshCacheEntry(cacheKey: string, status: Server5RefreshSta
   trimServer5RefreshCache(now);
 }
 
+function trimMatchBootstrapPrimeCache(now = Date.now()) {
+  for (const [key, expiresAt] of matchBootstrapPrimeCache.entries()) {
+    if (expiresAt <= now) matchBootstrapPrimeCache.delete(key);
+  }
+}
+
+function getBootstrapPrimeUiServers(row: MatchApiRow) {
+  const slotServers: SlotServerId[] = [1, 2, 3, 4];
+  return slotServers
+    .filter((slotServer) => {
+      const sourceUrl = getSlotSourceUrlFromRow(row, slotServer);
+      return isAllowedBootstrapSourceUrl(sourceUrl);
+    })
+    .map((slotServer) => getUiServerIdForSlotServer(slotServer));
+}
+
+function queueBootstrapPrime(req: Request, matchId: number, uiServers: UiServerId[]) {
+  if (!Number.isFinite(matchId) || matchId <= 0) return false;
+  const safeUiServers = [...new Set(uiServers.filter((uiServer) => Number.isFinite(uiServer)))].sort((a, b) => a - b) as UiServerId[];
+  if (!safeUiServers.length) return false;
+
+  const now = Date.now();
+  trimMatchBootstrapPrimeCache(now);
+  const cacheKey = `${matchId}|${safeUiServers.join(",")}`;
+  const cachedUntil = matchBootstrapPrimeCache.get(cacheKey) || 0;
+  if (cachedUntil > now) return false;
+  matchBootstrapPrimeCache.set(cacheKey, now + MATCH_BOOTSTRAP_PRIME_TTL_MS);
+
+  const endpoint = new URL("/api/repack/bootstrap", req.url).toString();
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), MATCH_BOOTSTRAP_PRIME_TIMEOUT_MS);
+  void fetch(endpoint, {
+    method: "POST",
+    cache: "no-store",
+    signal: controller.signal,
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      matchId,
+      uiServers: safeUiServers,
+    }),
+  })
+    .catch(() => null)
+    .finally(() => {
+      clearTimeout(timeoutId);
+    });
+  return true;
+}
+
+function withQueuedBootstrapStatus(status: Awaited<ReturnType<typeof buildMatchR2Status>>, row: MatchApiRow, uiServers: UiServerId[]) {
+  if (!status?.servers?.length) return status;
+  const queuedSlots = new Set(uiServers.map((uiServer) => getSlotServerIdForUiServer(uiServer)));
+  const updatedAt = new Date().toISOString();
+  return {
+    ...status,
+    updatedAt,
+    servers: status.servers.map((entry) => {
+      const sourceUrl = getSlotSourceUrlFromRow(row, entry.slotServer);
+      if (!queuedSlots.has(entry.slotServer)) return entry;
+      if (!isAllowedBootstrapSourceUrl(sourceUrl)) return entry;
+      if (entry.state === "ready") return entry;
+      if (entry.reason === "missing-source" || entry.reason === "source-not-allowed" || entry.reason === "blocked-outside-window") {
+        return entry;
+      }
+      return {
+        ...entry,
+        state: "warming" as const,
+        reason: "bootstrap-queued",
+        updatedAt,
+      };
+    }),
+  };
+}
+
 function buildServer5RefreshCacheKey(row: MatchApiRow, idHint?: number | null) {
   const matchKey = cleanMatchKey(row.match_key) || `id:${Number.isFinite(idHint as number) ? Number(idHint) : 0}`;
   const day = getCairoDayKey(row.match_start || null);
@@ -950,12 +1037,26 @@ export async function GET(req: Request, ctx: Ctx) {
 
   const repackFlags = getRuntimeRepackFlags();
   const streamMode = getServerStreamMode();
-  const r2Status = await buildMatchR2Status({
+  let r2Status = await buildMatchR2Status({
     mode: streamMode,
     matchId: Number(payload.id),
     row: payload,
     repackBaseUrl: repackFlags.publicBaseUrl,
   });
+  const matchWindow = computeMatchWindowState({
+    nowMs: Date.now(),
+    matchStartMs: parseMatchStartMs(payload.match_start),
+    config: getMatchWindowConfig(),
+  });
+  if (streamMode === "r2_strict" && matchWindow.inWindow) {
+    const bootstrapUiServers = getBootstrapPrimeUiServers(payload).filter((uiServer) => {
+      const entry = r2Status?.servers?.find((item) => item.uiServer === uiServer);
+      return entry?.state !== "ready";
+    });
+    if (bootstrapUiServers.length && queueBootstrapPrime(req, Number(payload.id), bootstrapUiServers)) {
+      r2Status = withQueuedBootstrapStatus(r2Status, payload, bootstrapUiServers);
+    }
+  }
   const repackHints = {
     enabled: repackFlags.enabled,
     readPct: repackFlags.readPct,

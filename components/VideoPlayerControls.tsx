@@ -10,6 +10,36 @@ interface VideoPlayerControlsProps {
     isLive?: boolean;
 }
 
+function inferHeightFromBitrate(bitrate: number) {
+    if (!Number.isFinite(bitrate) || bitrate <= 0) return 0;
+    if (bitrate >= 7000000) return 2160;
+    if (bitrate >= 4000000) return 1080;
+    if (bitrate >= 2200000) return 720;
+    if (bitrate >= 1100000) return 480;
+    if (bitrate >= 650000) return 360;
+    return 240;
+}
+
+function getLevelLabel(level: { height?: number; width?: number; bitrate?: number; name?: string }, index: number) {
+    const explicitHeight = Number(level?.height || 0);
+    if (explicitHeight > 0) return `${explicitHeight}p`;
+
+    const name = String(level?.name || "").trim();
+    const nameMatch = name.match(/(\d{3,4})p/i);
+    if (nameMatch?.[1]) return `${nameMatch[1]}p`;
+
+    const bitrateHeight = inferHeightFromBitrate(Number(level?.bitrate || 0));
+    if (bitrateHeight > 0) return `${bitrateHeight}p`;
+
+    const width = Number(level?.width || 0);
+    if (width >= 360) {
+        const estimatedHeight = Math.round((width * 9) / 16);
+        if (estimatedHeight >= 200) return `${estimatedHeight}p`;
+    }
+
+    return `جودة ${index + 1}`;
+}
+
 export default function VideoPlayerControls({
     videoRef,
     hls,
@@ -325,31 +355,71 @@ function FullscreenIcon({ size = 24, isFs = false }: { size?: number, isFs?: boo
 }
 
 function QualitySelector({ hls }: { hls: Hls }) {
-    const [level, setLevel] = useState(hls.currentLevel);
+    const [manualLevel, setManualLevel] = useState(hls.manualLevel);
+    const [currentLevel, setCurrentLevel] = useState(hls.currentLevel);
     const [showMenu, setShowMenu] = useState(false);
 
     useEffect(() => {
-        setLevel(hls.currentLevel);
-        const onLevelSwitched = (_event: string, data: { level: number }) => {
-            setLevel(data.level);
+        const syncState = () => {
+            setManualLevel(hls.manualLevel);
+            setCurrentLevel(hls.currentLevel);
         };
+        syncState();
+        const onLevelSwitched = (_event: string, data: { level: number }) => {
+            setCurrentLevel(data.level);
+            setManualLevel(hls.manualLevel);
+        };
+        const onManifestParsed = () => syncState();
+        const onLevelsUpdated = () => syncState();
         hls.on(Hls.Events.LEVEL_SWITCHED, onLevelSwitched);
+        hls.on(Hls.Events.MANIFEST_PARSED, onManifestParsed);
+        hls.on(Hls.Events.LEVELS_UPDATED, onLevelsUpdated);
         return () => {
             hls.off(Hls.Events.LEVEL_SWITCHED, onLevelSwitched);
+            hls.off(Hls.Events.MANIFEST_PARSED, onManifestParsed);
+            hls.off(Hls.Events.LEVELS_UPDATED, onLevelsUpdated);
         };
     }, [hls]);
 
     const levels = hls.levels || [];
     if (levels.length < 1) return null;
 
+    const autoEnabled = hls.autoLevelEnabled || manualLevel === -1;
+    const currentAutoLabel =
+        currentLevel >= 0 && levels[currentLevel] ? getLevelLabel(levels[currentLevel], currentLevel) : "";
+    const selectedLabel =
+        manualLevel >= 0 && levels[manualLevel] ? getLevelLabel(levels[manualLevel], manualLevel) : "";
+
     const applyLevel = (nextLevel: number, e: React.MouseEvent<HTMLButtonElement>) => {
         e.stopPropagation();
-        // Hls.js quality switch API is implemented via mutable property assignment.
-        // eslint-disable-next-line react-hooks/immutability
-        hls.currentLevel = nextLevel;
-        setLevel(nextLevel);
+        if (nextLevel < 0) {
+            hls.currentLevel = -1;
+            hls.nextLevel = -1;
+            hls.loadLevel = -1;
+            hls.autoLevelCapping = -1;
+            setManualLevel(-1);
+        } else {
+            hls.currentLevel = nextLevel;
+            hls.nextLevel = nextLevel;
+            hls.loadLevel = nextLevel;
+            setManualLevel(nextLevel);
+        }
+        setCurrentLevel(nextLevel);
         setShowMenu(false);
     };
+
+    const levelEntries = levels
+        .map((lvl, idx) => ({
+            idx,
+            label: getLevelLabel(lvl, idx),
+            sortHeight: Number.parseInt(getLevelLabel(lvl, idx), 10) || 0,
+            bitrate: Number(lvl?.bitrate || 0),
+        }))
+        .sort((a, b) => {
+            if (b.sortHeight !== a.sortHeight) return b.sortHeight - a.sortHeight;
+            if (b.bitrate !== a.bitrate) return b.bitrate - a.bitrate;
+            return a.idx - b.idx;
+        });
 
     return (
         <div className="relative">
@@ -357,23 +427,23 @@ function QualitySelector({ hls }: { hls: Hls }) {
                 onClick={(e) => { e.stopPropagation(); setShowMenu(!showMenu); }}
                 className="text-[11px] sm:text-xs font-bold text-gray-300 hover:text-white border border-gray-600 rounded px-2 py-1 whitespace-nowrap"
             >
-                {level === -1 ? "Auto" : `${levels[level]?.height}p`}
+                {autoEnabled ? (currentAutoLabel ? `Auto (${currentAutoLabel})` : "Auto") : selectedLabel || "جودة"}
             </button>
             {showMenu && (
                 <div className="absolute bottom-full mb-2 left-0 bg-black/90 border border-gray-700 rounded-lg p-2 flex flex-col gap-1 min-w-[80px]">
                     <button
                         onClick={(e) => applyLevel(-1, e)}
-                        className={`text-left text-xs px-2 py-1 rounded ${level === -1 ? "bg-blue-600 text-white" : "text-gray-300 hover:bg-white/10"}`}
+                        className={`text-left text-xs px-2 py-1 rounded ${autoEnabled ? "bg-blue-600 text-white" : "text-gray-300 hover:bg-white/10"}`}
                     >
-                        Auto
+                        {currentAutoLabel ? `Auto (${currentAutoLabel})` : "Auto"}
                     </button>
-                    {levels.map((lvl, idx) => (
+                    {levelEntries.map((entry) => (
                         <button
-                            key={idx}
-                            onClick={(e) => applyLevel(idx, e)}
-                            className={`text-left text-xs px-2 py-1 rounded ${level === idx ? "bg-blue-600 text-white" : "text-gray-300 hover:bg-white/10"}`}
+                            key={entry.idx}
+                            onClick={(e) => applyLevel(entry.idx, e)}
+                            className={`text-left text-xs px-2 py-1 rounded ${!autoEnabled && manualLevel === entry.idx ? "bg-blue-600 text-white" : "text-gray-300 hover:bg-white/10"}`}
                         >
-                            {lvl.height}p
+                            {entry.label}
                         </button>
                     ))}
                 </div>

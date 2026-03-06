@@ -191,12 +191,7 @@ export function isIngestCandidateAlignedWithSlotServer(input: {
   if (hostMatchesAnySuffix(targetHost, allowlist)) return true;
 
   const targetMappedSlot = findSlotServerByHost(targetHost);
-  if (targetMappedSlot && targetMappedSlot !== slotServerId) {
-    // Allow cross-host embeds only when the candidate is proven to originate
-    // from the slot's own source/referrer chain. This preserves per-source
-    // isolation while allowing sites like livehd to embed third-party players.
-    return true;
-  }
+  if (targetMappedSlot && targetMappedSlot !== slotServerId) return false;
 
   return true;
 }
