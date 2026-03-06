@@ -180,6 +180,10 @@ function isKnownNoiseCandidateUrl(rawUrl: string, depth = 0): boolean {
     }
     if (hostMatchesSuffix(host, NOISE_HOST_SUFFIXES)) return true;
     if (looksLikeNonStreamAssetPath(pathname)) return true;
+    if (/^\/(?:author|category|tag)\//i.test(pathname)) return true;
+    if (/\/page\/\d+\/?$/i.test(pathname) && !/\/(?:tv|live|stream|player|playlist|manifest|hls|albaplayer|playerv2)\//i.test(pathname)) {
+      return true;
+    }
     if (pathname === "/" && !u.search) {
       if (!/live|stream|player|hls|playlist|m3u8|albaplayer|playerv2/i.test(host)) return true;
     }

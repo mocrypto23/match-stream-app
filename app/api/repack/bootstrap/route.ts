@@ -571,7 +571,10 @@ export async function POST(req: Request) {
       requestOrigin: resolverRequestOrigin,
       referrerUrl: sourceUrl,
       timeoutMs: Math.max(8000, Number.parseInt(String(process.env.REPACK_RESOLVE_TIMEOUT_MS || "10000"), 10) || 10000),
-      maxCandidates: Math.max(48, Number.parseInt(String(process.env.REPACK_RESOLVE_MAX_CANDIDATES || "16"), 10) || 16),
+      maxCandidates: Math.min(
+        24,
+        Math.max(16, Number.parseInt(String(process.env.REPACK_RESOLVE_MAX_CANDIDATES || "16"), 10) || 16)
+      ),
       allowCandidate: ({ candidateUrl, referrerUrl }) =>
         isIngestCandidateAlignedWithSlotServer({
           slotServerId: slotServer,
