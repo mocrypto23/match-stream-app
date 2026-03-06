@@ -255,6 +255,27 @@ function localAgentUrl(pathname: string) {
   return `http://${bind}:${port}${pathname}`;
 }
 
+function resolveInternalPlayerOrigin(req: Request) {
+  const configuredInternal = String(
+    process.env.REPACK_INTERNAL_PLAYER_ORIGIN || process.env.INTERNAL_APP_ORIGIN || ""
+  ).trim();
+  if (configuredInternal && isValidHttpUrl(configuredInternal)) return configuredInternal.replace(/\/+$/, "");
+
+  const appPort = Number.parseInt(String(process.env.PORT || "3000"), 10) || 3000;
+  const localhostOrigin = `http://127.0.0.1:${appPort}`;
+  if (isValidHttpUrl(localhostOrigin)) return localhostOrigin;
+
+  const configuredPublic = String(process.env.REPACK_PLAYER_ORIGIN || "").trim();
+  if (configuredPublic && isValidHttpUrl(configuredPublic)) return configuredPublic.replace(/\/+$/, "");
+
+  try {
+    const reqOrigin = new URL(req.url).origin;
+    if (isValidHttpUrl(reqOrigin)) return reqOrigin.replace(/\/+$/, "");
+  } catch {}
+
+  return "";
+}
+
 async function readJson(req: Request) {
   try {
     return (await req.json()) as BootstrapRequest;
@@ -405,17 +426,7 @@ export async function POST(req: Request) {
   if (!Number.isFinite(matchId) || matchId <= 0) {
     return NextResponse.json({ ok: false, error: "invalid-match-id" }, { status: 400 });
   }
-  const resolverRequestOrigin = (() => {
-    const configured = String(
-      process.env.REPACK_INTERNAL_PLAYER_ORIGIN ||
-      process.env.INTERNAL_APP_ORIGIN ||
-      process.env.REPACK_PLAYER_ORIGIN ||
-      ""
-    ).trim();
-    if (configured && isValidHttpUrl(configured)) return configured.replace(/\/+$/, "");
-    const appPort = Number.parseInt(String(process.env.PORT || "3000"), 10) || 3000;
-    return `http://127.0.0.1:${appPort}`;
-  })();
+  const resolverRequestOrigin = resolveInternalPlayerOrigin(req);
 
   const mode = getServerStreamMode();
   const repackFlags = getRuntimeRepackFlags();

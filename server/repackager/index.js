@@ -1525,7 +1525,12 @@ function loadConfig() {
     startFailureWindowMs: toInt(process.env.REPACK_START_FAILURE_WINDOW_MS, 4500, 800),
     deleteRemoteIndexAfterStartFailures: toInt(process.env.REPACK_DELETE_REMOTE_INDEX_AFTER_START_FAILURES, 3, 1),
     publicBaseUrl: String(process.env.REPACK_PUBLIC_BASE_URL || "https://r2.tf-player.site/live").trim(),
-    playerOrigin: String(process.env.REPACK_PLAYER_ORIGIN || "https://tf-player.site").trim(),
+    playerOrigin: String(
+      process.env.REPACK_INTERNAL_PLAYER_ORIGIN ||
+        process.env.INTERNAL_APP_ORIGIN ||
+        process.env.REPACK_PLAYER_ORIGIN ||
+        "http://127.0.0.1:3000"
+    ).trim(),
     repackServers,
     repackProfile: {
       segmentDurationSec: toInt(process.env.REPACK_SEGMENT_DURATION_SEC, 1, 1),
