@@ -177,11 +177,6 @@ export function isIngestCandidateAlignedWithSlotServer(input: {
   const targetHost = extractHost(targetUrl);
   if (!targetHost) return false;
 
-  if (hostMatchesAnySuffix(targetHost, allowlist)) return true;
-
-  const targetMappedSlot = findSlotServerByHost(targetHost);
-  if (targetMappedSlot && targetMappedSlot !== slotServerId) return false;
-
   const referrerPool = [
     String(input.probeReferrerUrl || "").trim(),
     String(input.probePlaylistUrl || "").trim(),
@@ -192,6 +187,16 @@ export function isIngestCandidateAlignedWithSlotServer(input: {
     return !!refHost && hostMatchesAnySuffix(refHost, allowlist);
   });
   if (!hasOwnReferrer) return false;
+
+  if (hostMatchesAnySuffix(targetHost, allowlist)) return true;
+
+  const targetMappedSlot = findSlotServerByHost(targetHost);
+  if (targetMappedSlot && targetMappedSlot !== slotServerId) {
+    // Allow cross-host embeds only when the candidate is proven to originate
+    // from the slot's own source/referrer chain. This preserves per-source
+    // isolation while allowing sites like livehd to embed third-party players.
+    return true;
+  }
 
   return true;
 }
