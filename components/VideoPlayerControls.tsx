@@ -20,7 +20,23 @@ function inferHeightFromBitrate(bitrate: number) {
     return 240;
 }
 
-function getLevelLabel(level: { height?: number; width?: number; bitrate?: number; name?: string }, index: number) {
+function getFallbackQualityHeight(index: number, totalLevels: number) {
+    const ladders = [
+        [480],
+        [720, 480],
+        [1080, 720, 480],
+        [1080, 720, 480, 360],
+        [1080, 720, 480, 360, 240],
+    ];
+    const ladder = ladders[Math.max(0, Math.min(ladders.length - 1, totalLevels - 1))] || [480];
+    return ladder[Math.max(0, Math.min(index, ladder.length - 1))] || 480;
+}
+
+function getLevelLabel(
+    level: { height?: number; width?: number; bitrate?: number; name?: string },
+    index: number,
+    totalLevels: number
+) {
     const explicitHeight = Number(level?.height || 0);
     if (explicitHeight > 0) return `${explicitHeight}p`;
 
@@ -37,7 +53,7 @@ function getLevelLabel(level: { height?: number; width?: number; bitrate?: numbe
         if (estimatedHeight >= 200) return `${estimatedHeight}p`;
     }
 
-    return `جودة ${index + 1}`;
+    return `${getFallbackQualityHeight(index, totalLevels)}p`;
 }
 
 export default function VideoPlayerControls({
@@ -386,9 +402,9 @@ function QualitySelector({ hls }: { hls: Hls }) {
 
     const autoEnabled = hls.autoLevelEnabled || manualLevel === -1;
     const currentAutoLabel =
-        currentLevel >= 0 && levels[currentLevel] ? getLevelLabel(levels[currentLevel], currentLevel) : "";
+        currentLevel >= 0 && levels[currentLevel] ? getLevelLabel(levels[currentLevel], currentLevel, levels.length) : "";
     const selectedLabel =
-        manualLevel >= 0 && levels[manualLevel] ? getLevelLabel(levels[manualLevel], manualLevel) : "";
+        manualLevel >= 0 && levels[manualLevel] ? getLevelLabel(levels[manualLevel], manualLevel, levels.length) : "";
 
     const applyLevel = (nextLevel: number, e: React.MouseEvent<HTMLButtonElement>) => {
         e.stopPropagation();
@@ -411,8 +427,8 @@ function QualitySelector({ hls }: { hls: Hls }) {
     const levelEntries = levels
         .map((lvl, idx) => ({
             idx,
-            label: getLevelLabel(lvl, idx),
-            sortHeight: Number.parseInt(getLevelLabel(lvl, idx), 10) || 0,
+            label: getLevelLabel(lvl, idx, levels.length),
+            sortHeight: Number.parseInt(getLevelLabel(lvl, idx, levels.length), 10) || 0,
             bitrate: Number(lvl?.bitrate || 0),
         }))
         .sort((a, b) => {

@@ -4,10 +4,11 @@
 
 const path = require("path");
 const dotenv = require("dotenv");
+const { createClient } = require("@supabase/supabase-js");
 
 dotenv.config({ path: path.join(process.cwd(), ".env.local") });
 
-const UI_SERVERS = [1, 2, 3, 4];
+const TABLE = "match-stream-app";
 
 function nowIso() {
   return new Date().toISOString();
@@ -62,6 +63,39 @@ function normalizeOrigin(raw) {
   const value = String(raw || "").trim();
   if (!value) return "http://127.0.0.1:3000";
   return value.replace(/\/+$/, "");
+}
+
+function normalizeOptionalUrl(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  return value.replace(/\/+$/, "");
+}
+
+function isValidHttpUrl(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return false;
+  try {
+    const u = new URL(value);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function createSupabaseClientFromEnv() {
+  const url = normalizeOptionalUrl(process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL);
+  const key = String(
+    process.env.SUPABASE_KEY ||
+      process.env.SUPABASE_SERVICE_ROLE_KEY ||
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+      ""
+  ).trim();
+  if (!url || !key) return null;
+  try {
+    return createClient(url, key, { auth: { persistSession: false } });
+  } catch {
+    return null;
+  }
 }
 
 function log(level, message, extra = {}) {
@@ -151,6 +185,36 @@ async function fetchMatchesForDays(origin, timeoutMs) {
   return Array.from(all.values());
 }
 
+async function fetchMatchesForDaysViaSupabase(supabase) {
+  const days = [getCairoDayKey(-1), getCairoDayKey(0), getCairoDayKey(1)];
+  const all = new Map();
+  for (const day of days) {
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select("id,match_day,match_start,status_key,stream_url,stream_url_2,stream_url_3,stream_url_4")
+      .eq("match_day", day)
+      .order("match_start", { ascending: true, nullsFirst: false })
+      .order("id", { ascending: true })
+      .limit(500);
+    if (error || !Array.isArray(data)) continue;
+    for (const row of data) {
+      const id = Number.parseInt(String(row?.id || ""), 10);
+      if (!Number.isFinite(id) || id <= 0) continue;
+      all.set(id, row);
+    }
+  }
+  return Array.from(all.values());
+}
+
+function getUiServersForMatch(row) {
+  const servers = [];
+  if (isValidHttpUrl(row?.stream_url_4)) servers.push(1);
+  if (isValidHttpUrl(row?.stream_url_2)) servers.push(2);
+  if (isValidHttpUrl(row?.stream_url_3)) servers.push(3);
+  if (isValidHttpUrl(row?.stream_url)) servers.push(4);
+  return servers;
+}
+
 function pickTargetMatches(matches, config, nowMs) {
   return matches
     .map((row) => {
@@ -158,14 +222,16 @@ function pickTargetMatches(matches, config, nowMs) {
       const status = String(row?.status_key || "").trim().toLowerCase();
       const matchStartMs = parseMatchStartMs(row?.match_start);
       const windowState = computeWindowState(matchStartMs, config, nowMs);
+      const uiServers = getUiServersForMatch(row);
       return {
         matchId,
         status,
         matchStartMs,
         inWindow: windowState.inWindow,
+        uiServers,
       };
     })
-    .filter((row) => Number.isFinite(row.matchId) && row.matchId > 0 && row.inWindow)
+    .filter((row) => Number.isFinite(row.matchId) && row.matchId > 0 && row.inWindow && row.uiServers.length > 0)
     .sort((a, b) => {
       const rank = (status) => {
         if (status === "live") return 3;
@@ -183,7 +249,9 @@ function pickTargetMatches(matches, config, nowMs) {
 
 async function runCycle(config) {
   const startedAt = Date.now();
-  const matches = await fetchMatchesForDays(config.origin, config.httpTimeoutMs);
+  const matches = config.supabase
+    ? await fetchMatchesForDaysViaSupabase(config.supabase)
+    : await fetchMatchesForDays(config.origin, config.httpTimeoutMs);
   const targets = pickTargetMatches(matches, config, Date.now()).slice(0, config.maxMatches);
 
   if (!targets.length) {
@@ -199,7 +267,7 @@ async function runCycle(config) {
       },
       body: JSON.stringify({
         matchId: item.matchId,
-        uiServers: UI_SERVERS,
+        uiServers: item.uiServers,
       }),
     });
   });
@@ -251,6 +319,7 @@ function loadConfig() {
     prematchOpenMs: prematchOpenMinutes * 60 * 1000,
     matchDurationMs: matchDurationMinutes * 60 * 1000,
     postmatchGraceMs: postmatchGraceMinutes * 60 * 1000,
+    supabase: createSupabaseClientFromEnv(),
   };
 }
 
@@ -271,6 +340,7 @@ async function main() {
     concurrency: config.concurrency,
     maxMatches: config.maxMatches,
     origin: config.origin,
+    supabaseDirect: !!config.supabase,
   });
 
   while (!stopped) {

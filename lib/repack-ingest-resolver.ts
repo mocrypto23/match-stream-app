@@ -680,8 +680,14 @@ async function buildPlayerv2Candidates(sourceUrl: string, html: string, timeoutM
     for (const domain of domains.slice(0, 4)) {
       const variants = [`${pathValue}.m3u8`, pathValue];
       for (const variantPath of variants) {
-        const finalUrl = `${domain}/${variantPath}?ts=${ts}&nonce=${encodeURIComponent(nonce)}&token=${encodeURIComponent(token.token)}&session_id=${encodeURIComponent(token.sessionId)}`;
-        if (isValidHttpUrl(finalUrl)) out.push(finalUrl);
+        const queryVariants = [
+          `ts=${ts}&nonce=${encodeURIComponent(nonce)}&token=${encodeURIComponent(token.token)}&sid=${encodeURIComponent(token.sessionId)}`,
+          `ts=${ts}&nonce=${encodeURIComponent(nonce)}&token=${encodeURIComponent(token.token)}&session_id=${encodeURIComponent(token.sessionId)}`,
+        ];
+        for (const query of queryVariants) {
+          const finalUrl = `${domain}/${variantPath}?${query}`;
+          if (isValidHttpUrl(finalUrl)) out.push(finalUrl);
+        }
       }
     }
   }
@@ -785,6 +791,7 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
     if (search.includes("serv=")) score += 26;
     if (search.includes("stream=")) score += 34;
     if (search.includes("token=") || search.includes("session") || search.includes("playlist")) score += 45;
+    if (search.includes("sid=")) score += 65;
     if (u.port === "8443" && combined.includes(".m3u8")) score += 210;
     if (u.hostname.toLowerCase().endsWith(".58103793.net") || u.hostname.toLowerCase().endsWith(".77911050.net")) score += 170;
     if ((u.hostname.toLowerCase() === "showchop.net" || u.hostname.toLowerCase().endsWith(".showchop.net")) && pathname.includes("/embed/")) {
