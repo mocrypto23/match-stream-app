@@ -6462,12 +6462,14 @@ export default function WatchPage() {
     const controller = new AbortController();
     const orderedUiServers = [1, 2, 3, 4] as UiServerId[];
     for (const uiServer of orderedUiServers) {
+      const slotServer = getSlotServerIdForUiServer(uiServer);
+      if (strictBootstrapAttemptedBySlot[slotServer]) continue;
       void bootstrapStrictUiServer(uiServer, controller.signal);
     }
     return () => {
       controller.abort();
     };
-  }, [bootstrapStrictUiServer, idNum, match?.id, shouldBlockStream]);
+  }, [bootstrapStrictUiServer, idNum, match?.id, shouldBlockStream, strictBootstrapAttemptedBySlot]);
 
   useEffect(() => {
     if (!R2_STRICT_MODE) return;
