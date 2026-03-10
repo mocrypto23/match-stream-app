@@ -1396,14 +1396,7 @@ class RepackManager {
       upstreamProbePlaylistStatus < 300 &&
       upstreamProbeSegmentStatus >= 200 &&
       upstreamProbeSegmentStatus < 300;
-    const canBypassProtectedSegmentPreflight =
-      !preflight.ok &&
-      preflight.reason === "segment-http-403" &&
-      ingest.ingestVerified === true &&
-      ingest.ingestMode === "backend_proxy_ingest" &&
-      upstreamProbePlaylistStatus >= 200 &&
-      upstreamProbePlaylistStatus < 300 &&
-      upstreamProbeSegmentStatus === 403;
+    const canBypassProtectedSegmentPreflight = false;
     if (!preflight.ok && !canBypass403Preflight && !canBypassProtectedSegmentPreflight) {
       this.metrics.seedPreflightFailed += 1;
       const reason = `preflight-failed:${preflight.reason}`;

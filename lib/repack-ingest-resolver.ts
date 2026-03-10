@@ -1164,6 +1164,36 @@ function buildInternalEmbedProxyUrl(input: { sourceUrl: string; requestOrigin: s
   return `${String(input.requestOrigin || "").replace(/\/+$/, "")}/api/embed-proxy?${params.toString()}`;
 }
 
+function shouldPreferProxyResolvedIngest(input: {
+  sourceUrl: string;
+  candidateUrl: string;
+  referrerUrl?: string | null;
+  requestOrigin?: string | null;
+}) {
+  if (!isValidHttpUrl(String(input.requestOrigin || "").trim())) return false;
+  if (!isValidHttpUrl(input.candidateUrl) || !isValidHttpUrl(input.sourceUrl)) return false;
+  try {
+    const source = new URL(input.sourceUrl);
+    const candidate = new URL(input.candidateUrl);
+    const referrer = isValidHttpUrl(String(input.referrerUrl || "").trim())
+      ? new URL(String(input.referrerUrl || "").trim())
+      : null;
+    const sourceHost = source.hostname.toLowerCase();
+    const candidateHost = candidate.hostname.toLowerCase();
+    const referrerHost = referrer?.hostname?.toLowerCase() || "";
+
+    if (sourceHost !== candidateHost) return true;
+    if (referrerHost && referrerHost !== candidateHost) return true;
+    if (isBeinLiveMatchPageUrl(input.sourceUrl)) return true;
+    if (looksLikePlayerv2PageUrl(input.sourceUrl)) return true;
+    if (isLikelyAlbaLandingUrl(input.sourceUrl)) return true;
+    if (/\/tv\/[^/?#]+\/?$/i.test(String(source.pathname || ""))) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function shouldWrapCandidateForInternalProxy(candidateUrl: string, sourceUrl: string) {
   if (!isValidHttpUrl(candidateUrl)) return false;
   try {
@@ -1931,16 +1961,36 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
           isValidHttpUrl(String(probe.evidence?.playlistUrl || "").trim())
             ? String(probe.evidence?.playlistUrl || "").trim()
             : item.candidateUrl;
+        const preferredProxyUrl =
+          item.mode !== "backend_proxy_ingest" &&
+          shouldPreferProxyResolvedIngest({
+            sourceUrl,
+            candidateUrl: effectiveIngestUrl,
+            referrerUrl: item.referrerUrl || sourceFetch.finalUrl || sourceUrl,
+            requestOrigin,
+          })
+            ? buildInternalEmbedProxyUrl({
+                sourceUrl: effectiveIngestUrl,
+                requestOrigin,
+                referrerUrl: item.referrerUrl || sourceFetch.finalUrl || sourceUrl,
+              })
+            : "";
+        const finalMode =
+          preferredProxyUrl && isValidHttpUrl(preferredProxyUrl) ? "backend_proxy_ingest" : item.mode;
+        const finalIngestUrl =
+          preferredProxyUrl && isValidHttpUrl(preferredProxyUrl) ? preferredProxyUrl : effectiveIngestUrl;
+        const finalReason =
+          finalMode === "backend_proxy_ingest" ? "resolved-proxy-candidate" : "resolved-direct-candidate";
         return {
-          mode: item.mode,
-          ingestUrl: effectiveIngestUrl,
-          reason: item.mode === "backend_proxy_ingest" ? "resolved-proxy-candidate" : "resolved-direct-candidate",
+          mode: finalMode,
+          ingestUrl: finalIngestUrl,
+          reason: finalReason,
           resolver: {
             stage: "done",
             candidatesFound: rankedSeed.length,
             candidatesProbed,
-            selectedCandidate: effectiveIngestUrl,
-            selectedKind: item.mode,
+            selectedCandidate: finalIngestUrl,
+            selectedKind: finalMode,
             rejectReason: "",
             resolverState: "ok",
           },
@@ -1963,15 +2013,15 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
           mode: item.mode,
           ingestUrl: item.candidateUrl,
           reason: "resolved-proxy-candidate-soft",
-        resolver: {
-          stage: "done",
-          candidatesFound: rankedSeed.length,
-          candidatesProbed,
-          selectedCandidate: item.candidateUrl,
-          selectedKind: item.mode,
-          rejectReason: "",
-          resolverState: "ok",
-        },
+          resolver: {
+            stage: "done",
+            candidatesFound: rankedSeed.length,
+            candidatesProbed,
+            selectedCandidate: item.candidateUrl,
+            selectedKind: item.mode,
+            rejectReason: "soft-accepted-protected-segment",
+            resolverState: "probe-failed",
+          },
           probeEvidence: finalProbe.evidence
             ? { ...finalProbe.evidence, referrerUrl: item.referrerUrl || sourceFetch.finalUrl || sourceUrl }
             : null,

@@ -221,35 +221,10 @@ async function maybeHydrateSlotSourceUrl(slotServer: SlotServerId, rawSourceUrl:
   } catch {}
   if (!isBeinMatchPage) return sourceUrl;
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 2800);
-  try {
-    const response = await fetch(sourceUrl, {
-      method: "GET",
-      cache: "no-store",
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        "user-agent": DEFAULT_INGEST_USER_AGENT,
-        accept: "text/html,application/xhtml+xml,*/*",
-      },
-    });
-    if (!response.ok) return sourceUrl;
-    const html = await response.text();
-    const normalized = String(html || "").replace(/\\u002f/gi, "/").replace(/\\\//g, "/").replace(/&amp;/gi, "&");
-    const matches = normalized.match(/https?:\/\/[^\s"'<>]+\/albaplayer\/[^\s"'<>]+/gi) || [];
-    for (const candidateRaw of matches) {
-      const candidate = String(candidateRaw || "").trim();
-      if (!candidate || !isValidHttpUrl(candidate)) continue;
-      if (!isAllowedSourceForSlotServer(slotServer, candidate)) continue;
-      return candidate;
-    }
-    return sourceUrl;
-  } catch {
-    return sourceUrl;
-  } finally {
-    clearTimeout(timeoutId);
-  }
+  // Keep bein rows anchored to the original match page. Jumping early to an embedded
+  // alba/player host makes the slot look like it is borrowing another family and loses
+  // the strongest referrer/origin context that the downstream resolver/proxy needs.
+  return sourceUrl;
 }
 
 function localAgentUrl(pathname: string) {
