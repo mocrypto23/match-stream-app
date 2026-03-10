@@ -2006,6 +2006,8 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     }
 
     if (!finalProbe) continue;
+    const stableSourceReferrer =
+      normalizeHttpUrl(item.referrerUrl || sourceFetch.finalUrl || sourceUrl) || sourceUrl;
     if (canSoftAcceptProtectedSegmentProbe({
       candidateUrl: item.candidateUrl,
       reason: finalProbe.reason,
@@ -2027,7 +2029,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
             resolverState: "probe-failed",
           },
           probeEvidence: finalProbe.evidence
-            ? { ...finalProbe.evidence, referrerUrl: item.referrerUrl || sourceFetch.finalUrl || sourceUrl }
+            ? { ...finalProbe.evidence, referrerUrl: stableSourceReferrer }
             : null,
         };
       }
@@ -2043,7 +2045,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       const proxiedCandidate = buildInternalEmbedProxyUrl({
         sourceUrl: item.candidateUrl,
         requestOrigin,
-        referrerUrl: finalProbe.evidence?.playlistUrl || item.referrerUrl || sourceFetch.finalUrl || sourceUrl,
+        referrerUrl: stableSourceReferrer,
       });
       if (proxiedCandidate) {
         const proxyKey = canonicalizeUrl(proxiedCandidate) || proxiedCandidate.toLowerCase();
@@ -2053,7 +2055,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
             candidateUrl: proxiedCandidate,
             score: item.score + 500,
             mode: "backend_proxy_ingest",
-            referrerUrl: normalizeHttpUrl(finalProbe.evidence?.playlistUrl || item.referrerUrl || sourceUrl) || sourceUrl,
+            referrerUrl: stableSourceReferrer,
           });
         }
       }
@@ -2082,15 +2084,15 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       const extraKey = canonicalizeUrl(normalized) || normalized.toLowerCase();
       if (!extraKey || seenProbeKeys.has(extraKey) || seen.has(extraKey)) continue;
       if (looksLikeHlsManifestUrl(normalized)) {
-        pushImmediateManifest(normalized, finalProbe.evidence?.playlistUrl || item.referrerUrl || item.candidateUrl);
+        pushImmediateManifest(normalized, stableSourceReferrer);
         if (requestOrigin && !isEmbedProxyCandidateUrl(normalized)) {
           const proxiedManifest = buildInternalEmbedProxyUrl({
             sourceUrl: normalized,
             requestOrigin,
-            referrerUrl: finalProbe.evidence?.playlistUrl || item.referrerUrl || sourceFetch.finalUrl || sourceUrl,
+            referrerUrl: stableSourceReferrer,
           });
           if (proxiedManifest) {
-            pushImmediateManifest(proxiedManifest, finalProbe.evidence?.playlistUrl || item.referrerUrl || item.candidateUrl);
+            pushImmediateManifest(proxiedManifest, stableSourceReferrer);
           }
         }
         if (immediateManifestExtras.length >= 8) continue;
@@ -2107,7 +2109,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
         extraPool,
         sourceUrl,
         Math.max(2, maxCandidates - candidatesProbed),
-        finalProbe.evidence?.playlistUrl || item.referrerUrl || item.candidateUrl
+        stableSourceReferrer
       );
       pending.push(...rankedExtra);
     }
