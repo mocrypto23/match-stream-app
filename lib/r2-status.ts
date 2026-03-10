@@ -443,6 +443,12 @@ export async function buildMatchR2Status(input: {
       const recentReadyAgeMs = getRecentReadyAgeMs(matchSlotKey, nowMs);
       const hasRecentReadyGrace = Number.isFinite(recentReadyAgeMs) && recentReadyAgeMs !== null && recentReadyAgeMs <= readyGraceMs;
       const recentSeedState = getRepackSeedRuntimeState(matchId, slotServer);
+      const recentAcceptedAt =
+        recentSeedState?.accepted && Number.isFinite(recentSeedState.acceptedAt)
+          ? Number(recentSeedState.acceptedAt)
+          : null;
+      const recentAcceptedAgeMs =
+        recentAcceptedAt !== null && Number.isFinite(recentAcceptedAt) ? Math.max(0, nowMs - recentAcceptedAt) : null;
       const recentSeedRejected =
         !!recentSeedState &&
         !recentSeedState.accepted &&
@@ -470,8 +476,16 @@ export async function buildMatchR2Status(input: {
         Number.isFinite(sequenceAgeMs) &&
         sequenceAgeMs !== null &&
         sequenceAgeMs > staleSequenceGuardMs;
+      const staleAgainstRecentSeed =
+        probed.state === "ready" &&
+        recentAcceptedAgeMs !== null &&
+        recentAcceptedAgeMs <= DEFAULT_SEED_WARMING_WINDOW_MS &&
+        Number.isFinite(sequenceAgeMs) &&
+        sequenceAgeMs !== null &&
+        sequenceAgeMs > Math.max(12_000, recentAcceptedAgeMs + 4_000);
       const staleSequenceCount = noteStaleSequenceCount(playlistUrl, isStaleSequence, nowMs);
-      const staleSequenceConfirmed = isStaleSequence && staleSequenceCount >= STALE_SEQUENCE_CONFIRMATION_COUNT;
+      const staleSequenceConfirmed =
+        staleAgainstRecentSeed || (isStaleSequence && staleSequenceCount >= STALE_SEQUENCE_CONFIRMATION_COUNT);
       if (probed.state === "ready" && !staleSequenceConfirmed) {
         if (!isStaleSequence) noteRecentReadyState(matchSlotKey, nowMs);
         return {
