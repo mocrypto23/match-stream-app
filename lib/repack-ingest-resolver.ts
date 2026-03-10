@@ -1876,13 +1876,17 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     });
     if (!albaFetched.ok || !isLikelyHtmlResponse(albaFetched.contentType, albaFetched.body)) continue;
     const albaReferrer = albaFetched.finalUrl || albaLandingUrl;
+    const proxyReferrer =
+      normalizeHttpUrl(sourceFetch.finalUrl || sourceUrl) ||
+      normalizeHttpUrl(albaReferrer) ||
+      normalizeHttpUrl(sourceUrl);
     for (const derived of extractCandidatesFromText(albaFetched.body, albaReferrer)) {
       pushCandidateUnique(candidateSeed, seen, derived);
       if (!requestOrigin || !isValidHttpUrl(derived)) continue;
       const proxied = buildInternalEmbedProxyUrl({
         sourceUrl: derived,
         requestOrigin,
-        referrerUrl: albaReferrer,
+        referrerUrl: proxyReferrer,
       });
       if (proxied) pushCandidateUnique(candidateSeed, seen, proxied);
     }

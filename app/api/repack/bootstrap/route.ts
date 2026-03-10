@@ -574,6 +574,26 @@ export async function POST(req: Request) {
         }),
     });
 
+    if (ingest.resolver.resolverState !== "ok") {
+      const rejectReason = `invalid-ingest-url:${ingest.reason}`;
+      pushResult({
+        uiServer,
+        slotServer,
+        accepted: false,
+        reason: rejectReason,
+        statusCode: 202,
+        sourceUrl,
+        resolver: ingest.resolver,
+        ingest: {
+          mode: ingest.mode,
+          reason: ingest.reason,
+          ingestUrl: ingest.ingestUrl || null,
+        },
+        probeEvidence: ingest.probeEvidence,
+      });
+      continue;
+    }
+
     if (!ingest.ingestUrl || !isValidHttpUrl(ingest.ingestUrl)) {
       const rejectReason = `invalid-ingest-url:${ingest.reason}`;
       pushResult({
