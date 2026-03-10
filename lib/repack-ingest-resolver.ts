@@ -1,4 +1,4 @@
-import { isValidHttpUrl } from "./server-source-policy";
+import { isValidHttpUrl, type SlotServerId } from "./server-source-policy";
 import type { RepackResolverState } from "./repack-runtime-state";
 
 export type RepackIngestMode = "direct_m3u8" | "backend_proxy_ingest" | "none";
@@ -38,6 +38,8 @@ export type RepackIngestResolution = {
 type ResolveRepackIngestInput = {
   sourceUrl: string;
   requestOrigin: string;
+  slotServerId?: SlotServerId;
+  preferProxyIngest?: boolean;
   referrerUrl?: string | null;
   timeoutMs?: number;
   maxCandidates?: number;
@@ -50,6 +52,13 @@ type FetchResult = {
   finalUrl: string;
   contentType: string;
   body: string;
+};
+
+type SourcePageVariant = {
+  pageUrl: string;
+  via: "raw" | "proxy";
+  referrerUrl: string;
+  fetch: FetchResult;
 };
 
 type ProbeResult = {
@@ -1153,6 +1162,82 @@ async function fetchEmbeddedPlayerv2ResolvedCandidates(input: {
   return Array.from(out);
 }
 
+async function fetchSourcePageVariants(input: {
+  sourceUrl: string;
+  sourceFetch: FetchResult;
+  requestOrigin: string;
+  referrerUrl?: string | null;
+  timeoutMs: number;
+  slotServerId?: SlotServerId;
+}) {
+  const out: SourcePageVariant[] = [];
+  const seen = new Set<string>();
+  const baseReferrer = normalizeHttpUrl(input.referrerUrl || input.sourceUrl) || input.sourceUrl;
+
+  const pushVariant = (pageUrl: string, via: SourcePageVariant["via"], referrerUrl: string, fetch: FetchResult) => {
+    const safePageUrl = normalizeHttpUrl(pageUrl);
+    const safeReferrer = normalizeHttpUrl(referrerUrl) || baseReferrer;
+    if (!safePageUrl) return;
+    const key = `${via}:${canonicalizeUrl(safePageUrl) || safePageUrl.toLowerCase()}`;
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push({
+      pageUrl: safePageUrl,
+      via,
+      referrerUrl: safeReferrer,
+      fetch,
+    });
+  };
+
+  pushVariant(input.sourceUrl, "raw", baseReferrer, input.sourceFetch);
+
+  const queueFetch = async (pageUrl: string, via: SourcePageVariant["via"], referrerUrl: string) => {
+    const safePageUrl = normalizeHttpUrl(pageUrl);
+    const safeReferrer = normalizeHttpUrl(referrerUrl) || baseReferrer;
+    if (!safePageUrl) return;
+    const key = `${via}:${canonicalizeUrl(safePageUrl) || safePageUrl.toLowerCase()}`;
+    if (!key || seen.has(key)) return;
+    const fetched = await fetchWithTimeout(safePageUrl, Math.min(input.timeoutMs, 3000), {
+      referer: safeReferrer,
+      origin: safeOrigin(safeReferrer),
+    });
+    pushVariant(safePageUrl, via, safeReferrer, fetched);
+  };
+
+  if (isValidHttpUrl(input.requestOrigin)) {
+    const proxiedSourcePage = buildInternalEmbedProxyUrl({
+      sourceUrl: input.sourceUrl,
+      requestOrigin: input.requestOrigin,
+      referrerUrl: baseReferrer,
+    });
+    if (proxiedSourcePage) {
+      await queueFetch(proxiedSourcePage, "proxy", baseReferrer);
+    }
+  }
+
+  if (input.slotServerId === 3) {
+    const livehdVariants = Array.from(
+      new Set([
+        ...expandLivehdTvServVariants(input.sourceUrl),
+        ...expandLivehdTvServVariants(input.sourceFetch.finalUrl || input.sourceUrl),
+      ])
+    ).slice(0, 4);
+    for (const variantUrl of livehdVariants) {
+      await queueFetch(variantUrl, "raw", baseReferrer);
+      if (isValidHttpUrl(input.requestOrigin)) {
+        const proxiedVariant = buildInternalEmbedProxyUrl({
+          sourceUrl: variantUrl,
+          requestOrigin: input.requestOrigin,
+          referrerUrl: baseReferrer,
+        });
+        if (proxiedVariant) await queueFetch(proxiedVariant, "proxy", baseReferrer);
+      }
+    }
+  }
+
+  return out;
+}
+
 function buildInternalEmbedProxyUrl(input: { sourceUrl: string; requestOrigin: string; referrerUrl?: string | null }) {
   if (!isValidHttpUrl(input.requestOrigin)) return "";
   const params = new URLSearchParams();
@@ -1240,6 +1325,59 @@ function classifyMode(rawUrl: string): RepackIngestMode {
   } catch {
     return "none";
   }
+}
+
+function finalizeSuccessfulResolution(input: {
+  sourceUrl: string;
+  selectedCandidateUrl: string;
+  stage: ResolverStage;
+  candidatesFound: number;
+  candidatesProbed: number;
+  probe: ProbeResult;
+  requestOrigin: string;
+  sourceReferrerUrl: string;
+  preferProxyIngest?: boolean;
+}) {
+  const effectiveIngestUrl =
+    isValidHttpUrl(String(input.probe.evidence?.playlistUrl || "").trim())
+      ? String(input.probe.evidence?.playlistUrl || "").trim()
+      : input.selectedCandidateUrl;
+  const stableReferrer = normalizeHttpUrl(input.sourceReferrerUrl || input.sourceUrl) || input.sourceUrl;
+  const proxyWrapped =
+    input.preferProxyIngest && isValidHttpUrl(input.requestOrigin)
+      ? buildInternalEmbedProxyUrl({
+          sourceUrl: effectiveIngestUrl,
+          requestOrigin: input.requestOrigin,
+          referrerUrl: stableReferrer,
+        })
+      : "";
+  const shouldProxy =
+    (!!proxyWrapped && isValidHttpUrl(proxyWrapped)) ||
+    shouldPreferProxyResolvedIngest({
+      sourceUrl: input.sourceUrl,
+      candidateUrl: effectiveIngestUrl,
+      referrerUrl: stableReferrer,
+      requestOrigin: input.requestOrigin,
+    });
+  const finalIngestUrl =
+    shouldProxy && proxyWrapped && isValidHttpUrl(proxyWrapped) ? proxyWrapped : effectiveIngestUrl;
+  const finalMode =
+    shouldProxy && proxyWrapped && isValidHttpUrl(proxyWrapped) ? "backend_proxy_ingest" : classifyMode(finalIngestUrl);
+  return {
+    mode: finalMode,
+    ingestUrl: finalIngestUrl,
+    reason: finalMode === "backend_proxy_ingest" ? "resolved-proxy-candidate" : "resolved-direct-candidate",
+    resolver: {
+      stage: input.stage,
+      candidatesFound: input.candidatesFound,
+      candidatesProbed: input.candidatesProbed,
+      selectedCandidate: finalIngestUrl,
+      selectedKind: finalMode,
+      rejectReason: "",
+      resolverState: "ok" as const,
+    },
+    probeEvidence: input.probe.evidence ? { ...input.probe.evidence, referrerUrl: stableReferrer } : null,
+  } satisfies RepackIngestResolution;
 }
 
 function scoreCandidate(rawUrl: string, sourceHost: string) {
@@ -1732,6 +1870,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
   );
 
   const sourceUrl = normalizeHttpUrl(input.sourceUrl);
+  const preferProxyIngest = input.preferProxyIngest !== false;
   if (!sourceUrl) {
     return emptyResolution("invalid-source-url", {
       stage: "validate-source",
@@ -1754,21 +1893,17 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       requestOrigin: input.requestOrigin,
     });
     if (directProbe.ok && allowedDirectSource) {
-      return {
-        mode: classifyMode(sourceUrl),
-        ingestUrl: sourceUrl,
-        reason: "source-is-manifest",
-        resolver: {
-          stage: "source-direct",
-          candidatesFound: 1,
-          candidatesProbed: 1,
-          selectedCandidate: sourceUrl,
-          selectedKind: classifyMode(sourceUrl),
-          rejectReason: "",
-          resolverState: "ok",
-        },
-        probeEvidence: directProbe.evidence,
-      };
+      return finalizeSuccessfulResolution({
+        sourceUrl,
+        selectedCandidateUrl: sourceUrl,
+        stage: "source-direct",
+        candidatesFound: 1,
+        candidatesProbed: 1,
+        probe: directProbe,
+        requestOrigin: input.requestOrigin,
+        sourceReferrerUrl: sourceUrl,
+        preferProxyIngest,
+      });
     }
   }
 
@@ -1783,84 +1918,96 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       requestOrigin: input.requestOrigin,
     });
     if (servedProbe.ok && allowedServedSource) {
-      const directUrl = servedUrl;
-      return {
-        mode: classifyMode(directUrl),
-        ingestUrl: directUrl,
-        reason: "source-served-manifest",
-        resolver: {
-          stage: "source-fetch",
-          candidatesFound: 1,
-          candidatesProbed: 1,
-          selectedCandidate: directUrl,
-          selectedKind: classifyMode(directUrl),
-          rejectReason: "",
-          resolverState: "ok",
-        },
-        probeEvidence: servedProbe.evidence,
-      };
+      return finalizeSuccessfulResolution({
+        sourceUrl,
+        selectedCandidateUrl: servedUrl,
+        stage: "source-fetch",
+        candidatesFound: 1,
+        candidatesProbed: 1,
+        probe: servedProbe,
+        requestOrigin: input.requestOrigin,
+        sourceReferrerUrl: sourceFetch.finalUrl || sourceUrl,
+        preferProxyIngest,
+      });
     }
   }
 
   const requestOrigin = normalizeHttpUrl(input.requestOrigin);
   const candidateSeed: string[] = [];
   const seen = new Set<string>();
+  const sourceVariants = await fetchSourcePageVariants({
+    sourceUrl,
+    sourceFetch,
+    requestOrigin,
+    referrerUrl: input.referrerUrl || sourceUrl,
+    timeoutMs,
+    slotServerId: input.slotServerId,
+  });
 
   pushCandidateUnique(candidateSeed, seen, sourceUrl);
   pushCandidateUnique(candidateSeed, seen, sourceFetch.finalUrl || sourceUrl);
-  for (const variant of expandLivehdTvServVariants(sourceUrl)) {
-    pushCandidateUnique(candidateSeed, seen, variant);
-  }
-  for (const variant of expandLivehdTvServVariants(sourceFetch.finalUrl || sourceUrl)) {
-    pushCandidateUnique(candidateSeed, seen, variant);
-  }
-  if (sourceFetch.body) {
-    const sourceBaseUrl = sourceFetch.finalUrl || sourceUrl;
-    const extractedCandidates = extractCandidatesFromText(sourceFetch.body, sourceBaseUrl);
+  for (const variant of sourceVariants) {
+    const sourceBaseUrl = variant.fetch.finalUrl || variant.pageUrl || sourceUrl;
+    if (variant.fetch.ok && isLikelyManifestResponse(variant.fetch.contentType, variant.fetch.body, sourceBaseUrl)) {
+      pushCandidateUnique(candidateSeed, seen, sourceBaseUrl);
+    }
+
+    const shouldUseHtmlExtraction = shouldExtractCandidatesFromBody(variant.fetch.contentType, variant.fetch.body);
+    const extractedCandidates = shouldUseHtmlExtraction ? extractCandidatesFromText(variant.fetch.body, sourceBaseUrl) : [];
     for (const candidate of extractedCandidates) {
       pushCandidateUnique(candidateSeed, seen, candidate);
       if (requestOrigin && shouldWrapCandidateForInternalProxy(candidate, sourceBaseUrl)) {
         const proxied = buildInternalEmbedProxyUrl({
           sourceUrl: candidate,
           requestOrigin,
-          referrerUrl: sourceBaseUrl,
+          referrerUrl: variant.referrerUrl || sourceBaseUrl,
         });
         if (proxied) pushCandidateUnique(candidateSeed, seen, proxied);
       }
     }
 
-    const beinAjaxCandidates = await fetchBeinAjaxResolvedCandidates(sourceBaseUrl, sourceFetch.body, Math.min(timeoutMs, 3200));
-    for (const candidate of beinAjaxCandidates) {
-      pushCandidateUnique(candidateSeed, seen, candidate);
-      if (requestOrigin && shouldWrapCandidateForInternalProxy(candidate, sourceBaseUrl)) {
-        const proxied = buildInternalEmbedProxyUrl({
-          sourceUrl: candidate,
-          requestOrigin,
-          referrerUrl: sourceBaseUrl,
-        });
-        if (proxied) pushCandidateUnique(candidateSeed, seen, proxied);
-      }
-    }
-
-    const playerv2Candidates = await buildPlayerv2Candidates(
-      sourceBaseUrl,
-      sourceFetch.body,
-      Math.min(timeoutMs, 2600),
-      requestOrigin
-    );
-    for (const candidate of playerv2Candidates) {
-      pushCandidateUnique(candidateSeed, seen, candidate);
-    }
-
-    if (requestOrigin) {
-      const embeddedPlayerv2Candidates = await fetchEmbeddedPlayerv2ResolvedCandidates({
-        pageUrl: sourceBaseUrl,
-        pageHtml: sourceFetch.body,
-        timeoutMs: Math.min(timeoutMs, 2800),
-        requestOrigin,
-      });
-      for (const candidate of embeddedPlayerv2Candidates) {
+    if (input.slotServerId === 1 || isBeinLiveMatchPageUrl(sourceBaseUrl)) {
+      const beinAjaxCandidates = await fetchBeinAjaxResolvedCandidates(
+        sourceBaseUrl,
+        variant.fetch.body,
+        Math.min(timeoutMs, 3200)
+      );
+      for (const candidate of beinAjaxCandidates) {
         pushCandidateUnique(candidateSeed, seen, candidate);
+        if (requestOrigin && shouldWrapCandidateForInternalProxy(candidate, sourceBaseUrl)) {
+          const proxied = buildInternalEmbedProxyUrl({
+            sourceUrl: candidate,
+            requestOrigin,
+            referrerUrl: variant.referrerUrl || sourceBaseUrl,
+          });
+          if (proxied) pushCandidateUnique(candidateSeed, seen, proxied);
+        }
+      }
+    }
+
+    const shouldUsePlayerv2Flow =
+      input.slotServerId === 2 || looksLikePlayerv2PageUrl(sourceBaseUrl) || looksLikePlayerv2Html(variant.fetch.body);
+    if (shouldUsePlayerv2Flow) {
+      const playerv2Candidates = await buildPlayerv2Candidates(
+        sourceBaseUrl,
+        variant.fetch.body,
+        Math.min(timeoutMs, 2600),
+        requestOrigin
+      );
+      for (const candidate of playerv2Candidates) {
+        pushCandidateUnique(candidateSeed, seen, candidate);
+      }
+
+      if (requestOrigin) {
+        const embeddedPlayerv2Candidates = await fetchEmbeddedPlayerv2ResolvedCandidates({
+          pageUrl: sourceBaseUrl,
+          pageHtml: variant.fetch.body,
+          timeoutMs: Math.min(timeoutMs, 2800),
+          requestOrigin,
+        });
+        for (const candidate of embeddedPlayerv2Candidates) {
+          pushCandidateUnique(candidateSeed, seen, candidate);
+        }
       }
     }
   }
@@ -1883,9 +2030,9 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     for (const derived of extractCandidatesFromText(albaFetched.body, albaReferrer)) {
       pushCandidateUnique(candidateSeed, seen, derived);
       if (!requestOrigin || !isValidHttpUrl(derived)) continue;
-      const proxied = buildInternalEmbedProxyUrl({
-        sourceUrl: derived,
-        requestOrigin,
+        const proxied = buildInternalEmbedProxyUrl({
+          sourceUrl: derived,
+          requestOrigin,
         referrerUrl: proxyReferrer,
       });
       if (proxied) pushCandidateUnique(candidateSeed, seen, proxied);
@@ -1960,46 +2107,17 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
         requestOrigin,
       });
       if (probe.ok) {
-        const effectiveIngestUrl =
-          item.mode !== "backend_proxy_ingest" &&
-          isValidHttpUrl(String(probe.evidence?.playlistUrl || "").trim())
-            ? String(probe.evidence?.playlistUrl || "").trim()
-            : item.candidateUrl;
-        const preferredProxyUrl =
-          item.mode !== "backend_proxy_ingest" &&
-          shouldPreferProxyResolvedIngest({
-            sourceUrl,
-            candidateUrl: effectiveIngestUrl,
-            referrerUrl: item.referrerUrl || sourceFetch.finalUrl || sourceUrl,
-            requestOrigin,
-          })
-            ? buildInternalEmbedProxyUrl({
-                sourceUrl: effectiveIngestUrl,
-                requestOrigin,
-                referrerUrl: item.referrerUrl || sourceFetch.finalUrl || sourceUrl,
-              })
-            : "";
-        const finalMode =
-          preferredProxyUrl && isValidHttpUrl(preferredProxyUrl) ? "backend_proxy_ingest" : item.mode;
-        const finalIngestUrl =
-          preferredProxyUrl && isValidHttpUrl(preferredProxyUrl) ? preferredProxyUrl : effectiveIngestUrl;
-        const finalReason =
-          finalMode === "backend_proxy_ingest" ? "resolved-proxy-candidate" : "resolved-direct-candidate";
-        return {
-          mode: finalMode,
-          ingestUrl: finalIngestUrl,
-          reason: finalReason,
-          resolver: {
-            stage: "done",
-            candidatesFound: rankedSeed.length,
-            candidatesProbed,
-            selectedCandidate: finalIngestUrl,
-            selectedKind: finalMode,
-            rejectReason: "",
-            resolverState: "ok",
-          },
-          probeEvidence: probe.evidence ? { ...probe.evidence, referrerUrl } : null,
-        };
+        return finalizeSuccessfulResolution({
+          sourceUrl,
+          selectedCandidateUrl: item.candidateUrl,
+          stage: "done",
+          candidatesFound: rankedSeed.length,
+          candidatesProbed,
+          probe,
+          requestOrigin,
+          sourceReferrerUrl: item.referrerUrl || referrerUrl || sourceFetch.finalUrl || sourceUrl,
+          preferProxyIngest,
+        });
       }
       finalProbe = pickBetterProbeFailure(finalProbe, probe);
       if (probe.extraCandidates.length) aggregatedExtraCandidates.push(...probe.extraCandidates);

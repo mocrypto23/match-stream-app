@@ -558,6 +558,8 @@ export async function POST(req: Request) {
     const ingest = await resolveRepackIngestUrl({
       sourceUrl,
       requestOrigin: resolverRequestOrigin,
+      slotServerId: slotServer,
+      preferProxyIngest: true,
       referrerUrl: sourceUrl,
       timeoutMs: Math.max(8000, Number.parseInt(String(process.env.REPACK_RESOLVE_TIMEOUT_MS || "10000"), 10) || 10000),
       maxCandidates: Math.min(

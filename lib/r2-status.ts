@@ -18,6 +18,9 @@ const DEFAULT_SEED_WARMING_WINDOW_MS = 120_000;
 const DEFAULT_MAX_SEED_WARMING_MS = 18_000;
 const DEFAULT_READY_GRACE_MS = 10_000;
 const DEFAULT_STALE_SEQUENCE_GUARD_MS = 30_000;
+const DEFAULT_AGENT_READY_PUBLISH_GRACE_MS = 18_000;
+const DEFAULT_AGENT_WARMING_PUBLISH_GRACE_MS = 45_000;
+const DEFAULT_AGENT_SEED_GRACE_MS = 25_000;
 const SEQUENCE_STATE_TTL_MS = 10 * 60 * 1000;
 const STALE_SEQUENCE_CONFIRMATION_COUNT = 3;
 
@@ -44,6 +47,19 @@ type PlaylistProbeResult = {
   segmentUrl: string | null;
 };
 
+type AgentDiagJob = {
+  key: string;
+  state: string;
+  lastSeedAt: number | null;
+  lastPublishAt: number | null;
+  lastPublishAgeMs: number | null;
+  lastObservedTargetDurationSec: number | null;
+  degradedReason?: string | null;
+  consecutiveSourceErrors?: number | null;
+  ingestUrl?: string | null;
+  ingestUrlKind?: string | null;
+};
+
 const sequenceStateByPlaylist = new Map<string, SequenceState>();
 const staleSequenceCountByPlaylist = new Map<string, { count: number; lastSeenAt: number }>();
 const recentReadySeenAtByMatchSlot = new Map<string, number>();
@@ -52,6 +68,89 @@ const segmentFailStateByMatchSlot = new Map<string, { count: number; lastSeenAt:
 
 function nowIso(now = Date.now()) {
   return new Date(now).toISOString();
+}
+
+function localAgentUrl(pathname: string) {
+  const port = Number.parseInt(String(process.env.REPACK_AGENT_PORT || "3400"), 10) || 3400;
+  const bind = String(process.env.REPACK_AGENT_BIND || "127.0.0.1").trim() || "127.0.0.1";
+  return `http://${bind}:${port}${pathname}`;
+}
+
+async function fetchAgentDiagJobs() {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 1400);
+  try {
+    const response = await fetch(localAgentUrl("/diag"), {
+      method: "GET",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok) return new Map<string, AgentDiagJob>();
+    const payload = (await response.json().catch(() => null)) as { jobs?: AgentDiagJob[] } | null;
+    const jobs = Array.isArray(payload?.jobs) ? payload.jobs : [];
+    const out = new Map<string, AgentDiagJob>();
+    for (const job of jobs) {
+      const key = String(job?.key || "").trim();
+      if (!key) continue;
+      out.set(key, job);
+    }
+    return out;
+  } catch {
+    return new Map<string, AgentDiagJob>();
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function deriveAgentPublishGraceMs(job: AgentDiagJob | null, fallbackMs: number) {
+  const targetDurationSec = Number(job?.lastObservedTargetDurationSec || 0);
+  if (!Number.isFinite(targetDurationSec) || targetDurationSec <= 0) return fallbackMs;
+  return Math.max(fallbackMs, Math.min(90_000, Math.round(targetDurationSec * 1000 * 4 + 4000)));
+}
+
+function deriveAgentSignal(job: AgentDiagJob | null, nowMs: number) {
+  if (!job) return null;
+  const state = String(job.state || "").trim().toLowerCase();
+  const lastPublishAgeMs =
+    Number.isFinite(Number(job.lastPublishAgeMs)) && job.lastPublishAgeMs !== null ? Number(job.lastPublishAgeMs) : null;
+  const lastSeedAt = Number.isFinite(Number(job.lastSeedAt)) && job.lastSeedAt !== null ? Number(job.lastSeedAt) : null;
+  const lastSeedAgeMs = lastSeedAt !== null ? Math.max(0, nowMs - lastSeedAt) : null;
+  const readyPublishGraceMs = deriveAgentPublishGraceMs(job, DEFAULT_AGENT_READY_PUBLISH_GRACE_MS);
+  const warmingPublishGraceMs = deriveAgentPublishGraceMs(job, DEFAULT_AGENT_WARMING_PUBLISH_GRACE_MS);
+  const seedGraceMs = Math.max(DEFAULT_AGENT_SEED_GRACE_MS, Math.floor(readyPublishGraceMs * 0.8));
+
+  if (state === "degraded") {
+    return {
+      state: "down" as R2ServerState,
+      reason: `agent-degraded:${String(job.degradedReason || "unknown").trim() || "unknown"}`,
+      resolverState: "probe-failed" as const,
+      resolveReason: String(job.degradedReason || "agent-degraded").trim() || "agent-degraded",
+    };
+  }
+
+  if (state === "running" || state === "starting" || state === "restarting") {
+    if (lastPublishAgeMs !== null && lastPublishAgeMs <= readyPublishGraceMs) {
+      return {
+        state: "ready" as R2ServerState,
+        reason: `agent-recent-publish:${state}`,
+        resolverState: "ok" as const,
+        resolveReason: "agent-recent-publish",
+      };
+    }
+    if (
+      (lastPublishAgeMs !== null && lastPublishAgeMs <= warmingPublishGraceMs) ||
+      (lastSeedAgeMs !== null && lastSeedAgeMs <= seedGraceMs)
+    ) {
+      return {
+        state: "warming" as R2ServerState,
+        reason: `agent-active:${state}`,
+        resolverState: "ok" as const,
+        resolveReason: "agent-active",
+      };
+    }
+  }
+
+  return null;
 }
 
 function trimSequenceState(nowMs: number) {
@@ -365,12 +464,14 @@ export async function buildMatchR2Status(input: {
     Number.parseInt(String(process.env.R2_STATUS_STALE_SEQUENCE_GUARD_MS || DEFAULT_STALE_SEQUENCE_GUARD_MS), 10)
   );
   const shouldProbeR2 = mode === "r2_strict";
+  const agentJobsByKey = shouldProbeR2 ? await fetchAgentDiagJobs() : new Map<string, AgentDiagJob>();
   trimEarlyStopState(nowMs);
 
   const servers = await Promise.all(
     UI_SERVER_IDS.map(async (uiServer): Promise<R2StatusServerEntry> => {
       const slotServer = getSlotServerIdForUiServer(uiServer);
       const matchSlotKey = `m${matchId}:s${slotServer}`;
+      const agentJob = agentJobsByKey.get(matchSlotKey) || null;
       const sourceUrl = getSlotSourceUrlFromRow(input.row, slotServer) || "";
       const hasSource = isValidHttpUrl(sourceUrl);
       const sourceAllowed = hasSource ? isAllowedSourceForSlotServer(slotServer, sourceUrl) : false;
@@ -502,6 +603,23 @@ export async function buildMatchR2Status(input: {
         };
       }
 
+      const agentSignal = deriveAgentSignal(agentJob, nowMs);
+      if (agentSignal?.state === "ready") {
+        noteRecentReadyState(matchSlotKey, nowMs);
+        return {
+          uiServer,
+          slotServer,
+          state: "ready",
+          playlistUrl,
+          segmentProbe: probed.segmentProbe === "ok" ? "ok" : "unknown",
+          lastSequenceAgeMs: sequenceAgeMs,
+          resolverState: agentSignal.resolverState,
+          resolveReason: agentSignal.resolveReason,
+          reason: `${agentSignal.reason}:${probed.reason}`,
+          updatedAt: nowIso(nowMs),
+        };
+      }
+
       if (hasRecentReadyGrace) {
         return {
           uiServer,
@@ -515,6 +633,21 @@ export async function buildMatchR2Status(input: {
           reason: staleSequenceConfirmed
             ? `r2-ready-grace:sequence-age=${sequenceAgeMs}`
             : `r2-ready-grace:${probed.reason}`,
+          updatedAt: nowIso(nowMs),
+        };
+      }
+
+      if (agentSignal?.state === "warming") {
+        return {
+          uiServer,
+          slotServer,
+          state: "warming",
+          playlistUrl,
+          segmentProbe: probed.segmentProbe === "ok" ? "ok" : "unknown",
+          lastSequenceAgeMs: sequenceAgeMs,
+          resolverState: agentSignal.resolverState,
+          resolveReason: agentSignal.resolveReason,
+          reason: `${agentSignal.reason}:${probed.reason}`,
           updatedAt: nowIso(nowMs),
         };
       }
@@ -546,16 +679,17 @@ export async function buildMatchR2Status(input: {
           ? probed.reason
           : seeded.resolveReason;
       if (seeded.state === "down") clearRecentReadyState(matchSlotKey);
+      const finalAgentDown = agentSignal?.state === "down" ? agentSignal : null;
       return {
         uiServer,
         slotServer,
-        state: seeded.state,
+        state: finalAgentDown?.state || seeded.state,
         playlistUrl,
         segmentProbe: staleSequenceConfirmed ? "ok" : probed.segmentProbe,
         lastSequenceAgeMs: sequenceAgeMs,
-        resolverState: fallbackResolverState,
-        resolveReason: fallbackResolveReason,
-        reason: staleSequenceConfirmed ? `${seeded.reason}:age=${sequenceAgeMs}` : seeded.reason,
+        resolverState: finalAgentDown?.resolverState || fallbackResolverState,
+        resolveReason: finalAgentDown?.resolveReason || fallbackResolveReason,
+        reason: finalAgentDown?.reason || (staleSequenceConfirmed ? `${seeded.reason}:age=${sequenceAgeMs}` : seeded.reason),
         updatedAt: nowIso(nowMs),
       };
     })
