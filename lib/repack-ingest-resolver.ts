@@ -1343,8 +1343,9 @@ function finalizeSuccessfulResolution(input: {
       ? String(input.probe.evidence?.playlistUrl || "").trim()
       : input.selectedCandidateUrl;
   const stableReferrer = normalizeHttpUrl(input.sourceReferrerUrl || input.sourceUrl) || input.sourceUrl;
+  const effectiveIsProxy = isEmbedProxyCandidateUrl(effectiveIngestUrl);
   const proxyWrapped =
-    input.preferProxyIngest && isValidHttpUrl(input.requestOrigin)
+    input.preferProxyIngest && !effectiveIsProxy && isValidHttpUrl(input.requestOrigin)
       ? buildInternalEmbedProxyUrl({
           sourceUrl: effectiveIngestUrl,
           requestOrigin: input.requestOrigin,
@@ -1352,6 +1353,7 @@ function finalizeSuccessfulResolution(input: {
         })
       : "";
   const shouldProxy =
+    effectiveIsProxy ||
     (!!proxyWrapped && isValidHttpUrl(proxyWrapped)) ||
     shouldPreferProxyResolvedIngest({
       sourceUrl: input.sourceUrl,
@@ -1360,9 +1362,15 @@ function finalizeSuccessfulResolution(input: {
       requestOrigin: input.requestOrigin,
     });
   const finalIngestUrl =
-    shouldProxy && proxyWrapped && isValidHttpUrl(proxyWrapped) ? proxyWrapped : effectiveIngestUrl;
+    effectiveIsProxy
+      ? effectiveIngestUrl
+      : shouldProxy && proxyWrapped && isValidHttpUrl(proxyWrapped)
+        ? proxyWrapped
+        : effectiveIngestUrl;
   const finalMode =
-    shouldProxy && proxyWrapped && isValidHttpUrl(proxyWrapped) ? "backend_proxy_ingest" : classifyMode(finalIngestUrl);
+    effectiveIsProxy || (shouldProxy && proxyWrapped && isValidHttpUrl(proxyWrapped))
+      ? "backend_proxy_ingest"
+      : classifyMode(finalIngestUrl);
   return {
     mode: finalMode,
     ingestUrl: finalIngestUrl,
