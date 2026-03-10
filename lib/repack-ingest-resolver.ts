@@ -1902,6 +1902,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
   let candidatesProbed = 0;
   let lastProbeReason = "probe-failed";
   let lastEvidence: RepackIngestResolution["probeEvidence"] = null;
+  let softAcceptedResult: RepackIngestResolution | null = null;
 
   while (pending.length && candidatesProbed < maxCandidates) {
     const item = pending.shift();
@@ -1957,10 +1958,11 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       evidence: finalProbe.evidence,
       mode: item.mode,
     })) {
-      return {
-        mode: item.mode,
-        ingestUrl: item.candidateUrl,
-        reason: "resolved-proxy-candidate-soft",
+      if (!softAcceptedResult) {
+        softAcceptedResult = {
+          mode: item.mode,
+          ingestUrl: item.candidateUrl,
+          reason: "resolved-proxy-candidate-soft",
         resolver: {
           stage: "done",
           candidatesFound: rankedSeed.length,
@@ -1970,8 +1972,11 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
           rejectReason: "",
           resolverState: "ok",
         },
-        probeEvidence: finalProbe.evidence ? { ...finalProbe.evidence, referrerUrl: item.referrerUrl || sourceFetch.finalUrl || sourceUrl } : null,
-      };
+          probeEvidence: finalProbe.evidence
+            ? { ...finalProbe.evidence, referrerUrl: item.referrerUrl || sourceFetch.finalUrl || sourceUrl }
+            : null,
+        };
+      }
     }
     lastProbeReason = finalProbe.reason || "probe-failed";
     lastEvidence = finalProbe.evidence;
@@ -2052,6 +2057,10 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       );
       pending.push(...rankedExtra);
     }
+  }
+
+  if (softAcceptedResult) {
+    return softAcceptedResult;
   }
 
   const resolverState: RepackResolverState = rankedSeed.length ? "probe-failed" : "no-candidate";
