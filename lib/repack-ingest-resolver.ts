@@ -573,7 +573,7 @@ function extractAlbaDynamicManifestCandidates(text: string, baseUrl: string) {
   if (!domainPool.size) return [] as string[];
 
   const pathPool = new Set<string>();
-  const hlsPathRe = /\/hls\/[a-z0-9_-]+\/live\/index\.m3u8/gi;
+  const hlsPathRe = /\/hls\/[a-z0-9_-]+\/(?:master\.m3u8|index\.m3u8|live\/index\.m3u8)/gi;
   for (const match of text.matchAll(hlsPathRe)) {
     const path = String(match[0] || "").trim();
     if (!path) continue;
@@ -1377,6 +1377,29 @@ function shouldRetryProtectedCandidateViaProxy(reason: string) {
   return /^(?:playlist|segment|variant)-http-(?:0|401|403|406)$/i.test(String(reason || "").trim());
 }
 
+function canSoftAcceptProtectedSegmentProbe(input: {
+  candidateUrl: string;
+  reason: string;
+  evidence?: ProbeResult["evidence"] | null;
+  mode: RepackIngestMode;
+}) {
+  if (input.mode !== "backend_proxy_ingest") return false;
+  if (!/^segment-http-(?:401|403)$/i.test(String(input.reason || "").trim())) return false;
+  const playlistStatus = Number.parseInt(String(input.evidence?.playlistStatus || 0), 10) || 0;
+  if (playlistStatus < 200 || playlistStatus >= 300) return false;
+  const targetUrl = extractEmbedProxyTargetUrl(input.candidateUrl) || input.candidateUrl;
+  if (!isValidHttpUrl(targetUrl)) return false;
+  try {
+    const u = new URL(targetUrl);
+    const host = u.hostname.toLowerCase();
+    const pathname = String(u.pathname || "").toLowerCase();
+    if ((host.endsWith(".yallashot.us") || host === "yallashot.us") && pathname.includes("/kooora/")) return true;
+    if (pathname.includes("/albaplayer/")) return true;
+    if (host.includes("yallashoot") || host.includes("yallalive")) return true;
+  } catch {}
+  return false;
+}
+
 async function probeCandidate(input: {
   candidateUrl: string;
   timeoutMs: number;
@@ -1921,6 +1944,28 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     }
 
     if (!finalProbe) continue;
+    if (canSoftAcceptProtectedSegmentProbe({
+      candidateUrl: item.candidateUrl,
+      reason: finalProbe.reason,
+      evidence: finalProbe.evidence,
+      mode: item.mode,
+    })) {
+      return {
+        mode: item.mode,
+        ingestUrl: item.candidateUrl,
+        reason: "resolved-proxy-candidate-soft",
+        resolver: {
+          stage: "done",
+          candidatesFound: rankedSeed.length,
+          candidatesProbed,
+          selectedCandidate: item.candidateUrl,
+          selectedKind: item.mode,
+          rejectReason: "",
+          resolverState: "ok",
+        },
+        probeEvidence: finalProbe.evidence ? { ...finalProbe.evidence, referrerUrl: item.referrerUrl || sourceFetch.finalUrl || sourceUrl } : null,
+      };
+    }
     lastProbeReason = finalProbe.reason || "probe-failed";
     lastEvidence = finalProbe.evidence;
     if (

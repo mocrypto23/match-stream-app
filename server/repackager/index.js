@@ -609,6 +609,17 @@ class RepackJob {
       } catch {}
       return;
     }
+
+    // A job may be idle-stopped while keeping the same ingest URL. A fresh seed for the
+    // same source must bring ffmpeg back, otherwise the UI stays warming with R2 404s.
+    if (!this.ffmpegProc && this.state === "stopped") {
+      this.state = "starting";
+      this.pendingHardReset = !this.lastPublishAt;
+      this.manager.log("info", "repack resume from stopped seed", { job: this.key });
+      this.spawnFfmpeg();
+      return;
+    }
+
     if (this.state === "degraded" || forceRestart) {
       this.consecutiveStartFailures = 0;
       this.degradedReason = "";
@@ -1358,7 +1369,15 @@ class RepackManager {
       upstreamProbePlaylistStatus < 300 &&
       upstreamProbeSegmentStatus >= 200 &&
       upstreamProbeSegmentStatus < 300;
-    if (!preflight.ok && !canBypass403Preflight) {
+    const canBypassProtectedSegmentPreflight =
+      !preflight.ok &&
+      preflight.reason === "segment-http-403" &&
+      ingest.ingestVerified === true &&
+      ingest.ingestMode === "backend_proxy_ingest" &&
+      upstreamProbePlaylistStatus >= 200 &&
+      upstreamProbePlaylistStatus < 300 &&
+      upstreamProbeSegmentStatus === 403;
+    if (!preflight.ok && !canBypass403Preflight && !canBypassProtectedSegmentPreflight) {
       this.metrics.seedPreflightFailed += 1;
       const reason = `preflight-failed:${preflight.reason}`;
       this.noteSeedReject(reason);
@@ -1372,7 +1391,7 @@ class RepackManager {
         preflight: preflight.evidence,
       };
     }
-    if (canBypass403Preflight) {
+    if (canBypass403Preflight || canBypassProtectedSegmentPreflight) {
       this.log("warn", "repack preflight bypassed for verified ingest", {
         matchId,
         serverId,
