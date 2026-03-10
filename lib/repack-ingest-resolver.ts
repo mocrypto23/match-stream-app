@@ -1478,6 +1478,7 @@ async function probeCandidate(input: {
   }
 
   let finalSegmentUrl = segmentUrl;
+  let finalPlaylistUrl = fetched.finalUrl || input.candidateUrl;
   let finalPlaylistStatus = fetched.status;
   let finalContentType = fetched.contentType;
   if (looksLikeHlsManifestUrl(segmentUrl)) {
@@ -1531,6 +1532,7 @@ async function probeCandidate(input: {
       };
     }
     finalSegmentUrl = childSegment;
+    finalPlaylistUrl = childFetched.finalUrl || segmentUrl;
     finalPlaylistStatus = childFetched.status || fetched.status;
     finalContentType = childFetched.contentType || fetched.contentType;
   }
@@ -1541,7 +1543,7 @@ async function probeCandidate(input: {
       ok: false,
       reason: `segment-http-${segmentProbe.status || 0}`,
       evidence: {
-        playlistUrl: fetched.finalUrl || input.candidateUrl,
+        playlistUrl: finalPlaylistUrl,
         segmentUrl: finalSegmentUrl,
         playlistStatus: finalPlaylistStatus,
         segmentStatus: segmentProbe.status || 0,
@@ -1555,7 +1557,7 @@ async function probeCandidate(input: {
     ok: true,
     reason: "manifest+segment-ok",
     evidence: {
-      playlistUrl: fetched.finalUrl || input.candidateUrl,
+      playlistUrl: finalPlaylistUrl,
       segmentUrl: finalSegmentUrl,
       playlistStatus: finalPlaylistStatus,
       segmentStatus: segmentProbe.status,
@@ -1923,15 +1925,20 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
         requestOrigin,
       });
       if (probe.ok) {
+        const effectiveIngestUrl =
+          item.mode !== "backend_proxy_ingest" &&
+          isValidHttpUrl(String(probe.evidence?.playlistUrl || "").trim())
+            ? String(probe.evidence?.playlistUrl || "").trim()
+            : item.candidateUrl;
         return {
           mode: item.mode,
-          ingestUrl: item.candidateUrl,
+          ingestUrl: effectiveIngestUrl,
           reason: item.mode === "backend_proxy_ingest" ? "resolved-proxy-candidate" : "resolved-direct-candidate",
           resolver: {
             stage: "done",
             candidatesFound: rankedSeed.length,
             candidatesProbed,
-            selectedCandidate: item.candidateUrl,
+            selectedCandidate: effectiveIngestUrl,
             selectedKind: item.mode,
             rejectReason: "",
             resolverState: "ok",

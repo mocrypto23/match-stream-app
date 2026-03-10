@@ -52,6 +52,9 @@ const SERVER5_REFRESH_POSTMATCH_WINDOW_MS = 3 * 60 * 60 * 1000;
 const DUPLICATE_SIBLING_START_WINDOW_MS = 6 * 60 * 60 * 1000;
 const MATCH_BOOTSTRAP_PRIME_TTL_MS = 10_000;
 const MATCH_BOOTSTRAP_PRIME_TIMEOUT_MS = 1_200;
+const MATCH_BOOTSTRAP_SYNC_TIMEOUT_MS = 4_200;
+const MATCH_BOOTSTRAP_SETTLE_TIMEOUT_MS = 5_400;
+const MATCH_BOOTSTRAP_SETTLE_POLL_MS = 700;
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 
@@ -603,6 +606,87 @@ function queueBootstrapPrime(req: Request, matchId: number, uiServers: UiServerI
   return true;
 }
 
+type MatchBootstrapPrimeResponse = {
+  ok?: boolean;
+  r2Status?: Awaited<ReturnType<typeof buildMatchR2Status>> | null;
+};
+
+async function runBootstrapPrimeSync(req: Request, matchId: number, uiServers: UiServerId[]) {
+  if (!Number.isFinite(matchId) || matchId <= 0) return null as Awaited<ReturnType<typeof buildMatchR2Status>> | null;
+  const safeUiServers = [...new Set(uiServers.filter((uiServer) => Number.isFinite(uiServer)))].sort((a, b) => a - b) as UiServerId[];
+  if (!safeUiServers.length) return null as Awaited<ReturnType<typeof buildMatchR2Status>> | null;
+  const endpoint = new URL("/api/repack/bootstrap", req.url).toString();
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), MATCH_BOOTSTRAP_SYNC_TIMEOUT_MS);
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      cache: "no-store",
+      signal: controller.signal,
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        matchId,
+        uiServers: safeUiServers,
+      }),
+    });
+    if (!response.ok) return null;
+    const payload = (await response.json().catch(() => null)) as MatchBootstrapPrimeResponse | null;
+    return payload?.r2Status?.servers?.length ? payload.r2Status : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function isBootstrapSettledStatus(
+  status: Awaited<ReturnType<typeof buildMatchR2Status>> | null,
+  uiServers: UiServerId[]
+) {
+  if (!status?.servers?.length) return { hasReady: false, settled: false };
+  const slotTargets = new Set(uiServers.map((uiServer) => getSlotServerIdForUiServer(uiServer)));
+  let hasReady = false;
+  let hasPending = false;
+  for (const entry of status.servers) {
+    if (!slotTargets.has(entry.slotServer)) continue;
+    if (entry.state === "ready") {
+      hasReady = true;
+      continue;
+    }
+    const reason = String(entry.reason || "");
+    if (entry.state === "warming" || reason === "bootstrap-queued" || reason.startsWith("seed-accepted:")) {
+      hasPending = true;
+    }
+  }
+  return { hasReady, settled: !hasPending };
+}
+
+async function waitForBootstrapSettle(input: {
+  matchId: number;
+  uiServers: UiServerId[];
+  row: MatchApiRow;
+  repackBaseUrl: string;
+  initialStatus: Awaited<ReturnType<typeof buildMatchR2Status>> | null;
+  mode: ReturnType<typeof getServerStreamMode>;
+}) {
+  let status = input.initialStatus;
+  const deadlineAt = Date.now() + MATCH_BOOTSTRAP_SETTLE_TIMEOUT_MS;
+  while (Date.now() < deadlineAt) {
+    const settledState = isBootstrapSettledStatus(status, input.uiServers);
+    if (settledState.hasReady || settledState.settled) return status;
+    await new Promise((resolve) => setTimeout(resolve, MATCH_BOOTSTRAP_SETTLE_POLL_MS));
+    status = await buildMatchR2Status({
+      mode: input.mode,
+      matchId: input.matchId,
+      row: input.row,
+      repackBaseUrl: input.repackBaseUrl,
+    });
+  }
+  return status;
+}
+
 function withQueuedBootstrapStatus(status: Awaited<ReturnType<typeof buildMatchR2Status>>, row: MatchApiRow, uiServers: UiServerId[]) {
   if (!status?.servers?.length) return status;
   const queuedSlots = new Set(uiServers.map((uiServer) => getSlotServerIdForUiServer(uiServer)));
@@ -1077,7 +1161,24 @@ export async function GET(req: Request, ctx: Ctx) {
       }
       return true;
     });
-    if (bootstrapUiServers.length && queueBootstrapPrime(req, Number(payload.id), bootstrapUiServers)) {
+    const hasReadyServer = !!r2Status?.servers?.some((entry) => entry.state === "ready");
+    if (bootstrapUiServers.length && !hasReadyServer) {
+      const syncStatus = await runBootstrapPrimeSync(req, Number(payload.id), bootstrapUiServers);
+      if (syncStatus?.servers?.length) {
+        r2Status = syncStatus;
+      }
+      const settledStatus = await waitForBootstrapSettle({
+        matchId: Number(payload.id),
+        uiServers: bootstrapUiServers,
+        row: payload,
+        repackBaseUrl: repackFlags.publicBaseUrl,
+        initialStatus: r2Status,
+        mode: streamMode,
+      });
+      if (settledStatus?.servers?.length) {
+        r2Status = settledStatus;
+      }
+    } else if (bootstrapUiServers.length && queueBootstrapPrime(req, Number(payload.id), bootstrapUiServers)) {
       r2Status = withQueuedBootstrapStatus(r2Status, payload, bootstrapUiServers);
     }
   }

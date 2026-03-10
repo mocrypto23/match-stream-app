@@ -390,6 +390,19 @@ class RepackJob {
     return Math.max(safeBase, Math.min(120_000, derived));
   }
 
+  shouldForceRestartOnSeed(now = Date.now()) {
+    if (this.state === "degraded") return true;
+    const staleMs = this.getAdaptiveStaleMs(this.manager.config.seedRestartStaleMs, 8);
+    if (!this.lastPublishAt) {
+      return now - this.createdAt > staleMs;
+    }
+    if (now - this.lastPublishAt > staleMs) return true;
+    if (this.lastFfmpegExitAt && this.lastFfmpegExitAt >= this.lastPublishAt && now - this.lastFfmpegExitAt > 1200) {
+      return true;
+    }
+    return false;
+  }
+
   resetEncoderRunState({ hardReset = false } = {}) {
     this.lastLocalSegmentFingerprint = "";
     this.lastLocalSegmentChangedAt = 0;
@@ -1415,7 +1428,7 @@ class RepackManager {
     }
 
     let job = existingJob || this.jobs.get(key);
-    const forceRestart = Boolean(job && job.state === "degraded");
+    const forceRestart = Boolean(job && job.shouldForceRestartOnSeed(nowMs));
     if (!job) {
       const workDir = path.join(this.config.workRoot, `m${matchId}`, `s${serverId}`);
       const remotePrefix = `live/m${matchId}/s${serverId}`;

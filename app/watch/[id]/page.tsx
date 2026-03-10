@@ -6504,14 +6504,15 @@ export default function WatchPage() {
     };
     void refresh();
     const hasPendingBootstrap = Object.keys(strictBootstrapPendingBySlot).length > 0;
+    const hasWarmingServer = !!r2Status?.servers?.some((entry) => entry.state === "warming");
     const timerId = window.setInterval(() => {
       void refresh();
-    }, hasPendingBootstrap ? 2500 : 15000);
+    }, hasPendingBootstrap || hasWarmingServer ? 4000 : 15000);
     return () => {
       cancel = true;
       window.clearInterval(timerId);
     };
-  }, [idNum, match?.id, strictBootstrapPendingBySlot]);
+  }, [idNum, match?.id, strictBootstrapPendingBySlot, r2Status]);
 
   useEffect(() => {
     if (!selectedOption) return;
