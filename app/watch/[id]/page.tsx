@@ -6415,6 +6415,7 @@ export default function WatchPage() {
       const slotServer = getSlotServerIdForUiServer(uiServer);
       const statusEntry = strictR2StatusBySlot.get(slotServer);
       const playlistUrl = String(statusEntry?.playlistUrl || "").trim();
+      const terminalReason = String(statusEntry?.reason || "");
       const statusUpdatedAtMs = Number.parseInt(String(new Date(statusEntry?.updatedAt || "").getTime()), 10);
       const hasRecentStatus = Number.isFinite(statusUpdatedAtMs) && Date.now() - statusUpdatedAtMs < STRICT_BOOTSTRAP_RECENT_WINDOW_MS;
       if (statusEntry?.state === "ready" && isValidHttpUrl(playlistUrl)) {
@@ -6423,6 +6424,21 @@ export default function WatchPage() {
         return;
       }
       if (statusEntry?.state === "warming" && hasRecentStatus) {
+        markStrictBootstrapPending([slotServer], false);
+        markStrictBootstrapAttempted([slotServer]);
+        return;
+      }
+      if (
+        statusEntry?.state === "down" &&
+        (terminalReason === "missing-source" ||
+          terminalReason === "source-not-allowed" ||
+          terminalReason === "blocked-outside-window" ||
+          terminalReason.startsWith("seed-rejected:") ||
+          terminalReason.startsWith("seed-stalled:") ||
+          statusEntry?.resolverState === "missing-source" ||
+          statusEntry?.resolverState === "no-candidate" ||
+          statusEntry?.resolverState === "probe-failed")
+      ) {
         markStrictBootstrapPending([slotServer], false);
         markStrictBootstrapAttempted([slotServer]);
         return;
