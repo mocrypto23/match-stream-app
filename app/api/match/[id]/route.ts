@@ -614,8 +614,16 @@ function withQueuedBootstrapStatus(status: Awaited<ReturnType<typeof buildMatchR
       const sourceUrl = getSlotSourceUrlFromRow(row, entry.slotServer);
       if (!queuedSlots.has(entry.slotServer)) return entry;
       if (!isAllowedBootstrapSourceUrl(sourceUrl)) return entry;
-      if (entry.state === "ready") return entry;
-      if (entry.reason === "missing-source" || entry.reason === "source-not-allowed" || entry.reason === "blocked-outside-window") {
+      if (entry.state !== "down") return entry;
+      if (
+        entry.reason === "missing-source" ||
+        entry.reason === "source-not-allowed" ||
+        entry.reason === "blocked-outside-window" ||
+        entry.reason.startsWith("seed-rejected:") ||
+        entry.reason.startsWith("seed-stalled:") ||
+        entry.resolverState === "no-candidate" ||
+        entry.resolverState === "probe-failed"
+      ) {
         return entry;
       }
       return {
@@ -1054,7 +1062,20 @@ export async function GET(req: Request, ctx: Ctx) {
   if (streamMode === "r2_strict" && matchWindow.inWindow) {
     const bootstrapUiServers = getBootstrapPrimeUiServers(payload).filter((uiServer) => {
       const entry = r2Status?.servers?.find((item) => item.uiServer === uiServer);
-      return entry?.state !== "ready";
+      if (!entry) return true;
+      if (entry.state === "ready" || entry.state === "warming") return false;
+      if (
+        entry.reason === "missing-source" ||
+        entry.reason === "source-not-allowed" ||
+        entry.reason === "blocked-outside-window" ||
+        entry.reason.startsWith("seed-rejected:") ||
+        entry.reason.startsWith("seed-stalled:") ||
+        entry.resolverState === "no-candidate" ||
+        entry.resolverState === "probe-failed"
+      ) {
+        return false;
+      }
+      return true;
     });
     if (bootstrapUiServers.length && queueBootstrapPrime(req, Number(payload.id), bootstrapUiServers)) {
       r2Status = withQueuedBootstrapStatus(r2Status, payload, bootstrapUiServers);

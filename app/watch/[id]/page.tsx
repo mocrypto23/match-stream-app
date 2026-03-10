@@ -5304,9 +5304,18 @@ function getStrictServerSubtitle(
 ) {
   if (entry?.state === "ready") return "مباشر";
   if (!hasSource) return "لا يوجد بث";
-  if (!bootstrapAttempted || bootstrapPending) return "جاري التحضير";
+  if (
+    entry?.state === "down" ||
+    entry?.resolverState === "missing-source" ||
+    entry?.resolverState === "no-candidate" ||
+    String(entry?.reason || "").startsWith("seed-rejected:") ||
+    String(entry?.reason || "").startsWith("seed-stalled:")
+  ) {
+    return "لا يوجد بث";
+  }
+  if (bootstrapPending) return "جاري التحضير";
+  if (!entry && !bootstrapAttempted) return "جاري التحضير";
   if (entry?.state === "warming" || health === "pending") return "جاري التحضير";
-  if (entry?.resolverState === "missing-source" || entry?.resolverState === "no-candidate") return "لا يوجد بث";
   if (entry?.state === "down" || health === "down" || !hasUrl) return "لا يوجد بث";
   return "جاري التحضير";
 }

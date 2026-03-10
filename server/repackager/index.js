@@ -913,6 +913,20 @@ class RepackJob {
       return;
     }
     const staleMs = this.getAdaptiveStaleMs(this.manager.config.stalePublishMs, 8);
+    if (!this.ffmpegProc && this.state !== "stopped" && this.state !== "degraded") {
+      const silentForMs = this.lastPublishAt ? now - this.lastPublishAt : now - this.createdAt;
+      if (silentForMs > staleMs) {
+        this.manager.log("warn", "repack missing-ffmpeg respawn", {
+          job: this.key,
+          staleMs: silentForMs,
+          staleThresholdMs: staleMs,
+          state: this.state,
+        });
+        this.state = "starting";
+        this.spawnFfmpeg();
+        return;
+      }
+    }
     if (this.lastPublishAt && now - this.lastPublishAt > staleMs) {
       const staleForMs = now - this.lastPublishAt;
       this.manager.log("warn", "repack stale publish", {

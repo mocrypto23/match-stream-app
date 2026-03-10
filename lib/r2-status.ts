@@ -15,8 +15,11 @@ import { computeMatchWindowState, getMatchWindowConfig, parseMatchStartMs } from
 const DEFAULT_R2_PROBE_TIMEOUT_MS = 2400;
 const DEFAULT_SEGMENT_PROBE_TIMEOUT_MS = 3200;
 const DEFAULT_SEED_WARMING_WINDOW_MS = 120_000;
+const DEFAULT_MAX_SEED_WARMING_MS = 75_000;
+const DEFAULT_READY_GRACE_MS = 45_000;
 const DEFAULT_STALE_SEQUENCE_GUARD_MS = 30_000;
 const SEQUENCE_STATE_TTL_MS = 10 * 60 * 1000;
+const STALE_SEQUENCE_CONFIRMATION_COUNT = 3;
 
 type StreamRowFields = {
   stream_url?: string | null;
@@ -43,6 +46,7 @@ type PlaylistProbeResult = {
 
 const sequenceStateByPlaylist = new Map<string, SequenceState>();
 const staleSequenceCountByPlaylist = new Map<string, { count: number; lastSeenAt: number }>();
+const recentReadySeenAtByMatchSlot = new Map<string, number>();
 const finishedSeenAtByMatchSlot = new Map<string, number>();
 const segmentFailStateByMatchSlot = new Map<string, { count: number; lastSeenAt: number }>();
 
@@ -56,6 +60,9 @@ function trimSequenceState(nowMs: number) {
   }
   for (const [key, value] of staleSequenceCountByPlaylist.entries()) {
     if (nowMs - value.lastSeenAt > SEQUENCE_STATE_TTL_MS) staleSequenceCountByPlaylist.delete(key);
+  }
+  for (const [key, seenAt] of recentReadySeenAtByMatchSlot.entries()) {
+    if (nowMs - seenAt > SEQUENCE_STATE_TTL_MS) recentReadySeenAtByMatchSlot.delete(key);
   }
 }
 
@@ -177,6 +184,22 @@ function noteStaleSequenceCount(playlistUrl: string, isStale: boolean, nowMs: nu
   return next.count;
 }
 
+function clearRecentReadyState(matchSlotKey: string) {
+  recentReadySeenAtByMatchSlot.delete(matchSlotKey);
+}
+
+function noteRecentReadyState(matchSlotKey: string, nowMs: number) {
+  trimSequenceState(nowMs);
+  recentReadySeenAtByMatchSlot.set(matchSlotKey, nowMs);
+}
+
+function getRecentReadyAgeMs(matchSlotKey: string, nowMs: number) {
+  trimSequenceState(nowMs);
+  const seenAt = recentReadySeenAtByMatchSlot.get(matchSlotKey);
+  if (!Number.isFinite(seenAt)) return null;
+  return Math.max(0, nowMs - Number(seenAt));
+}
+
 async function probeR2Playlist(playlistUrl: string, timeoutMs: number): Promise<PlaylistProbeResult> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -254,7 +277,13 @@ async function probeR2Playlist(playlistUrl: string, timeoutMs: number): Promise<
   }
 }
 
-function resolveStateFromRecentSeed(matchId: number, slotServer: SlotServerId, probeReason: string, nowMs: number) {
+function resolveStateFromRecentSeed(
+  matchId: number,
+  slotServer: SlotServerId,
+  probeReason: string,
+  nowMs: number,
+  maxSeedWarmingMs: number
+) {
   const seedState = getRepackSeedRuntimeState(matchId, slotServer);
   if (!seedState) {
     return {
@@ -273,6 +302,16 @@ function resolveStateFromRecentSeed(matchId: number, slotServer: SlotServerId, p
     };
   }
   if (seedState.accepted) {
+    const acceptedAt = Number.isFinite(seedState.acceptedAt) ? Number(seedState.acceptedAt) : seedState.updatedAt;
+    const acceptedAgeMs = Math.max(0, nowMs - acceptedAt);
+    if (acceptedAgeMs > maxSeedWarmingMs) {
+      return {
+        state: "down" as R2ServerState,
+        reason: `seed-stalled:${seedState.reason || "ok"}:${probeReason}`,
+        resolverState: seedState.resolverState || ("ok" as const),
+        resolveReason: seedState.resolveReason || "seed-stalled",
+      };
+    }
     return {
       state: "warming" as R2ServerState,
       reason: `seed-accepted:${seedState.reason || "ok"}:${probeReason}`,
@@ -313,6 +352,14 @@ export async function buildMatchR2Status(input: {
     600,
     Number.parseInt(String(process.env.R2_STATUS_SEGMENT_PROBE_TIMEOUT_MS || DEFAULT_SEGMENT_PROBE_TIMEOUT_MS), 10)
   );
+  const maxSeedWarmingMs = Math.max(
+    10_000,
+    Number.parseInt(String(process.env.R2_STATUS_MAX_SEED_WARMING_MS || DEFAULT_MAX_SEED_WARMING_MS), 10)
+  );
+  const readyGraceMs = Math.max(
+    5_000,
+    Number.parseInt(String(process.env.R2_STATUS_READY_GRACE_MS || DEFAULT_READY_GRACE_MS), 10)
+  );
   const staleSequenceGuardMs = Math.max(
     3000,
     Number.parseInt(String(process.env.R2_STATUS_STALE_SEQUENCE_GUARD_MS || DEFAULT_STALE_SEQUENCE_GUARD_MS), 10)
@@ -330,6 +377,7 @@ export async function buildMatchR2Status(input: {
       const playlistUrl = buildR2PlaylistUrlForSlot(input.repackBaseUrl, matchId, slotServer);
       if (!hasSource || !sourceAllowed || !playlistUrl) {
         clearEarlyStopState(matchSlotKey);
+        clearRecentReadyState(matchSlotKey);
         return {
           uiServer,
           slotServer,
@@ -346,6 +394,7 @@ export async function buildMatchR2Status(input: {
 
       if (!shouldProbeR2) {
         clearEarlyStopState(matchSlotKey);
+        clearRecentReadyState(matchSlotKey);
         return {
           uiServer,
           slotServer,
@@ -362,6 +411,7 @@ export async function buildMatchR2Status(input: {
 
       if (!matchWindow.inWindow) {
         clearEarlyStopState(matchSlotKey);
+        clearRecentReadyState(matchSlotKey);
         return {
           uiServer,
           slotServer,
@@ -390,25 +440,13 @@ export async function buildMatchR2Status(input: {
       const probed = await probeR2Playlist(playlistUrl, Math.max(probeTimeoutMs, segmentProbeTimeoutMs));
       const sequenceAgeMs = noteSequenceAndGetAgeMs(playlistUrl, probed.mediaSequence, nowMs);
       const consecutiveSegmentFails = noteSegmentProbeFailure(matchSlotKey, probed.segmentProbe === "fail", nowMs);
+      const recentReadyAgeMs = getRecentReadyAgeMs(matchSlotKey, nowMs);
+      const hasRecentReadyGrace = Number.isFinite(recentReadyAgeMs) && recentReadyAgeMs !== null && recentReadyAgeMs <= readyGraceMs;
       const recentSeedState = getRepackSeedRuntimeState(matchId, slotServer);
       const recentSeedRejected =
         !!recentSeedState &&
         !recentSeedState.accepted &&
         nowMs - recentSeedState.updatedAt <= DEFAULT_SEED_WARMING_WINDOW_MS;
-      if (recentSeedRejected) {
-        return {
-          uiServer,
-          slotServer,
-          state: "down",
-          playlistUrl,
-          segmentProbe: probed.segmentProbe,
-          lastSequenceAgeMs: sequenceAgeMs,
-          resolverState: recentSeedState?.resolverState || "unknown",
-          resolveReason: recentSeedState?.resolveReason || recentSeedState?.reason || "seed-rejected",
-          reason: `seed-rejected:${recentSeedState?.reason || "unknown"}`,
-          updatedAt: nowIso(nowMs),
-        };
-      }
       const finishedDebounced =
         shouldEarlyStopFinished &&
         finishedSeenAt !== null &&
@@ -433,8 +471,9 @@ export async function buildMatchR2Status(input: {
         sequenceAgeMs !== null &&
         sequenceAgeMs > staleSequenceGuardMs;
       const staleSequenceCount = noteStaleSequenceCount(playlistUrl, isStaleSequence, nowMs);
-      const staleSequenceConfirmed = isStaleSequence && staleSequenceCount >= 2;
+      const staleSequenceConfirmed = isStaleSequence && staleSequenceCount >= STALE_SEQUENCE_CONFIRMATION_COUNT;
       if (probed.state === "ready" && !staleSequenceConfirmed) {
+        if (!isStaleSequence) noteRecentReadyState(matchSlotKey, nowMs);
         return {
           uiServer,
           slotServer,
@@ -449,8 +488,41 @@ export async function buildMatchR2Status(input: {
         };
       }
 
+      if (hasRecentReadyGrace) {
+        return {
+          uiServer,
+          slotServer,
+          state: "ready",
+          playlistUrl,
+          segmentProbe: probed.segmentProbe === "ok" ? "ok" : "unknown",
+          lastSequenceAgeMs: sequenceAgeMs,
+          resolverState: "ok",
+          resolveReason: "recent-ready-grace",
+          reason: staleSequenceConfirmed
+            ? `r2-ready-grace:sequence-age=${sequenceAgeMs}`
+            : `r2-ready-grace:${probed.reason}`,
+          updatedAt: nowIso(nowMs),
+        };
+      }
+
+      if (recentSeedRejected) {
+        clearRecentReadyState(matchSlotKey);
+        return {
+          uiServer,
+          slotServer,
+          state: "down",
+          playlistUrl,
+          segmentProbe: probed.segmentProbe,
+          lastSequenceAgeMs: sequenceAgeMs,
+          resolverState: recentSeedState?.resolverState || "unknown",
+          resolveReason: recentSeedState?.resolveReason || recentSeedState?.reason || "seed-rejected",
+          reason: `seed-rejected:${recentSeedState?.reason || "unknown"}`,
+          updatedAt: nowIso(nowMs),
+        };
+      }
+
       const fallbackReason = staleSequenceConfirmed ? "r2-sequence-stale" : probed.reason;
-      const seeded = resolveStateFromRecentSeed(matchId, slotServer, fallbackReason, nowMs);
+      const seeded = resolveStateFromRecentSeed(matchId, slotServer, fallbackReason, nowMs, maxSeedWarmingMs);
       const fallbackResolverState =
         seeded.resolverState === "unknown" && probed.segmentProbe === "fail"
           ? "probe-failed"
@@ -459,6 +531,7 @@ export async function buildMatchR2Status(input: {
         seeded.resolverState === "unknown" && probed.segmentProbe === "fail"
           ? probed.reason
           : seeded.resolveReason;
+      if (seeded.state === "down") clearRecentReadyState(matchSlotKey);
       return {
         uiServer,
         slotServer,

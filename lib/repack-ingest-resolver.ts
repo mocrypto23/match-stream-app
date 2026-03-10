@@ -1247,7 +1247,7 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
           const tPath = String(tu.pathname || "").toLowerCase();
           const tHost = tu.hostname.toLowerCase();
           if ((tHost.endsWith(".yallashot.us") || tHost === "yallashot.us") && tPath.includes("/kooora/")) {
-            score += 240;
+            score += 420;
           }
           if ((tHost === "showchop.net" || tHost.endsWith(".showchop.net")) && tPath.includes("/embed/")) score += 180;
           if (tu.port === "8443" && tPath.includes(".m3u8")) score += 240;
@@ -1279,7 +1279,7 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
     if (u.hostname.toLowerCase().endsWith(`.${sourceHost}`)) score += 18;
     if (u.hostname.toLowerCase() === sourceHost && !hasStreamishPath && !combined.includes("serv=")) score -= 45;
     if (pathname.startsWith("/matches/") || pathname.startsWith("/home_")) score -= 65;
-    if (isYallashotKoooraDirect && (search.includes("token=") || search.includes("session_id="))) score -= 140;
+    if (isYallashotKoooraDirect && (search.includes("token=") || search.includes("session_id="))) score -= 260;
   } catch {
     return Number.NEGATIVE_INFINITY;
   }

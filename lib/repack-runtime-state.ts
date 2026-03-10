@@ -13,6 +13,8 @@ export type RepackSeedRuntimeState = {
   resolveReason: string;
   ingestMode: string;
   ingestUrl: string | null;
+  acceptedAt: number | null;
+  lastAcceptedAt: number | null;
   updatedAt: number;
 };
 
@@ -35,24 +37,39 @@ function trimRuntimeState(now = Date.now()) {
 export function setRepackSeedRuntimeState(
   matchId: number,
   slotServerId: SlotServerId,
-  input: Omit<RepackSeedRuntimeState, "updatedAt"> & { updatedAt?: number }
+  input: Omit<RepackSeedRuntimeState, "updatedAt" | "acceptedAt" | "lastAcceptedAt"> & { updatedAt?: number }
 ) {
   trimRuntimeState();
+  const now = Number.isFinite(input.updatedAt) ? Number(input.updatedAt) : Date.now();
+  const prev = repackSeedRuntimeState.get(runtimeStateKey(matchId, slotServerId)) || null;
+  const accepted = Boolean(input.accepted);
+  const reason = String(input.reason || "").trim() || "unknown";
+  const normalizedResolverState =
+    String(input.resolverState || "").trim() === "ok" ||
+    String(input.resolverState || "").trim() === "no-candidate" ||
+    String(input.resolverState || "").trim() === "probe-failed" ||
+    String(input.resolverState || "").trim() === "missing-source"
+      ? (input.resolverState as RepackResolverState)
+      : "unknown";
+  const ingestMode = String(input.ingestMode || "").trim() || "none";
+  const ingestUrl =
+    typeof input.ingestUrl === "string" && input.ingestUrl.trim() ? input.ingestUrl.trim() : null;
+  const sameAcceptedWindow =
+    accepted &&
+    prev?.accepted &&
+    prev.ingestUrl === ingestUrl &&
+    prev.ingestMode === ingestMode;
   const next: RepackSeedRuntimeState = {
-    accepted: Boolean(input.accepted),
-    reason: String(input.reason || "").trim() || "unknown",
+    accepted,
+    reason,
     statusCode: Number.isFinite(input.statusCode) ? Number(input.statusCode) : 0,
-    resolverState:
-      String(input.resolverState || "").trim() === "ok" ||
-      String(input.resolverState || "").trim() === "no-candidate" ||
-      String(input.resolverState || "").trim() === "probe-failed" ||
-      String(input.resolverState || "").trim() === "missing-source"
-        ? (input.resolverState as RepackResolverState)
-        : "unknown",
+    resolverState: normalizedResolverState,
     resolveReason: String(input.resolveReason || "").trim() || "unknown",
-    ingestMode: String(input.ingestMode || "").trim() || "none",
-    ingestUrl: typeof input.ingestUrl === "string" && input.ingestUrl.trim() ? input.ingestUrl.trim() : null,
-    updatedAt: Number.isFinite(input.updatedAt) ? Number(input.updatedAt) : Date.now(),
+    ingestMode,
+    ingestUrl,
+    acceptedAt: accepted ? (sameAcceptedWindow ? prev?.acceptedAt || prev?.lastAcceptedAt || prev?.updatedAt || now : now) : null,
+    lastAcceptedAt: accepted ? now : prev?.lastAcceptedAt || null,
+    updatedAt: now,
   };
   repackSeedRuntimeState.set(runtimeStateKey(matchId, slotServerId), next);
 }
