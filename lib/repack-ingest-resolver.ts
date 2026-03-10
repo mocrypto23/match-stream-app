@@ -66,6 +66,12 @@ type RankedCandidate = {
   referrerUrl: string;
 };
 
+type Playerv2Config = {
+  paths: string[];
+  domains: string[];
+  randomCandidates: string[];
+};
+
 const DEFAULT_TIMEOUT_MS = 5200;
 const DEFAULT_SEGMENT_TIMEOUT_MS = 2200;
 const DEFAULT_MAX_CANDIDATES = 32;
@@ -189,7 +195,7 @@ function buildPlayerv2FingerprintCandidates() {
     for (let idx = 0; idx < length; idx += 1) out += alphabet[Math.floor(Math.random() * alphabet.length)] || "x";
     return out;
   };
-  return Array.from(new Set([pick(6), pick(8), "abc123"])).filter(Boolean);
+  return Array.from(new Set([pick(6), pick(8), pick(10), "abc123"])).filter(Boolean);
 }
 
 function decodeBase64ToText(raw: string) {
@@ -654,32 +660,47 @@ function normalizeDomainPrefix(rawDomain: string, baseUrl: string) {
   return normalized.replace(/\/+$/, "");
 }
 
-function extractPlayerv2ConfigFromHtml(html: string, pageUrl: string) {
+function extractPlayerv2ConfigFromHtml(html: string, pageUrl: string): Playerv2Config {
   const text = normalizeHtmlForScan(html);
   const paths = new Set<string>();
   const domains = new Set<string>();
+  const randomCandidates = new Set<string>();
 
-  const cfgMatch = text.match(/window\.tabsConfig\s*=\s*(\{[\s\S]*?\})\s*;/i);
-  if (cfgMatch?.[1]) {
-    try {
-      const cfg = JSON.parse(cfgMatch[1]) as {
-        tabs?: Array<{ path?: string; mobile_path?: string }>;
-        activeDomains?: string[];
-      };
-      for (const tab of Array.isArray(cfg.tabs) ? cfg.tabs : []) {
-        if (tab?.path) paths.add(tab.path);
-        if (tab?.mobile_path) paths.add(tab.mobile_path);
-      }
-      for (const domain of Array.isArray(cfg.activeDomains) ? cfg.activeDomains : []) {
-        const normalized = ensureTrailingSlash(domain);
-        if (normalized) domains.add(normalized);
-      }
-    } catch {}
+  const bootstrap = extractPlayerv2Bootstrap(text);
+  if (bootstrap) {
+    for (const path of bootstrap.paths) paths.add(path);
+    for (const domain of bootstrap.activeDomains) {
+      const normalized = ensureTrailingSlash(domain);
+      if (normalized) domains.add(normalized);
+    }
+    for (const candidate of bootstrap.randomCandidates) {
+      const normalized = normalizeCandidate(candidate, pageUrl);
+      if (normalized) randomCandidates.add(normalized);
+    }
   }
 
   for (const match of text.matchAll(/data-(?:mobile-)?path=["']([^"']+)["']/gi)) {
     const value = String(match[1] || "").trim();
     if (value) paths.add(value);
+  }
+
+  const linkRe =
+    /<a\b[^>]*(?:class=["'][^"']*(?:tablinks|servers_list)[^"']*["'][^>]*)?(?:href=["']([^"']+)["'])?[^>]*(?:data-(?:mobile-)?path=["']([^"']+)["'])?[^>]*>/gi;
+  for (const match of text.matchAll(linkRe)) {
+    const hrefValue = String(match[1] || "").trim();
+    const dataPathValue = String(match[2] || "").trim();
+    if (dataPathValue) paths.add(dataPathValue);
+    if (!hrefValue || /^javascript:/i.test(hrefValue)) continue;
+    const normalizedHref = normalizeCandidate(hrefValue, pageUrl);
+    if (!normalizedHref) continue;
+    try {
+      const hrefUrl = new URL(normalizedHref);
+      const pathCandidate = normalizePlayerv2Path(`${hrefUrl.pathname}${hrefUrl.search}`);
+      if (pathCandidate) paths.add(pathCandidate);
+      randomCandidates.add(hrefUrl.toString());
+      const origin = ensureTrailingSlash(hrefUrl.origin);
+      if (origin) domains.add(origin);
+    } catch {}
   }
 
   let pageHost = "";
@@ -697,10 +718,67 @@ function extractPlayerv2ConfigFromHtml(html: string, pageUrl: string) {
     }
   }
 
+  for (const candidate of randomCandidates) {
+    try {
+      const u = new URL(candidate);
+      const origin = ensureTrailingSlash(u.origin);
+      if (origin) domains.add(origin);
+      const pathCandidate = normalizePlayerv2Path(`${u.pathname}${u.search}`);
+      if (pathCandidate) paths.add(pathCandidate);
+    } catch {}
+  }
+
   return {
     paths: Array.from(paths).map((item) => normalizePlayerv2Path(item)).filter(Boolean),
     domains: Array.from(domains),
+    randomCandidates: Array.from(randomCandidates),
   };
+}
+
+function extractEmbedProxyTargetUrl(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return "";
+  try {
+    const u = new URL(rawUrl);
+    const pathname = String(u.pathname || "").toLowerCase();
+    if (!pathname.includes("/api/embed-proxy")) return "";
+    const targetRaw = safeDecodeURIComponent(String(u.searchParams.get("url") || "").trim());
+    return normalizeHttpUrl(targetRaw);
+  } catch {
+    return "";
+  }
+}
+
+function looksLikePlayerv2PageUrl(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    const u = new URL(rawUrl);
+    return String(u.pathname || "").toLowerCase().includes("/playerv2.php");
+  } catch {
+    return false;
+  }
+}
+
+function looksLikePlayerv2Html(html: string) {
+  const text = normalizeHtmlForScan(html).toLowerCase();
+  return (
+    text.includes("window.tabsconfig") ||
+    text.includes("playerv2.php?action=generate_token") ||
+    text.includes("data-mobile-path=") ||
+    text.includes("data-path=") ||
+    text.includes("albaplayer_name")
+  );
+}
+
+function resolvePlayerv2ContextUrl(rawUrl: string, referrerUrl?: string) {
+  for (const value of [
+    normalizeHttpUrl(rawUrl),
+    extractEmbedProxyTargetUrl(rawUrl),
+    extractEmbedProxyReferrer(rawUrl),
+    normalizeHttpUrl(referrerUrl || ""),
+  ]) {
+    if (looksLikePlayerv2PageUrl(value)) return value;
+  }
+  return "";
 }
 
 async function requestPlayerv2TokenViaProxy(input: {
@@ -938,7 +1016,8 @@ async function buildPlayerv2Candidates(sourceUrl: string, html: string, timeoutM
   const config = extractPlayerv2ConfigFromHtml(html, sourceUrl);
   if (!config.paths.length || !config.domains.length) {
     const fallbackOnly = buildPlayerv2ChannelFallbackCandidates(sourceUrl).filter((candidate) => isValidHttpUrl(candidate));
-    return Array.from(new Set(fallbackOnly));
+    const seeded = [...fallbackOnly, ...config.randomCandidates.filter((candidate) => isValidHttpUrl(candidate))];
+    return Array.from(new Set(seeded));
   }
 
   const out: string[] = [];
@@ -949,6 +1028,17 @@ async function buildPlayerv2Candidates(sourceUrl: string, html: string, timeoutM
 
   for (const fallbackCandidate of buildPlayerv2ChannelFallbackCandidates(sourceUrl)) {
     pushCandidate(fallbackCandidate);
+  }
+  for (const seededCandidate of config.randomCandidates) {
+    pushCandidate(seededCandidate);
+    if (requestOrigin) {
+      const proxied = buildInternalEmbedProxyUrl({
+        sourceUrl: seededCandidate,
+        requestOrigin,
+        referrerUrl: sourceUrl,
+      });
+      if (proxied) pushCandidate(proxied);
+    }
   }
 
   const maxPaths = Math.min(4, config.paths.length);
@@ -1025,6 +1115,42 @@ async function buildPlayerv2Candidates(sourceUrl: string, html: string, timeoutM
     result.push(candidate);
   }
   return result;
+}
+
+async function fetchEmbeddedPlayerv2ResolvedCandidates(input: {
+  pageUrl: string;
+  pageHtml: string;
+  timeoutMs: number;
+  requestOrigin: string;
+}) {
+  const out = new Set<string>();
+  const seedCandidates = extractCandidatesFromText(input.pageHtml, input.pageUrl);
+  const playerv2Pages = Array.from(
+    new Set(
+      seedCandidates
+        .map((candidate) => normalizeHttpUrl(candidate))
+        .filter((candidate) => looksLikePlayerv2PageUrl(candidate) || looksLikePlayerv2PageUrl(extractEmbedProxyTargetUrl(candidate)))
+    )
+  ).slice(0, 4);
+
+  for (const rawPageUrl of playerv2Pages) {
+    const playerv2PageUrl = extractEmbedProxyTargetUrl(rawPageUrl) || rawPageUrl;
+    if (!looksLikePlayerv2PageUrl(playerv2PageUrl)) continue;
+    const fetched = await fetchWithTimeout(playerv2PageUrl, Math.min(input.timeoutMs, 2600), {
+      referer: input.pageUrl,
+      origin: safeOrigin(input.pageUrl),
+    });
+    if (!fetched.ok || !shouldExtractCandidatesFromBody(fetched.contentType, fetched.body)) continue;
+    const candidates = await buildPlayerv2Candidates(
+      playerv2PageUrl,
+      fetched.body,
+      Math.min(input.timeoutMs, 2400),
+      input.requestOrigin
+    );
+    for (const candidate of candidates) out.add(candidate);
+  }
+
+  return Array.from(out);
 }
 
 function buildInternalEmbedProxyUrl(input: { sourceUrl: string; requestOrigin: string; referrerUrl?: string | null }) {
@@ -1256,6 +1382,7 @@ async function probeCandidate(input: {
   timeoutMs: number;
   segmentTimeoutMs: number;
   referrerUrl?: string;
+  requestOrigin?: string;
 }): Promise<ProbeResult> {
   const fetchHeaders: Record<string, string> = {};
   const safeReferer = normalizeHttpUrl(input.referrerUrl || "");
@@ -1284,6 +1411,19 @@ async function probeCandidate(input: {
     const extraCandidates = shouldExtractCandidatesFromBody(fetched.contentType, fetched.body)
       ? extractCandidatesFromText(fetched.body, fetched.finalUrl || input.candidateUrl)
       : [];
+    const playerv2ContextUrl = resolvePlayerv2ContextUrl(
+      fetched.finalUrl || input.candidateUrl,
+      input.referrerUrl || input.candidateUrl
+    );
+    if (input.requestOrigin && playerv2ContextUrl && looksLikePlayerv2Html(fetched.body)) {
+      const playerv2Candidates = await buildPlayerv2Candidates(
+        playerv2ContextUrl,
+        fetched.body,
+        Math.min(input.timeoutMs, 2600),
+        input.requestOrigin
+      );
+      extraCandidates.unshift(...playerv2Candidates);
+    }
     return {
       ok: false,
       reason: "non-manifest",
@@ -1556,6 +1696,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       timeoutMs,
       segmentTimeoutMs,
       referrerUrl: sourceUrl,
+      requestOrigin: input.requestOrigin,
     });
     if (directProbe.ok && allowedDirectSource) {
       return {
@@ -1584,6 +1725,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       timeoutMs,
       segmentTimeoutMs,
       referrerUrl: servedUrl,
+      requestOrigin: input.requestOrigin,
     });
     if (servedProbe.ok && allowedServedSource) {
       const directUrl = servedUrl;
@@ -1653,6 +1795,18 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     );
     for (const candidate of playerv2Candidates) {
       pushCandidateUnique(candidateSeed, seen, candidate);
+    }
+
+    if (requestOrigin) {
+      const embeddedPlayerv2Candidates = await fetchEmbeddedPlayerv2ResolvedCandidates({
+        pageUrl: sourceBaseUrl,
+        pageHtml: sourceFetch.body,
+        timeoutMs: Math.min(timeoutMs, 2800),
+        requestOrigin,
+      });
+      for (const candidate of embeddedPlayerv2Candidates) {
+        pushCandidateUnique(candidateSeed, seen, candidate);
+      }
     }
   }
   for (const nested of extractCandidatesFromQueryParams(sourceUrl)) {
@@ -1743,6 +1897,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
         timeoutMs,
         segmentTimeoutMs,
         referrerUrl,
+        requestOrigin,
       });
       if (probe.ok) {
         return {
