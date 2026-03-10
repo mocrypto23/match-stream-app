@@ -72,6 +72,10 @@ const DEFAULT_MAX_CANDIDATES = 32;
 const MAX_DYNAMIC_CANDIDATES = 64;
 const DEFAULT_RESOLVER_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+const PLAYERV2_FALLBACK_DOMAINS = [
+  "https://1rxolmirvosixpyfy.yallashot.us/",
+  "https://jqyjghfms1mu8zc.yallashot.us/",
+];
 
 function normalizeHttpUrl(raw: unknown) {
   const value = String(raw || "").trim();
@@ -128,6 +132,116 @@ function normalizeCandidate(raw: unknown, baseUrl: string) {
     return resolved;
   } catch {
     return "";
+  }
+}
+
+function normalizeHtmlForScan(html: string) {
+  return String(html || "")
+    .replace(/&amp;/gi, "&")
+    .replace(/\\u0026/gi, "&")
+    .replace(/\\u002f/gi, "/")
+    .replace(/\\\//g, "/");
+}
+
+function ensureTrailingSlash(raw?: string | null) {
+  const value = String(raw || "").trim();
+  if (!value || !isValidHttpUrl(value)) return "";
+  return value.endsWith("/") ? value : `${value}/`;
+}
+
+function normalizePlayerv2Path(raw?: string | null) {
+  let value = String(raw || "").trim();
+  if (!value) return "";
+  if (isValidHttpUrl(value)) {
+    try {
+      const u = new URL(value);
+      value = `${u.pathname}${u.search}`.replace(/^\/+/, "");
+    } catch {
+      return "";
+    }
+  }
+  value = value.replace(/^\/+/, "").split("?")[0].split("#")[0];
+  if (value.endsWith(".m3u8")) value = value.slice(0, -5);
+  if (!value) return "";
+  if (!value.startsWith("kooora/")) value = `kooora/${value}`;
+  return value.replace(/\/{2,}/g, "/");
+}
+
+function buildPlayerv2NonceCandidates() {
+  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  const pick = (length: number) => {
+    let out = "";
+    for (let idx = 0; idx < length; idx += 1) out += alphabet[Math.floor(Math.random() * alphabet.length)] || "x";
+    return out;
+  };
+  const base36 = (length: number) => {
+    let out = "";
+    while (out.length < length) out += Math.random().toString(36).slice(2);
+    return out.slice(0, length);
+  };
+  return Array.from(new Set([base36(6), pick(6), pick(8)])).filter(Boolean);
+}
+
+function buildPlayerv2FingerprintCandidates() {
+  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  const pick = (length: number) => {
+    let out = "";
+    for (let idx = 0; idx < length; idx += 1) out += alphabet[Math.floor(Math.random() * alphabet.length)] || "x";
+    return out;
+  };
+  return Array.from(new Set([pick(6), pick(8), "abc123"])).filter(Boolean);
+}
+
+function decodeBase64ToText(raw: string) {
+  let value = String(raw || "").trim();
+  if (!value) return "";
+  value = value.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
+  if (!/^[A-Za-z0-9+/=]+$/.test(value)) return "";
+  if (value.length % 4) value = `${value}${"=".repeat(4 - (value.length % 4))}`;
+  try {
+    return Buffer.from(value, "base64").toString("utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+function isBeinLiveMatchPageUrl(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    const u = new URL(rawUrl);
+    const host = u.hostname.toLowerCase();
+    const pathname = String(u.pathname || "").toLowerCase();
+    return (host === "bein-live.com" || host.endsWith(".bein-live.com")) && pathname.includes("/matches/");
+  } catch {
+    return false;
+  }
+}
+
+function isLivehdTvPageUrl(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    const u = new URL(rawUrl);
+    const host = u.hostname.toLowerCase();
+    const pathname = String(u.pathname || "").toLowerCase();
+    return (host === "livehd77.pro" || host.endsWith(".livehd77.pro")) && /^\/tv\/[^/?#]+\/?$/.test(pathname);
+  } catch {
+    return false;
+  }
+}
+
+function expandLivehdTvServVariants(rawUrl: string) {
+  if (!isLivehdTvPageUrl(rawUrl)) return [] as string[];
+  try {
+    const u = new URL(rawUrl);
+    const out: string[] = [];
+    for (const serv of ["0", "1"]) {
+      const next = new URL(u.toString());
+      next.searchParams.set("serv", serv);
+      out.push(next.toString());
+    }
+    return Array.from(new Set(out));
+  } catch {
+    return [] as string[];
   }
 }
 
@@ -540,6 +654,193 @@ function normalizeDomainPrefix(rawDomain: string, baseUrl: string) {
   return normalized.replace(/\/+$/, "");
 }
 
+function extractPlayerv2ConfigFromHtml(html: string, pageUrl: string) {
+  const text = normalizeHtmlForScan(html);
+  const paths = new Set<string>();
+  const domains = new Set<string>();
+
+  const cfgMatch = text.match(/window\.tabsConfig\s*=\s*(\{[\s\S]*?\})\s*;/i);
+  if (cfgMatch?.[1]) {
+    try {
+      const cfg = JSON.parse(cfgMatch[1]) as {
+        tabs?: Array<{ path?: string; mobile_path?: string }>;
+        activeDomains?: string[];
+      };
+      for (const tab of Array.isArray(cfg.tabs) ? cfg.tabs : []) {
+        if (tab?.path) paths.add(tab.path);
+        if (tab?.mobile_path) paths.add(tab.mobile_path);
+      }
+      for (const domain of Array.isArray(cfg.activeDomains) ? cfg.activeDomains : []) {
+        const normalized = ensureTrailingSlash(domain);
+        if (normalized) domains.add(normalized);
+      }
+    } catch {}
+  }
+
+  for (const match of text.matchAll(/data-(?:mobile-)?path=["']([^"']+)["']/gi)) {
+    const value = String(match[1] || "").trim();
+    if (value) paths.add(value);
+  }
+
+  let pageHost = "";
+  try {
+    const u = new URL(pageUrl);
+    pageHost = String(u.hostname || "").toLowerCase();
+    const origin = ensureTrailingSlash(u.origin);
+    if (origin) domains.add(origin);
+  } catch {}
+
+  if (pageHost.endsWith("yallashot.us")) {
+    for (const fallback of PLAYERV2_FALLBACK_DOMAINS) {
+      const normalized = ensureTrailingSlash(fallback);
+      if (normalized) domains.add(normalized);
+    }
+  }
+
+  return {
+    paths: Array.from(paths).map((item) => normalizePlayerv2Path(item)).filter(Boolean),
+    domains: Array.from(domains),
+  };
+}
+
+async function requestPlayerv2TokenViaProxy(input: {
+  playerv2Url: string;
+  pathValue: string;
+  timeoutMs: number;
+  requestOrigin: string;
+}) {
+  const endpoint = (() => {
+    try {
+      return new URL("/playerv2.php?action=generate_token", input.playerv2Url).toString();
+    } catch {
+      return "";
+    }
+  })();
+  if (!endpoint) return null as { token: string; sessionId: string } | null;
+
+  const proxyEndpoint = buildInternalEmbedProxyUrl({
+    sourceUrl: endpoint,
+    requestOrigin: input.requestOrigin,
+    referrerUrl: input.playerv2Url,
+  });
+  if (!proxyEndpoint) return null as { token: string; sessionId: string } | null;
+
+  const payloads = [
+    ...buildPlayerv2FingerprintCandidates().map((fp) => new URLSearchParams({ path: input.pathValue, fp }).toString()),
+    new URLSearchParams({ path: input.pathValue }).toString(),
+  ];
+
+  for (const payload of payloads) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), Math.max(800, input.timeoutMs));
+    try {
+      const response = await fetch(proxyEndpoint, {
+        method: "POST",
+        cache: "no-store",
+        redirect: "follow",
+        signal: controller.signal,
+        headers: {
+          "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "x-requested-with": "XMLHttpRequest",
+          "user-agent": DEFAULT_RESOLVER_USER_AGENT,
+        },
+        body: payload,
+      });
+      const text = await response.text();
+      let json: unknown = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {}
+      const parsed = json as { token?: string | number; session_id?: string | number } | null;
+      const token = parsed?.token != null ? String(parsed.token).trim() : "";
+      const sessionId = parsed?.session_id != null ? String(parsed.session_id).trim() : "";
+      if (token && sessionId) return { token, sessionId };
+    } catch {
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  return null as { token: string; sessionId: string } | null;
+}
+
+function extractBeinAjaxContext(html: string, sourceUrl: string) {
+  const text = normalizeHtmlForScan(html);
+  const matchId =
+    (text.match(/\balba-ajax-servers-container\b[^>]*data-match-id=['"](\d+)['"]/i)?.[1] ||
+      text.match(/\bmatch_id['"]?\s*[:=]\s*['"]?(\d+)['"]?/i)?.[1] ||
+      "").trim();
+  const ajaxUrlRaw =
+    (text.match(/\bAlbaAjax\s*=\s*\{\s*["']ajax_url["']\s*:\s*["']([^"']+)["']/i)?.[1] || "").trim();
+  const ajaxUrl = normalizeCandidate(ajaxUrlRaw, sourceUrl) || (() => {
+    try {
+      return new URL("/wp-admin/admin-ajax.php", sourceUrl).toString();
+    } catch {
+      return "";
+    }
+  })();
+  return {
+    matchId,
+    ajaxUrl,
+  };
+}
+
+function extractBeinAjaxCandidates(html: string, sourceUrl: string) {
+  const text = normalizeHtmlForScan(html);
+  const out = new Set<string>();
+  const pushResolved = (raw: unknown) => {
+    const candidate = normalizeCandidate(raw, sourceUrl);
+    if (candidate) out.add(candidate);
+  };
+  const pushMaybeBase64 = (raw: unknown) => {
+    const decoded = decodeBase64ToText(String(raw || "").trim());
+    if (decoded) pushResolved(decoded);
+  };
+
+  for (const match of text.matchAll(/\bdata-vload=['"]([^"']+)['"]/gi)) pushMaybeBase64(match[1]);
+  for (const match of text.matchAll(/\bdata-id=['"]([^"']+)['"]/gi)) pushMaybeBase64(match[1]);
+  for (const match of text.matchAll(/\b(?:data-initial|data-url|src|data-src|href)=['"]([^"']+)['"]/gi)) pushResolved(match[1]);
+  for (const candidate of extractCandidatesFromText(text, sourceUrl)) pushResolved(candidate);
+
+  return Array.from(out);
+}
+
+async function fetchBeinAjaxResolvedCandidates(sourceUrl: string, sourceHtml: string, timeoutMs: number) {
+  if (!isBeinLiveMatchPageUrl(sourceUrl)) return [] as string[];
+  const ctx = extractBeinAjaxContext(sourceHtml, sourceUrl);
+  if (!ctx.matchId || !ctx.ajaxUrl) return [] as string[];
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), Math.max(1200, timeoutMs));
+  try {
+    const response = await fetch(ctx.ajaxUrl, {
+      method: "POST",
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        accept: "text/html,application/xhtml+xml,*/*",
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "user-agent": DEFAULT_RESOLVER_USER_AGENT,
+        referer: sourceUrl,
+        origin: safeOrigin(sourceUrl),
+        "x-requested-with": "XMLHttpRequest",
+      },
+      body: new URLSearchParams({
+        action: "load_match_servers",
+        match_id: ctx.matchId,
+      }).toString(),
+    });
+    if (!response.ok) return [] as string[];
+    const html = await response.text();
+    return extractBeinAjaxCandidates(html, sourceUrl);
+  } catch {
+    return [] as string[];
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 function extractPlayerv2Bootstrap(html: string) {
   const text = String(html || "");
   const match = text.match(/window\.tabsConfig\s*=\s*(\{[\s\S]*?\})\s*;/i);
@@ -633,64 +934,88 @@ async function requestPlayerv2Token(input: {
   }
 }
 
-async function buildPlayerv2Candidates(sourceUrl: string, html: string, timeoutMs: number) {
-  const bootstrap = extractPlayerv2Bootstrap(html);
-  if (!bootstrap) return [] as string[];
+async function buildPlayerv2Candidates(sourceUrl: string, html: string, timeoutMs: number, requestOrigin: string) {
+  const config = extractPlayerv2ConfigFromHtml(html, sourceUrl);
+  if (!config.paths.length || !config.domains.length) {
+    const fallbackOnly = buildPlayerv2ChannelFallbackCandidates(sourceUrl).filter((candidate) => isValidHttpUrl(candidate));
+    return Array.from(new Set(fallbackOnly));
+  }
+
   const out: string[] = [];
+  const pushCandidate = (raw: string) => {
+    if (!isValidHttpUrl(raw)) return;
+    out.push(raw);
+  };
 
   for (const fallbackCandidate of buildPlayerv2ChannelFallbackCandidates(sourceUrl)) {
-    if (isValidHttpUrl(fallbackCandidate)) out.push(fallbackCandidate);
+    pushCandidate(fallbackCandidate);
   }
 
-  for (const candidate of bootstrap.randomCandidates.slice(0, 20)) {
-    const normalized = normalizeCandidate(candidate, sourceUrl);
-    if (!normalized) continue;
-    out.push(normalized);
-  }
-
-  let tokenEndpoint = "";
-  try {
-    const source = new URL(sourceUrl);
-    tokenEndpoint = new URL("/playerv2.php?action=generate_token", `${source.protocol}//${source.host}`).toString();
-  } catch {
-    return [] as string[];
-  }
-
-  const domains = bootstrap.activeDomains.length
-    ? bootstrap.activeDomains.map((item) => normalizeDomainPrefix(item, sourceUrl)).filter(Boolean)
-    : [normalizeDomainPrefix(sourceUrl, sourceUrl)];
-  if (!domains.length) return [] as string[];
-
-  const maxPaths = Math.min(4, bootstrap.paths.length);
-  for (const rawPath of bootstrap.paths.slice(0, maxPaths)) {
-    const pathValue = String(rawPath || "")
-      .trim()
-      .replace(/^\/+/, "")
-      .replace(/\.m3u8$/i, "");
+  const maxPaths = Math.min(4, config.paths.length);
+  for (const rawPath of config.paths.slice(0, maxPaths)) {
+    const pathValue = normalizePlayerv2Path(rawPath);
     if (!pathValue) continue;
-    const token = await requestPlayerv2Token({
-      tokenEndpoint,
-      pathValue,
-      timeoutMs: Math.max(1200, timeoutMs),
-      sourceUrl,
-    });
+
+    const tokenViaProxy = requestOrigin
+      ? await requestPlayerv2TokenViaProxy({
+          playerv2Url: sourceUrl,
+          pathValue,
+          timeoutMs: Math.max(1200, timeoutMs),
+          requestOrigin,
+        })
+      : null;
+    const token =
+      tokenViaProxy ||
+      (await requestPlayerv2Token({
+        tokenEndpoint: (() => {
+          try {
+            const source = new URL(sourceUrl);
+            return new URL("/playerv2.php?action=generate_token", `${source.protocol}//${source.host}`).toString();
+          } catch {
+            return "";
+          }
+        })(),
+        pathValue,
+        timeoutMs: Math.max(1200, timeoutMs),
+        sourceUrl,
+      }));
     if (!token) continue;
-    const ts = Math.floor(Date.now() / 1000);
-    const nonce = buildPlayerv2Nonce(ts);
-    for (const domain of domains.slice(0, 4)) {
-      const variants = [`${pathValue}.m3u8`, pathValue];
-      for (const variantPath of variants) {
-        const queryVariants = [
-          `ts=${ts}&nonce=${encodeURIComponent(nonce)}&token=${encodeURIComponent(token.token)}&sid=${encodeURIComponent(token.sessionId)}`,
-          `ts=${ts}&nonce=${encodeURIComponent(nonce)}&token=${encodeURIComponent(token.token)}&session_id=${encodeURIComponent(token.sessionId)}`,
-        ];
-        for (const query of queryVariants) {
-          const finalUrl = `${domain}/${variantPath}?${query}`;
-          if (isValidHttpUrl(finalUrl)) out.push(finalUrl);
+
+    const ts = String(Math.floor(Date.now() / 1000));
+    const nonces = buildPlayerv2NonceCandidates();
+    const basePath = pathValue.replace(/\.m3u8$/i, "");
+    const pathVariants = Array.from(new Set([basePath, `${basePath}.m3u8`]));
+
+    for (const domain of config.domains.slice(0, 4).map((item) => normalizeDomainPrefix(item, sourceUrl)).filter(Boolean)) {
+      for (const variantPath of pathVariants) {
+        let absolute = "";
+        try {
+          absolute = new URL(variantPath.replace(/^\/+/, ""), ensureTrailingSlash(domain) || domain).toString();
+        } catch {
+          continue;
+        }
+        for (const nonce of nonces) {
+          const queryVariants = [
+            new URLSearchParams({ ts, nonce, token: token.token, sid: token.sessionId }).toString(),
+            new URLSearchParams({ ts, nonce, token: token.token, session_id: token.sessionId }).toString(),
+          ];
+          for (const query of queryVariants) {
+            const directUrl = `${absolute}?${query}`;
+            pushCandidate(directUrl);
+            if (requestOrigin) {
+              const proxied = buildInternalEmbedProxyUrl({
+                sourceUrl: directUrl,
+                requestOrigin,
+                referrerUrl: sourceUrl,
+              });
+              if (proxied) pushCandidate(proxied);
+            }
+          }
         }
       }
     }
   }
+
   const deduped = new Set<string>();
   const result: string[] = [];
   for (const candidate of out) {
@@ -711,6 +1036,30 @@ function buildInternalEmbedProxyUrl(input: { sourceUrl: string; requestOrigin: s
   const ref = normalizeHttpUrl(input.referrerUrl || input.sourceUrl);
   if (ref) params.set("ref", ref);
   return `${String(input.requestOrigin || "").replace(/\/+$/, "")}/api/embed-proxy?${params.toString()}`;
+}
+
+function shouldWrapCandidateForInternalProxy(candidateUrl: string, sourceUrl: string) {
+  if (!isValidHttpUrl(candidateUrl)) return false;
+  try {
+    const candidate = new URL(candidateUrl);
+    const source = new URL(sourceUrl);
+    const pathname = String(candidate.pathname || "").toLowerCase();
+    if (pathname.includes("/api/embed-proxy")) return false;
+    if (candidate.hostname.toLowerCase() !== source.hostname.toLowerCase()) return true;
+    if (looksLikeHlsManifestUrl(candidateUrl)) return true;
+    return (
+      pathname.includes("/albaplayer/") ||
+      pathname.includes("/playerv2.php") ||
+      pathname.includes("/embed") ||
+      pathname.includes("/player") ||
+      pathname.includes("/hls/") ||
+      pathname.includes("/live/") ||
+      pathname.includes("/manifest/") ||
+      pathname.includes("/stream/")
+    );
+  } catch {
+    return false;
+  }
 }
 
 function isLikelyAlbaLandingUrl(rawUrl: string) {
@@ -788,6 +1137,9 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
     if (pathname.includes("/player/")) score += 60;
     if (pathname.includes("/go.php")) score += 48;
     if (pathname.includes("/chtv/")) score += 52;
+    if (pathname.startsWith("/tv/")) score += 72;
+    if (search.includes("serv=0")) score += 220;
+    if (search.includes("serv=1")) score -= 60;
     if (search.includes("serv=")) score += 26;
     if (search.includes("stream=")) score += 34;
     if (search.includes("token=") || search.includes("session") || search.includes("playlist")) score += 45;
@@ -1259,15 +1611,45 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
 
   pushCandidateUnique(candidateSeed, seen, sourceUrl);
   pushCandidateUnique(candidateSeed, seen, sourceFetch.finalUrl || sourceUrl);
+  for (const variant of expandLivehdTvServVariants(sourceUrl)) {
+    pushCandidateUnique(candidateSeed, seen, variant);
+  }
+  for (const variant of expandLivehdTvServVariants(sourceFetch.finalUrl || sourceUrl)) {
+    pushCandidateUnique(candidateSeed, seen, variant);
+  }
   if (sourceFetch.body) {
-    for (const candidate of extractCandidatesFromText(sourceFetch.body, sourceFetch.finalUrl || sourceUrl)) {
+    const sourceBaseUrl = sourceFetch.finalUrl || sourceUrl;
+    const extractedCandidates = extractCandidatesFromText(sourceFetch.body, sourceBaseUrl);
+    for (const candidate of extractedCandidates) {
       pushCandidateUnique(candidateSeed, seen, candidate);
+      if (requestOrigin && shouldWrapCandidateForInternalProxy(candidate, sourceBaseUrl)) {
+        const proxied = buildInternalEmbedProxyUrl({
+          sourceUrl: candidate,
+          requestOrigin,
+          referrerUrl: sourceBaseUrl,
+        });
+        if (proxied) pushCandidateUnique(candidateSeed, seen, proxied);
+      }
+    }
+
+    const beinAjaxCandidates = await fetchBeinAjaxResolvedCandidates(sourceBaseUrl, sourceFetch.body, Math.min(timeoutMs, 3200));
+    for (const candidate of beinAjaxCandidates) {
+      pushCandidateUnique(candidateSeed, seen, candidate);
+      if (requestOrigin && shouldWrapCandidateForInternalProxy(candidate, sourceBaseUrl)) {
+        const proxied = buildInternalEmbedProxyUrl({
+          sourceUrl: candidate,
+          requestOrigin,
+          referrerUrl: sourceBaseUrl,
+        });
+        if (proxied) pushCandidateUnique(candidateSeed, seen, proxied);
+      }
     }
 
     const playerv2Candidates = await buildPlayerv2Candidates(
-      sourceFetch.finalUrl || sourceUrl,
+      sourceBaseUrl,
       sourceFetch.body,
-      Math.min(timeoutMs, 2600)
+      Math.min(timeoutMs, 2600),
+      requestOrigin
     );
     for (const candidate of playerv2Candidates) {
       pushCandidateUnique(candidateSeed, seen, candidate);

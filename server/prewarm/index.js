@@ -296,23 +296,45 @@ async function runCycle(config) {
   let rejected = 0;
   let skippedReady = 0;
   const rejectReasons = {};
+  const targetDetails = [];
 
-  for (const response of responses) {
+  responses.forEach((response, index) => {
+    const target = targets[index];
     if (response?.body?.skipped && response?.body?.reason === "already-ready") {
       skippedReady += 1;
-      continue;
+      targetDetails.push({
+        matchId: target?.matchId || null,
+        uiServers: target?.uiServers || [],
+        skipped: true,
+        reason: "already-ready",
+      });
+      return;
     }
     const results = Array.isArray(response?.body?.results) ? response.body.results : [];
+    const detail = {
+      matchId: target?.matchId || null,
+      uiServers: target?.uiServers || [],
+      results: [],
+    };
     for (const item of results) {
       if (item?.accepted) {
         accepted += 1;
-        continue;
+      } else {
+        rejected += 1;
+        const reason = String(item?.reason || "unknown");
+        rejectReasons[reason] = (rejectReasons[reason] || 0) + 1;
       }
-      rejected += 1;
-      const reason = String(item?.reason || "unknown");
-      rejectReasons[reason] = (rejectReasons[reason] || 0) + 1;
+      detail.results.push({
+        uiServer: Number(item?.uiServer || 0),
+        slotServer: Number(item?.slotServer || 0),
+        accepted: !!item?.accepted,
+        reason: String(item?.reason || "unknown"),
+        resolverState: String(item?.resolver?.resolverState || "unknown"),
+        rejectReason: String(item?.resolver?.rejectReason || ""),
+      });
     }
-  }
+    targetDetails.push(detail);
+  });
 
   log("info", "prewarm cycle done", {
     matchesFetched: matches.length,
@@ -321,6 +343,7 @@ async function runCycle(config) {
     rejected,
     skippedReady,
     rejectReasons,
+    targetDetails,
     durationMs: Date.now() - startedAt,
   });
 }

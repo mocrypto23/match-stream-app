@@ -109,6 +109,32 @@ function extractEmbedProxyReferrer(rawUrl: string) {
   }
 }
 
+function looksLikeEmbeddedPlayerOrStreamTarget(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    const u = new URL(rawUrl);
+    const pathname = String(u.pathname || "").toLowerCase();
+    const search = String(u.search || "").toLowerCase();
+    const combined = `${pathname}${search}`;
+    return (
+      combined.includes(".m3u8") ||
+      pathname.includes("/albaplayer/") ||
+      pathname.includes("/playerv2.php") ||
+      pathname.includes("/embed") ||
+      pathname.includes("/player") ||
+      pathname.includes("/hls/") ||
+      pathname.includes("/live/") ||
+      pathname.includes("/manifest/") ||
+      pathname.includes("/stream/") ||
+      search.includes("token=") ||
+      search.includes("sid=") ||
+      search.includes("session")
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function isValidHttpUrl(raw: unknown): raw is string {
   if (typeof raw !== "string") return false;
   try {
@@ -182,16 +208,22 @@ export function isIngestCandidateAlignedWithSlotServer(input: {
     String(input.probePlaylistUrl || "").trim(),
     sourceUrl,
   ].filter((value) => isValidHttpUrl(value));
-  const hasOwnReferrer = referrerPool.some((refUrl) => {
+  const ownReferrers = referrerPool.filter((refUrl) => {
     const refHost = extractHost(refUrl);
     return !!refHost && hostMatchesAnySuffix(refHost, allowlist);
   });
-  if (!hasOwnReferrer) return false;
+  if (!ownReferrers.length) return false;
 
   if (hostMatchesAnySuffix(targetHost, allowlist)) return true;
 
   const targetMappedSlot = findSlotServerByHost(targetHost);
-  if (targetMappedSlot && targetMappedSlot !== slotServerId) return false;
+  if (targetMappedSlot && targetMappedSlot !== slotServerId) {
+    const canUseEmbeddedForeignTarget =
+      slotServerId === 3 &&
+      /livehd77\.pro|alkoora\.live/i.test(sourceUrl) &&
+      looksLikeEmbeddedPlayerOrStreamTarget(targetUrl);
+    if (!canUseEmbeddedForeignTarget) return false;
+  }
 
   return true;
 }
