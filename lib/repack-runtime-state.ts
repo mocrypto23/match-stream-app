@@ -13,6 +13,8 @@ export type RepackSeedRuntimeState = {
   resolveReason: string;
   ingestMode: string;
   ingestUrl: string | null;
+  sourceUrl: string | null;
+  probeReferrerUrl: string | null;
   acceptedAt: number | null;
   lastAcceptedAt: number | null;
   updatedAt: number;
@@ -54,6 +56,12 @@ export function setRepackSeedRuntimeState(
   const ingestMode = String(input.ingestMode || "").trim() || "none";
   const ingestUrl =
     typeof input.ingestUrl === "string" && input.ingestUrl.trim() ? input.ingestUrl.trim() : null;
+  const sourceUrl =
+    typeof input.sourceUrl === "string" && input.sourceUrl.trim() ? input.sourceUrl.trim() : null;
+  const probeReferrerUrl =
+    typeof input.probeReferrerUrl === "string" && input.probeReferrerUrl.trim()
+      ? input.probeReferrerUrl.trim()
+      : null;
   const sameAcceptedWindow =
     accepted &&
     prev?.accepted &&
@@ -67,6 +75,8 @@ export function setRepackSeedRuntimeState(
     resolveReason: String(input.resolveReason || "").trim() || "unknown",
     ingestMode,
     ingestUrl,
+    sourceUrl,
+    probeReferrerUrl,
     acceptedAt: accepted ? (sameAcceptedWindow ? prev?.acceptedAt || prev?.lastAcceptedAt || prev?.updatedAt || now : now) : null,
     lastAcceptedAt: accepted ? now : prev?.lastAcceptedAt || null,
     updatedAt: now,

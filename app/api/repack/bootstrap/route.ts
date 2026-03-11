@@ -26,6 +26,7 @@ import {
   type RepackIngestResolverDiag,
   type RepackIngestResolution,
 } from "@/lib/repack-ingest-resolver";
+import { buildRepackGatewayManifestUrl } from "@/lib/repack-ingest-gateway";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -435,6 +436,8 @@ export async function POST(req: Request) {
       resolveReason,
       ingestMode: String(input.ingest.mode || "none"),
       ingestUrl: input.ingest.ingestUrl || null,
+      sourceUrl: input.sourceUrl || null,
+      probeReferrerUrl: input.probeEvidence?.referrerUrl || input.sourceUrl || null,
     });
     noteRepackBootstrapOutcome({
       accepted: input.accepted,
@@ -656,20 +659,22 @@ export async function POST(req: Request) {
       continue;
     }
 
+    const gatewayIngestUrl = buildRepackGatewayManifestUrl({
+      matchId,
+      slotServer,
+      internalOrigin: resolverRequestOrigin,
+    });
     const upstream = await postSeedToAgent({
       matchId,
       serverId: slotServer,
       sourceUrl,
       sourceCandidate: ingest.ingestUrl,
-      ingestUrl: ingest.ingestUrl,
-      ingestMode: ingest.mode,
+      ingestUrl: gatewayIngestUrl,
+      ingestMode: "backend_proxy_ingest",
       ingestVerified: ingest.resolver.resolverState === "ok" || allowProtectedProxySoft,
-      ingestHeaders: buildIngestHeaders({
-        sourceUrl,
-        ingestUrl: ingest.ingestUrl,
-        probePlaylistUrl: ingest.probeEvidence?.playlistUrl || null,
-        probeReferrerUrl: ingest.probeEvidence?.referrerUrl || null,
-      }),
+      ingestHeaders: {
+        "user-agent": DEFAULT_INGEST_USER_AGENT,
+      },
       probeEvidence: ingest.probeEvidence,
       matchStatus: String(row.status_key || ""),
       matchStart: String(row.match_start || ""),
