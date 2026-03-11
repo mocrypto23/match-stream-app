@@ -2109,8 +2109,8 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     if (!albaFetched.ok || !isLikelyHtmlResponse(albaFetched.contentType, albaFetched.body)) continue;
     const albaReferrer = normalizeHttpUrl(albaFetched.finalUrl || next.url) || next.url;
     const proxyReferrer =
-      normalizeHttpUrl(sourceFetch.finalUrl || sourceUrl) ||
       normalizeHttpUrl(albaReferrer) ||
+      normalizeHttpUrl(sourceFetch.finalUrl || sourceUrl) ||
       normalizeHttpUrl(sourceUrl);
 
     for (const derived of extractCandidatesFromText(albaFetched.body, albaReferrer)) {
@@ -2154,14 +2154,19 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
   });
   if (internalProxy) pushCandidateUnique(candidateSeed, seen, internalProxy);
 
-  const rankedSeed = rankCandidates(candidateSeed, sourceUrl, maxCandidates, sourceFetch.finalUrl || sourceUrl);
-  const policyFilteredSeed = rankedSeed.filter((item) =>
-    isCandidateAllowedByPolicy(input.allowCandidate, item.candidateUrl, item.referrerUrl)
+  const rankedSeedPool = rankCandidates(
+    candidateSeed,
+    sourceUrl,
+    Math.min(192, Math.max(maxCandidates, maxCandidates * 4)),
+    sourceFetch.finalUrl || sourceUrl
   );
+  const policyFilteredSeed = rankedSeedPool
+    .filter((item) => isCandidateAllowedByPolicy(input.allowCandidate, item.candidateUrl, item.referrerUrl))
+    .slice(0, maxCandidates);
   if (!policyFilteredSeed.length) {
     return emptyResolution("no-ingest-candidate", {
       stage: "candidate-probe",
-      candidatesFound: rankedSeed.length,
+      candidatesFound: rankedSeedPool.length,
       candidatesProbed: 0,
       rejectReason: "no-ingest-candidate",
       resolverState: "no-candidate",
@@ -2201,7 +2206,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
           sourceUrl,
           selectedCandidateUrl: item.candidateUrl,
           stage: "done",
-          candidatesFound: rankedSeed.length,
+          candidatesFound: rankedSeedPool.length,
           candidatesProbed,
           probe,
           requestOrigin,
@@ -2230,7 +2235,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
           reason: "resolved-proxy-candidate-soft",
           resolver: {
             stage: "done",
-            candidatesFound: rankedSeed.length,
+            candidatesFound: rankedSeedPool.length,
             candidatesProbed,
             selectedCandidate: item.candidateUrl,
             selectedKind: item.mode,
@@ -2328,14 +2333,14 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     return softAcceptedResult;
   }
 
-  const resolverState: RepackResolverState = rankedSeed.length ? "probe-failed" : "no-candidate";
+  const resolverState: RepackResolverState = rankedSeedPool.length ? "probe-failed" : "no-candidate";
   return {
     mode: "none",
     ingestUrl: null,
     reason: resolverState === "no-candidate" ? "no-ingest-candidate" : "probe-failed",
     resolver: {
       stage: "done",
-      candidatesFound: rankedSeed.length,
+      candidatesFound: rankedSeedPool.length,
       candidatesProbed,
       selectedCandidate: null,
       selectedKind: "none",
