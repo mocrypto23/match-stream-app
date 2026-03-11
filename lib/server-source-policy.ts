@@ -40,7 +40,15 @@ const HOST_ALLOWLIST_BY_SLOT: Record<SlotServerId, string[]> = {
   ],
   2: ["siiir.tv", "yallashot.us", "aleynoxitram.sbs"],
   3: ["livehd77.pro", "alkoora.live"],
-  4: ["livekora.vip", "koooralive.click", "gomatch-live.com", "kooraxx.com", "sia-bth.net", "baranewssumsel.online"],
+  4: [
+    "livekora.vip",
+    "koooralive.click",
+    "gomatch-live.com",
+    "kooraxx.com",
+    "sia-bth.net",
+    "baranewssumsel.online",
+    "sportsurges.cc",
+  ],
 };
 
 type StreamRowFields = {
@@ -221,7 +229,8 @@ export function isIngestCandidateAlignedWithSlotServer(input: {
     const canUseEmbeddedForeignTarget =
       slotServerId === 3 &&
       /livehd77\.pro|alkoora\.live/i.test(sourceUrl) &&
-      looksLikeEmbeddedPlayerOrStreamTarget(targetUrl);
+      looksLikeEmbeddedPlayerOrStreamTarget(targetUrl) &&
+      !/\.m3u8(?:[?#]|$)/i.test(targetUrl);
     if (!canUseEmbeddedForeignTarget) return false;
   }
 

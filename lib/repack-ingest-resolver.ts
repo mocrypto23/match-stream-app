@@ -1555,7 +1555,7 @@ async function probeSegmentUrl(segmentUrl: string, timeoutMs: number, headers?: 
 }
 
 function shouldRetryProtectedCandidateViaProxy(reason: string) {
-  return /^(?:playlist|segment|variant)-http-(?:0|401|403|406)$/i.test(String(reason || "").trim());
+  return /^(?:playlist|segment|variant)-http-(?:0|401|403|406|429|5\d{2})$/i.test(String(reason || "").trim());
 }
 
 function canSoftAcceptProtectedSegmentProbe(input: {

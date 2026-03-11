@@ -589,7 +589,11 @@ export async function POST(req: Request) {
     });
 
     const allowProtectedProxySoft = canAcceptProtectedProxySoftResult(ingest);
-    if (ingest.resolver.resolverState !== "ok" && !allowProtectedProxySoft) {
+    const ingestResolverAccepted = ingest.resolver.resolverState === "ok" || allowProtectedProxySoft;
+    const resolvedCandidate = String(ingest.ingestUrl || "").trim();
+    const hasResolvedCandidate = isValidHttpUrl(resolvedCandidate);
+
+    if (ingestResolverAccepted && !hasResolvedCandidate) {
       const rejectReason = `invalid-ingest-url:${ingest.reason}`;
       pushResult({
         uiServer,
@@ -609,54 +613,36 @@ export async function POST(req: Request) {
       continue;
     }
 
-    if (!ingest.ingestUrl || !isValidHttpUrl(ingest.ingestUrl)) {
-      const rejectReason = `invalid-ingest-url:${ingest.reason}`;
-      pushResult({
-        uiServer,
-        slotServer,
-        accepted: false,
-        reason: rejectReason,
-        statusCode: 202,
+    if (ingestResolverAccepted && hasResolvedCandidate) {
+      const alignedIngest = isIngestCandidateAlignedWithSlotServer({
+        slotServerId: slotServer,
         sourceUrl,
-        resolver: ingest.resolver,
-        ingest: {
-          mode: ingest.mode,
-          reason: ingest.reason,
-          ingestUrl: ingest.ingestUrl || null,
-        },
-        probeEvidence: ingest.probeEvidence,
+        ingestUrl: resolvedCandidate,
+        probeReferrerUrl: ingest.probeEvidence?.referrerUrl || null,
+        probePlaylistUrl: ingest.probeEvidence?.playlistUrl || null,
       });
-      continue;
-    }
-
-    const alignedIngest = isIngestCandidateAlignedWithSlotServer({
-      slotServerId: slotServer,
-      sourceUrl,
-      ingestUrl: ingest.ingestUrl,
-      probeReferrerUrl: ingest.probeEvidence?.referrerUrl || null,
-      probePlaylistUrl: ingest.probeEvidence?.playlistUrl || null,
-    });
-    if (!alignedIngest) {
-      pushResult({
-        uiServer,
-        slotServer,
-        accepted: false,
-        reason: "ingest-source-mismatch",
-        statusCode: 202,
-        sourceUrl,
-        resolver: {
-          ...ingest.resolver,
-          rejectReason: "ingest-source-mismatch",
-          resolverState: "probe-failed",
-        },
-        ingest: {
-          mode: ingest.mode,
+      if (!alignedIngest) {
+        pushResult({
+          uiServer,
+          slotServer,
+          accepted: false,
           reason: "ingest-source-mismatch",
-          ingestUrl: ingest.ingestUrl,
-        },
-        probeEvidence: ingest.probeEvidence,
-      });
-      continue;
+          statusCode: 202,
+          sourceUrl,
+          resolver: {
+            ...ingest.resolver,
+            rejectReason: "ingest-source-mismatch",
+            resolverState: "probe-failed",
+          },
+          ingest: {
+            mode: ingest.mode,
+            reason: "ingest-source-mismatch",
+            ingestUrl: ingest.ingestUrl,
+          },
+          probeEvidence: ingest.probeEvidence,
+        });
+        continue;
+      }
     }
 
     const gatewayIngestUrl = buildRepackGatewayManifestUrl({
@@ -664,14 +650,15 @@ export async function POST(req: Request) {
       slotServer,
       internalOrigin: resolverRequestOrigin,
     });
+    const sourceCandidateForAgent = hasResolvedCandidate ? resolvedCandidate : sourceUrl;
     const upstream = await postSeedToAgent({
       matchId,
       serverId: slotServer,
       sourceUrl,
-      sourceCandidate: ingest.ingestUrl,
+      sourceCandidate: sourceCandidateForAgent,
       ingestUrl: gatewayIngestUrl,
       ingestMode: "backend_proxy_ingest",
-      ingestVerified: ingest.resolver.resolverState === "ok" || allowProtectedProxySoft,
+      ingestVerified: ingestResolverAccepted,
       ingestHeaders: {
         "user-agent": DEFAULT_INGEST_USER_AGENT,
       },

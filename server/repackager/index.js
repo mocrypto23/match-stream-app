@@ -1203,11 +1203,16 @@ class RepackManager {
     const ingestVerified = payload?.ingestVerified === true;
     const ingestHeaders = normalizeIngestHeaders(payload?.ingestHeaders, payload?.sourceUrl);
     const explicitIngest = normalizeCandidateUrl(payload?.ingestUrl, this.config.playerOrigin);
-    if (explicitIngest && ingestVerified && isHttpUrl(explicitIngest)) {
+    const explicitMode = explicitIngest ? normalizeIngestMode(payload.ingestMode, explicitIngest) : "none";
+    const explicitTrusted =
+      explicitIngest &&
+      isHttpUrl(explicitIngest) &&
+      (ingestVerified || explicitMode === "backend_proxy_ingest");
+    if (explicitTrusted) {
       return {
         ingestUrl: explicitIngest,
-        ingestMode: normalizeIngestMode(payload.ingestMode, explicitIngest),
-        ingestVerified: true,
+        ingestMode: explicitMode,
+        ingestVerified: ingestVerified || explicitMode === "backend_proxy_ingest",
         ingestHeaders,
       };
     }
@@ -1241,7 +1246,10 @@ class RepackManager {
   }
 
   async preflightIngest(ingestUrl, ingestMode, ingestHeaders = {}) {
-    const timeoutMs = this.config.preflightTimeoutMs;
+    const timeoutMs =
+      ingestMode === "backend_proxy_ingest"
+        ? Math.max(this.config.preflightTimeoutMs, 6500)
+        : this.config.preflightTimeoutMs;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     const headers = normalizeIngestHeaders(ingestHeaders, ingestUrl);
@@ -1410,7 +1418,19 @@ class RepackManager {
       upstreamProbePlaylistStatus >= 200 &&
       upstreamProbePlaylistStatus < 300 &&
       upstreamProbeSegmentStatus === 403;
-    if (!preflight.ok && !canBypass403Preflight && !canBypassProtectedSegmentPreflight) {
+    const gatewayTransientPreflightFailure =
+      !preflight.ok &&
+      ingest.ingestMode === "backend_proxy_ingest" &&
+      /\/api\/repack\/ingest\?/i.test(String(ingestUrl || "")) &&
+      /^(?:fetch-failed|non-manifest|http-(?:408|429|500|502|503|504|522|524)|segment-http-0)$/i.test(
+        String(preflight.reason || "").trim()
+      );
+    if (
+      !preflight.ok &&
+      !canBypass403Preflight &&
+      !canBypassProtectedSegmentPreflight &&
+      !gatewayTransientPreflightFailure
+    ) {
       this.metrics.seedPreflightFailed += 1;
       const reason = `preflight-failed:${preflight.reason}`;
       this.noteSeedReject(reason);
@@ -1424,8 +1444,8 @@ class RepackManager {
         preflight: preflight.evidence,
       };
     }
-    if (canBypass403Preflight || canBypassProtectedSegmentPreflight) {
-      this.log("warn", "repack preflight bypassed for verified ingest", {
+    if (canBypass403Preflight || canBypassProtectedSegmentPreflight || gatewayTransientPreflightFailure) {
+      this.log("warn", "repack preflight bypassed", {
         matchId,
         serverId,
         ingestUrl,
