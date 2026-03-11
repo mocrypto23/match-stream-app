@@ -202,10 +202,19 @@ export function isIngestCandidateAlignedWithSlotServer(input: {
   if (!isValidHttpUrl(ingestUrl)) return false;
 
   const allowlist = getSlotHostAllowlist(slotServerId);
+  const sourceIsLivehdFamily = slotServerId === 3 && /livehd77\.pro|alkoora\.live/i.test(sourceUrl);
   const proxyEmbeddedRef = extractEmbedProxyReferrer(ingestUrl);
   if (proxyEmbeddedRef) {
     const proxyRefHost = extractHost(proxyEmbeddedRef);
-    if (!proxyRefHost || !hostMatchesAnySuffix(proxyRefHost, allowlist)) return false;
+    if (!proxyRefHost) return false;
+    if (!hostMatchesAnySuffix(proxyRefHost, allowlist)) {
+      const proxyRefMappedSlot = findSlotServerByHost(proxyRefHost);
+      const canUseEmbeddedForeignRef =
+        sourceIsLivehdFamily &&
+        looksLikeEmbeddedPlayerOrStreamTarget(proxyEmbeddedRef) &&
+        (!!proxyRefMappedSlot && proxyRefMappedSlot !== slotServerId);
+      if (!canUseEmbeddedForeignRef) return false;
+    }
   }
   const targetUrl = unwrapEmbedProxyTarget(ingestUrl) || ingestUrl;
   const targetHost = extractHost(targetUrl);
@@ -227,8 +236,7 @@ export function isIngestCandidateAlignedWithSlotServer(input: {
   const targetMappedSlot = findSlotServerByHost(targetHost);
   if (targetMappedSlot && targetMappedSlot !== slotServerId) {
     const canUseEmbeddedForeignTarget =
-      slotServerId === 3 &&
-      /livehd77\.pro|alkoora\.live/i.test(sourceUrl) &&
+      sourceIsLivehdFamily &&
       looksLikeEmbeddedPlayerOrStreamTarget(targetUrl) &&
       !/\.m3u8(?:[?#]|$)/i.test(targetUrl);
     if (!canUseEmbeddedForeignTarget) return false;
