@@ -2408,7 +2408,11 @@ function buildUpstreamRequestHeaders(req: Request, target: URL, referrerUrl?: st
     origin = new URL(referer).origin;
   } catch {}
 
-  out.set("user-agent", incoming.get("user-agent") || DEFAULT_USER_AGENT);
+  const incomingUserAgent = String(incoming.get("user-agent") || "").trim();
+  const shouldForceBrowserUserAgent =
+    !incomingUserAgent ||
+    /(?:\blavf\/|\bffmpeg\b|\blibavformat\b|\bcurl\/|\bpython-requests\b)/i.test(incomingUserAgent);
+  out.set("user-agent", shouldForceBrowserUserAgent ? DEFAULT_USER_AGENT : incomingUserAgent);
   out.set("accept", incoming.get("accept") || "*/*");
   out.set("accept-language", incoming.get("accept-language") || "ar,en-US;q=0.9,en;q=0.8");
   // Ask upstream for plain payloads to avoid encoding/header mismatches when re-streaming.
