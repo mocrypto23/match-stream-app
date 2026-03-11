@@ -1365,12 +1365,15 @@ function finalizeSuccessfulResolution(input: {
   sourceReferrerUrl: string;
   preferProxyIngest?: boolean;
 }) {
-  const effectiveIngestUrl =
-    isValidHttpUrl(String(input.probe.evidence?.playlistUrl || "").trim())
+  const selectedCandidateUrl = String(input.selectedCandidateUrl || "").trim();
+  const selectedIsProxy = isEmbedProxyCandidateUrl(selectedCandidateUrl);
+  const effectiveIngestUrl = selectedIsProxy
+    ? selectedCandidateUrl
+    : isValidHttpUrl(String(input.probe.evidence?.playlistUrl || "").trim())
       ? String(input.probe.evidence?.playlistUrl || "").trim()
-      : input.selectedCandidateUrl;
+      : selectedCandidateUrl;
   const stableReferrer = normalizeHttpUrl(input.sourceReferrerUrl || input.sourceUrl) || input.sourceUrl;
-  const effectiveIsProxy = isEmbedProxyCandidateUrl(effectiveIngestUrl);
+  const effectiveIsProxy = selectedIsProxy || isEmbedProxyCandidateUrl(effectiveIngestUrl);
   const finalIngestUrl = effectiveIngestUrl;
   const finalMode = effectiveIsProxy ? "backend_proxy_ingest" : classifyMode(finalIngestUrl);
   return {
