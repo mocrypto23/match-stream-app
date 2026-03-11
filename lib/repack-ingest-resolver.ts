@@ -85,6 +85,8 @@ const DEFAULT_TIMEOUT_MS = 5200;
 const DEFAULT_SEGMENT_TIMEOUT_MS = 2200;
 const DEFAULT_MAX_CANDIDATES = 32;
 const MAX_DYNAMIC_CANDIDATES = 64;
+const MAX_ALBA_EXPAND_PAGES = 12;
+const MAX_ALBA_EXPAND_DEPTH = 2;
 const DEFAULT_RESOLVER_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 const PLAYERV2_FALLBACK_DOMAINS = [
@@ -407,10 +409,11 @@ function decodeMaybeBase64Url(raw: string, baseUrl: string) {
     .replace(/\\x3d/gi, "=")
     .replace(/\s+/g, "");
   if (!token || token.length < 20 || token.length > 8000) return "";
-  if (!/^[A-Za-z0-9+/=]+$/.test(token)) return "";
-  if (token.length % 4 !== 0) return "";
+  if (!/^[A-Za-z0-9+/_=-]+$/.test(token)) return "";
+  let normalized = token.replace(/-/g, "+").replace(/_/g, "/");
+  if (normalized.length % 4) normalized = `${normalized}${"=".repeat(4 - (normalized.length % 4))}`;
   try {
-    const decoded = Buffer.from(token, "base64").toString("utf8").trim();
+    const decoded = Buffer.from(normalized, "base64").toString("utf8").trim();
     return normalizeCandidate(decoded, baseUrl);
   } catch {
     return "";
@@ -425,17 +428,17 @@ function extractBase64ManifestCandidates(text: string, baseUrl: string) {
     out.add(candidate);
   };
 
-  const albaControlRe = /AlbaPlayerControl\s*\(\s*['"]([A-Za-z0-9+/=]{20,})['"]\s*,/gi;
+  const albaControlRe = /AlbaPlayerControl\s*\(\s*['"]([A-Za-z0-9+/_=-]{20,})['"]\s*,/gi;
   for (const match of text.matchAll(albaControlRe)) {
     pushDecoded(String(match[1] || ""));
   }
 
-  const atobRe = /atob\(\s*['"]([A-Za-z0-9+/=]{20,})['"]\s*\)/gi;
+  const atobRe = /atob\(\s*['"]([A-Za-z0-9+/_=-]{20,})['"]\s*\)/gi;
   for (const match of text.matchAll(atobRe)) {
     pushDecoded(String(match[1] || ""));
   }
 
-  const longBase64Re = /['"]([A-Za-z0-9+/=]{40,})['"]/g;
+  const longBase64Re = /['"]([A-Za-z0-9+/_=-]{40,})['"]/g;
   for (const match of text.matchAll(longBase64Re)) {
     pushDecoded(String(match[1] || ""));
     if (out.size >= 24) break;
@@ -1490,6 +1493,9 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
     if (search.includes("sid=")) score += 65;
     if (u.port === "8443" && combined.includes(".m3u8")) score += 210;
     if (u.hostname.toLowerCase().endsWith(".58103793.net") || u.hostname.toLowerCase().endsWith(".77911050.net")) score += 170;
+    if (u.hostname.toLowerCase().includes("baranewssumsel.online")) score += 210;
+    if (u.hostname.toLowerCase().endsWith("amazonaws.com") && combined.includes("/hls/") && combined.includes(".m3u8")) score += 320;
+    if (pathname.includes("heartbeat-controller.php")) score -= 280;
     if ((u.hostname.toLowerCase() === "showchop.net" || u.hostname.toLowerCase().endsWith(".showchop.net")) && pathname.includes("/embed/")) {
       score += 140;
     }
@@ -2066,26 +2072,60 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     if (normalized) pushCandidateUnique(candidateSeed, seen, normalized);
   }
 
-  const albaLandingCandidates = candidateSeed.filter((candidate) => isLikelyAlbaLandingUrl(candidate)).slice(0, 5);
-  for (const albaLandingUrl of albaLandingCandidates) {
-    const albaFetched = await fetchWithTimeout(albaLandingUrl, Math.min(timeoutMs, 2600), {
-      referer: sourceFetch.finalUrl || sourceUrl,
+  type AlbaQueueItem = { url: string; depth: number; referrerUrl: string };
+  const albaQueue: AlbaQueueItem[] = [];
+  const albaQueued = new Set<string>();
+  const albaVisited = new Set<string>();
+  const enqueueAlbaLanding = (rawUrl: string, depth: number, referrerUrl: string) => {
+    const normalized = normalizeHttpUrl(rawUrl);
+    if (!normalized) return;
+    const target = extractEmbedProxyTargetUrl(normalized) || normalized;
+    if (!isLikelyAlbaLandingUrl(target)) return;
+    const key = canonicalizeUrl(target) || target.toLowerCase();
+    if (!key || albaQueued.has(key) || albaVisited.has(key)) return;
+    albaQueued.add(key);
+    albaQueue.push({
+      url: target,
+      depth,
+      referrerUrl: normalizeHttpUrl(referrerUrl || sourceFetch.finalUrl || sourceUrl) || sourceFetch.finalUrl || sourceUrl,
+    });
+  };
+
+  for (const candidate of candidateSeed) {
+    enqueueAlbaLanding(candidate, 0, sourceFetch.finalUrl || sourceUrl);
+    if (albaQueue.length >= MAX_ALBA_EXPAND_PAGES) break;
+  }
+
+  while (albaQueue.length && albaVisited.size < MAX_ALBA_EXPAND_PAGES) {
+    const next = albaQueue.shift();
+    if (!next) continue;
+    const key = canonicalizeUrl(next.url) || next.url.toLowerCase();
+    if (!key || albaVisited.has(key)) continue;
+    albaVisited.add(key);
+
+    const albaFetched = await fetchWithTimeout(next.url, Math.min(timeoutMs, 2600), {
+      referer: normalizeHttpUrl(next.referrerUrl || sourceFetch.finalUrl || sourceUrl) || sourceFetch.finalUrl || sourceUrl,
     });
     if (!albaFetched.ok || !isLikelyHtmlResponse(albaFetched.contentType, albaFetched.body)) continue;
-    const albaReferrer = albaFetched.finalUrl || albaLandingUrl;
+    const albaReferrer = normalizeHttpUrl(albaFetched.finalUrl || next.url) || next.url;
     const proxyReferrer =
       normalizeHttpUrl(sourceFetch.finalUrl || sourceUrl) ||
       normalizeHttpUrl(albaReferrer) ||
       normalizeHttpUrl(sourceUrl);
+
     for (const derived of extractCandidatesFromText(albaFetched.body, albaReferrer)) {
       pushCandidateUnique(candidateSeed, seen, derived);
-      if (!requestOrigin || !isValidHttpUrl(derived)) continue;
+      if (requestOrigin && isValidHttpUrl(derived)) {
         const proxied = buildInternalEmbedProxyUrl({
           sourceUrl: derived,
           requestOrigin,
-        referrerUrl: proxyReferrer,
-      });
-      if (proxied) pushCandidateUnique(candidateSeed, seen, proxied);
+          referrerUrl: proxyReferrer,
+        });
+        if (proxied) pushCandidateUnique(candidateSeed, seen, proxied);
+      }
+      if (next.depth < MAX_ALBA_EXPAND_DEPTH) {
+        enqueueAlbaLanding(derived, next.depth + 1, albaReferrer);
+      }
     }
   }
 
