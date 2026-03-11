@@ -2582,6 +2582,7 @@ async function handleProxyRequest(req: Request) {
     const rawUrl = requestUrl.searchParams.get("url");
     const depth = parseDepth(requestUrl.searchParams.get("depth"));
     const safeReferrer = parseSafeReferrer(requestUrl.searchParams.get("ref"));
+    const backendMode = requestUrl.searchParams.get("backend") === "1";
     const stableMode = requestUrl.searchParams.get("stable") === "1";
     const server5PassQuery = pickServer5ProxyPassQueryParams(requestUrl.searchParams);
 
@@ -2769,6 +2770,16 @@ async function handleProxyRequest(req: Request) {
     }
 
     let html = await upstream.text();
+    if (backendMode) {
+      const headers = withProxyMetaHeaders(filterResponseHeaders(upstream.headers, { html: true }));
+      headers.set("content-type", "text/html; charset=utf-8");
+      headers.set("x-embed-proxy-backend", "1");
+      return new Response(html, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers,
+      });
+    }
     html = rewriteAttributeUrls(html, target.toString(), depth);
     html = rewriteSrcsetUrls(html, target.toString(), depth);
     html = rewriteKnownInlineEndpoints(html, target, depth, stableMode);

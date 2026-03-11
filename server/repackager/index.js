@@ -205,6 +205,12 @@ function normalizeIngestHeaders(rawHeaders, fallbackSourceUrl = "") {
   };
 }
 
+function isLocalCleanupWarning(line) {
+  const value = String(line || "").toLowerCase();
+  if (!value) return false;
+  return value.includes("failed to delete old segment") || value.includes("/tmp/tf-repack/");
+}
+
 function parseLastSegmentFromManifest(playlistUrl, manifestText) {
   const lines = String(manifestText || "").split(/\r?\n/);
   for (let idx = lines.length - 1; idx >= 0; idx -= 1) {
@@ -500,7 +506,7 @@ class RepackJob {
       "-hls_list_size",
       String(this.profile.playlistSize),
       "-hls_flags",
-      "delete_segments+omit_endlist+program_date_time+temp_file",
+      "omit_endlist+program_date_time+temp_file",
       "-hls_segment_filename",
       segmentPattern,
       this.playlistPath
@@ -525,6 +531,7 @@ class RepackJob {
       this.stderrLog.unshift(line);
       if (this.stderrLog.length > 80) this.stderrLog.length = 80;
       const lower = line.toLowerCase();
+      if (isLocalCleanupWarning(lower)) return;
       if (
         lower.includes("error") ||
         lower.includes("failed") ||
@@ -1396,7 +1403,13 @@ class RepackManager {
       upstreamProbePlaylistStatus < 300 &&
       upstreamProbeSegmentStatus >= 200 &&
       upstreamProbeSegmentStatus < 300;
-    const canBypassProtectedSegmentPreflight = false;
+    const canBypassProtectedSegmentPreflight =
+      !preflight.ok &&
+      preflight.reason === "http-403" &&
+      ingest.ingestMode === "backend_proxy_ingest" &&
+      upstreamProbePlaylistStatus >= 200 &&
+      upstreamProbePlaylistStatus < 300 &&
+      upstreamProbeSegmentStatus === 403;
     if (!preflight.ok && !canBypass403Preflight && !canBypassProtectedSegmentPreflight) {
       this.metrics.seedPreflightFailed += 1;
       const reason = `preflight-failed:${preflight.reason}`;

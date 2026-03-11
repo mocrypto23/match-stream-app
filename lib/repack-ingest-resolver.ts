@@ -1238,12 +1238,17 @@ async function fetchSourcePageVariants(input: {
   return out;
 }
 
-function buildInternalEmbedProxyUrl(input: { sourceUrl: string; requestOrigin: string; referrerUrl?: string | null }) {
+function buildInternalEmbedProxyUrl(input: {
+  sourceUrl: string;
+  requestOrigin: string;
+  referrerUrl?: string | null;
+  backendMode?: boolean;
+}) {
   if (!isValidHttpUrl(input.requestOrigin)) return "";
   const params = new URLSearchParams();
   params.set("url", input.sourceUrl);
   params.set("depth", "0");
-  params.set("stable", "1");
+  if (input.backendMode !== false) params.set("backend", "1");
   const ref = normalizeHttpUrl(input.referrerUrl || input.sourceUrl);
   if (ref) params.set("ref", ref);
   return `${String(input.requestOrigin || "").replace(/\/+$/, "")}/api/embed-proxy?${params.toString()}`;

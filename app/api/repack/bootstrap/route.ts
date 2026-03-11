@@ -70,6 +70,15 @@ type BootstrapServerResult = {
   probeEvidence: RepackIngestResolution["probeEvidence"];
 };
 
+function canAcceptProtectedProxySoftResult(ingest: RepackIngestResolution) {
+  if (ingest.mode !== "backend_proxy_ingest") return false;
+  if (!isValidHttpUrl(String(ingest.ingestUrl || "").trim())) return false;
+  if (String(ingest.reason || "").trim() !== "resolved-proxy-candidate-soft") return false;
+  const playlistStatus = Number.parseInt(String(ingest.probeEvidence?.playlistStatus || 0), 10) || 0;
+  const segmentStatus = Number.parseInt(String(ingest.probeEvidence?.segmentStatus || 0), 10) || 0;
+  return playlistStatus >= 200 && playlistStatus < 300 && segmentStatus === 403;
+}
+
 function toInt(raw: unknown) {
   const value = Number.parseInt(String(raw ?? ""), 10);
   return Number.isFinite(value) ? value : NaN;
@@ -576,7 +585,8 @@ export async function POST(req: Request) {
         }),
     });
 
-    if (ingest.resolver.resolverState !== "ok") {
+    const allowProtectedProxySoft = canAcceptProtectedProxySoftResult(ingest);
+    if (ingest.resolver.resolverState !== "ok" && !allowProtectedProxySoft) {
       const rejectReason = `invalid-ingest-url:${ingest.reason}`;
       pushResult({
         uiServer,
@@ -653,7 +663,7 @@ export async function POST(req: Request) {
       sourceCandidate: ingest.ingestUrl,
       ingestUrl: ingest.ingestUrl,
       ingestMode: ingest.mode,
-      ingestVerified: ingest.resolver.resolverState === "ok",
+      ingestVerified: ingest.resolver.resolverState === "ok" || allowProtectedProxySoft,
       ingestHeaders: buildIngestHeaders({
         sourceUrl,
         ingestUrl: ingest.ingestUrl,
