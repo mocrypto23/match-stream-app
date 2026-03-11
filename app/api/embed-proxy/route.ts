@@ -678,10 +678,13 @@ function rewriteM3u8Manifest(
       if (!isYallashotPair) return rawChildAbsoluteUrl;
 
       const token = String(parent.searchParams.get("token") || "").trim();
+      const parentSid = String(parent.searchParams.get("sid") || "").trim();
       const sessionId = String(parent.searchParams.get("session_id") || "").trim();
-      if (!token || !sessionId) return rawChildAbsoluteUrl;
+      const sid = parentSid || sessionId;
+      if (!token || !sid) return rawChildAbsoluteUrl;
       if (!child.searchParams.get("token")) child.searchParams.set("token", token);
-      if (!child.searchParams.get("session_id")) child.searchParams.set("session_id", sessionId);
+      if (!child.searchParams.get("sid")) child.searchParams.set("sid", sid);
+      if (!child.searchParams.get("session_id") && sessionId) child.searchParams.set("session_id", sessionId);
 
       const ts = String(parent.searchParams.get("ts") || "").trim();
       const nonce = String(parent.searchParams.get("nonce") || "").trim();
