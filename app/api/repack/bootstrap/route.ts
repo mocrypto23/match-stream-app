@@ -325,7 +325,7 @@ async function postSeedToAgent(payload: {
   matchStart: string;
 }) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 3400);
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
   try {
     const upstream = await fetch(localAgentUrl("/seed"), {
       method: "POST",

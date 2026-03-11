@@ -444,6 +444,37 @@ function extractBase64ManifestCandidates(text: string, baseUrl: string) {
   return Array.from(out);
 }
 
+function reverseText(value: string) {
+  return Array.from(String(value || "")).reverse().join("");
+}
+
+function extractRepairedAlbaHeartbeatCandidates(rawUrl: string) {
+  const out = new Set<string>();
+  if (!isValidHttpUrl(rawUrl)) return [] as string[];
+  try {
+    const u = new URL(rawUrl);
+    const combined = `${String(u.pathname || "")}${String(u.search || "")}`.toLowerCase();
+    if (!combined.includes("rellortnoc-taebtraeh") && !combined.includes("=nekot")) return [] as string[];
+
+    const tokenRaw =
+      (String(u.pathname || "").match(/\/albaplayer\/[^/?#]+\/([a-z0-9]{12,})=nekot(?:[/?#]|$)/i) || [])[1] || "";
+    if (!tokenRaw) return [] as string[];
+
+    const token = reverseText(tokenRaw);
+    if (!/^[a-z0-9]{12,}$/i.test(token)) return [] as string[];
+
+    const heartbeatPaths = [
+      "/wp-content/plugins/AlbaPlayer/assets/js/heartbeat-controller.php",
+      "/wp-content/plugins/albaplayer/assets/js/heartbeat-controller.php",
+    ];
+    for (const heartbeatPath of heartbeatPaths) {
+      const repaired = `${u.origin}${heartbeatPath}?token=${encodeURIComponent(token)}`;
+      if (isValidHttpUrl(repaired)) out.add(repaired);
+    }
+  } catch {}
+  return Array.from(out);
+}
+
 function decodeTokenInBase(raw: string, base: number) {
   if (!raw || base < 2 || base > 62) return -1;
   const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -489,6 +520,12 @@ function extractCandidatesFromText(text: string, baseUrl: string) {
     const candidate = normalizeCandidate(raw, baseUrl);
     if (!candidate) return;
     out.add(candidate);
+
+    // Some Alba pages emit reversed heartbeat URLs; repair them so resolver can
+    // probe the real token endpoint instead of a guaranteed 404 target.
+    for (const repaired of extractRepairedAlbaHeartbeatCandidates(candidate)) {
+      out.add(repaired);
+    }
 
     for (const nested of extractCandidatesFromQueryParams(candidate)) {
       const nestedNormalized = normalizeCandidate(nested, candidate);
