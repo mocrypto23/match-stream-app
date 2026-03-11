@@ -4,10 +4,8 @@ import Hls from "hls.js";
 import Link from "next/link";
 import VideoPlayerControls from "@/components/VideoPlayerControls";
 import {
-  buildRepackPlaylistUrl,
   getRuntimeRepackFlags,
   isRepackPlaylistUrl,
-  shouldUseRepackForViewer,
 } from "@/lib/repack-flags";
 import type { MatchR2Status, R2StatusServerEntry } from "@/lib/r2-status-types";
 import { getServerCapability } from "@/lib/server-capabilities";
@@ -37,9 +35,6 @@ type MatchRow = {
   r2_status?: MatchR2Status | null;
   repack?: {
     enabled?: boolean;
-    readPct?: number;
-    readPctByServer?: Record<string, number>;
-    forceDisableServers?: number[];
     repackServers?: number[];
     p2pServers?: number[];
     publicBaseUrl?: string;
@@ -49,9 +44,6 @@ type MatchRow = {
 type ClientRepackFlags = {
   enabled: boolean;
   repackServers: Set<number>;
-  readPct: number;
-  readPctByServer: Map<number, number>;
-  forceDisableServers: Set<number>;
   p2pServers: Set<number>;
   publicBaseUrl: string;
 };
@@ -112,7 +104,6 @@ const P2P_FEATURE_FLAG = String(process.env.NEXT_PUBLIC_P2P_ENABLED || "").trim(
 const REPACK_FLAGS = getRuntimeRepackFlags();
 const STREAM_MODE = getClientStreamMode();
 const R2_STRICT_MODE = isR2StrictMode(STREAM_MODE);
-const LEGACY_STRICT_MODE = STREAM_MODE === "legacy_strict";
 const MATCH_WINDOW_CONFIG = getMatchWindowConfig();
 const P2P_PROFILE = (() => {
   const raw = String(process.env.NEXT_PUBLIC_P2P_PROFILE || "").trim().toLowerCase();
@@ -129,9 +120,8 @@ const NETWORK_FATAL_WINDOW_MS = 12_000;
 const RESOLVE_COOLDOWN_MS = 1500;
 const REPACK_SEED_DEDUPE_WINDOW_MS = 12_000;
 const REPACK_TOKEN_REFRESH_KICK_MS = 16_000;
-const EMBED_FALLBACK_ENABLED = String(process.env.NEXT_PUBLIC_EMBED_FALLBACK_ENABLED || "0").trim() === "1";
+const EMBED_FALLBACK_ENABLED = false;
 const LIVE_ONLY_PLAYBACK = String(process.env.NEXT_PUBLIC_LIVE_ONLY_PLAYBACK || "1").trim() !== "0";
-const FORCE_REPACK_READ = String(process.env.NEXT_PUBLIC_FORCE_REPACK_READ || "0").trim() === "1";
 const CANDIDATE_PROBE_TIMEOUT_MS = 6500;
 const FAST_PHASE_PROBE_TIMEOUT_MS = 2200;
 const FAST_PHASE_MAX_PLAYER_PAGES = 5;
@@ -1053,12 +1043,6 @@ function canonicalizeUrl(value: string) {
   }
 }
 
-function clampPct(raw: unknown, fallback = 0) {
-  const parsed = Number.parseFloat(String(raw ?? "").trim());
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(0, Math.min(100, Math.floor(parsed)));
-}
-
 function parseServerIdSetFromUnknown(raw: unknown, fallback: Set<number>) {
   const out = new Set<number>();
   if (Array.isArray(raw)) {
@@ -1075,34 +1059,12 @@ function parseServerIdSetFromUnknown(raw: unknown, fallback: Set<number>) {
   return out.size ? out : fallback;
 }
 
-function parseReadPctByServerFromUnknown(raw: unknown, fallback: Map<number, number>) {
-  const out = new Map<number, number>();
-  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    for (const [idRaw, pctRaw] of Object.entries(raw as Record<string, unknown>)) {
-      const serverId = Number.parseInt(String(idRaw || "").trim(), 10);
-      if (!Number.isFinite(serverId) || serverId <= 0) continue;
-      out.set(serverId, clampPct(pctRaw, 0));
-    }
-  } else if (typeof raw === "string") {
-    for (const token of raw.split(",")) {
-      const [idRaw, pctRaw] = token.split(":");
-      const serverId = Number.parseInt(String(idRaw || "").trim(), 10);
-      if (!Number.isFinite(serverId) || serverId <= 0) continue;
-      out.set(serverId, clampPct(pctRaw, 0));
-    }
-  }
-  return out.size ? out : fallback;
-}
-
 function buildClientRepackFlags(matchRepack: MatchRow["repack"]): ClientRepackFlags {
   const fallback = REPACK_FLAGS;
   const enabled = typeof matchRepack?.enabled === "boolean" ? matchRepack.enabled : fallback.enabled;
   return {
     enabled,
     repackServers: parseServerIdSetFromUnknown(matchRepack?.repackServers, fallback.repackServers),
-    readPct: clampPct(matchRepack?.readPct, fallback.readPct),
-    readPctByServer: parseReadPctByServerFromUnknown(matchRepack?.readPctByServer, fallback.readPctByServer),
-    forceDisableServers: parseServerIdSetFromUnknown(matchRepack?.forceDisableServers, fallback.forceDisableServers),
     p2pServers: parseServerIdSetFromUnknown(matchRepack?.p2pServers, fallback.p2pServers),
     publicBaseUrl:
       String(matchRepack?.publicBaseUrl || "").trim().replace(/\/+$/, "") || fallback.publicBaseUrl,
@@ -5474,7 +5436,6 @@ export default function WatchPage() {
       if (!capability?.repackEligible) return;
       if (!runtimeRepackFlags.enabled) return;
       if (!runtimeRepackFlags.repackServers.has(params.serverId)) return;
-      if (runtimeRepackFlags.forceDisableServers.has(params.serverId)) return;
       const sourceCandidate = String(params.sourceCandidate || "").trim();
       const sourceUrl = String(params.sourceUrl || "").trim();
       const candidateUnderlying = toUnderlyingUrl(sourceCandidate) || sourceCandidate;
@@ -6139,7 +6100,6 @@ export default function WatchPage() {
   }, [match?.stream_url, match?.stream_url_2, match?.stream_url_3, match?.stream_url_4]);
 
   const serverOptions = useMemo<ServerOption[]>(() => {
-    void repackBypassVersion;
     if (R2_STRICT_MODE) {
       const out: ServerOption[] = [];
       for (const uiServer of [1, 2, 3, 4] as const) {
@@ -6188,8 +6148,6 @@ export default function WatchPage() {
       server5Source,
       match?.stream_url_6 ?? null,
     ];
-    const allowByWindow = matchWindow.inWindow;
-    const allowRepackRead = FORCE_REPACK_READ || allowByWindow;
 
     const out: ServerOption[] = [];
     for (let i = 0; i < 6; i += 1) {
@@ -6197,13 +6155,7 @@ export default function WatchPage() {
       const raw = String(explicit[i] || "").trim();
       const legacyUrl = raw && isValidHttpUrl(raw) ? raw : null;
       const capability = getServerCapability(n);
-      let url = legacyUrl;
-      let fallbackUrl: string | null = null;
-      let repackActive = false;
-      let repackDecisionReason = "not-eligible";
-      let repackReadPct = 0;
-      let repackBucket = -1;
-      if (LIVE_ONLY_PLAYBACK && !allowByWindow) {
+      if (LIVE_ONLY_PLAYBACK && !matchWindow.inWindow) {
         const label = SERVER_SOURCE_LABELS[n] || `سيرفر ${n}`;
         out.push({
           n,
@@ -6218,53 +6170,20 @@ export default function WatchPage() {
         });
         continue;
       }
-      if (LEGACY_STRICT_MODE) {
-        if (legacyUrl && capability?.repackEligible) repackDecisionReason = "legacy-strict-no-r2";
-      } else {
-        const repackRuntimeBypass = EMBED_FALLBACK_ENABLED && repackBypassServersRef.current.has(n);
-        if (repackRuntimeBypass && legacyUrl && capability?.repackEligible) {
-          repackDecisionReason = "runtime-unavailable";
-        } else if (legacyUrl && idNum && allowRepackRead && capability?.repackEligible) {
-          const decision = shouldUseRepackForViewer({
-            flags: runtimeRepackFlags,
-            serverId: n,
-            matchId: idNum,
-            viewerSessionId,
-          });
-          repackDecisionReason = decision.reason;
-          repackReadPct = decision.readPct;
-          repackBucket = decision.bucket;
-          if (decision.useRepack) {
-            const repackUrl = buildRepackPlaylistUrl({
-              baseUrl: runtimeRepackFlags.publicBaseUrl,
-              matchId: idNum,
-              serverId: n,
-            });
-            if (isValidHttpUrl(repackUrl)) {
-              url = repackUrl;
-              fallbackUrl = legacyUrl;
-              repackActive = true;
-            } else {
-              repackDecisionReason = "invalid-repack-url";
-            }
-          }
-        } else if (legacyUrl && capability?.repackEligible && !allowRepackRead) {
-          repackDecisionReason = "match-not-live";
-        }
-      }
       const label = SERVER_SOURCE_LABELS[n] || `سيرفر ${n}`;
-      // Smart Guard: Only allow sticky if config says so AND the URL looks safe (no tokens)
+      const repackDecisionReason =
+        legacyUrl && capability?.repackEligible ? "legacy-direct" : capability?.repackEligible ? "missing-source" : "not-eligible";
       const stickyConfig = n === 2 || n === 4;
-      const sticky = !repackActive && stickyConfig && isSafeToCacheUrl(url);
+      const sticky = stickyConfig && isSafeToCacheUrl(legacyUrl);
       out.push({
         n,
         label,
-        url,
-        fallbackUrl,
-        repackActive,
+        url: legacyUrl,
+        fallbackUrl: null,
+        repackActive: false,
         repackDecisionReason,
-        repackReadPct,
-        repackBucket,
+        repackReadPct: 0,
+        repackBucket: -1,
         sticky,
       });
     }
@@ -6272,7 +6191,7 @@ export default function WatchPage() {
     SERVER_DISPLAY_ORDER.forEach((n, idx) => orderIndex.set(n, idx));
     out.sort((a, b) => (orderIndex.get(a.n) ?? 999) - (orderIndex.get(b.n) ?? 999));
     return out;
-  }, [match, derivedServer3Url, runtimeServer5Url, server3VerifiedAvailable, idNum, runtimeRepackFlags, viewerSessionId, repackBypassVersion, matchWindow.inWindow, strictR2StatusBySlot]);
+  }, [match, derivedServer3Url, runtimeServer5Url, server3VerifiedAvailable, matchWindow.inWindow, strictR2StatusBySlot]);
 
   useEffect(() => {
     if (!R2_STRICT_MODE) return;

@@ -3,8 +3,6 @@ export type StreamMode = "r2_strict" | "legacy_strict";
 export const DEFAULT_STREAM_MODE: StreamMode = "r2_strict";
 
 function normalizeStreamMode(raw: unknown): StreamMode {
-  const value = String(raw || "").trim().toLowerCase();
-  if (value === "legacy_strict") return "legacy_strict";
   return "r2_strict";
 }
 
@@ -21,4 +19,3 @@ export function getClientStreamMode(env = process.env): StreamMode {
 export function isR2StrictMode(mode: StreamMode) {
   return mode === "r2_strict";
 }
-

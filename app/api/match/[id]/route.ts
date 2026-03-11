@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 import { supabaseAdmin } from "../../_supabase";
 import { getRuntimeRepackFlags } from "@/lib/repack-flags";
 import { buildMatchR2Status } from "@/lib/r2-status";
-import { listServerCapabilities } from "@/lib/server-capabilities";
 import { computeMatchWindowState, getMatchWindowConfig, parseMatchStartMs } from "@/lib/match-window";
 import {
   getSlotServerIdForUiServer,
@@ -1187,15 +1186,6 @@ export async function GET(req: Request, ctx: Ctx) {
     repackServers: Array.from(repackFlags.repackServers).sort((a, b) => a - b),
     p2pServers: Array.from(repackFlags.p2pServers).sort((a, b) => a - b),
     publicBaseUrl: repackFlags.publicBaseUrl,
-    capabilityRegistry: listServerCapabilities().map((item) => ({
-      serverId: item.serverId,
-      repackEligible: item.repackEligible,
-      p2pEligible: item.p2pEligible,
-      proxyAuthMode: item.proxyAuthMode,
-      tokenMode: item.tokenMode,
-      fallbackPolicy: item.fallbackPolicy,
-      repackProfile: item.repackProfile,
-    })),
   };
 
   const res = NextResponse.json({

@@ -588,7 +588,7 @@ export async function POST(req: Request) {
       continue;
     }
 
-    if (!repackFlags.repackServers.has(slotServer) || repackFlags.forceDisableServers.has(slotServer)) {
+    if (!repackFlags.repackServers.has(slotServer)) {
       pushResult({
         uiServer,
         slotServer,
