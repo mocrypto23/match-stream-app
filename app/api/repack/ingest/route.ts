@@ -253,7 +253,7 @@ async function fetchGatewayManifest(fetchUrl: string, headers?: Record<string, s
     method: "GET",
     cache: "no-store",
     headers: {
-      accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
+      accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/html,*/*",
       "user-agent": DEFAULT_USER_AGENT,
       ...(headers || {}),
     },
