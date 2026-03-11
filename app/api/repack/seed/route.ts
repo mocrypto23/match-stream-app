@@ -1,8 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { getRuntimeRepackFlags } from "@/lib/repack-flags";
-import { isAllowedSourceForSlotServer, isValidHttpUrl } from "@/lib/server-source-policy";
-import { getServerCapability } from "@/lib/server-capabilities";
+import { getUiServerIdForSlotServer, type SlotServerId } from "@/lib/server-source-policy";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -10,11 +8,6 @@ export const dynamic = "force-dynamic";
 type SeedPayload = {
   matchId?: number;
   serverId?: number;
-  sourceUrl?: string;
-  sourceCandidate?: string;
-  matchStatus?: string | null;
-  matchStart?: string | null;
-  viewerSessionId?: string | null;
 };
 
 function toInt(raw: unknown) {
@@ -22,10 +15,8 @@ function toInt(raw: unknown) {
   return Number.isFinite(n) ? n : NaN;
 }
 
-function localAgentUrl(pathname: string) {
-  const port = Number.parseInt(String(process.env.REPACK_AGENT_PORT || "3400"), 10) || 3400;
-  const bind = String(process.env.REPACK_AGENT_BIND || "127.0.0.1").trim() || "127.0.0.1";
-  return `http://${bind}:${port}${pathname}`;
+function isSlotServerId(value: number): value is SlotServerId {
+  return value === 1 || value === 2 || value === 3 || value === 4;
 }
 
 async function readJson(req: Request) {
@@ -40,48 +31,22 @@ export async function POST(req: Request) {
   const payload = await readJson(req);
   const matchId = toInt(payload.matchId);
   const serverId = toInt(payload.serverId);
-  if (!Number.isFinite(matchId) || matchId <= 0 || !Number.isFinite(serverId) || serverId <= 0) {
+  if (!Number.isFinite(matchId) || matchId <= 0 || !Number.isFinite(serverId) || !isSlotServerId(serverId)) {
     return NextResponse.json({ ok: false, error: "invalid-input" }, { status: 400 });
   }
 
-  const capability = getServerCapability(serverId);
-  if (!capability?.repackEligible) {
-    return NextResponse.json({ ok: false, skipped: true, reason: "server-not-eligible" }, { status: 202 });
-  }
-
-  const flags = getRuntimeRepackFlags();
-  if (!flags.enabled) {
-    return NextResponse.json({ ok: false, skipped: true, reason: "repack-disabled" }, { status: 202 });
-  }
-  if (!flags.repackServers.has(serverId) || flags.forceDisableServers.has(serverId)) {
-    return NextResponse.json({ ok: false, skipped: true, reason: "server-flag-disabled" }, { status: 202 });
-  }
-
-  const sourceCandidate = String(payload.sourceCandidate || "").trim();
-  const sourceUrl = String(payload.sourceUrl || "").trim();
-  const upstreamSource = sourceCandidate || sourceUrl;
-  if (!isValidHttpUrl(upstreamSource) || !isAllowedSourceForSlotServer(serverId as 1 | 2 | 3 | 4, upstreamSource)) {
-    return NextResponse.json({ ok: false, skipped: true, reason: "source-not-allowed" }, { status: 202 });
-  }
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 2800);
+  const bootstrapUrl = new URL("/api/repack/bootstrap", req.url).toString();
+  const uiServer = getUiServerIdForSlotServer(serverId);
   try {
-    const upstream = await fetch(localAgentUrl("/seed"), {
+    const upstream = await fetch(bootstrapUrl, {
       method: "POST",
       cache: "no-store",
-      signal: controller.signal,
       headers: {
         "content-type": "application/json",
       },
       body: JSON.stringify({
         matchId,
-        serverId,
-        sourceUrl: String(payload.sourceUrl || ""),
-        sourceCandidate: String(payload.sourceCandidate || ""),
-        matchStatus: String(payload.matchStatus || ""),
-        matchStart: String(payload.matchStart || ""),
-        viewerSessionId: String(payload.viewerSessionId || ""),
+        uiServers: [uiServer],
       }),
     });
     const text = await upstream.text();
@@ -104,12 +69,10 @@ export async function POST(req: Request) {
     return NextResponse.json(
       {
         ok: false,
-        error: "repack-agent-unreachable",
+        error: "repack-bootstrap-unreachable",
         detail: message,
       },
       { status: 503 }
     );
-  } finally {
-    clearTimeout(timeoutId);
   }
 }

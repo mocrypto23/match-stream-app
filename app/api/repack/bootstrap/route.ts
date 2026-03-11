@@ -311,16 +311,7 @@ async function postSeedToAgent(payload: {
   matchId: number;
   serverId: number;
   sourceUrl: string;
-  sourceCandidate: string;
   ingestUrl: string;
-  ingestMode: RepackIngestMode;
-  ingestVerified: boolean;
-  ingestHeaders: {
-    referer?: string;
-    origin?: string;
-    "user-agent"?: string;
-  };
-  probeEvidence: RepackIngestResolution["probeEvidence"];
   matchStatus: string;
   matchStart: string;
 }) {
@@ -358,6 +349,55 @@ async function postSeedToAgent(payload: {
         reason: "repack-agent-unreachable",
         error: message,
       } as Record<string, unknown>,
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function verifyGatewayManifest(fetchUrl: string) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 12_000);
+  try {
+    const response = await fetch(fetchUrl, {
+      method: "GET",
+      cache: "no-store",
+      signal: controller.signal,
+      headers: {
+        accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
+        "user-agent": DEFAULT_INGEST_USER_AGENT,
+      },
+    });
+    const body = await response.text();
+    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+    const looksLikeManifest =
+      body.includes("#EXTM3U") ||
+      contentType.includes("application/vnd.apple.mpegurl") ||
+      contentType.includes("application/x-mpegurl");
+    if (!response.ok) {
+      return {
+        ok: false,
+        reason: `ingest-http-${response.status || 0}`,
+        status: response.status,
+      };
+    }
+    if (!looksLikeManifest) {
+      return {
+        ok: false,
+        reason: "ingest-not-hls",
+        status: 502,
+      };
+    }
+    return {
+      ok: true,
+      reason: "ok",
+      status: response.status,
+    };
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      reason: `ingest-fetch-failed:${error instanceof Error ? error.message : String(error)}`,
+      status: 503,
     };
   } finally {
     clearTimeout(timeoutId);
@@ -567,102 +607,36 @@ export async function POST(req: Request) {
       continue;
     }
 
-    const ingest = await resolveRepackIngestUrl({
-      sourceUrl,
-      requestOrigin: resolverRequestOrigin,
-      slotServerId: slotServer,
-      preferProxyIngest: true,
-      referrerUrl: sourceUrl,
-      timeoutMs: Math.max(8000, Number.parseInt(String(process.env.REPACK_RESOLVE_TIMEOUT_MS || "10000"), 10) || 10000),
-      maxCandidates: Math.min(
-        24,
-        Math.max(16, Number.parseInt(String(process.env.REPACK_RESOLVE_MAX_CANDIDATES || "16"), 10) || 16)
-      ),
-      allowCandidate: ({ candidateUrl, referrerUrl }) =>
-        isIngestCandidateAlignedWithSlotServer({
-          slotServerId: slotServer,
-          sourceUrl,
-          ingestUrl: candidateUrl,
-          probeReferrerUrl: referrerUrl,
-          probePlaylistUrl: candidateUrl,
-        }),
-    });
-
-    const allowProtectedProxySoft = canAcceptProtectedProxySoftResult(ingest);
-    const ingestResolverAccepted = ingest.resolver.resolverState === "ok" || allowProtectedProxySoft;
-    const resolvedCandidate = String(ingest.ingestUrl || "").trim();
-    const hasResolvedCandidate = isValidHttpUrl(resolvedCandidate);
-
-    if (ingestResolverAccepted && !hasResolvedCandidate) {
-      const rejectReason = `invalid-ingest-url:${ingest.reason}`;
-      pushResult({
-        uiServer,
-        slotServer,
-        accepted: false,
-        reason: rejectReason,
-        statusCode: 202,
-        sourceUrl,
-        resolver: ingest.resolver,
-        ingest: {
-          mode: ingest.mode,
-          reason: ingest.reason,
-          ingestUrl: ingest.ingestUrl || null,
-        },
-        probeEvidence: ingest.probeEvidence,
-      });
-      continue;
-    }
-
-    if (ingestResolverAccepted && hasResolvedCandidate) {
-      const alignedIngest = isIngestCandidateAlignedWithSlotServer({
-        slotServerId: slotServer,
-        sourceUrl,
-        ingestUrl: resolvedCandidate,
-        probeReferrerUrl: ingest.probeEvidence?.referrerUrl || null,
-        probePlaylistUrl: ingest.probeEvidence?.playlistUrl || null,
-      });
-      if (!alignedIngest) {
-        pushResult({
-          uiServer,
-          slotServer,
-          accepted: false,
-          reason: "ingest-source-mismatch",
-          statusCode: 202,
-          sourceUrl,
-          resolver: {
-            ...ingest.resolver,
-            rejectReason: "ingest-source-mismatch",
-            resolverState: "probe-failed",
-          },
-          ingest: {
-            mode: ingest.mode,
-            reason: "ingest-source-mismatch",
-            ingestUrl: ingest.ingestUrl,
-          },
-          probeEvidence: ingest.probeEvidence,
-        });
-        continue;
-      }
-    }
-
     const gatewayIngestUrl = buildRepackGatewayManifestUrl({
       matchId,
       slotServer,
       internalOrigin: resolverRequestOrigin,
     });
-    const sourceCandidateForAgent = hasResolvedCandidate ? resolvedCandidate : sourceUrl;
+    const verifiedGateway = await verifyGatewayManifest(gatewayIngestUrl);
+    if (!verifiedGateway.ok) {
+      pushResult({
+        uiServer,
+        slotServer,
+        accepted: false,
+        reason: verifiedGateway.reason,
+        statusCode: verifiedGateway.status,
+        sourceUrl,
+        resolver: fallbackResolver(verifiedGateway.reason, "probe-failed"),
+        ingest: {
+          mode: "none",
+          reason: verifiedGateway.reason,
+          ingestUrl: gatewayIngestUrl,
+        },
+        probeEvidence: null,
+      });
+      continue;
+    }
+
     const upstream = await postSeedToAgent({
       matchId,
       serverId: slotServer,
       sourceUrl,
-      sourceCandidate: sourceCandidateForAgent,
       ingestUrl: gatewayIngestUrl,
-      ingestMode: "backend_proxy_ingest",
-      ingestVerified: ingestResolverAccepted,
-      ingestHeaders: {
-        "user-agent": DEFAULT_INGEST_USER_AGENT,
-      },
-      probeEvidence: ingest.probeEvidence,
       matchStatus: String(row.status_key || ""),
       matchStart: String(row.match_start || ""),
     });
@@ -677,13 +651,17 @@ export async function POST(req: Request) {
       reason,
       statusCode: upstream.status,
       sourceUrl,
-      resolver: ingest.resolver,
-      ingest: {
-        mode: ingest.mode,
-        reason: ingest.reason,
-        ingestUrl: ingest.ingestUrl,
+      resolver: {
+        ...fallbackResolver(accepted ? "ok" : reason, accepted ? "ok" : "probe-failed"),
+        selectedCandidate: gatewayIngestUrl,
+        selectedKind: accepted ? "backend_proxy_ingest" : "none",
       },
-      probeEvidence: ingest.probeEvidence,
+      ingest: {
+        mode: accepted ? "backend_proxy_ingest" : "none",
+        reason: accepted ? "ok" : reason,
+        ingestUrl: gatewayIngestUrl,
+      },
+      probeEvidence: null,
     });
   }
 

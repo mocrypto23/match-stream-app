@@ -3,10 +3,8 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 
 const http = require("http");
-const fs = require("fs");
-const fsp = require("fs/promises");
 const path = require("path");
-const { spawn } = require("child_process");
+const { createHash } = require("crypto");
 const dotenv = require("dotenv");
 const {
   S3Client,
@@ -20,6 +18,9 @@ dotenv.config({ path: path.join(process.cwd(), ".env.local") });
 
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+const DEFAULT_MANIFEST_CACHE_CONTROL = "no-store, no-cache, must-revalidate, max-age=0";
+const DEFAULT_SEGMENT_CACHE_CONTROL = "public, max-age=3600, s-maxage=86400, immutable";
+const DEFAULT_KEY_CACHE_CONTROL = "public, max-age=60, s-maxage=300";
 
 function nowIso() {
   return new Date().toISOString();
@@ -68,11 +69,18 @@ function computeMatchWindowState(matchStartMs, config, nowMs = Date.now()) {
 
 function isHttpUrl(value) {
   try {
-    const u = new URL(String(value || ""));
+    const u = new URL(String(value || "").trim());
     return u.protocol === "http:" || u.protocol === "https:";
   } catch {
     return false;
   }
+}
+
+function normalizeHeaderValue(raw) {
+  const value = String(raw || "")
+    .replace(/[\r\n]+/g, " ")
+    .trim();
+  return value || "";
 }
 
 function normalizeCandidateUrl(raw, playerOrigin) {
@@ -83,152 +91,38 @@ function normalizeCandidateUrl(raw, playerOrigin) {
   return "";
 }
 
-function safeDecodeURIComponent(value) {
-  try {
-    return decodeURIComponent(String(value || ""));
-  } catch {
-    return String(value || "");
-  }
+function hashHex(value) {
+  return createHash("sha1").update(String(value || "")).digest("hex");
 }
 
-function looksLikeNonStreamAssetPath(pathname) {
-  const p = String(pathname || "").toLowerCase();
-  if (!p) return false;
-  return /\.(?:css|js|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf|eot|map|json|xml|txt|pdf)(?:$|\?)/i.test(p);
+function inferContentTypeFromName(name, fallback = "application/octet-stream") {
+  const lower = String(name || "").toLowerCase();
+  if (lower.endsWith(".m3u8")) return "application/vnd.apple.mpegurl; charset=utf-8";
+  if (lower.endsWith(".ts")) return "video/mp2t";
+  if (lower.endsWith(".m4s")) return "video/iso.segment";
+  if (lower.endsWith(".mp4")) return "video/mp4";
+  if (lower.endsWith(".aac")) return "audio/aac";
+  if (lower.endsWith(".ac3")) return "audio/ac3";
+  if (lower.endsWith(".ec3")) return "audio/eac3";
+  if (lower.endsWith(".mp3")) return "audio/mpeg";
+  if (lower.endsWith(".vtt")) return "text/vtt; charset=utf-8";
+  if (lower.endsWith(".key")) return "application/octet-stream";
+  return fallback;
 }
 
-function looksLikeHlsishUrl(rawUrl) {
-  try {
-    const url = new URL(String(rawUrl || ""));
-    const pathname = String(url.pathname || "").toLowerCase();
-    const search = String(url.search || "").toLowerCase();
-    const combined = `${pathname}${search}`;
-    if (looksLikeNonStreamAssetPath(pathname)) return false;
-    if (pathname.endsWith(".mpd") || combined.includes(".mpd")) return false;
-    if (pathname.includes("/dash/") && !pathname.endsWith(".m3u8") && !combined.includes(".m3u8")) return false;
-    if (pathname.endsWith(".m3u8") || combined.includes(".m3u8")) return true;
-    if (
-      pathname.includes("/hls/") ||
-      pathname.includes("/live/") ||
-      pathname.includes("/stream/") ||
-      pathname.includes("/playlist/") ||
-      pathname.includes("/manifest/") ||
-      pathname.includes("/kooora/")
-    ) {
-      return true;
-    }
-    // Some upstreams expose manifest endpoints without .m3u8 extension.
-    // Tokenized/live params are a strong signal that URL is media-like.
-    if (
-      search.includes("token=") ||
-      search.includes("sid=") ||
-      search.includes("nonce=") ||
-      search.includes("ts=") ||
-      search.includes("session")
-    ) {
-      return true;
-    }
-    return false;
-  } catch {
-    return false;
-  }
+function looksLikeManifestResponse(contentType, body, finalUrl) {
+  const ct = String(contentType || "").toLowerCase();
+  const text = String(body || "");
+  const url = String(finalUrl || "").toLowerCase();
+  if (/^\s*#extm3u/m.test(text)) return true;
+  if (ct.includes("application/vnd.apple.mpegurl") || ct.includes("application/x-mpegurl")) return true;
+  return url.includes(".m3u8");
 }
 
-function isLikelyHlsManifestUrl(rawUrl) {
-  try {
-    const url = new URL(String(rawUrl || ""));
-    const pathname = String(url.pathname || "").toLowerCase();
-    const search = String(url.search || "").toLowerCase();
-    if (pathname.endsWith(".mpd") || `${pathname}${search}`.includes(".mpd")) return false;
-    if (pathname.endsWith(".m3u8")) return true;
-    if (`${pathname}${search}`.includes(".m3u8")) return true;
-    if (pathname.includes("/api/embed-proxy")) {
-      const target = safeDecodeURIComponent(String(url.searchParams.get("url") || ""));
-      if (looksLikeHlsishUrl(target)) return true;
-    }
-    if (looksLikeHlsishUrl(url.toString())) {
-      return true;
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-function detectIngestUrlKind(rawUrl) {
-  const value = String(rawUrl || "").trim();
-  if (!value) return "none";
-  try {
-    const u = new URL(value);
-    const pathname = String(u.pathname || "").toLowerCase();
-    if (pathname.includes("/api/embed-proxy")) return "backend_proxy_ingest";
-    if (isLikelyHlsManifestUrl(value)) return "direct_m3u8";
-    return "other";
-  } catch {
-    return "other";
-  }
-}
-
-function normalizeIngestMode(rawMode, ingestUrl) {
-  const mode = String(rawMode || "").trim().toLowerCase();
-  if (mode === "direct_m3u8" || mode === "backend_proxy_ingest") return mode;
-  return detectIngestUrlKind(ingestUrl);
-}
-
-function normalizeHeaderValue(raw) {
-  const value = String(raw || "")
-    .replace(/[\r\n]+/g, " ")
-    .trim();
-  return value || "";
-}
-
-function normalizeIngestHeaders(rawHeaders, fallbackSourceUrl = "") {
-  const sourceFallback = String(fallbackSourceUrl || "").trim();
-  const refererInput =
-    normalizeHeaderValue(rawHeaders?.referer || rawHeaders?.referrer || rawHeaders?.Referer) || sourceFallback;
-  const referer = isHttpUrl(refererInput) ? refererInput : "";
-  const originInput = normalizeHeaderValue(rawHeaders?.origin || rawHeaders?.Origin);
-  const origin = originInput || (referer ? (() => {
-    try {
-      return new URL(referer).origin;
-    } catch {
-      return "";
-    }
-  })() : "");
-  const userAgent = normalizeHeaderValue(
-    rawHeaders?.["user-agent"] || rawHeaders?.userAgent || rawHeaders?.UserAgent || DEFAULT_USER_AGENT
-  );
-  return {
-    referer: referer || "",
-    origin: origin || "",
-    "user-agent": userAgent || DEFAULT_USER_AGENT,
-  };
-}
-
-function isLocalCleanupWarning(line) {
-  const value = String(line || "").toLowerCase();
-  if (!value) return false;
-  return value.includes("failed to delete old segment") || value.includes("/tmp/tf-repack/");
-}
-
-function parseLastSegmentFromManifest(playlistUrl, manifestText) {
-  const lines = String(manifestText || "").split(/\r?\n/);
-  for (let idx = lines.length - 1; idx >= 0; idx -= 1) {
-    const raw = String(lines[idx] || "").trim();
-    if (!raw || raw.startsWith("#")) continue;
-    try {
-      const abs = new URL(raw, playlistUrl).toString();
-      if (isHttpUrl(abs)) return abs;
-    } catch {}
-  }
-  return "";
-}
-
-function parseTargetDurationSecFromPlaylistLines(lines) {
-  for (const line of lines || []) {
-    const raw = String(line || "").trim();
-    if (!raw) continue;
-    const match = raw.match(/^#EXT-X-TARGETDURATION:(\d+(?:\.\d+)?)/i);
+function parseTargetDurationSecFromPlaylist(manifestText) {
+  for (const line of String(manifestText || "").split(/\r?\n/)) {
+    const trimmed = String(line || "").trim();
+    const match = trimmed.match(/^#EXT-X-TARGETDURATION:(\d+(?:\.\d+)?)/i);
     if (!match || !match[1]) continue;
     const n = Number.parseFloat(match[1]);
     if (Number.isFinite(n) && n > 0) return n;
@@ -236,50 +130,79 @@ function parseTargetDurationSecFromPlaylistLines(lines) {
   return 0;
 }
 
-async function probeSegmentUrl(segmentUrl, timeoutMs, headers = {}) {
-  const baseHeaders = {
-    "user-agent": DEFAULT_USER_AGENT,
-    ...(headers || {}),
-  };
-  const runTimedFetch = async (method, extraHeaders = {}) => {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      return await fetch(segmentUrl, {
-        method,
-        cache: "no-store",
-        redirect: "follow",
-        signal: controller.signal,
-        headers: {
-          ...baseHeaders,
-          ...(extraHeaders || {}),
-        },
-      });
-    } finally {
-      clearTimeout(timeoutId);
-    }
-  };
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const head = await runTimedFetch("HEAD");
-      if (head.ok) return { ok: true, status: head.status };
-      if (head.status === 405 || head.status === 403 || head.status === 401) {
-        const getResp = await runTimedFetch("GET", { range: "bytes=0-1" });
-        if (getResp.ok || getResp.status === 206) return { ok: true, status: getResp.status };
-        if (attempt === 0 && (getResp.status >= 500 || getResp.status === 429)) continue;
-        return { ok: false, status: getResp.status };
-      }
-      if (attempt === 0 && (head.status >= 500 || head.status === 429)) continue;
-      return { ok: false, status: head.status };
-    } catch {
-      if (attempt === 0) continue;
-      return { ok: false, status: 0 };
-    }
-  }
-  return { ok: false, status: 0 };
+function parseMediaSequence(manifestText) {
+  const match = String(manifestText || "").match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/i);
+  if (!match || !match[1]) return null;
+  const value = Number.parseInt(match[1], 10);
+  return Number.isFinite(value) ? value : null;
 }
 
-function readJsonBody(req, maxBytes = 64 * 1024) {
+function resolveManifestUrl(raw, baseUrl) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  try {
+    const absolute = new URL(value, baseUrl).toString();
+    return isHttpUrl(absolute) ? absolute : "";
+  } catch {
+    return "";
+  }
+}
+
+function isLikelyChildPlaylistUrl(rawUrl) {
+  return String(rawUrl || "").toLowerCase().includes(".m3u8");
+}
+
+function hasMediaSegments(manifestText, baseUrl) {
+  let previousExtInf = false;
+  for (const line of String(manifestText || "").split(/\r?\n/)) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith("#EXTINF")) {
+      previousExtInf = true;
+      continue;
+    }
+    if (trimmed.startsWith("#")) {
+      if (!trimmed.startsWith("#EXT-X-STREAM-INF")) previousExtInf = false;
+      continue;
+    }
+    const absolute = resolveManifestUrl(trimmed, baseUrl);
+    if (!absolute) continue;
+    if (previousExtInf) return true;
+    if (!isLikelyChildPlaylistUrl(absolute)) return true;
+    previousExtInf = false;
+  }
+  return false;
+}
+
+function buildStrictGatewayIngestUrlKey(matchId, serverId) {
+  return `m${matchId}:s${serverId}`;
+}
+
+function isStrictGatewayIngestUrl(rawUrl, matchId, serverId) {
+  if (!isHttpUrl(rawUrl)) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    if (!String(parsed.pathname || "").toLowerCase().includes("/api/repack/ingest")) return false;
+    const matchParam = Number.parseInt(String(parsed.searchParams.get("matchId") || ""), 10);
+    const slotParam = Number.parseInt(String(parsed.searchParams.get("slotServer") || ""), 10);
+    return matchParam === matchId && slotParam === serverId;
+  } catch {
+    return false;
+  }
+}
+
+function shouldDeleteRemoteName(name) {
+  const lower = String(name || "").toLowerCase();
+  return (
+    lower === "index.m3u8" ||
+    lower.startsWith("seg-") ||
+    lower.startsWith("key-") ||
+    lower.startsWith("map-") ||
+    lower.startsWith("asset-")
+  );
+}
+
+async function readJsonBody(req, maxBytes = 64 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
@@ -314,752 +237,464 @@ function sendJson(res, statusCode, payload) {
   res.end(body);
 }
 
-class RepackJob {
+async function mapLimit(items, limit, handler) {
+  const safeLimit = Math.max(1, limit);
+  const out = new Array(items.length);
+  let index = 0;
+
+  async function worker() {
+    while (true) {
+      const current = index;
+      index += 1;
+      if (current >= items.length) return;
+      out[current] = await handler(items[current], current);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(safeLimit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return out;
+}
+
+class MirrorJob {
   constructor(manager, input) {
     this.manager = manager;
     this.matchId = input.matchId;
     this.serverId = input.serverId;
+    this.sourceUrl = input.sourceUrl;
     this.ingestUrl = input.ingestUrl;
-    this.ingestHeaders = normalizeIngestHeaders(input.ingestHeaders, input.ingestUrl);
-    this.workDir = input.workDir;
     this.remotePrefix = input.remotePrefix.replace(/\/+$/, "");
-    this.profile = input.profile;
     this.state = "starting";
     this.createdAt = Date.now();
     this.lastSeedAt = Date.now();
     this.lastPublishAt = 0;
     this.lastErrorAt = 0;
-    this.sourceReadErrors = 0;
+    this.lastError = "";
     this.consecutiveSourceErrors = 0;
-    this.consecutiveUploadErrors = 0;
-    this.uploadedSegments = new Map();
-    this.remoteSeq = 0;
-    this.lastPlaylistMediaSeq = 0;
+    this.lastObservedTargetDurationSec = 0;
+    this.lastPlaylistMediaSeq = null;
+    this.lastPublishedPlaylistFingerprint = "";
+    this.assetsBySourceUrl = new Map();
+    this.pollTimer = null;
+    this.monitorTimer = null;
+    this.syncPromise = null;
     this.totalPlaylistPublishes = 0;
-    this.totalSegmentUploads = 0;
-    this.totalSegmentBytes = 0;
+    this.totalAssetUploads = 0;
+    this.totalAssetBytes = 0;
     this.lastUploadLatencyMs = 0;
     this.lastPlaylistLatencyMs = 0;
-    this.lastPublishedPlaylistFingerprint = "";
-    this.remoteHistory = [];
-    this.lastStaleRestartAt = 0;
-    this.lastLocalSegmentFingerprint = "";
-    this.lastLocalSegmentChangedAt = 0;
-    this.lastObservedTargetDurationSec = 0;
-    this.ffmpegProc = null;
-    this.uploadTimer = null;
-    this.monitorTimer = null;
-    this.stdoutLog = [];
-    this.stderrLog = [];
-    this.lastFfmpegExitAt = 0;
-    this.lastFfmpegExitCode = null;
-    this.lastFfmpegExitSignal = null;
-    this.lastSpawnAt = 0;
-    this.consecutiveStartFailures = 0;
     this.degradedReason = "";
     this.degradedAt = 0;
-    this.pendingHardReset = false;
-    this.pendingDiscontinuity = false;
   }
 
   get key() {
-    return `m${this.matchId}:s${this.serverId}`;
+    return buildStrictGatewayIngestUrlKey(this.matchId, this.serverId);
   }
 
-  get playlistPath() {
-    return path.join(this.workDir, "index.m3u8");
+  get playlistKey() {
+    return `${this.remotePrefix}/index.m3u8`;
+  }
+
+  get publicPlaylistUrl() {
+    return `${this.manager.config.publicBaseUrl}/m${this.matchId}/s${this.serverId}/index.m3u8`;
   }
 
   async start() {
-    await fsp.mkdir(this.workDir, { recursive: true });
-    this.spawnFfmpeg();
-    const pollMs = this.manager.config.uploadPollMs;
-    this.uploadTimer = setInterval(() => {
-      this.syncPlaylist().catch((error) => {
-        this.lastErrorAt = Date.now();
-        this.consecutiveUploadErrors += 1;
-        this.manager.log("warn", "repack sync failed", {
-          job: this.key,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      });
-    }, pollMs);
-    this.monitorTimer = setInterval(() => this.healthSweep(), 2500);
+    if (this.manager.config.purgeRemoteOnStart) {
+      await this.manager.purgeRemotePrefix(this.remotePrefix, this.manager.config.purgeStopMaxKeys);
+    }
+    this.pollTimer = setInterval(() => {
+      void this.syncNow("poll");
+    }, this.manager.config.uploadPollMs);
+    this.monitorTimer = setInterval(() => {
+      void this.healthSweep();
+    }, 5000);
     this.state = "running";
   }
 
-  getAdaptiveStaleMs(baseMs, multiplier = 3) {
-    const safeBase = Math.max(2000, Number(baseMs) || 0);
-    const targetDurationSec = Number(this.lastObservedTargetDurationSec || 0);
-    if (!Number.isFinite(targetDurationSec) || targetDurationSec <= 0) return safeBase;
-    const derived = Math.round(targetDurationSec * 1000 * multiplier + 2000);
-    return Math.max(safeBase, Math.min(120_000, derived));
-  }
-
-  shouldForceRestartOnSeed(now = Date.now()) {
-    if (this.state === "degraded") return true;
-    const staleMs = this.getAdaptiveStaleMs(this.manager.config.seedRestartStaleMs, 8);
-    if (!this.lastPublishAt) {
-      return now - this.createdAt > staleMs;
-    }
-    if (now - this.lastPublishAt > staleMs) return true;
-    if (this.lastFfmpegExitAt && this.lastFfmpegExitAt >= this.lastPublishAt && now - this.lastFfmpegExitAt > 1200) {
-      return true;
-    }
-    return false;
-  }
-
-  resetEncoderRunState({ hardReset = false } = {}) {
-    this.lastLocalSegmentFingerprint = "";
-    this.lastLocalSegmentChangedAt = 0;
-    try {
-      const entries = fs.readdirSync(this.workDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (!entry.isFile()) continue;
-        const name = String(entry.name || "").toLowerCase();
-        const shouldDelete =
-          name === "index.m3u8" ||
-          name === "index.m3u8.tmp" ||
-          name.endsWith(".ts") ||
-          /^seg-\d+\.ts\.tmp$/i.test(name);
-        if (!shouldDelete) continue;
-        try {
-          fs.unlinkSync(path.join(this.workDir, entry.name));
-        } catch {}
-      }
-    } catch {}
-    if (!hardReset) return;
-    // Hard reset is reserved for first boot or source switch only.
-    // Normal restarts preserve state to avoid playback gaps.
-    this.uploadedSegments = new Map();
-    this.lastPublishAt = 0;
-    this.lastPlaylistMediaSeq = 0;
-    this.lastPublishedPlaylistFingerprint = "";
-    this.pendingDiscontinuity = false;
-  }
-
-  spawnFfmpeg() {
-    if (this.state === "stopped") return;
-    const hardReset = this.pendingHardReset || !this.lastPublishAt;
-    this.pendingHardReset = false;
-    if (!hardReset && this.lastPublishAt) {
-      this.pendingDiscontinuity = true;
-    }
-    this.resetEncoderRunState({ hardReset });
-    const ffmpegBin = this.manager.config.ffmpegBin;
-    const segmentPattern = path.join(this.workDir, "seg-%08d.ts");
-    const ingestHeaders = normalizeIngestHeaders(this.ingestHeaders, this.ingestUrl);
-    const ffUserAgent = normalizeHeaderValue(ingestHeaders["user-agent"]) || DEFAULT_USER_AGENT;
-    const ffExtraHeaders = [];
-    if (ingestHeaders.origin) ffExtraHeaders.push(`Origin: ${ingestHeaders.origin}`);
-    if (ingestHeaders.referer) ffExtraHeaders.push(`Referer: ${ingestHeaders.referer}`);
-    const args = [
-      "-nostdin",
-      "-hide_banner",
-      "-loglevel",
-      "warning",
-      "-user_agent",
-      ffUserAgent,
-      "-rw_timeout",
-      "15000000",
-      "-reconnect",
-      "1",
-      "-reconnect_streamed",
-      "1",
-      "-reconnect_at_eof",
-      "1",
-      "-reconnect_on_network_error",
-      "1",
-      "-reconnect_delay_max",
-      "2",
-      "-analyzeduration",
-      "10000000",
-      "-probesize",
-      "10000000",
-      "-fflags",
-      "+discardcorrupt",
-      "-live_start_index",
-      "-1",
-    ];
-    if (ingestHeaders.referer) {
-      args.push("-referer", ingestHeaders.referer);
-    }
-    if (ffExtraHeaders.length) {
-      args.push("-headers", `${ffExtraHeaders.join("\r\n")}\r\n`);
-    }
-    args.push(
-      "-i",
-      this.ingestUrl,
-      "-ignore_unknown",
-      "-map",
-      "0:v:0?",
-      "-map",
-      "0:a:0?",
-      "-sn",
-      "-dn",
-      "-c",
-      "copy",
-      "-f",
-      "hls",
-      "-hls_time",
-      String(this.profile.segmentDurationSec),
-      "-hls_list_size",
-      String(this.profile.playlistSize),
-      "-hls_flags",
-      "omit_endlist+program_date_time+temp_file",
-      "-hls_segment_filename",
-      segmentPattern,
-      this.playlistPath
-    );
-    this.lastSpawnAt = Date.now();
-    this.state = "starting";
-
-    this.ffmpegProc = spawn(ffmpegBin, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    this.ffmpegProc.stdout?.on("data", (chunk) => {
-      const line = String(chunk || "").trim();
-      if (!line) return;
-      this.stdoutLog.unshift(line);
-      if (this.stdoutLog.length > 50) this.stdoutLog.length = 50;
-    });
-
-    this.ffmpegProc.stderr?.on("data", (chunk) => {
-      const line = String(chunk || "").trim();
-      if (!line) return;
-      this.stderrLog.unshift(line);
-      if (this.stderrLog.length > 80) this.stderrLog.length = 80;
-      const lower = line.toLowerCase();
-      if (isLocalCleanupWarning(lower)) return;
-      if (
-        lower.includes("error") ||
-        lower.includes("failed") ||
-        lower.includes("timed out") ||
-        lower.includes("404")
-      ) {
-        this.sourceReadErrors += 1;
-        this.consecutiveSourceErrors += 1;
-        this.lastErrorAt = Date.now();
-      }
-    });
-
-    this.ffmpegProc.on("exit", (code, signal) => {
-      this.manager.log("warn", "ffmpeg exited", {
-        job: this.key,
-        code: Number.isFinite(code) ? code : null,
-        signal: signal || null,
-      });
-      this.ffmpegProc = null;
-      this.lastErrorAt = Date.now();
-      this.lastFfmpegExitAt = Date.now();
-      this.lastFfmpegExitCode = Number.isFinite(code) ? code : null;
-      this.lastFfmpegExitSignal = signal || null;
-      if (this.state === "stopped") return;
-
-      const now = Date.now();
-      const exitedQuickly = !this.lastPublishAt || now - this.lastSpawnAt <= this.manager.config.startFailureWindowMs;
-      if (exitedQuickly) {
-        this.consecutiveStartFailures += 1;
-      } else {
-        this.consecutiveStartFailures = 0;
-      }
-
-      const overFailureLimit = this.consecutiveStartFailures >= this.manager.config.maxConsecutiveStartFailures;
-      if (overFailureLimit) {
-        this.state = "degraded";
-        this.degradedReason = "ffmpeg-restart-loop";
-        this.degradedAt = now;
-        this.manager.log("error", "repack degraded", {
-          job: this.key,
-          reason: this.degradedReason,
-          consecutiveStartFailures: this.consecutiveStartFailures,
-        });
-        return;
-      }
-
-      const retryDelayMs = exitedQuickly
-        ? Math.min(
-            this.manager.config.startFailureMaxBackoffMs,
-            this.manager.config.startFailureBaseBackoffMs * Math.pow(2, Math.max(0, this.consecutiveStartFailures - 1))
-          )
-        : 1400;
-      this.state = "restarting";
-      setTimeout(() => {
-        if (this.state === "stopped") return;
-        if (this.state === "degraded") return;
-        this.spawnFfmpeg();
-        this.state = "running";
-      }, retryDelayMs);
-    });
-  }
-
-  touchSeed(ingestUrl, opts = {}) {
-    this.lastSeedAt = Date.now();
-    const forceRestart = Boolean(opts.forceRestart);
-    const nextHeaders = normalizeIngestHeaders(opts.ingestHeaders || this.ingestHeaders, ingestUrl || this.ingestUrl);
-    const headersChanged =
-      normalizeHeaderValue(nextHeaders.referer) !== normalizeHeaderValue(this.ingestHeaders?.referer) ||
-      normalizeHeaderValue(nextHeaders.origin) !== normalizeHeaderValue(this.ingestHeaders?.origin) ||
-      normalizeHeaderValue(nextHeaders["user-agent"]) !== normalizeHeaderValue(this.ingestHeaders?.["user-agent"]);
-    if (headersChanged) {
-      this.ingestHeaders = nextHeaders;
-    }
-
-    if (ingestUrl && ingestUrl !== this.ingestUrl) {
-      this.ingestUrl = ingestUrl;
-      this.pendingHardReset = true;
-      this.consecutiveStartFailures = 0;
-      this.degradedReason = "";
-      this.degradedAt = 0;
-      this.manager.log("info", "repack source updated", { job: this.key });
-      if (this.ffmpegProc) {
-        try {
-          this.ffmpegProc.kill("SIGTERM");
-        } catch {}
-      } else {
-        this.spawnFfmpeg();
-      }
-      return;
-    }
-    if (headersChanged && this.ffmpegProc) {
-      this.manager.log("info", "repack source headers updated", { job: this.key });
-      try {
-        this.ffmpegProc.kill("SIGTERM");
-      } catch {}
-      return;
-    }
-
-    // A job may be idle-stopped while keeping the same ingest URL. A fresh seed for the
-    // same source must bring ffmpeg back, otherwise the UI stays warming with R2 404s.
-    if (!this.ffmpegProc && this.state === "stopped") {
-      this.state = "starting";
-      this.pendingHardReset = !this.lastPublishAt;
-      this.manager.log("info", "repack resume from stopped seed", { job: this.key });
-      this.spawnFfmpeg();
-      return;
-    }
-
-    if (this.state === "degraded" || forceRestart) {
-      this.consecutiveStartFailures = 0;
-      this.degradedReason = "";
-      this.degradedAt = 0;
-      this.state = "starting";
-      this.manager.log("info", "repack degraded recovery requested", { job: this.key, forceRestart });
-      if (this.ffmpegProc) {
-        try {
-          this.ffmpegProc.kill("SIGTERM");
-        } catch {}
-      } else {
-        this.spawnFfmpeg();
-      }
-      return;
-    }
-
-    // If source is unchanged but stream is stale/restarting, force ffmpeg recycle.
-    const now = Date.now();
-    const staleMs = this.getAdaptiveStaleMs(this.manager.config.seedRestartStaleMs, 8);
-    const noPublishYet = !this.lastPublishAt && now - this.createdAt > staleMs;
-    const stalePublish = !!this.lastPublishAt && now - this.lastPublishAt > staleMs;
-    const recentlySpawned = this.lastSpawnAt && now - this.lastSpawnAt < Math.max(5000, Math.floor(staleMs * 0.4));
-    if ((this.state === "restarting" || noPublishYet || stalePublish) && this.ffmpegProc && !recentlySpawned) {
-      this.manager.log("warn", "repack seed-triggered restart", {
-        job: this.key,
-        staleThresholdMs: staleMs,
-        staleMs: this.lastPublishAt ? now - this.lastPublishAt : now - this.createdAt,
-      });
-      try {
-        this.ffmpegProc.kill("SIGTERM");
-      } catch {}
-    }
-  }
-
-  parsePlaylist(rawText) {
-    const lines = String(rawText || "").split(/\r?\n/);
-    const segmentLines = [];
-    for (const line of lines) {
-      const value = String(line || "").trim();
-      if (!value || value.startsWith("#")) continue;
-      segmentLines.push(value);
-    }
-    return { lines, segmentLines };
-  }
-
-  buildRemoteSegmentName() {
-    const nowMs = Date.now();
-    this.remoteSeq += 1;
-    return `seg-${nowMs}-${String(this.remoteSeq).padStart(6, "0")}.ts`;
-  }
-
-  async uploadSegment(localName, providedStat = null) {
-    const localPath = path.join(this.workDir, localName);
-    let stat = providedStat;
-    try {
-      if (!stat) stat = await fsp.stat(localPath);
-    } catch {
-      return false;
-    }
-    if (!stat.isFile() || stat.size <= 0) return false;
-    const localSignature = `${stat.size}:${Math.floor(stat.mtimeMs)}`;
-
-    const remoteName = this.buildRemoteSegmentName();
-    const remoteKey = `${this.remotePrefix}/${remoteName}`;
-    const startedAt = Date.now();
-    const fileBody = await fsp.readFile(localPath);
-    await this.manager.putObject({
-      key: remoteKey,
-      body: fileBody,
-      contentType: "video/mp2t",
-      // Segment object names are unique and immutable, so long edge caching is safe
-      // and significantly reduces repeated Class B reads on R2.
-      cacheControl: "public, max-age=3600, s-maxage=86400, immutable",
-    });
-
-    this.lastUploadLatencyMs = Date.now() - startedAt;
-    this.totalSegmentUploads += 1;
-    this.totalSegmentBytes += stat.size;
-    this.uploadedSegments.set(localName, {
-      remoteName,
-      remoteKey,
-      remoteSeq: this.remoteSeq,
-      uploadedAt: Date.now(),
-      bytes: stat.size,
-      localSignature,
-    });
-    this.remoteHistory.push({
-      key: remoteKey,
-      uploadedAt: Date.now(),
-    });
-    if (this.remoteHistory.length > 2000) this.remoteHistory.splice(0, this.remoteHistory.length - 1200);
-    return true;
-  }
-
-  async uploadPlaylist(lines) {
-    const startedAt = Date.now();
-    const rewrittenLines = [];
-    const activeRemoteSeq = [];
-    let mediaSeqLineIndex = -1;
-    let insertedDiscontinuity = false;
-    for (const line of lines) {
-      const rawLine = String(line || "");
-      const trimmed = rawLine.trim();
-      if (/^#EXT-X-MEDIA-SEQUENCE:/i.test(trimmed)) {
-        mediaSeqLineIndex = rewrittenLines.length;
-        rewrittenLines.push(rawLine);
-        continue;
-      }
-      if (!trimmed || trimmed.startsWith("#")) {
-        rewrittenLines.push(rawLine);
-        continue;
-      }
-      const mapped = this.uploadedSegments.get(trimmed);
-      if (mapped) {
-        if (this.pendingDiscontinuity && !insertedDiscontinuity) {
-          rewrittenLines.push("#EXT-X-DISCONTINUITY");
-          insertedDiscontinuity = true;
-        }
-        rewrittenLines.push(mapped.remoteName);
-        if (Number.isFinite(mapped.remoteSeq) && mapped.remoteSeq > 0) {
-          activeRemoteSeq.push(mapped.remoteSeq);
-        }
-        continue;
-      }
-      rewrittenLines.push(rawLine);
-    }
-
-    if (activeRemoteSeq.length) {
-      let mediaSequence = Math.min(...activeRemoteSeq);
-      if (!Number.isFinite(mediaSequence) || mediaSequence < 1) mediaSequence = 1;
-      if (this.lastPlaylistMediaSeq > 0 && mediaSequence < this.lastPlaylistMediaSeq) {
-        mediaSequence = this.lastPlaylistMediaSeq;
-      }
-      this.lastPlaylistMediaSeq = mediaSequence;
-      const seqLine = `#EXT-X-MEDIA-SEQUENCE:${mediaSequence}`;
-      if (mediaSeqLineIndex >= 0) {
-        rewrittenLines[mediaSeqLineIndex] = seqLine;
-      } else {
-        let insertAt = rewrittenLines.findIndex((line) => /^#EXT-X-TARGETDURATION:/i.test(String(line || "").trim()));
-        if (insertAt < 0) insertAt = rewrittenLines.findIndex((line) => /^#EXT-X-VERSION:/i.test(String(line || "").trim()));
-        if (insertAt < 0) insertAt = rewrittenLines.findIndex((line) => /^#EXTM3U$/i.test(String(line || "").trim()));
-        if (insertAt >= 0) rewrittenLines.splice(insertAt + 1, 0, seqLine);
-        else rewrittenLines.unshift(seqLine);
-      }
-    }
-
-    const rewritten = rewrittenLines.join("\n");
-
-    await this.manager.putObject({
-      key: `${this.remotePrefix}/index.m3u8`,
-      body: Buffer.from(rewritten, "utf8"),
-      contentType: "application/vnd.apple.mpegurl; charset=utf-8",
-      cacheControl: "no-store, no-cache, must-revalidate, max-age=0",
-    });
-    this.lastPlaylistLatencyMs = Date.now() - startedAt;
-    this.lastPublishAt = Date.now();
-    if (insertedDiscontinuity) {
-      this.pendingDiscontinuity = false;
-    }
-    this.totalPlaylistPublishes += 1;
-    this.consecutiveUploadErrors = 0;
-    this.consecutiveSourceErrors = 0;
-  }
-
-  async syncPlaylist() {
-    if (this.state === "stopped") return;
-    let playlistRaw;
-    try {
-      playlistRaw = await fsp.readFile(this.playlistPath, "utf8");
-    } catch {
-      return;
-    }
-    const { lines, segmentLines } = this.parsePlaylist(playlistRaw);
-    const targetDurationSec = parseTargetDurationSecFromPlaylistLines(lines);
-    if (targetDurationSec > 0) this.lastObservedTargetDurationSec = targetDurationSec;
-    if (!segmentLines.length) return;
-    const now = Date.now();
-    const localFingerprint = segmentLines.slice(-3).join("|");
-    if (!this.lastLocalSegmentFingerprint || this.lastLocalSegmentFingerprint !== localFingerprint) {
-      this.lastLocalSegmentFingerprint = localFingerprint;
-      this.lastLocalSegmentChangedAt = now;
-    } else {
-      const staleForMs = this.lastLocalSegmentChangedAt ? now - this.lastLocalSegmentChangedAt : 0;
-      const staleInputThresholdMs = this.getAdaptiveStaleMs(this.manager.config.staleInputSequenceMs, 12);
-      if (
-        staleForMs > staleInputThresholdMs &&
-        this.ffmpegProc &&
-        now - this.lastStaleRestartAt >= this.manager.config.staleRestartCooldownMs
-      ) {
-        this.lastStaleRestartAt = now;
-        this.manager.log("warn", "repack local-segments-stale", {
-          job: this.key,
-          staleMs: staleForMs,
-          staleThresholdMs: staleInputThresholdMs,
-          targetDurationSec: this.lastObservedTargetDurationSec || 0,
-        });
-        try {
-          this.ffmpegProc.kill("SIGTERM");
-        } catch {}
-      }
-    }
-
-    for (const segmentName of segmentLines) {
-      const localPath = path.join(this.workDir, segmentName);
-      let stat;
-      try {
-        stat = await fsp.stat(localPath);
-      } catch {
-        return;
-      }
-      if (!stat.isFile() || stat.size <= 0) return;
-      const localSignature = `${stat.size}:${Math.floor(stat.mtimeMs)}`;
-      const existing = this.uploadedSegments.get(segmentName);
-      if (existing && existing.localSignature === localSignature) continue;
-      const ok = await this.uploadSegment(segmentName, stat);
-      if (!ok) return;
-    }
-
-    for (const segmentName of segmentLines) {
-      if (!this.uploadedSegments.has(segmentName)) return;
-    }
-
-    const publishFingerprint = segmentLines
-      .map((segmentName) => this.uploadedSegments.get(segmentName)?.remoteName || segmentName)
-      .join("|");
-    const publishNow = Date.now();
-    const sinceLastPublishMs = this.lastPublishAt ? Math.max(0, publishNow - this.lastPublishAt) : Number.MAX_SAFE_INTEGER;
-    const shouldPublishPlaylist =
-      this.pendingDiscontinuity ||
-      publishFingerprint !== this.lastPublishedPlaylistFingerprint ||
-      sinceLastPublishMs >= this.manager.config.playlistPublishMinIntervalMs;
-
-    if (shouldPublishPlaylist) {
-      await this.uploadPlaylist(lines);
-      this.lastPublishedPlaylistFingerprint = publishFingerprint;
-    }
-    await this.cleanupLocal(segmentLines);
-    await this.cleanupRemote(segmentLines);
-  }
-
-  async cleanupLocal(activeSegments) {
-    const safeSet = new Set(activeSegments);
-    const retentionMs = this.manager.config.localRetentionMs;
-    const now = Date.now();
-    let files = [];
-    try {
-      files = await fsp.readdir(this.workDir);
-    } catch {
-      return;
-    }
-    for (const file of files) {
-      if (!file.endsWith(".ts")) continue;
-      if (safeSet.has(file)) continue;
-      const filePath = path.join(this.workDir, file);
-      try {
-        const stat = await fsp.stat(filePath);
-        if (now - stat.mtimeMs < retentionMs) continue;
-        await fsp.unlink(filePath);
-      } catch {}
-    }
-  }
-
-  async cleanupRemote(activeSegments) {
-    const activeRemote = new Set(
-      activeSegments.map((name) => this.uploadedSegments.get(name)?.remoteKey).filter(Boolean)
-    );
-    const now = Date.now();
-    const retentionMs = this.manager.config.remoteRetentionMs;
-    const staleKeys = [];
-
-    for (const [localName, meta] of this.uploadedSegments.entries()) {
-      if (activeRemote.has(meta.remoteKey)) continue;
-      if (now - meta.uploadedAt < retentionMs) continue;
-      staleKeys.push({ localName, remoteKey: meta.remoteKey });
-    }
-
-    if (!staleKeys.length) return;
-    for (const item of staleKeys.slice(0, 12)) {
-      try {
-        await this.manager.deleteObject(item.remoteKey);
-      } catch {}
-      this.uploadedSegments.delete(item.localName);
-    }
-  }
-
-  healthSweep() {
-    const now = Date.now();
-    if (now - this.lastSeedAt > this.manager.config.idleStopMs) {
-      this.manager.log("info", "repack idle-stop", { job: this.key });
-      this.stop();
-      return;
-    }
-    const staleMs = this.getAdaptiveStaleMs(this.manager.config.stalePublishMs, 8);
-    if (!this.ffmpegProc && this.state !== "stopped" && this.state !== "degraded") {
-      const silentForMs = this.lastPublishAt ? now - this.lastPublishAt : now - this.createdAt;
-      if (silentForMs > staleMs) {
-        this.manager.log("warn", "repack missing-ffmpeg respawn", {
-          job: this.key,
-          staleMs: silentForMs,
-          staleThresholdMs: staleMs,
-          state: this.state,
-        });
-        this.state = "starting";
-        this.spawnFfmpeg();
-        return;
-      }
-    }
-    if (this.lastPublishAt && now - this.lastPublishAt > staleMs) {
-      const staleForMs = now - this.lastPublishAt;
-      this.manager.log("warn", "repack stale publish", {
-        job: this.key,
-        staleMs: staleForMs,
-        staleThresholdMs: staleMs,
-        targetDurationSec: this.lastObservedTargetDurationSec || 0,
-      });
-      const restartCooldownMs = this.manager.config.staleRestartCooldownMs;
-      if (this.ffmpegProc && now - this.lastStaleRestartAt >= restartCooldownMs) {
-        this.lastStaleRestartAt = now;
-        this.manager.log("warn", "repack stale restart", {
-          job: this.key,
-          staleMs: staleForMs,
-          staleThresholdMs: staleMs,
-        });
-        try {
-          this.ffmpegProc.kill("SIGTERM");
-        } catch {}
-      }
-    }
-  }
-
   async stop() {
-    if (this.state === "stopped") return;
     this.state = "stopped";
-    if (this.uploadTimer) clearInterval(this.uploadTimer);
+    if (this.pollTimer) clearInterval(this.pollTimer);
     if (this.monitorTimer) clearInterval(this.monitorTimer);
-    this.uploadTimer = null;
+    this.pollTimer = null;
     this.monitorTimer = null;
-    if (this.ffmpegProc) {
-      try {
-        this.ffmpegProc.kill("SIGTERM");
-      } catch {}
-      this.ffmpegProc = null;
-    }
     if (this.manager.config.purgeRemoteOnStop) {
-      try {
-        const purge = await this.manager.purgePrefix(this.remotePrefix, this.manager.config.purgeStopMaxKeys);
-        this.manager.log("info", "repack remote-purge on-stop", {
-          job: this.key,
-          deleted: purge.deleted,
-          scanned: purge.scanned,
-          truncated: purge.truncated,
-        });
-      } catch (error) {
-        this.manager.log("warn", "repack remote-purge failed", {
-          job: this.key,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
+      await this.manager.purgeRemotePrefix(this.remotePrefix, this.manager.config.purgeStopMaxKeys);
     }
   }
 
-  toDiag() {
+  updateSeed(input) {
+    this.lastSeedAt = Date.now();
+    this.sourceUrl = input.sourceUrl || this.sourceUrl;
+    this.ingestUrl = input.ingestUrl || this.ingestUrl;
+    if (this.state === "degraded") {
+      this.state = "running";
+      this.degradedReason = "";
+      this.degradedAt = 0;
+      this.consecutiveSourceErrors = 0;
+    }
+  }
+
+  toDiag(nowMs = Date.now()) {
     return {
       key: this.key,
       matchId: this.matchId,
       serverId: this.serverId,
       state: this.state,
+      sourceUrl: this.sourceUrl,
       ingestUrl: this.ingestUrl,
-      ingestUrlKind: detectIngestUrlKind(this.ingestUrl),
-      ingestHeaders: {
-        referer: normalizeHeaderValue(this.ingestHeaders?.referer) || "",
-        origin: normalizeHeaderValue(this.ingestHeaders?.origin) || "",
-        userAgentSet: Boolean(normalizeHeaderValue(this.ingestHeaders?.["user-agent"])),
-      },
-      createdAt: this.createdAt,
+      ingestUrlKind: "strict_gateway",
       lastSeedAt: this.lastSeedAt,
-      lastPublishAt: this.lastPublishAt,
-      lastPublishAgeMs: this.lastPublishAt ? Math.max(0, Date.now() - this.lastPublishAt) : null,
+      lastPublishAt: this.lastPublishAt || null,
+      lastPublishAgeMs: this.lastPublishAt ? Math.max(0, nowMs - this.lastPublishAt) : null,
       lastObservedTargetDurationSec: this.lastObservedTargetDurationSec || null,
-      lastErrorAt: this.lastErrorAt,
-      lastFfmpegExit: this.lastFfmpegExitAt
-        ? {
-            at: this.lastFfmpegExitAt,
-            code: this.lastFfmpegExitCode,
-            signal: this.lastFfmpegExitSignal,
-          }
-        : null,
-      consecutiveStartFailures: this.consecutiveStartFailures,
-      degradedAt: this.degradedAt || null,
-      degradedReason: this.degradedReason || null,
-      sourceReadErrors: this.sourceReadErrors,
       consecutiveSourceErrors: this.consecutiveSourceErrors,
-      consecutiveUploadErrors: this.consecutiveUploadErrors,
+      degradedReason: this.degradedReason || null,
       totalPlaylistPublishes: this.totalPlaylistPublishes,
-      totalSegmentUploads: this.totalSegmentUploads,
-      totalSegmentBytes: this.totalSegmentBytes,
-      lastUploadLatencyMs: this.lastUploadLatencyMs,
-      lastPlaylistLatencyMs: this.lastPlaylistLatencyMs,
-      stderrTail: this.stderrLog.slice(0, 20),
+      totalAssetUploads: this.totalAssetUploads,
+      totalAssetBytes: this.totalAssetBytes,
+      publicPlaylistUrl: this.publicPlaylistUrl,
+      lastError: this.lastError || null,
     };
+  }
+
+  async healthSweep() {
+    if (this.state === "stopped") return;
+    const nowMs = Date.now();
+    if (nowMs - this.lastSeedAt > this.manager.config.idleStopMs) {
+      await this.manager.stopJob(this.key);
+    }
+  }
+
+  async syncNow(reason) {
+    if (this.syncPromise) return this.syncPromise;
+    this.syncPromise = this.performSync(reason)
+      .catch((error) => ({
+        ok: false,
+        reason: error instanceof Error ? error.message : String(error),
+      }))
+      .finally(() => {
+        this.syncPromise = null;
+      });
+    return this.syncPromise;
+  }
+
+  ensureAssetRecord(sourceUrl, kind) {
+    const existing = this.assetsBySourceUrl.get(sourceUrl);
+    if (existing) return existing;
+
+    let ext = "";
+    try {
+      const pathname = String(new URL(sourceUrl).pathname || "");
+      const match = pathname.match(/(\.[a-z0-9]{1,8})$/i);
+      ext = match && match[1] ? match[1].toLowerCase() : "";
+    } catch {}
+    if (!ext) {
+      if (kind === "segment") ext = ".ts";
+      else if (kind === "key") ext = ".key";
+      else if (kind === "map") ext = ".mp4";
+      else ext = ".bin";
+    }
+
+    const prefix =
+      kind === "segment" ? "seg" : kind === "key" ? "key" : kind === "map" ? "map" : "asset";
+    const remoteName = `${prefix}-${hashHex(sourceUrl).slice(0, 24)}${ext}`;
+    const record = {
+      sourceUrl,
+      kind,
+      remoteName,
+      remoteKey: `${this.remotePrefix}/${remoteName}`,
+      uploadedAt: 0,
+      lastSeenAt: 0,
+      contentType: inferContentTypeFromName(remoteName),
+    };
+    this.assetsBySourceUrl.set(sourceUrl, record);
+    return record;
+  }
+
+  rewriteManifestForPublic(manifestText, baseUrl) {
+    const lines = String(manifestText || "").split(/\r?\n/);
+    const out = [];
+    const currentAssetUrls = new Set();
+
+    for (const line of lines) {
+      const trimmed = String(line || "").trim();
+      if (!trimmed) {
+        out.push(line);
+        continue;
+      }
+      if (trimmed.startsWith("#")) {
+        let nextLine = line;
+        nextLine = nextLine.replace(/URI="([^"]+)"/gi, (_match, rawUri) => {
+          const absolute = resolveManifestUrl(rawUri, baseUrl);
+          if (!absolute) return `URI="${rawUri}"`;
+          const upper = trimmed.toUpperCase();
+          const kind = upper.startsWith("#EXT-X-KEY") ? "key" : upper.startsWith("#EXT-X-MAP") ? "map" : "asset";
+          const record = this.ensureAssetRecord(absolute, kind);
+          currentAssetUrls.add(absolute);
+          return `URI="${record.remoteName}"`;
+        });
+        out.push(nextLine);
+        continue;
+      }
+
+      const absolute = resolveManifestUrl(trimmed, baseUrl);
+      if (!absolute) {
+        out.push(line);
+        continue;
+      }
+      const record = this.ensureAssetRecord(absolute, "segment");
+      currentAssetUrls.add(absolute);
+      out.push(record.remoteName);
+    }
+
+    return {
+      manifestBody: out.join("\n"),
+      currentAssetUrls,
+      mediaSequence: parseMediaSequence(manifestText),
+      targetDurationSec: parseTargetDurationSecFromPlaylist(manifestText),
+    };
+  }
+
+  async fetchManifestDocument() {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.manager.config.manifestFetchTimeoutMs);
+    try {
+      const response = await fetch(this.ingestUrl, {
+        method: "GET",
+        cache: "no-store",
+        redirect: "follow",
+        signal: controller.signal,
+        headers: {
+          accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
+          "user-agent": DEFAULT_USER_AGENT,
+        },
+      });
+      const body = await response.text();
+      const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+      const finalUrl = response.url || this.ingestUrl;
+      if (!response.ok) {
+        return {
+          ok: false,
+          reason: `manifest-http-${response.status || 0}`,
+          body,
+          contentType,
+          finalUrl,
+        };
+      }
+      if (!looksLikeManifestResponse(contentType, body, finalUrl)) {
+        return {
+          ok: false,
+          reason: "manifest-not-hls",
+          body,
+          contentType,
+          finalUrl,
+        };
+      }
+      if (!hasMediaSegments(body, finalUrl)) {
+        return {
+          ok: false,
+          reason: "manifest-no-media-segments",
+          body,
+          contentType,
+          finalUrl,
+        };
+      }
+      return {
+        ok: true,
+        body,
+        contentType,
+        finalUrl,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: `manifest-fetch-failed:${error instanceof Error ? error.message : String(error)}`,
+        body: "",
+        contentType: "",
+        finalUrl: this.ingestUrl,
+      };
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  async uploadAsset(record) {
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.manager.config.assetFetchTimeoutMs);
+    try {
+      const response = await fetch(record.sourceUrl, {
+        method: "GET",
+        cache: "no-store",
+        redirect: "follow",
+        signal: controller.signal,
+        headers: {
+          "user-agent": DEFAULT_USER_AGENT,
+        },
+      });
+      if (!response.ok) {
+        throw new Error(`asset-http-${response.status || 0}`);
+      }
+      const bytes = Buffer.from(await response.arrayBuffer());
+      const contentType =
+        normalizeHeaderValue(response.headers.get("content-type")) || inferContentTypeFromName(record.remoteName);
+      const cacheControl = record.kind === "segment" ? DEFAULT_SEGMENT_CACHE_CONTROL : DEFAULT_KEY_CACHE_CONTROL;
+      await this.manager.r2.send(
+        new PutObjectCommand({
+          Bucket: this.manager.config.r2Bucket,
+          Key: record.remoteKey,
+          Body: bytes,
+          ContentType: contentType,
+          CacheControl: cacheControl,
+        })
+      );
+      record.uploadedAt = Date.now();
+      record.contentType = contentType;
+      this.totalAssetUploads += 1;
+      this.totalAssetBytes += bytes.length;
+      this.lastUploadLatencyMs = Date.now() - startedAt;
+      return { ok: true };
+    } catch (error) {
+      this.manager.metrics.uploadErrors += 1;
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  async cleanupStaleAssets(nowMs, currentAssetUrls) {
+    const staleSources = [];
+    for (const [sourceUrl, record] of this.assetsBySourceUrl.entries()) {
+      if (currentAssetUrls.has(sourceUrl)) continue;
+      if (nowMs - record.lastSeenAt <= this.manager.config.remoteRetentionMs) continue;
+      staleSources.push(sourceUrl);
+    }
+
+    if (!staleSources.length) return;
+    await mapLimit(staleSources, this.manager.config.mirrorAssetConcurrency, async (sourceUrl) => {
+      const record = this.assetsBySourceUrl.get(sourceUrl);
+      if (!record) return;
+      try {
+        await this.manager.r2.send(
+          new DeleteObjectCommand({
+            Bucket: this.manager.config.r2Bucket,
+            Key: record.remoteKey,
+          })
+        );
+      } catch {}
+      this.assetsBySourceUrl.delete(sourceUrl);
+    });
+  }
+
+  async uploadManifest(manifestBody) {
+    const startedAt = Date.now();
+    await this.manager.r2.send(
+      new PutObjectCommand({
+        Bucket: this.manager.config.r2Bucket,
+        Key: this.playlistKey,
+        Body: manifestBody,
+        ContentType: "application/vnd.apple.mpegurl; charset=utf-8",
+        CacheControl: DEFAULT_MANIFEST_CACHE_CONTROL,
+      })
+    );
+    this.lastPlaylistLatencyMs = Date.now() - startedAt;
+    this.lastPublishAt = Date.now();
+    this.totalPlaylistPublishes += 1;
+  }
+
+  async performSync(reason) {
+    if (this.state === "stopped") return { ok: false, reason: "job-stopped" };
+
+    const manifest = await this.fetchManifestDocument();
+    if (!manifest.ok) {
+      this.lastErrorAt = Date.now();
+      this.lastError = manifest.reason;
+      this.consecutiveSourceErrors += 1;
+      if (this.consecutiveSourceErrors >= this.manager.config.maxConsecutiveFailures) {
+        this.state = "degraded";
+        this.degradedReason = manifest.reason;
+        this.degradedAt = Date.now();
+      }
+      this.manager.metrics.lastError = manifest.reason;
+      this.manager.log("warn", "mirror sync failed", {
+        job: this.key,
+        reason: manifest.reason,
+        syncReason: reason,
+      });
+      return { ok: false, reason: manifest.reason };
+    }
+
+    const rewritten = this.rewriteManifestForPublic(manifest.body, manifest.finalUrl);
+    const nowMs = Date.now();
+    this.lastObservedTargetDurationSec = rewritten.targetDurationSec || this.lastObservedTargetDurationSec;
+    this.lastPlaylistMediaSeq = rewritten.mediaSequence;
+
+    const uploads = [];
+    for (const sourceUrl of rewritten.currentAssetUrls) {
+      const record = this.assetsBySourceUrl.get(sourceUrl);
+      if (!record) continue;
+      record.lastSeenAt = nowMs;
+      if (record.uploadedAt > 0) continue;
+      uploads.push(record);
+    }
+
+    try {
+      await mapLimit(uploads, this.manager.config.mirrorAssetConcurrency, async (record) => {
+        await this.uploadAsset(record);
+      });
+      await this.cleanupStaleAssets(nowMs, rewritten.currentAssetUrls);
+
+      const fingerprint = hashHex(rewritten.manifestBody);
+      const shouldPublish =
+        fingerprint !== this.lastPublishedPlaylistFingerprint ||
+        !this.lastPublishAt ||
+        nowMs - this.lastPublishAt >= this.manager.config.playlistPublishMinIntervalMs;
+      if (shouldPublish) {
+        await this.uploadManifest(rewritten.manifestBody);
+        this.lastPublishedPlaylistFingerprint = fingerprint;
+      }
+
+      this.state = "running";
+      this.degradedReason = "";
+      this.degradedAt = 0;
+      this.consecutiveSourceErrors = 0;
+      this.lastError = "";
+      return { ok: true, reason: "ok" };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.lastErrorAt = Date.now();
+      this.lastError = message;
+      this.consecutiveSourceErrors += 1;
+      if (this.consecutiveSourceErrors >= this.manager.config.maxConsecutiveFailures) {
+        this.state = "degraded";
+        this.degradedReason = message;
+        this.degradedAt = Date.now();
+      }
+      this.manager.metrics.lastError = message;
+      this.manager.log("warn", "mirror publish failed", {
+        job: this.key,
+        reason: message,
+      });
+      return { ok: false, reason: message };
+    }
   }
 }
 
-class RepackManager {
+class MirrorManager {
   constructor(config) {
     this.config = config;
-    this.jobs = new Map();
-    this.finishedSeenAtByJob = new Map();
     this.startedAt = Date.now();
+    this.jobs = new Map();
     this.metrics = {
       seedRequests: 0,
       seedAccepted: 0,
       seedRejected: 0,
       seedRejectedByReason: {},
-      seedPreflightFailed: 0,
       uploadErrors: 0,
       lastError: "",
     };
-
-    this.s3 = new S3Client({
+    this.r2 = new S3Client({
       region: "auto",
       endpoint: config.r2Endpoint,
       forcePathStyle: true,
@@ -1070,299 +705,114 @@ class RepackManager {
     });
   }
 
-  noteFinishedSeenAt(jobKey, isFinished, nowMs) {
-    if (!jobKey) return null;
-    if (!isFinished) {
-      this.finishedSeenAtByJob.delete(jobKey);
-      return null;
-    }
-    const existing = this.finishedSeenAtByJob.get(jobKey);
-    if (Number.isFinite(existing)) return Number(existing);
-    this.finishedSeenAtByJob.set(jobKey, nowMs);
-    return nowMs;
-  }
-
   log(level, message, extra = {}) {
-    const record = { ts: nowIso(), level, message, ...extra };
-    process.stdout.write(`${JSON.stringify(record)}\n`);
-  }
-
-  async putObject(input) {
-    try {
-      await this.s3.send(
-        new PutObjectCommand({
-          Bucket: this.config.r2Bucket,
-          Key: input.key,
-          Body: input.body,
-          ContentType: input.contentType,
-          CacheControl: input.cacheControl,
-        })
-      );
-    } catch (error) {
-      this.metrics.uploadErrors += 1;
-      this.metrics.lastError = error instanceof Error ? error.message : String(error);
-      throw error;
-    }
-  }
-
-  async deleteObject(key) {
-    try {
-      await this.s3.send(
-        new DeleteObjectCommand({
-          Bucket: this.config.r2Bucket,
-          Key: key,
-        })
-      );
-    } catch (error) {
-      this.metrics.uploadErrors += 1;
-      this.metrics.lastError = error instanceof Error ? error.message : String(error);
-      throw error;
-    }
-  }
-
-  async deleteObjects(keys) {
-    const safe = Array.isArray(keys) ? keys.filter(Boolean) : [];
-    if (!safe.length) return;
-    for (let idx = 0; idx < safe.length; idx += 1000) {
-      const chunk = safe.slice(idx, idx + 1000);
-      try {
-        await this.s3.send(
-          new DeleteObjectsCommand({
-            Bucket: this.config.r2Bucket,
-            Delete: {
-              Objects: chunk.map((key) => ({ Key: key })),
-              Quiet: true,
-            },
-          })
-        );
-      } catch (error) {
-        this.metrics.uploadErrors += 1;
-        this.metrics.lastError = error instanceof Error ? error.message : String(error);
-        throw error;
-      }
-    }
-  }
-
-  async purgePrefix(prefix, maxKeys = 20_000) {
-    const normalized = String(prefix || "")
-      .replace(/^\/+/, "")
-      .replace(/\/+$/, "");
-    if (!normalized) return { deleted: 0, scanned: 0, truncated: false };
-    const rootPrefix = `${normalized}/`;
-    let continuationToken = undefined;
-    let deleted = 0;
-    let scanned = 0;
-    let truncated = false;
-
-    while (true) {
-      const remainingBudget = Math.max(0, maxKeys - scanned);
-      if (remainingBudget <= 0) {
-        truncated = true;
-        break;
-      }
-      const listMax = Math.max(1, Math.min(1000, remainingBudget));
-      let listed;
-      try {
-        listed = await this.s3.send(
-          new ListObjectsV2Command({
-            Bucket: this.config.r2Bucket,
-            Prefix: rootPrefix,
-            ContinuationToken: continuationToken,
-            MaxKeys: listMax,
-          })
-        );
-      } catch (error) {
-        this.metrics.uploadErrors += 1;
-        this.metrics.lastError = error instanceof Error ? error.message : String(error);
-        throw error;
-      }
-
-      const keys = (listed.Contents || [])
-        .map((item) => String(item?.Key || "").trim())
-        .filter(Boolean);
-      scanned += keys.length;
-      if (keys.length) {
-        await this.deleteObjects(keys);
-        deleted += keys.length;
-      }
-
-      if (!listed.IsTruncated || !listed.NextContinuationToken) break;
-      continuationToken = listed.NextContinuationToken;
-    }
-
-    return { deleted, scanned, truncated };
+    const payload = { ts: nowIso(), level, message, ...extra };
+    process.stdout.write(`${JSON.stringify(payload)}\n`);
   }
 
   noteSeedReject(reason) {
     const key = String(reason || "unknown").trim() || "unknown";
     this.metrics.seedRejected += 1;
     this.metrics.seedRejectedByReason[key] = (this.metrics.seedRejectedByReason[key] || 0) + 1;
+    this.metrics.lastError = key;
   }
 
-  resolveIngestPayload(payload) {
-    const ingestVerified = payload?.ingestVerified === true;
-    const ingestHeaders = normalizeIngestHeaders(payload?.ingestHeaders, payload?.sourceUrl);
-    const explicitIngest = normalizeCandidateUrl(payload?.ingestUrl, this.config.playerOrigin);
-    const explicitMode = explicitIngest ? normalizeIngestMode(payload.ingestMode, explicitIngest) : "none";
-    const explicitTrusted =
-      explicitIngest &&
-      isHttpUrl(explicitIngest) &&
-      (ingestVerified || explicitMode === "backend_proxy_ingest");
-    if (explicitTrusted) {
-      return {
-        ingestUrl: explicitIngest,
-        ingestMode: explicitMode,
-        ingestVerified: ingestVerified || explicitMode === "backend_proxy_ingest",
-        ingestHeaders,
-      };
-    }
+  async purgeRemotePrefix(prefix, maxKeys) {
+    const safePrefix = String(prefix || "").trim().replace(/^\/+/, "").replace(/\/+$/, "");
+    if (!safePrefix) return { deleted: 0, scanned: 0, truncated: false };
 
-    const candidate = normalizeCandidateUrl(payload?.sourceCandidate, this.config.playerOrigin);
-    if (candidate && isLikelyHlsManifestUrl(candidate)) {
-      return {
-        ingestUrl: candidate,
-        ingestMode: normalizeIngestMode(payload.ingestMode, candidate),
-        ingestVerified,
-        ingestHeaders,
-      };
-    }
+    let continuationToken = undefined;
+    let deleted = 0;
+    let scanned = 0;
+    let truncated = false;
 
-    const source = normalizeCandidateUrl(payload?.sourceUrl, this.config.playerOrigin);
-    if (source && isLikelyHlsManifestUrl(source)) {
-      return {
-        ingestUrl: source,
-        ingestMode: normalizeIngestMode(payload.ingestMode, source),
-        ingestVerified,
-        ingestHeaders,
-      };
-    }
-
-    return {
-      ingestUrl: "",
-      ingestMode: "none",
-      ingestVerified,
-      ingestHeaders,
-    };
-  }
-
-  async preflightIngest(ingestUrl, ingestMode, ingestHeaders = {}) {
-    const timeoutMs =
-      ingestMode === "backend_proxy_ingest"
-        ? Math.max(this.config.preflightTimeoutMs, 6500)
-        : this.config.preflightTimeoutMs;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-    const headers = normalizeIngestHeaders(ingestHeaders, ingestUrl);
-    const requestHeaders = {
-      accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
-      "user-agent": headers["user-agent"] || DEFAULT_USER_AGENT,
-    };
-    if (headers.referer) requestHeaders.referer = headers.referer;
-    if (headers.origin) requestHeaders.origin = headers.origin;
-    try {
-      const response = await fetch(ingestUrl, {
-        method: "GET",
-        cache: "no-store",
-        redirect: "follow",
-        signal: controller.signal,
-        headers: requestHeaders,
-      });
-      const body = await response.text();
-      const contentType = String(response.headers.get("content-type") || "").toLowerCase();
-      const finalUrl = response.url || ingestUrl;
-      const evidenceBase = {
-        ingestMode,
-        ingestUrl,
-        finalUrl,
-        playlistStatus: response.status,
-        segmentStatus: 0,
-        contentType,
-        segmentUrl: null,
-      };
-
-      if (!response.ok) {
-        return { ok: false, reason: `http-${response.status}`, evidence: evidenceBase };
-      }
-      const looksLikeManifest =
-        body.includes("#EXTM3U") ||
-        contentType.includes("application/vnd.apple.mpegurl") ||
-        contentType.includes("application/x-mpegurl") ||
-        (looksLikeHlsishUrl(finalUrl) && /#EXTINF:|#EXT-X-TARGETDURATION|#EXT-X-MEDIA-SEQUENCE/i.test(body));
-      if (!looksLikeManifest) {
-        return { ok: false, reason: "non-manifest", evidence: evidenceBase };
-      }
-
-      const segmentUrl = parseLastSegmentFromManifest(finalUrl, body);
-      if (!segmentUrl) {
-        return { ok: false, reason: "manifest-empty", evidence: evidenceBase };
-      }
-
-      const segmentProbe = await probeSegmentUrl(
-        segmentUrl,
-        Math.max(900, Math.floor(timeoutMs * 0.85)),
-        requestHeaders
+    while (deleted < maxKeys) {
+      const listed = await this.r2.send(
+        new ListObjectsV2Command({
+          Bucket: this.config.r2Bucket,
+          Prefix: `${safePrefix}/`,
+          ContinuationToken: continuationToken,
+          MaxKeys: 1000,
+        })
       );
-      if (!segmentProbe.ok) {
-        return {
-          ok: false,
-          reason: `segment-http-${segmentProbe.status || 0}`,
-          evidence: {
-            ...evidenceBase,
-            segmentUrl,
-            segmentStatus: segmentProbe.status || 0,
-          },
-        };
+      const contents = Array.isArray(listed.Contents) ? listed.Contents : [];
+      const keys = contents
+        .map((item) => String(item && item.Key ? item.Key : "").trim())
+        .filter(Boolean)
+        .filter((key) => shouldDeleteRemoteName(path.basename(key)));
+
+      scanned += contents.length;
+      if (keys.length) {
+        const limitedKeys = keys.slice(0, Math.max(0, maxKeys - deleted));
+        await this.r2.send(
+          new DeleteObjectsCommand({
+            Bucket: this.config.r2Bucket,
+            Delete: {
+              Objects: limitedKeys.map((key) => ({ Key: key })),
+              Quiet: true,
+            },
+          })
+        );
+        deleted += limitedKeys.length;
       }
 
-      return {
-        ok: true,
-        reason: "preflight-ok",
-        evidence: {
-          ...evidenceBase,
-          segmentUrl,
-          segmentStatus: segmentProbe.status,
-        },
-      };
-    } catch (error) {
-      return {
-        ok: false,
-        reason: "fetch-failed",
-        evidence: {
-          ingestMode,
-          ingestUrl,
-          finalUrl: ingestUrl,
-          playlistStatus: 0,
-          segmentStatus: 0,
-          contentType: "",
-          segmentUrl: null,
-          error: error instanceof Error ? error.message : String(error),
-        },
-      };
-    } finally {
-      clearTimeout(timeoutId);
+      if (!listed.IsTruncated || !listed.NextContinuationToken || deleted >= maxKeys) {
+        truncated = Boolean(listed.IsTruncated && listed.NextContinuationToken);
+        break;
+      }
+      continuationToken = listed.NextContinuationToken;
     }
+
+    return { deleted, scanned, truncated };
+  }
+
+  async stopJob(key) {
+    const job = this.jobs.get(key);
+    if (!job) return;
+    await job.stop();
+    this.jobs.delete(key);
+  }
+
+  resolvePayload(payload) {
+    const matchId = toInt(payload.matchId, NaN, 1);
+    const serverId = toInt(payload.serverId, NaN, 1);
+    const sourceUrl = normalizeCandidateUrl(payload.sourceUrl, this.config.playerOrigin);
+    const ingestUrl = normalizeCandidateUrl(payload.ingestUrl, this.config.playerOrigin);
+    const matchStatus = String(payload.matchStatus || "").trim().toLowerCase();
+    const matchStartMs = parseMatchStartMs(payload.matchStart);
+    return {
+      matchId,
+      serverId,
+      sourceUrl,
+      ingestUrl,
+      matchStatus,
+      matchStartMs,
+    };
   }
 
   async seed(payload) {
     this.metrics.seedRequests += 1;
-    const matchId = toInt(payload.matchId, NaN, 1);
-    const serverId = toInt(payload.serverId, NaN, 1);
-    const matchStatus = String(payload.matchStatus || "").trim().toLowerCase();
-    const matchStartMs = parseMatchStartMs(payload.matchStart);
-    const liveOnly = this.config.liveOnly;
-
-    if (!Number.isFinite(matchId) || !Number.isFinite(serverId)) {
+    const parsed = this.resolvePayload(payload || {});
+    if (!Number.isFinite(parsed.matchId) || !Number.isFinite(parsed.serverId)) {
       this.noteSeedReject("invalid-input");
       return { accepted: false, reason: "invalid-input" };
     }
-    if (!this.config.repackServers.has(serverId)) {
+    if (!this.config.repackServers.has(parsed.serverId)) {
       this.noteSeedReject("server-not-enabled");
       return { accepted: false, reason: "server-not-enabled" };
     }
-    const key = `m${matchId}:s${serverId}`;
+    if (!isHttpUrl(parsed.sourceUrl)) {
+      this.noteSeedReject("invalid-source-url");
+      return { accepted: false, reason: "invalid-source-url" };
+    }
+    if (!isStrictGatewayIngestUrl(parsed.ingestUrl, parsed.matchId, parsed.serverId)) {
+      this.noteSeedReject("invalid-ingest-url");
+      return { accepted: false, reason: "invalid-ingest-url" };
+    }
+
     const nowMs = Date.now();
-    const windowState = computeMatchWindowState(matchStartMs, this.config, nowMs);
-    if (liveOnly) {
+    const windowState = computeMatchWindowState(parsed.matchStartMs, this.config, nowMs);
+    if (this.config.liveOnly) {
       if (!windowState.hasStart) {
         this.noteSeedReject("missing-match-start");
         return { accepted: false, reason: "missing-match-start" };
@@ -1372,123 +822,49 @@ class RepackManager {
         return { accepted: false, reason: "match-outside-window" };
       }
     }
-    const seenFinishedAt = this.noteFinishedSeenAt(key, matchStatus === "finished", nowMs);
-    const existingJob = this.jobs.get(key);
-    if (this.config.earlyStopOnFinished && seenFinishedAt !== null) {
-      const finishedStableForMs = Math.max(0, nowMs - seenFinishedAt);
-      const finishedDebounced = finishedStableForMs >= this.config.finishedDebounceMs;
-      const sourceFailTrend = existingJob?.consecutiveSourceErrors || 0;
-      if (finishedDebounced && sourceFailTrend >= this.config.earlyStopSegmentFailStreak) {
-        if (existingJob) {
-          await existingJob.stop();
-          this.jobs.delete(key);
-        }
-        this.noteSeedReject("early-stop-finished+segment-fail");
-        return {
-          accepted: false,
-          reason: "early-stop-finished+segment-fail",
-          finishedStableForMs,
-          sourceFailTrend,
-        };
-      }
-    }
-    const ingest = this.resolveIngestPayload(payload || {});
-    const ingestUrl = ingest.ingestUrl;
-    if (!isHttpUrl(ingestUrl)) {
-      this.noteSeedReject("invalid-ingest-url");
-      return { accepted: false, reason: "invalid-ingest-url", ingestMode: ingest.ingestMode };
-    }
 
-    const preflight = await this.preflightIngest(ingestUrl, ingest.ingestMode, ingest.ingestHeaders);
-    const upstreamProbe = payload?.probeEvidence || null;
-    const upstreamProbePlaylistStatus = Number.parseInt(String(upstreamProbe?.playlistStatus || 0), 10) || 0;
-    const upstreamProbeSegmentStatus = Number.parseInt(String(upstreamProbe?.segmentStatus || 0), 10) || 0;
-    const canBypass403Preflight =
-      !preflight.ok &&
-      preflight.reason === "http-403" &&
-      ingest.ingestVerified === true &&
-      upstreamProbePlaylistStatus >= 200 &&
-      upstreamProbePlaylistStatus < 300 &&
-      upstreamProbeSegmentStatus >= 200 &&
-      upstreamProbeSegmentStatus < 300;
-    const canBypassProtectedSegmentPreflight =
-      !preflight.ok &&
-      preflight.reason === "http-403" &&
-      ingest.ingestMode === "backend_proxy_ingest" &&
-      upstreamProbePlaylistStatus >= 200 &&
-      upstreamProbePlaylistStatus < 300 &&
-      upstreamProbeSegmentStatus === 403;
-    const gatewayTransientPreflightFailure =
-      !preflight.ok &&
-      ingest.ingestMode === "backend_proxy_ingest" &&
-      /\/api\/repack\/ingest\?/i.test(String(ingestUrl || "")) &&
-      /^(?:fetch-failed|non-manifest|http-(?:408|429|500|502|503|504|522|524)|segment-http-0)$/i.test(
-        String(preflight.reason || "").trim()
-      );
-    if (
-      !preflight.ok &&
-      !canBypass403Preflight &&
-      !canBypassProtectedSegmentPreflight &&
-      !gatewayTransientPreflightFailure
-    ) {
-      this.metrics.seedPreflightFailed += 1;
-      const reason = `preflight-failed:${preflight.reason}`;
-      this.noteSeedReject(reason);
-      return {
-        accepted: false,
-        reason,
-        ingestUrl,
-        ingestMode: ingest.ingestMode,
-        ingestVerified: ingest.ingestVerified,
-        ingestHeaders: ingest.ingestHeaders,
-        preflight: preflight.evidence,
-      };
-    }
-    if (canBypass403Preflight || canBypassProtectedSegmentPreflight || gatewayTransientPreflightFailure) {
-      this.log("warn", "repack preflight bypassed", {
-        matchId,
-        serverId,
-        ingestUrl,
-        reason: preflight.reason,
-      });
-    }
-
-    let job = existingJob || this.jobs.get(key);
-    const forceRestart = Boolean(job && job.shouldForceRestartOnSeed(nowMs));
+    const key = buildStrictGatewayIngestUrlKey(parsed.matchId, parsed.serverId);
+    let job = this.jobs.get(key);
     if (!job) {
-      const workDir = path.join(this.config.workRoot, `m${matchId}`, `s${serverId}`);
-      const remotePrefix = `live/m${matchId}/s${serverId}`;
-      job = new RepackJob(this, {
-        matchId,
-        serverId,
-        ingestUrl,
-        ingestHeaders: ingest.ingestHeaders,
-        workDir,
-        remotePrefix,
-        profile: this.config.repackProfile,
+      job = new MirrorJob(this, {
+        matchId: parsed.matchId,
+        serverId: parsed.serverId,
+        sourceUrl: parsed.sourceUrl,
+        ingestUrl: parsed.ingestUrl,
+        remotePrefix: `live/m${parsed.matchId}/s${parsed.serverId}`,
       });
       this.jobs.set(key, job);
       await job.start();
-      this.log("info", "repack job started", {
+      this.log("info", "mirror job started", {
         job: key,
-        matchId,
-        serverId,
-        source: ingestUrl,
-        ingestMode: ingest.ingestMode,
+        matchId: parsed.matchId,
+        serverId: parsed.serverId,
+        ingestUrl: parsed.ingestUrl,
       });
     } else {
-      job.touchSeed(ingestUrl, { forceRestart, ingestHeaders: ingest.ingestHeaders });
+      job.updateSeed({
+        sourceUrl: parsed.sourceUrl,
+        ingestUrl: parsed.ingestUrl,
+      });
     }
+
+    const synced = await job.syncNow("seed");
+    if (!synced.ok) {
+      this.noteSeedReject(`sync-failed:${synced.reason}`);
+      return {
+        accepted: false,
+        reason: `sync-failed:${synced.reason}`,
+        ingestUrl: parsed.ingestUrl,
+      };
+    }
+
     this.metrics.seedAccepted += 1;
     return {
       accepted: true,
       reason: "ok",
       jobKey: key,
-      ingestUrl,
-      ingestMode: ingest.ingestMode,
-      ingestVerified: ingest.ingestVerified,
-      ingestHeaders: ingest.ingestHeaders,
-      preflight: canBypass403Preflight ? upstreamProbe : preflight.evidence,
+      ingestUrl: parsed.ingestUrl,
+      publicPlaylistUrl: job.publicPlaylistUrl,
     };
   }
 
@@ -1498,21 +874,15 @@ class RepackManager {
       await job.stop();
     }
     this.jobs.clear();
-    this.finishedSeenAtByJob.clear();
   }
 
   diag() {
-    const jobs = Array.from(this.jobs.values()).map((job) => job.toDiag());
+    const jobs = Array.from(this.jobs.values()).map((job) => job.toDiag(Date.now()));
     const perServer = {};
     for (const job of jobs) {
       perServer[String(job.serverId)] = {
-        repack_on: job.state === "running" || job.state === "restarting",
-        fallback_reason_top:
-          job.consecutiveSourceErrors > 0
-            ? "source-errors"
-            : job.consecutiveUploadErrors > 0
-              ? "upload-errors"
-              : "none",
+        repack_on: job.state === "running",
+        fallback_reason_top: job.degradedReason || "none",
         cache_status_mix: "n/a",
         stall_rate: "n/a",
       };
@@ -1530,19 +900,19 @@ class RepackManager {
         earlyStopOnFinished: this.config.earlyStopOnFinished,
         finishedDebounceMs: this.config.finishedDebounceMs,
         earlyStopSegmentFailStreak: this.config.earlyStopSegmentFailStreak,
-        preflightTimeoutMs: this.config.preflightTimeoutMs,
+        preflightTimeoutMs: this.config.manifestFetchTimeoutMs,
         uploadPollMs: this.config.uploadPollMs,
         playlistPublishMinIntervalMs: this.config.playlistPublishMinIntervalMs,
         localRetentionMs: this.config.localRetentionMs,
         remoteRetentionMs: this.config.remoteRetentionMs,
         purgeRemoteOnStop: this.config.purgeRemoteOnStop,
         purgeStopMaxKeys: this.config.purgeStopMaxKeys,
-        maxConsecutiveStartFailures: this.config.maxConsecutiveStartFailures,
-        startFailureBaseBackoffMs: this.config.startFailureBaseBackoffMs,
-        startFailureMaxBackoffMs: this.config.startFailureMaxBackoffMs,
+        maxConsecutiveStartFailures: this.config.maxConsecutiveFailures,
+        startFailureBaseBackoffMs: 0,
+        startFailureMaxBackoffMs: 0,
         staleInputSequenceMs: this.config.staleInputSequenceMs,
-        segmentDurationSec: this.config.repackProfile.segmentDurationSec,
-        playlistSize: this.config.repackProfile.playlistSize,
+        segmentDurationSec: 0,
+        playlistSize: 0,
         repackServers: Array.from(this.config.repackServers).sort((a, b) => a - b),
         r2Bucket: this.config.r2Bucket,
         publicBaseUrl: this.config.publicBaseUrl,
@@ -1566,22 +936,17 @@ function loadConfig() {
   const postmatchGraceMinutes = toInt(process.env.REPACK_POSTMATCH_GRACE_MINUTES, 15, 0);
   const finishedDebounceMinutes = toInt(process.env.REPACK_FINISHED_DEBOUNCE_MINUTES, 5, 0);
 
-  const cfg = {
+  const config = {
     bind: String(process.env.REPACK_AGENT_BIND || "127.0.0.1").trim(),
     port: toInt(process.env.REPACK_AGENT_PORT, 3400, 1),
-    ffmpegBin: String(process.env.REPACK_FFMPEG_BIN || "ffmpeg").trim(),
     workRoot: String(process.env.REPACK_WORK_ROOT || "/tmp/tf-repack").trim(),
-    uploadPollMs: toInt(process.env.REPACK_UPLOAD_POLL_MS, 1200, 400),
-    playlistPublishMinIntervalMs: toInt(process.env.REPACK_PLAYLIST_PUBLISH_MIN_INTERVAL_MS, 1900, 500),
-    // Keep seeded jobs alive long enough for full match windows unless explicitly overridden by env.
+    uploadPollMs: toInt(process.env.REPACK_UPLOAD_POLL_MS, 2000, 500),
+    playlistPublishMinIntervalMs: toInt(process.env.REPACK_PLAYLIST_PUBLISH_MIN_INTERVAL_MS, 2500, 500),
     idleStopMs: toInt(process.env.REPACK_IDLE_STOP_MS, 8 * 60 * 60 * 1000, 10_000),
-    stalePublishMs: toInt(process.env.REPACK_STALE_PUBLISH_MS, 8_000, 3000),
-    staleRestartCooldownMs: toInt(process.env.REPACK_STALE_RESTART_COOLDOWN_MS, 9_000, 3000),
-    staleInputSequenceMs: toInt(process.env.REPACK_STALE_INPUT_SEQUENCE_MS, 15_000, 5000),
-    seedRestartStaleMs: toInt(process.env.REPACK_SEED_RESTART_STALE_MS, 7_000, 3000),
-    localRetentionMs: toInt(process.env.REPACK_LOCAL_RETENTION_MS, 8 * 60 * 1000, 30_000),
-    remoteRetentionMs: toInt(process.env.REPACK_REMOTE_RETENTION_MS, 8 * 60 * 1000, 30_000),
+    localRetentionMs: toInt(process.env.REPACK_LOCAL_RETENTION_MS, 2 * 60 * 1000, 10_000),
+    remoteRetentionMs: toInt(process.env.REPACK_REMOTE_RETENTION_MS, 3 * 60 * 1000, 10_000),
     purgeRemoteOnStop: toBool(process.env.REPACK_PURGE_REMOTE_ON_STOP, true),
+    purgeRemoteOnStart: toBool(process.env.REPACK_PURGE_REMOTE_ON_START, true),
     purgeStopMaxKeys: toInt(process.env.REPACK_PURGE_STOP_MAX_KEYS, 30_000, 1000),
     liveOnly: toBool(process.env.REPACK_LIVE_ONLY, true),
     prematchOpenWindowMs: prematchOpenWindowMinutes * 60 * 1000,
@@ -1590,13 +955,11 @@ function loadConfig() {
     earlyStopOnFinished: toBool(process.env.REPACK_EARLY_STOP_ON_FINISHED, false),
     finishedDebounceMs: finishedDebounceMinutes * 60 * 1000,
     earlyStopSegmentFailStreak: toInt(process.env.REPACK_EARLY_STOP_SEGMENT_FAIL_STREAK, 4, 1),
-    preflightTimeoutMs: toInt(process.env.REPACK_AGENT_PREFLIGHT_TIMEOUT_MS, 2200, 900),
-    maxConsecutiveStartFailures: toInt(process.env.REPACK_AGENT_MAX_START_FAILURES, 6, 2),
-    startFailureBaseBackoffMs: toInt(process.env.REPACK_START_FAILURE_BASE_BACKOFF_MS, 2000, 300),
-    startFailureMaxBackoffMs: toInt(process.env.REPACK_START_FAILURE_MAX_BACKOFF_MS, 20000, 1200),
-    startFailureWindowMs: toInt(process.env.REPACK_START_FAILURE_WINDOW_MS, 4500, 800),
-    deleteRemoteIndexAfterStartFailures: toInt(process.env.REPACK_DELETE_REMOTE_INDEX_AFTER_START_FAILURES, 3, 1),
-    publicBaseUrl: String(process.env.REPACK_PUBLIC_BASE_URL || "https://r2.tf-player.site/live").trim(),
+    manifestFetchTimeoutMs: Math.max(6500, toInt(process.env.REPACK_AGENT_PREFLIGHT_TIMEOUT_MS, 6500, 1500)),
+    assetFetchTimeoutMs: Math.max(6000, toInt(process.env.REPACK_AGENT_ASSET_FETCH_TIMEOUT_MS, 12_000, 2000)),
+    maxConsecutiveFailures: toInt(process.env.REPACK_AGENT_MAX_START_FAILURES, 4, 2),
+    staleInputSequenceMs: toInt(process.env.REPACK_STALE_INPUT_SEQUENCE_MS, 15_000, 5000),
+    publicBaseUrl: String(process.env.REPACK_PUBLIC_BASE_URL || "https://r2.tf-player.site/live").trim().replace(/\/+$/, ""),
     playerOrigin: String(
       process.env.REPACK_INTERNAL_PLAYER_ORIGIN ||
         process.env.INTERNAL_APP_ORIGIN ||
@@ -1604,26 +967,22 @@ function loadConfig() {
         "http://127.0.0.1:3000"
     ).trim(),
     repackServers,
-    repackProfile: {
-      segmentDurationSec: toInt(process.env.REPACK_SEGMENT_DURATION_SEC, 1, 1),
-      playlistSize: toInt(process.env.REPACK_PLAYLIST_SIZE, 5, 2),
-    },
+    mirrorAssetConcurrency: toInt(process.env.REPACK_MIRROR_ASSET_CONCURRENCY, 6, 1),
     r2Endpoint: String(process.env.R2_ENDPOINT || process.env.REPACK_R2_ENDPOINT || "").trim(),
     r2Bucket: String(process.env.R2_BUCKET || process.env.REPACK_R2_BUCKET || "").trim(),
     r2AccessKeyId: String(process.env.R2_ACCESS_KEY_ID || process.env.REPACK_R2_ACCESS_KEY_ID || "").trim(),
     r2SecretAccessKey: String(process.env.R2_SECRET_ACCESS_KEY || process.env.REPACK_R2_SECRET_ACCESS_KEY || "").trim(),
   };
 
-  if (!cfg.r2Endpoint || !cfg.r2Bucket || !cfg.r2AccessKeyId || !cfg.r2SecretAccessKey) {
+  if (!config.r2Endpoint || !config.r2Bucket || !config.r2AccessKeyId || !config.r2SecretAccessKey) {
     throw new Error("Missing R2 configuration (endpoint/bucket/access key/secret).");
   }
-  return cfg;
+  return config;
 }
 
 async function main() {
   const config = loadConfig();
-  await fsp.mkdir(config.workRoot, { recursive: true });
-  const manager = new RepackManager(config);
+  const manager = new MirrorManager(config);
   const startedAt = Date.now();
 
   const server = http.createServer(async (req, res) => {

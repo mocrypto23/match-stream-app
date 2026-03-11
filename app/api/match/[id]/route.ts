@@ -1184,9 +1184,6 @@ export async function GET(req: Request, ctx: Ctx) {
   }
   const repackHints = {
     enabled: repackFlags.enabled,
-    readPct: repackFlags.readPct,
-    readPctByServer: Object.fromEntries(Array.from(repackFlags.readPctByServer.entries())),
-    forceDisableServers: Array.from(repackFlags.forceDisableServers).sort((a, b) => a - b),
     repackServers: Array.from(repackFlags.repackServers).sort((a, b) => a - b),
     p2pServers: Array.from(repackFlags.p2pServers).sort((a, b) => a - b),
     publicBaseUrl: repackFlags.publicBaseUrl,

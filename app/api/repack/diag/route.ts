@@ -36,9 +36,6 @@ export async function GET() {
         flags: {
           enabled: flags.enabled,
           repackServers: Array.from(flags.repackServers).sort((a, b) => a - b),
-          readPct: flags.readPct,
-          readPctByServer: Object.fromEntries(Array.from(flags.readPctByServer.entries())),
-          forceDisableServers: Array.from(flags.forceDisableServers).sort((a, b) => a - b),
           p2pServers: Array.from(flags.p2pServers).sort((a, b) => a - b),
           publicBaseUrl: flags.publicBaseUrl,
         },
@@ -55,9 +52,6 @@ export async function GET() {
         flags: {
           enabled: flags.enabled,
           repackServers: Array.from(flags.repackServers).sort((a, b) => a - b),
-          readPct: flags.readPct,
-          readPctByServer: Object.fromEntries(Array.from(flags.readPctByServer.entries())),
-          forceDisableServers: Array.from(flags.forceDisableServers).sort((a, b) => a - b),
           p2pServers: Array.from(flags.p2pServers).sort((a, b) => a - b),
           publicBaseUrl: flags.publicBaseUrl,
         },
