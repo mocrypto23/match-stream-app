@@ -2216,6 +2216,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     if (!finalProbe) continue;
     const stableSourceReferrer =
       normalizeHttpUrl(item.referrerUrl || sourceFetch.finalUrl || sourceUrl) || sourceUrl;
+    const extraCandidateReferrer = normalizeHttpUrl(finalProbe.evidence?.playlistUrl || "") || stableSourceReferrer;
     if (canSoftAcceptProtectedSegmentProbe({
       candidateUrl: item.candidateUrl,
       reason: finalProbe.reason,
@@ -2288,19 +2289,19 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     for (const extra of aggregatedExtraCandidates) {
       const normalized = normalizeCandidate(extra, item.candidateUrl);
       if (!normalized) continue;
-      if (!isCandidateAllowedByPolicy(input.allowCandidate, normalized, item.referrerUrl || item.candidateUrl)) continue;
+      if (!isCandidateAllowedByPolicy(input.allowCandidate, normalized, extraCandidateReferrer)) continue;
       const extraKey = canonicalizeUrl(normalized) || normalized.toLowerCase();
       if (!extraKey || seenProbeKeys.has(extraKey) || seen.has(extraKey)) continue;
       if (looksLikeHlsManifestUrl(normalized)) {
-        pushImmediateManifest(normalized, stableSourceReferrer);
+        pushImmediateManifest(normalized, extraCandidateReferrer);
         if (requestOrigin && !isEmbedProxyCandidateUrl(normalized)) {
           const proxiedManifest = buildInternalEmbedProxyUrl({
             sourceUrl: normalized,
             requestOrigin,
-            referrerUrl: stableSourceReferrer,
+            referrerUrl: extraCandidateReferrer,
           });
           if (proxiedManifest) {
-            pushImmediateManifest(proxiedManifest, stableSourceReferrer);
+            pushImmediateManifest(proxiedManifest, extraCandidateReferrer);
           }
         }
         if (immediateManifestExtras.length >= 8) continue;
@@ -2317,7 +2318,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
         extraPool,
         sourceUrl,
         Math.max(2, maxCandidates - candidatesProbed),
-        stableSourceReferrer
+        extraCandidateReferrer
       );
       pending.push(...rankedExtra);
     }
