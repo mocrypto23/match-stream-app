@@ -40,7 +40,6 @@ type CachedGatewayResolution = {
   expiresAt: number;
   sourceUrl: string;
   probeReferrerUrl: string;
-  upstreamFetchUrl: string;
   upstreamIngestUrl: string | null;
   upstreamMode: string;
 };
@@ -89,6 +88,56 @@ function buildInternalEmbedProxyUrl(input: {
   const referrerUrl = String(input.referrerUrl || "").trim();
   if (isValidHttpUrl(referrerUrl)) proxyUrl.searchParams.set("ref", referrerUrl);
   return proxyUrl.toString();
+}
+
+function safeOrigin(rawUrl: string) {
+  try {
+    return new URL(rawUrl).origin;
+  } catch {
+    return "";
+  }
+}
+
+function rewriteManifestForEmbedProxy(input: {
+  manifest: string;
+  baseUrl: string;
+  internalOrigin: string;
+  referrerUrl: string;
+}) {
+  const lines = String(input.manifest || "").split(/\r?\n/);
+  const out: string[] = [];
+  const rewriteUri = (raw: string) => {
+    const trimmed = String(raw || "").trim();
+    if (!trimmed) return trimmed;
+    if (/^data:/i.test(trimmed)) return trimmed;
+    if (trimmed.startsWith("/api/embed-proxy") || trimmed.includes("/api/embed-proxy?")) return trimmed;
+    try {
+      const absolute = new URL(trimmed, input.baseUrl).toString();
+      if (!isValidHttpUrl(absolute)) return trimmed;
+      return buildInternalEmbedProxyUrl({
+        sourceUrl: absolute,
+        internalOrigin: input.internalOrigin,
+        referrerUrl: input.referrerUrl,
+      });
+    } catch {
+      return trimmed;
+    }
+  };
+
+  for (const line of lines) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) {
+      out.push(line);
+      continue;
+    }
+    if (trimmed.startsWith("#")) {
+      out.push(line.replace(/URI="([^"]+)"/gi, (_m, rawUri) => `URI="${rewriteUri(rawUri)}"`));
+      continue;
+    }
+    out.push(rewriteUri(trimmed));
+  }
+
+  return out.join("\n");
 }
 
 function canAcceptProtectedProxySoftResult(ingest: RepackIngestResolution) {
@@ -179,18 +228,11 @@ async function resolveGatewayUpstream(input: {
     throw new Error(`invalid-ingest-url:${resolved.reason}`);
   }
 
-  const upstreamFetchUrl =
+  const validatedFetchUrl =
     resolvedMode === "backend_proxy_ingest"
       ? toAbsoluteInternalUrl(resolvedIngestUrl, input.internalOrigin)
-      : buildInternalEmbedProxyUrl({
-          sourceUrl: resolvedIngestUrl,
-          internalOrigin: input.internalOrigin,
-          referrerUrl:
-            String(resolved.probeEvidence?.referrerUrl || "").trim() ||
-            runtimeContext.probeReferrerUrl ||
-            sourceUrl,
-        });
-  if (!upstreamFetchUrl || !isValidHttpUrl(upstreamFetchUrl)) {
+      : resolvedIngestUrl;
+  if (!validatedFetchUrl || !isValidHttpUrl(validatedFetchUrl)) {
     throw new Error("invalid-upstream-fetch-url");
   }
 
@@ -199,7 +241,6 @@ async function resolveGatewayUpstream(input: {
     sourceUrl,
     probeReferrerUrl:
       String(resolved.probeEvidence?.referrerUrl || "").trim() || runtimeContext.probeReferrerUrl || sourceUrl,
-    upstreamFetchUrl,
     upstreamIngestUrl: resolvedIngestUrl,
     upstreamMode: resolvedMode || "backend_proxy_ingest",
   };
@@ -207,13 +248,14 @@ async function resolveGatewayUpstream(input: {
   return next;
 }
 
-async function fetchGatewayManifest(fetchUrl: string) {
+async function fetchGatewayManifest(fetchUrl: string, headers?: Record<string, string>) {
   const response = await fetch(fetchUrl, {
     method: "GET",
     cache: "no-store",
     headers: {
       accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
       "user-agent": DEFAULT_USER_AGENT,
+      ...(headers || {}),
     },
   });
   const body = await response.text();
@@ -245,7 +287,18 @@ export async function GET(req: Request) {
       slotServer,
       internalOrigin,
     });
-    let manifest = await fetchGatewayManifest(resolved.upstreamFetchUrl);
+    const manifestFetchHeaders =
+      resolved.upstreamMode === "backend_proxy_ingest"
+        ? undefined
+        : {
+            referer: resolved.probeReferrerUrl || resolved.sourceUrl,
+            origin: safeOrigin(resolved.probeReferrerUrl || resolved.sourceUrl),
+          };
+    const initialFetchUrl =
+      resolved.upstreamMode === "backend_proxy_ingest"
+        ? toAbsoluteInternalUrl(String(resolved.upstreamIngestUrl || ""), internalOrigin)
+        : String(resolved.upstreamIngestUrl || "");
+    let manifest = await fetchGatewayManifest(initialFetchUrl, manifestFetchHeaders);
 
     if (!manifest.ok || !looksLikeManifestResponse(manifest.contentType, manifest.body, manifest.finalUrl)) {
       gatewayResolutionCache.delete(runtimeCacheKey(matchId, slotServer));
@@ -254,7 +307,18 @@ export async function GET(req: Request) {
         slotServer,
         internalOrigin,
       });
-      manifest = await fetchGatewayManifest(resolved.upstreamFetchUrl);
+      const retryFetchHeaders =
+        resolved.upstreamMode === "backend_proxy_ingest"
+          ? undefined
+          : {
+              referer: resolved.probeReferrerUrl || resolved.sourceUrl,
+              origin: safeOrigin(resolved.probeReferrerUrl || resolved.sourceUrl),
+            };
+      const retryFetchUrl =
+        resolved.upstreamMode === "backend_proxy_ingest"
+          ? toAbsoluteInternalUrl(String(resolved.upstreamIngestUrl || ""), internalOrigin)
+          : String(resolved.upstreamIngestUrl || "");
+      manifest = await fetchGatewayManifest(retryFetchUrl, retryFetchHeaders);
     }
 
     if (!manifest.ok) {
@@ -282,7 +346,17 @@ export async function GET(req: Request) {
       );
     }
 
-    return new Response(manifest.body, {
+    const manifestBody =
+      resolved.upstreamMode === "backend_proxy_ingest"
+        ? manifest.body
+        : rewriteManifestForEmbedProxy({
+            manifest: manifest.body,
+            baseUrl: manifest.finalUrl || String(resolved.upstreamIngestUrl || ""),
+            internalOrigin,
+            referrerUrl: resolved.probeReferrerUrl || resolved.sourceUrl,
+          });
+
+    return new Response(manifestBody, {
       status: 200,
       headers: {
         "content-type": "application/vnd.apple.mpegurl; charset=utf-8",
@@ -308,4 +382,3 @@ export async function GET(req: Request) {
     );
   }
 }
-
