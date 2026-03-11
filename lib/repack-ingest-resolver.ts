@@ -1209,9 +1209,28 @@ async function fetchSourcePageVariants(input: {
       sourceUrl: input.sourceUrl,
       requestOrigin: input.requestOrigin,
       referrerUrl: baseReferrer,
+      backendMode: true,
     });
     if (proxiedSourcePage) {
       await queueFetch(proxiedSourcePage, "proxy", baseReferrer);
+    }
+
+    const shouldAddPlaybackProxyVariant =
+      input.slotServerId === 2 ||
+      looksLikePlayerv2PageUrl(input.sourceUrl) ||
+      looksLikePlayerv2PageUrl(input.sourceFetch.finalUrl || input.sourceUrl) ||
+      looksLikePlayerv2Html(input.sourceFetch.body);
+    if (shouldAddPlaybackProxyVariant) {
+      const proxiedPlaybackPage = buildInternalEmbedProxyUrl({
+        sourceUrl: input.sourceUrl,
+        requestOrigin: input.requestOrigin,
+        referrerUrl: baseReferrer,
+        backendMode: false,
+        stableMode: true,
+      });
+      if (proxiedPlaybackPage) {
+        await queueFetch(proxiedPlaybackPage, "proxy", baseReferrer);
+      }
     }
   }
 
@@ -1229,6 +1248,7 @@ async function fetchSourcePageVariants(input: {
           sourceUrl: variantUrl,
           requestOrigin: input.requestOrigin,
           referrerUrl: baseReferrer,
+          backendMode: true,
         });
         if (proxiedVariant) await queueFetch(proxiedVariant, "proxy", baseReferrer);
       }
@@ -1243,12 +1263,14 @@ function buildInternalEmbedProxyUrl(input: {
   requestOrigin: string;
   referrerUrl?: string | null;
   backendMode?: boolean;
+  stableMode?: boolean;
 }) {
   if (!isValidHttpUrl(input.requestOrigin)) return "";
   const params = new URLSearchParams();
   params.set("url", input.sourceUrl);
   params.set("depth", "0");
   if (input.backendMode !== false) params.set("backend", "1");
+  if (input.stableMode === true) params.set("stable", "1");
   const ref = normalizeHttpUrl(input.referrerUrl || input.sourceUrl);
   if (ref) params.set("ref", ref);
   return `${String(input.requestOrigin || "").replace(/\/+$/, "")}/api/embed-proxy?${params.toString()}`;
@@ -1349,33 +1371,8 @@ function finalizeSuccessfulResolution(input: {
       : input.selectedCandidateUrl;
   const stableReferrer = normalizeHttpUrl(input.sourceReferrerUrl || input.sourceUrl) || input.sourceUrl;
   const effectiveIsProxy = isEmbedProxyCandidateUrl(effectiveIngestUrl);
-  const proxyWrapped =
-    input.preferProxyIngest && !effectiveIsProxy && isValidHttpUrl(input.requestOrigin)
-      ? buildInternalEmbedProxyUrl({
-          sourceUrl: effectiveIngestUrl,
-          requestOrigin: input.requestOrigin,
-          referrerUrl: stableReferrer,
-        })
-      : "";
-  const shouldProxy =
-    effectiveIsProxy ||
-    (!!proxyWrapped && isValidHttpUrl(proxyWrapped)) ||
-    shouldPreferProxyResolvedIngest({
-      sourceUrl: input.sourceUrl,
-      candidateUrl: effectiveIngestUrl,
-      referrerUrl: stableReferrer,
-      requestOrigin: input.requestOrigin,
-    });
-  const finalIngestUrl =
-    effectiveIsProxy
-      ? effectiveIngestUrl
-      : shouldProxy && proxyWrapped && isValidHttpUrl(proxyWrapped)
-        ? proxyWrapped
-        : effectiveIngestUrl;
-  const finalMode =
-    effectiveIsProxy || (shouldProxy && proxyWrapped && isValidHttpUrl(proxyWrapped))
-      ? "backend_proxy_ingest"
-      : classifyMode(finalIngestUrl);
+  const finalIngestUrl = effectiveIngestUrl;
+  const finalMode = effectiveIsProxy ? "backend_proxy_ingest" : classifyMode(finalIngestUrl);
   return {
     mode: finalMode,
     ingestUrl: finalIngestUrl,
