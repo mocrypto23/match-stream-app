@@ -1516,6 +1516,7 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
       if (hasSessionId && !hasSid) score -= 420;
       if (hasSessionId && hasSid) score += 50;
       if (search.includes("token=") && !hasSid) score -= 260;
+      if (pathname.endsWith(".m3u8")) score -= 140;
     }
   } catch {
     return Number.NEGATIVE_INFINITY;
@@ -1630,14 +1631,7 @@ function canSoftAcceptProtectedSegmentProbe(input: {
     const u = new URL(targetUrl);
     const host = u.hostname.toLowerCase();
     const pathname = String(u.pathname || "").toLowerCase();
-    if ((host.endsWith(".yallashot.us") || host === "yallashot.us") && pathname.includes("/kooora/")) {
-      const search = String(u.search || "").toLowerCase();
-      const hasSid = search.includes("sid=");
-      const hasSessionOnly = search.includes("session_id=") && !hasSid;
-      if (hasSessionOnly) return false;
-      // For yallashot streams we only soft-accept when sid context exists.
-      return hasSid;
-    }
+    if ((host.endsWith(".yallashot.us") || host === "yallashot.us") && pathname.includes("/kooora/")) return false;
     if (pathname.includes("/albaplayer/")) return true;
     if (host.includes("yallashoot") || host.includes("yallalive")) return true;
   } catch {}
