@@ -1,5 +1,6 @@
 import { isValidHttpUrl, type SlotServerId } from "./server-source-policy";
 import type { RepackResolverState } from "./repack-runtime-state";
+import { extractPlayerv2BrowserCandidates } from "./repack-playerv2-browser";
 
 export type RepackIngestMode = "direct_m3u8" | "backend_proxy_ingest" | "none";
 
@@ -2084,6 +2085,21 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
   for (const nested of extractCandidatesFromQueryParams(sourceUrl)) {
     const normalized = normalizeCandidate(nested, sourceUrl);
     if (normalized) pushCandidateUnique(candidateSeed, seen, normalized);
+  }
+
+  const shouldUsePlayerv2BrowserExtraction =
+    input.slotServerId === 2 && requestOrigin && looksLikePlayerv2PageUrl(sourceUrl);
+  if (shouldUsePlayerv2BrowserExtraction) {
+    const browserCandidates = await extractPlayerv2BrowserCandidates({
+      sourceUrl,
+      requestOrigin,
+      timeoutMs: Math.max(6_000, Math.min(16_000, timeoutMs)),
+    });
+    if (browserCandidates.ok) {
+      for (const candidate of browserCandidates.candidates) {
+        pushCandidateUnique(candidateSeed, seen, candidate);
+      }
+    }
   }
 
   type AlbaQueueItem = { url: string; depth: number; referrerUrl: string };
