@@ -91,6 +91,14 @@ function normalizeCandidateUrl(raw, playerOrigin) {
   return "";
 }
 
+function safeDecodeURIComponent(value) {
+  try {
+    return decodeURIComponent(String(value || ""));
+  } catch {
+    return String(value || "");
+  }
+}
+
 function hashHex(value) {
   return createHash("sha1").update(String(value || "")).digest("hex");
 }
@@ -148,8 +156,86 @@ function resolveManifestUrl(raw, baseUrl) {
   }
 }
 
+function looksLikeNonStreamAssetPath(pathname) {
+  return /\.(?:css|js|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf|eot|map|json|xml|txt|pdf)(?:$|[?#])/i.test(
+    String(pathname || "").toLowerCase()
+  );
+}
+
 function isLikelyChildPlaylistUrl(rawUrl) {
-  return String(rawUrl || "").toLowerCase().includes(".m3u8");
+  if (!isHttpUrl(rawUrl)) return false;
+  try {
+    const u = new URL(rawUrl);
+    const pathname = String(u.pathname || "").toLowerCase();
+    const search = String(u.search || "").toLowerCase();
+    const combined = `${pathname}${search}`;
+    if (looksLikeNonStreamAssetPath(pathname)) return false;
+    if (/\.(?:ts|m4s|m4a|mp4|aac|mp3|vtt)(?:$|[?#])/i.test(pathname)) return false;
+    if (combined.includes(".mpd")) return false;
+    if (combined.includes(".m3u8")) return true;
+    if (pathname.includes("/api/embed-proxy")) {
+      const target = safeDecodeURIComponent(String(u.searchParams.get("url") || "").trim());
+      if (target && isLikelyChildPlaylistUrl(target)) return true;
+    }
+    if (
+      pathname.includes("/hls/") ||
+      pathname.includes("/live/") ||
+      pathname.includes("/playlist/") ||
+      pathname.includes("/manifest/") ||
+      pathname.includes("/stream/")
+    ) {
+      return true;
+    }
+    if (
+      search.includes("token=") ||
+      search.includes("session") ||
+      search.includes("stream=") ||
+      search.includes("playlist") ||
+      search.includes("m3u8") ||
+      search.includes("sid=")
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function pickVariantManifestUrl(manifestText, baseUrl) {
+  let pendingBandwidth = -1;
+  const variants = [];
+  let order = 0;
+
+  for (const line of String(manifestText || "").split(/\r?\n/)) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith("#EXT-X-STREAM-INF")) {
+      const match = trimmed.match(/BANDWIDTH=(\d+)/i);
+      pendingBandwidth = match && match[1] ? Number.parseInt(match[1], 10) : -1;
+      continue;
+    }
+    if (trimmed.startsWith("#")) continue;
+
+    const absolute = resolveManifestUrl(trimmed, baseUrl);
+    if (!absolute || !isLikelyChildPlaylistUrl(absolute)) {
+      pendingBandwidth = -1;
+      continue;
+    }
+    variants.push({
+      url: absolute,
+      bandwidth: Number.isFinite(pendingBandwidth) ? pendingBandwidth : -1,
+      order,
+    });
+    order += 1;
+    pendingBandwidth = -1;
+  }
+
+  variants.sort((left, right) => {
+    if (right.bandwidth !== left.bandwidth) return right.bandwidth - left.bandwidth;
+    return left.order - right.order;
+  });
+  return variants[0] ? variants[0].url : "";
 }
 
 function hasMediaSegments(manifestText, baseUrl) {
@@ -457,66 +543,86 @@ class MirrorJob {
   }
 
   async fetchManifestDocument() {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.manager.config.manifestFetchTimeoutMs);
-    try {
-      const response = await fetch(this.ingestUrl, {
-        method: "GET",
-        cache: "no-store",
-        redirect: "follow",
-        signal: controller.signal,
-        headers: {
-          accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
-          "user-agent": DEFAULT_USER_AGENT,
-        },
-      });
-      const body = await response.text();
-      const contentType = String(response.headers.get("content-type") || "").toLowerCase();
-      const finalUrl = response.url || this.ingestUrl;
-      if (!response.ok) {
+    const fetchManifestOnce = async (fetchUrl) => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), this.manager.config.manifestFetchTimeoutMs);
+      try {
+        const response = await fetch(fetchUrl, {
+          method: "GET",
+          cache: "no-store",
+          redirect: "follow",
+          signal: controller.signal,
+          headers: {
+            accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
+            "user-agent": DEFAULT_USER_AGENT,
+          },
+        });
+        const body = await response.text();
+        const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+        const finalUrl = response.url || fetchUrl;
+        if (!response.ok) {
+          return {
+            ok: false,
+            reason: `manifest-http-${response.status || 0}`,
+            body,
+            contentType,
+            finalUrl,
+          };
+        }
+        if (!looksLikeManifestResponse(contentType, body, finalUrl)) {
+          return {
+            ok: false,
+            reason: "manifest-not-hls",
+            body,
+            contentType,
+            finalUrl,
+          };
+        }
         return {
-          ok: false,
-          reason: `manifest-http-${response.status || 0}`,
+          ok: true,
           body,
           contentType,
           finalUrl,
         };
-      }
-      if (!looksLikeManifestResponse(contentType, body, finalUrl)) {
+      } catch (error) {
         return {
           ok: false,
-          reason: "manifest-not-hls",
-          body,
-          contentType,
-          finalUrl,
+          reason: `manifest-fetch-failed:${error instanceof Error ? error.message : String(error)}`,
+          body: "",
+          contentType: "",
+          finalUrl: fetchUrl,
         };
+      } finally {
+        clearTimeout(timeoutId);
       }
-      if (!hasMediaSegments(body, finalUrl)) {
+    };
+
+    let currentUrl = this.ingestUrl;
+    for (let depth = 0; depth < 3; depth += 1) {
+      const fetched = await fetchManifestOnce(currentUrl);
+      if (!fetched.ok) return fetched;
+      if (hasMediaSegments(fetched.body, fetched.finalUrl)) return fetched;
+
+      const variantUrl = pickVariantManifestUrl(fetched.body, fetched.finalUrl);
+      if (!variantUrl) {
         return {
           ok: false,
-          reason: "manifest-no-media-segments",
-          body,
-          contentType,
-          finalUrl,
+          reason: "manifest-no-media-playlist",
+          body: fetched.body,
+          contentType: fetched.contentType,
+          finalUrl: fetched.finalUrl,
         };
       }
-      return {
-        ok: true,
-        body,
-        contentType,
-        finalUrl,
-      };
-    } catch (error) {
-      return {
-        ok: false,
-        reason: `manifest-fetch-failed:${error instanceof Error ? error.message : String(error)}`,
-        body: "",
-        contentType: "",
-        finalUrl: this.ingestUrl,
-      };
-    } finally {
-      clearTimeout(timeoutId);
+      currentUrl = variantUrl;
     }
+
+    return {
+      ok: false,
+      reason: "manifest-recursion-limit",
+      body: "",
+      contentType: "",
+      finalUrl: this.ingestUrl,
+    };
   }
 
   async uploadAsset(record) {
