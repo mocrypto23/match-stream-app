@@ -1244,7 +1244,9 @@ async function fetchSourcePageVariants(input: {
     if (!safePageUrl) return;
     const key = `${via}:${canonicalizeUrl(safePageUrl) || safePageUrl.toLowerCase()}`;
     if (!key || seen.has(key)) return;
-    const fetched = await fetchWithTimeout(safePageUrl, Math.min(input.timeoutMs, 3000), {
+    const variantTimeoutMs =
+      input.slotServerId === 3 ? Math.min(input.timeoutMs, 4500) : Math.min(input.timeoutMs, 3000);
+    const fetched = await fetchWithTimeout(safePageUrl, variantTimeoutMs, {
       referer: safeReferrer,
       origin: safeOrigin(safeReferrer),
     });
@@ -1501,6 +1503,7 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
     if (u.port === "8443" && combined.includes(".m3u8")) score += 210;
     if (u.hostname.toLowerCase().endsWith(".58103793.net") || u.hostname.toLowerCase().endsWith(".77911050.net")) score += 170;
     if (u.hostname.toLowerCase().includes("baranewssumsel.online")) score += 210;
+    if (u.hostname.toLowerCase() === "pandalive.live" || u.hostname.toLowerCase().endsWith(".pandalive.live")) score += 240;
     if (u.hostname.toLowerCase().endsWith("amazonaws.com") && combined.includes("/hls/") && combined.includes(".m3u8")) score += 320;
     if (pathname.includes("heartbeat-controller.php")) score -= 280;
     if ((u.hostname.toLowerCase() === "showchop.net" || u.hostname.toLowerCase().endsWith(".showchop.net")) && pathname.includes("/embed/")) {
@@ -1508,6 +1511,12 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
     }
     if (u.hostname.toLowerCase() === sourceHost) score += 28;
     if (u.hostname.toLowerCase().endsWith(`.${sourceHost}`)) score += 18;
+    if (
+      (sourceHost === "livehd77.pro" || sourceHost.endsWith(".livehd77.pro") || sourceHost === "alkoora.live" || sourceHost.endsWith(".alkoora.live")) &&
+      search.includes("serv=1")
+    ) {
+      score += 120;
+    }
     if (u.hostname.toLowerCase() === sourceHost && !hasStreamishPath && !combined.includes("serv=")) score -= 45;
     if (pathname.startsWith("/matches/") || pathname.startsWith("/home_")) score -= 65;
     if (isYallashotKoooraDirect) {
@@ -1806,9 +1815,29 @@ async function probeCandidate(input: {
   };
 }
 
-function pushCandidateUnique(list: string[], seen: Set<string>, candidateUrl: string) {
+function rememberCandidateReferrer(
+  candidateReferrers: Map<string, string>,
+  candidateUrl: string,
+  referrerUrl?: string | null
+) {
+  const safeCandidate = normalizeHttpUrl(candidateUrl);
+  const safeReferrer = normalizeHttpUrl(referrerUrl || "");
+  if (!safeCandidate || !safeReferrer) return;
+  const key = canonicalizeUrl(safeCandidate) || safeCandidate.toLowerCase();
+  if (!key || candidateReferrers.has(key)) return;
+  candidateReferrers.set(key, safeReferrer);
+}
+
+function pushCandidateUnique(
+  list: string[],
+  seen: Set<string>,
+  candidateUrl: string,
+  candidateReferrers?: Map<string, string>,
+  referrerUrl?: string | null
+) {
   if (!isValidHttpUrl(candidateUrl)) return;
   const key = canonicalizeUrl(candidateUrl) || candidateUrl.toLowerCase();
+  if (candidateReferrers) rememberCandidateReferrer(candidateReferrers, candidateUrl, referrerUrl || candidateUrl);
   if (!key || seen.has(key)) return;
   seen.add(key);
   list.push(candidateUrl);
@@ -1830,7 +1859,13 @@ function isCandidateAllowedByPolicy(
   }
 }
 
-function rankCandidates(candidates: string[], sourceUrl: string, maxCandidates: number, referrerUrl: string) {
+function rankCandidates(
+  candidates: string[],
+  sourceUrl: string,
+  maxCandidates: number,
+  referrerUrl: string,
+  candidateReferrers?: Map<string, string>
+) {
   const sourceHost = (() => {
     try {
       return new URL(sourceUrl).hostname.toLowerCase();
@@ -1844,11 +1879,14 @@ function rankCandidates(candidates: string[], sourceUrl: string, maxCandidates: 
       candidateUrl,
       score: scoreCandidate(candidateUrl, sourceHost),
       mode: classifyMode(candidateUrl),
-      referrerUrl: normalizeHttpUrl(referrerUrl) || candidateUrl,
+      referrerUrl:
+        normalizeHttpUrl(candidateReferrers?.get(canonicalizeUrl(candidateUrl) || candidateUrl.toLowerCase()) || "") ||
+        normalizeHttpUrl(referrerUrl) ||
+        candidateUrl,
     }))
     .filter((item) => Number.isFinite(item.score) && item.score > Number.NEGATIVE_INFINITY)
     .sort((a, b) => b.score - a.score)
-    .slice(0, maxCandidates);
+    .slice(0, Math.max(1, maxCandidates));
 }
 
 function extractEmbedProxyReferrer(rawUrl: string) {
@@ -2006,6 +2044,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
   const requestOrigin = normalizeHttpUrl(input.requestOrigin);
   const candidateSeed: string[] = [];
   const seen = new Set<string>();
+  const candidateReferrers = new Map<string, string>();
   const sourceVariants = await fetchSourcePageVariants({
     sourceUrl,
     sourceFetch,
@@ -2015,25 +2054,26 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     slotServerId: input.slotServerId,
   });
 
-  pushCandidateUnique(candidateSeed, seen, sourceUrl);
-  pushCandidateUnique(candidateSeed, seen, sourceFetch.finalUrl || sourceUrl);
+  pushCandidateUnique(candidateSeed, seen, sourceUrl, candidateReferrers, sourceUrl);
+  pushCandidateUnique(candidateSeed, seen, sourceFetch.finalUrl || sourceUrl, candidateReferrers, sourceFetch.finalUrl || sourceUrl);
   for (const variant of sourceVariants) {
     const sourceBaseUrl = variant.fetch.finalUrl || variant.pageUrl || sourceUrl;
+    const variantReferrer = normalizeHttpUrl(variant.referrerUrl || sourceBaseUrl) || sourceBaseUrl;
     if (variant.fetch.ok && isLikelyManifestResponse(variant.fetch.contentType, variant.fetch.body, sourceBaseUrl)) {
-      pushCandidateUnique(candidateSeed, seen, sourceBaseUrl);
+      pushCandidateUnique(candidateSeed, seen, sourceBaseUrl, candidateReferrers, variantReferrer);
     }
 
     const shouldUseHtmlExtraction = shouldExtractCandidatesFromBody(variant.fetch.contentType, variant.fetch.body);
     const extractedCandidates = shouldUseHtmlExtraction ? extractCandidatesFromText(variant.fetch.body, sourceBaseUrl) : [];
     for (const candidate of extractedCandidates) {
-      pushCandidateUnique(candidateSeed, seen, candidate);
+      pushCandidateUnique(candidateSeed, seen, candidate, candidateReferrers, variantReferrer);
       if (requestOrigin && shouldWrapCandidateForInternalProxy(candidate, sourceBaseUrl)) {
         const proxied = buildInternalEmbedProxyUrl({
           sourceUrl: candidate,
           requestOrigin,
-          referrerUrl: variant.referrerUrl || sourceBaseUrl,
+          referrerUrl: variantReferrer,
         });
-        if (proxied) pushCandidateUnique(candidateSeed, seen, proxied);
+        if (proxied) pushCandidateUnique(candidateSeed, seen, proxied, candidateReferrers, variantReferrer);
       }
     }
 
@@ -2044,14 +2084,14 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
         Math.min(timeoutMs, 3200)
       );
       for (const candidate of beinAjaxCandidates) {
-        pushCandidateUnique(candidateSeed, seen, candidate);
+        pushCandidateUnique(candidateSeed, seen, candidate, candidateReferrers, variantReferrer);
         if (requestOrigin && shouldWrapCandidateForInternalProxy(candidate, sourceBaseUrl)) {
           const proxied = buildInternalEmbedProxyUrl({
             sourceUrl: candidate,
             requestOrigin,
-            referrerUrl: variant.referrerUrl || sourceBaseUrl,
+            referrerUrl: variantReferrer,
           });
-          if (proxied) pushCandidateUnique(candidateSeed, seen, proxied);
+          if (proxied) pushCandidateUnique(candidateSeed, seen, proxied, candidateReferrers, variantReferrer);
         }
       }
     }
@@ -2066,7 +2106,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
         requestOrigin
       );
       for (const candidate of playerv2Candidates) {
-        pushCandidateUnique(candidateSeed, seen, candidate);
+        pushCandidateUnique(candidateSeed, seen, candidate, candidateReferrers, sourceBaseUrl);
       }
 
       if (requestOrigin) {
@@ -2077,14 +2117,14 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
           requestOrigin,
         });
         for (const candidate of embeddedPlayerv2Candidates) {
-          pushCandidateUnique(candidateSeed, seen, candidate);
+          pushCandidateUnique(candidateSeed, seen, candidate, candidateReferrers, sourceBaseUrl);
         }
       }
     }
   }
   for (const nested of extractCandidatesFromQueryParams(sourceUrl)) {
     const normalized = normalizeCandidate(nested, sourceUrl);
-    if (normalized) pushCandidateUnique(candidateSeed, seen, normalized);
+    if (normalized) pushCandidateUnique(candidateSeed, seen, normalized, candidateReferrers, sourceFetch.finalUrl || sourceUrl);
   }
 
   const shouldUsePlayerv2BrowserExtraction =
@@ -2097,7 +2137,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     });
     if (browserCandidates.ok) {
       for (const candidate of browserCandidates.candidates) {
-        pushCandidateUnique(candidateSeed, seen, candidate);
+        pushCandidateUnique(candidateSeed, seen, candidate, candidateReferrers, sourceUrl);
       }
     }
   }
@@ -2144,14 +2184,14 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       normalizeHttpUrl(sourceUrl);
 
     for (const derived of extractCandidatesFromText(albaFetched.body, albaReferrer)) {
-      pushCandidateUnique(candidateSeed, seen, derived);
+      pushCandidateUnique(candidateSeed, seen, derived, candidateReferrers, albaReferrer);
       if (requestOrigin && isValidHttpUrl(derived)) {
         const proxied = buildInternalEmbedProxyUrl({
           sourceUrl: derived,
           requestOrigin,
           referrerUrl: proxyReferrer,
         });
-        if (proxied) pushCandidateUnique(candidateSeed, seen, proxied);
+        if (proxied) pushCandidateUnique(candidateSeed, seen, proxied, candidateReferrers, proxyReferrer);
       }
       if (next.depth < MAX_ALBA_EXPAND_DEPTH) {
         enqueueAlbaLanding(derived, next.depth + 1, albaReferrer);
@@ -2173,7 +2213,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
         requestOrigin,
         referrerUrl: sourceFetch.finalUrl || sourceUrl,
       });
-      if (proxyWrapped) pushCandidateUnique(candidateSeed, seen, proxyWrapped);
+      if (proxyWrapped) pushCandidateUnique(candidateSeed, seen, proxyWrapped, candidateReferrers, sourceFetch.finalUrl || sourceUrl);
     } catch {}
   }
 
@@ -2182,13 +2222,14 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     requestOrigin,
     referrerUrl: input.referrerUrl || sourceUrl,
   });
-  if (internalProxy) pushCandidateUnique(candidateSeed, seen, internalProxy);
+  if (internalProxy) pushCandidateUnique(candidateSeed, seen, internalProxy, candidateReferrers, input.referrerUrl || sourceUrl);
 
   const rankedSeedPool = rankCandidates(
     candidateSeed,
     sourceUrl,
-    Math.min(192, Math.max(maxCandidates, maxCandidates * 4)),
-    sourceFetch.finalUrl || sourceUrl
+    Math.max(candidateSeed.length, Math.min(192, Math.max(maxCandidates, maxCandidates * 4))),
+    sourceFetch.finalUrl || sourceUrl,
+    candidateReferrers
   );
   const policyFilteredSeed = rankedSeedPool
     .filter((item) => isCandidateAllowedByPolicy(input.allowCandidate, item.candidateUrl, item.referrerUrl))
