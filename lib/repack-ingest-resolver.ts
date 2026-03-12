@@ -1631,7 +1631,7 @@ function canSoftAcceptProtectedSegmentProbe(input: {
     const u = new URL(targetUrl);
     const host = u.hostname.toLowerCase();
     const pathname = String(u.pathname || "").toLowerCase();
-    if ((host.endsWith(".yallashot.us") || host === "yallashot.us") && pathname.includes("/kooora/")) return false;
+    if ((host.endsWith(".yallashot.us") || host === "yallashot.us") && pathname.includes("/kooora/")) return true;
     if (pathname.includes("/albaplayer/")) return true;
     if (host.includes("yallashoot") || host.includes("yallalive")) return true;
   } catch {}
@@ -2242,25 +2242,24 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       evidence: finalProbe.evidence,
       mode: item.mode,
     })) {
-      if (!softAcceptedResult) {
-        softAcceptedResult = {
-          mode: item.mode,
-          ingestUrl: item.candidateUrl,
-          reason: "resolved-proxy-candidate-soft",
-          resolver: {
-            stage: "done",
-            candidatesFound: rankedSeedPool.length,
-            candidatesProbed,
-            selectedCandidate: item.candidateUrl,
-            selectedKind: item.mode,
-            rejectReason: "soft-accepted-protected-segment",
-            resolverState: "probe-failed",
-          },
-          probeEvidence: finalProbe.evidence
-            ? { ...finalProbe.evidence, referrerUrl: stableSourceReferrer }
-            : null,
-        };
-      }
+      softAcceptedResult = {
+        mode: item.mode,
+        ingestUrl: item.candidateUrl,
+        reason: "resolved-proxy-candidate",
+        resolver: {
+          stage: "done",
+          candidatesFound: rankedSeedPool.length,
+          candidatesProbed,
+          selectedCandidate: item.candidateUrl,
+          selectedKind: item.mode,
+          rejectReason: "protected-segment-via-proxy",
+          resolverState: "ok",
+        },
+        probeEvidence: finalProbe.evidence
+          ? { ...finalProbe.evidence, referrerUrl: stableSourceReferrer }
+          : null,
+      };
+      return softAcceptedResult;
     }
     lastProbeReason = finalProbe.reason || "probe-failed";
     lastEvidence = finalProbe.evidence;

@@ -955,7 +955,7 @@ function loadConfig() {
     earlyStopOnFinished: toBool(process.env.REPACK_EARLY_STOP_ON_FINISHED, false),
     finishedDebounceMs: finishedDebounceMinutes * 60 * 1000,
     earlyStopSegmentFailStreak: toInt(process.env.REPACK_EARLY_STOP_SEGMENT_FAIL_STREAK, 4, 1),
-    manifestFetchTimeoutMs: Math.max(6500, toInt(process.env.REPACK_AGENT_PREFLIGHT_TIMEOUT_MS, 6500, 1500)),
+    manifestFetchTimeoutMs: Math.max(12_000, toInt(process.env.REPACK_AGENT_PREFLIGHT_TIMEOUT_MS, 12_000, 1500)),
     assetFetchTimeoutMs: Math.max(6000, toInt(process.env.REPACK_AGENT_ASSET_FETCH_TIMEOUT_MS, 12_000, 2000)),
     maxConsecutiveFailures: toInt(process.env.REPACK_AGENT_MAX_START_FAILURES, 4, 2),
     staleInputSequenceMs: toInt(process.env.REPACK_STALE_INPUT_SEQUENCE_MS, 15_000, 5000),
