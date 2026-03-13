@@ -5319,6 +5319,7 @@ export default function WatchPage() {
   const [strictBootstrapAttemptedBySlot, setStrictBootstrapAttemptedBySlot] = useState<Record<number, boolean>>({});
 
   const [selectedServer, setSelectedServer] = useState(4);
+  const [strictPlaylistSwitchNonce, setStrictPlaylistSwitchNonce] = useState(0);
   const [runtimeServer5Url, setRuntimeServer5Url] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [resolverLoading, setResolverLoading] = useState(false);
@@ -5508,6 +5509,10 @@ export default function WatchPage() {
       server3AutoSwitchWindowRef.current = { windowStart: 0, count: 0 };
     }
     if (R2_STRICT_MODE) setStrictPlaybackDiag(null);
+  }, [selectedServer]);
+
+  useEffect(() => {
+    setStrictPlaylistSwitchNonce((prev) => prev + 1);
   }, [selectedServer]);
 
   useEffect(() => {
@@ -6296,11 +6301,22 @@ export default function WatchPage() {
     Date.now() - cachedStrictReady.updatedAt <= STRICT_R2_READY_URL_GRACE_MS &&
     (selectedStrictStatus?.state === "warming" || selectedStrictStatus?.state === "ready");
   const selectedUrl = canReuseStrictCachedUrl ? String(cachedStrictReady?.url || "") : selectedReadyUrl;
+  const selectedResolveUrl = useMemo(() => {
+    if (!R2_STRICT_MODE || !isRepackPlaylistUrl(selectedUrl)) return selectedUrl;
+    try {
+      const url = new URL(selectedUrl);
+      url.searchParams.set("_sw", `${selectedServer}-${strictPlaylistSwitchNonce}`);
+      return url.toString();
+    } catch {
+      return selectedUrl;
+    }
+  }, [selectedServer, selectedUrl, strictPlaylistSwitchNonce]);
   const selectedFallbackUrl = selectedOption?.fallbackUrl ?? "";
   const server5OptionUrl = serverOptions.find((s) => s.n === 5)?.url ?? "";
   const server5DbUrl = String(match?.stream_url_5 || "").trim();
   const streamOpenMs = matchWindow.openAtMs;
-  const shouldBlockStream = LIVE_ONLY_PLAYBACK ? !matchWindow.inWindow : false;
+  const enforceMatchWindow = R2_STRICT_MODE || LIVE_ONLY_PLAYBACK;
+  const shouldBlockStream = enforceMatchWindow ? !matchWindow.inWindow : false;
 
   useEffect(() => {
     setStrictBootstrapPendingBySlot({});
@@ -6674,7 +6690,7 @@ export default function WatchPage() {
     activeResolveIdRef.current = resolveId;
     resolveLockRef.current = true;
     (async () => {
-      if (!selectedUrl || shouldBlockStream) {
+      if (!selectedResolveUrl || shouldBlockStream) {
         applyCandidatesPreservingSelection([]);
         setResolverError(null);
         setResolverLoading(false);
@@ -6690,7 +6706,7 @@ export default function WatchPage() {
           resolveLockRef.current = false;
           return;
         }
-        const strictCandidates = isValidHttpUrl(selectedUrl) ? [selectedUrl] : [];
+        const strictCandidates = isValidHttpUrl(selectedResolveUrl) ? [selectedResolveUrl] : [];
         applyCandidatesPreservingSelection(strictCandidates);
         setResolverError(strictCandidates.length ? null : NO_STREAM_SELECTED_SERVER_MESSAGE);
         setResolverLoading(false);
@@ -6699,13 +6715,13 @@ export default function WatchPage() {
         return;
       }
       const repackPrimaryOnlyMode =
-        isRepackPlaylistUrl(selectedUrl) && !repackBypassServersRef.current.has(selectedServer);
+        isRepackPlaylistUrl(selectedResolveUrl) && !repackBypassServersRef.current.has(selectedServer);
       const resolveSourceUrl =
         repackPrimaryOnlyMode &&
         selectedFallbackUrl &&
         isValidHttpUrl(selectedFallbackUrl)
           ? selectedFallbackUrl
-          : selectedUrl;
+          : selectedResolveUrl;
       const server5ResolveDeadlineAt = selectedServer === 5 ? Date.now() + SERVER5_RESOLVE_TOTAL_BUDGET_MS : 0;
       const getServer5ResolveBudgetRemainingMs = () =>
         selectedServer === 5 ? Math.max(0, server5ResolveDeadlineAt - Date.now()) : Number.POSITIVE_INFINITY;
@@ -7375,7 +7391,7 @@ export default function WatchPage() {
       if (activeResolveIdRef.current === resolveId) resolveLockRef.current = false;
     };
   }, [
-    selectedUrl,
+    selectedResolveUrl,
     selectedServer,
     shouldBlockStream,
     pushDiag,
@@ -8492,7 +8508,7 @@ export default function WatchPage() {
   const prettyStart = formatStartTimeAr(match?.match_start);
   const streamOpenLabel = formatTimeOnlyAr(streamOpenMs);
   const streamStartNotice = (() => {
-    if (!LIVE_ONLY_PLAYBACK) {
+    if (!enforceMatchWindow) {
       return streamOpenLabel
         ? `سيبدأ البث في الساعة ${streamOpenLabel} (قبل المباراة بنصف ساعة)`
         : "سيبدأ البث قبل المباراة بنصف ساعة";
