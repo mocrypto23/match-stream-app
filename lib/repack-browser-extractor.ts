@@ -47,6 +47,8 @@ type ExtractorCandidate = {
   ingestUrl: string;
   referrerUrl: string;
   targetUrl: string;
+  manifestBaseUrl?: string;
+  manifestBody?: string;
   score: number;
   via: "network-manifest" | "network-request" | "dom";
 };
@@ -465,12 +467,22 @@ function pushCandidate(
     ingestUrl,
     referrerUrl,
     targetUrl,
+    manifestBaseUrl: String(input.ingestUrl || "").trim(),
+    manifestBody: String(input.body || "").trim() || undefined,
     score: scoreCandidate(input),
     via: input.via,
   };
   const prev = candidates.get(key);
   if (!prev || next.score > prev.score) {
     candidates.set(key, next);
+    return;
+  }
+  if (!prev.manifestBody && next.manifestBody) {
+    candidates.set(key, {
+      ...prev,
+      manifestBody: next.manifestBody,
+      manifestBaseUrl: next.manifestBaseUrl || prev.manifestBaseUrl,
+    });
   }
 }
 

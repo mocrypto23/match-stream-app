@@ -8513,23 +8513,31 @@ export default function WatchPage() {
 
   const prettyStart = formatStartTimeAr(match?.match_start);
   const streamOpenLabel = formatTimeOnlyAr(streamOpenMs);
+  const prematchHalfHourNotice = streamOpenLabel
+    ? `سيبدأ البث في الساعة ${streamOpenLabel} (قبل المباراة بنصف ساعة)`
+    : "سيبدأ البث قبل المباراة بنصف ساعة";
+  const isBeforeKickoff = matchStartMs !== null && nowMs < matchStartMs;
   const streamStartNotice = (() => {
     if (!enforceMatchWindow) {
-      return streamOpenLabel
-        ? `سيبدأ البث في الساعة ${streamOpenLabel} (قبل المباراة بنصف ساعة)`
-        : "سيبدأ البث قبل المباراة بنصف ساعة";
+      return prematchHalfHourNotice;
     }
     if (!matchWindow.hasStart) return "البث غير متاح لأن موعد المباراة غير محدد.";
     if (matchWindow.openAtMs !== null && nowMs < matchWindow.openAtMs) {
-      return streamOpenLabel
-        ? `سيبدأ البث في الساعة ${streamOpenLabel} (قبل المباراة بنصف ساعة)`
-        : "سيبدأ البث قبل المباراة بنصف ساعة";
+      return prematchHalfHourNotice;
     }
     if (matchWindow.closeAtMs !== null && nowMs > matchWindow.closeAtMs) {
       return "انتهت نافذة البث لهذه المباراة.";
     }
     return "البث غير متاح حاليًا.";
   })();
+  const prematchPendingNotice =
+    isBeforeKickoff && matchWindow.hasStart
+      ? nowMs >= (matchWindow.openAtMs ?? Number.POSITIVE_INFINITY)
+        ? `جاري تجهيز البث الآن. ${prematchHalfHourNotice}`
+        : prematchHalfHourNotice
+      : "";
+  const shouldShowPrematchPendingNotice =
+    !shouldBlockStream && !selectedHlsUrl && !resolverLoading && !!prematchPendingNotice;
   const noStreamLabel = selectedUrl ? NO_STREAM_SELECTED_SERVER_MESSAGE : "لا يوجد بث";
   const home = match?.home_team ?? "الفريق الأول";
   const away = match?.away_team ?? "الفريق الثاني";
@@ -8649,6 +8657,11 @@ export default function WatchPage() {
           {shouldBlockStream ? (
             <div className="flex flex-col gap-2 items-center justify-center h-[55vh] min-h-[320px] text-gray-400 p-6 text-center">
               <div className="text-white font-bold text-xl">{streamStartNotice}</div>
+              {prettyStart ? <div className="text-sm text-gray-500">موعد المباراة: <span className="text-gray-300">{prettyStart}</span></div> : null}
+            </div>
+          ) : shouldShowPrematchPendingNotice ? (
+            <div className="flex flex-col gap-2 items-center justify-center h-[55vh] min-h-[320px] text-gray-400 p-6 text-center">
+              <div className="text-white font-bold text-xl">{prematchPendingNotice}</div>
               {prettyStart ? <div className="text-sm text-gray-500">موعد المباراة: <span className="text-gray-300">{prettyStart}</span></div> : null}
             </div>
           ) : selectedHlsUrl ? (

@@ -280,6 +280,21 @@ function pickVariantManifestUrl(manifest: string, baseUrl: string) {
   return variants[0]?.url || "";
 }
 
+function buildBackendProxyUrl(input: {
+  sourceUrl: string;
+  internalOrigin: string;
+  referrerUrl?: string | null;
+}) {
+  if (!isValidHttpUrl(input.sourceUrl) || !isValidHttpUrl(input.internalOrigin)) return "";
+  const params = new URLSearchParams();
+  params.set("url", input.sourceUrl);
+  params.set("depth", "0");
+  params.set("backend", "1");
+  const ref = String(input.referrerUrl || "").trim();
+  if (isValidHttpUrl(ref)) params.set("ref", ref);
+  return `${String(input.internalOrigin || "").replace(/\/+$/, "")}/api/embed-proxy?${params.toString()}`;
+}
+
 async function fetchManifestOnce(fetchUrl: string, headers?: Record<string, string>): Promise<FetchManifestResult> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), DEFAULT_FETCH_TIMEOUT_MS);
@@ -375,9 +390,15 @@ async function fetchStrictMediaManifest(fetchUrl: string, headers?: Record<strin
   } satisfies FetchManifestResult;
 }
 
-function absolutizeManifestUrls(manifest: string, baseUrl: string, internalOrigin: string) {
+function absolutizeManifestUrls(
+  manifest: string,
+  baseUrl: string,
+  internalOrigin: string,
+  referrerUrl?: string | null
+) {
   const lines = String(manifest || "").split(/\r?\n/);
   const out: string[] = [];
+  const stableReferrer = isValidHttpUrl(String(referrerUrl || "").trim()) ? String(referrerUrl || "").trim() : "";
 
   const absolutize = (raw: string) => {
     const value = String(raw || "").trim();
@@ -385,7 +406,16 @@ function absolutizeManifestUrls(manifest: string, baseUrl: string, internalOrigi
     try {
       const absolute = new URL(value, baseUrl).toString();
       if (!isValidHttpUrl(absolute)) return value;
-      return absolute.startsWith(internalOrigin) ? absolute : toAbsoluteInternalUrl(absolute, internalOrigin);
+      if (absolute.startsWith(internalOrigin)) {
+        return toAbsoluteInternalUrl(absolute, internalOrigin);
+      }
+      return (
+        buildBackendProxyUrl({
+          sourceUrl: absolute,
+          internalOrigin,
+          referrerUrl: stableReferrer || baseUrl,
+        }) || absolute
+      );
     } catch {
       return value;
     }
@@ -440,6 +470,8 @@ async function tryBrowserExtractorManifest(input: {
     const ingestUrl = String(candidate.ingestUrl || "").trim();
     const targetUrl = String(candidate.targetUrl || "").trim();
     const referrerUrl = String(candidate.referrerUrl || targetUrl || input.sourceUrl).trim() || input.sourceUrl;
+    const candidateManifestBody = String(candidate.manifestBody || "").trim();
+    const candidateManifestBaseUrl = String(candidate.manifestBaseUrl || ingestUrl || targetUrl || "").trim();
     if (!isValidHttpUrl(ingestUrl)) continue;
     if (
       !isIngestCandidateAlignedWithSlotServer({
@@ -454,6 +486,24 @@ async function tryBrowserExtractorManifest(input: {
     }
 
     candidatesTried += 1;
+    if (candidateManifestBody && looksLikeManifestResponse("application/vnd.apple.mpegurl", candidateManifestBody, candidateManifestBaseUrl)) {
+      const manifestBaseUrl = candidateManifestBaseUrl || ingestUrl;
+      if (hasMediaSegments(candidateManifestBody, manifestBaseUrl)) {
+        return {
+          ok: true as const,
+          error: "",
+          playbackUrl: String(extracted.playbackUrl || "").trim(),
+          candidatesFound,
+          candidatesTried,
+          ingestUrl,
+          referrerUrl,
+          targetUrl: targetUrl || ingestUrl,
+          finalUrl: manifestBaseUrl,
+          manifestBody: absolutizeManifestUrls(candidateManifestBody, manifestBaseUrl, input.internalOrigin, referrerUrl),
+        };
+      }
+    }
+
     const fetchUrl = toAbsoluteInternalUrl(ingestUrl, input.internalOrigin);
     const manifest = await fetchStrictMediaManifest(fetchUrl);
     if (!manifest.ok) {
@@ -471,7 +521,12 @@ async function tryBrowserExtractorManifest(input: {
       referrerUrl,
       targetUrl: targetUrl || ingestUrl,
       finalUrl: manifest.finalUrl || fetchUrl,
-      manifestBody: absolutizeManifestUrls(manifest.body, manifest.finalUrl || fetchUrl, input.internalOrigin),
+      manifestBody: absolutizeManifestUrls(
+        manifest.body,
+        manifest.finalUrl || fetchUrl,
+        input.internalOrigin,
+        referrerUrl
+      ),
     };
   }
 
