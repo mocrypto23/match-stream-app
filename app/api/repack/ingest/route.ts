@@ -74,6 +74,10 @@ const VERIFIED_MANIFEST_CACHE_FAST_PATH_MS = Math.max(
   2_500,
   Number.parseInt(String(process.env.REPACK_VERIFIED_MANIFEST_CACHE_FAST_PATH_MS || "5500"), 10) || 5_500
 );
+const VERIFIED_MANIFEST_WORKER_CACHE_MAX_AGE_MS = Math.max(
+  1_000,
+  Number.parseInt(String(process.env.REPACK_VERIFIED_MANIFEST_WORKER_CACHE_MAX_AGE_MS || "3500"), 10) || 3_500
+);
 const recentVerifiedManifestByKey = new Map<string, CachedManifestEntry>();
 
 function toInt(raw: unknown) {
@@ -920,6 +924,13 @@ function getRecentVerifiedManifestCacheFast(cacheKey: string) {
   return entry;
 }
 
+function getRecentVerifiedManifestCacheForWorker(cacheKey: string) {
+  const entry = getRecentVerifiedManifestCache(cacheKey);
+  if (!entry) return null;
+  if (Date.now() - entry.updatedAt > VERIFIED_MANIFEST_WORKER_CACHE_MAX_AGE_MS) return null;
+  return entry;
+}
+
 function setRecentVerifiedManifestCache(cacheKey: string, entry: CachedManifestEntry) {
   recentVerifiedManifestByKey.set(cacheKey, entry);
 }
@@ -962,8 +973,9 @@ export async function GET(req: Request) {
   }
 
   const manifestCacheKey = buildManifestCacheKey(matchId, slotServer, sourceUrl);
+  const isWorkerFetch = String(req.headers.get("x-repack-worker-fetch") || "").trim() === "1";
   const isFastCachePreferred = slotServer === 2 && looksLikePlayerv2SourceUrl(sourceUrl);
-  const fastCachedManifest = isFastCachePreferred ? getRecentVerifiedManifestCacheFast(manifestCacheKey) : null;
+  const fastCachedManifest = !isWorkerFetch && isFastCachePreferred ? getRecentVerifiedManifestCacheFast(manifestCacheKey) : null;
   if (fastCachedManifest) {
     return new Response(fastCachedManifest.manifestBody, {
       status: 200,
@@ -1009,7 +1021,9 @@ export async function GET(req: Request) {
       },
     });
   }
-  const cachedManifest = getRecentVerifiedManifestCache(manifestCacheKey);
+  const cachedManifest = isWorkerFetch
+    ? getRecentVerifiedManifestCacheForWorker(manifestCacheKey)
+    : getRecentVerifiedManifestCache(manifestCacheKey);
   if (cachedManifest) {
     return new Response(cachedManifest.manifestBody, {
       status: 200,

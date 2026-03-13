@@ -580,6 +580,7 @@ class MirrorJob {
           headers: {
             accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
             "user-agent": DEFAULT_USER_AGENT,
+            "x-repack-worker-fetch": "1",
           },
         });
         const body = await response.text();
