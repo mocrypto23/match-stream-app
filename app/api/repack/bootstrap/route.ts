@@ -32,11 +32,11 @@ export const dynamic = "force-dynamic";
 const DEFAULT_INGEST_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 const BOOTSTRAP_VERIFY_TIMEOUT_MS = Math.max(
-  20_000,
+  45_000,
   Number.parseInt(
-    String(process.env.REPACK_BOOTSTRAP_VERIFY_TIMEOUT_MS || process.env.REPACK_AGENT_PREFLIGHT_TIMEOUT_MS || "20000"),
+    String(process.env.REPACK_BOOTSTRAP_VERIFY_TIMEOUT_MS || process.env.REPACK_AGENT_PREFLIGHT_TIMEOUT_MS || "45000"),
     10
-  ) || 20_000
+  ) || 45_000
 );
 const DUPLICATE_SIBLING_START_WINDOW_MS = 6 * 60 * 60 * 1000;
 
