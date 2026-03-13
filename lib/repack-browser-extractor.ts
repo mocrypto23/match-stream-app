@@ -13,6 +13,14 @@ const EXTRACTOR_WAIT_MS = Math.max(
   2_000,
   Number.parseInt(String(process.env.REPACK_BROWSER_EXTRACTOR_WAIT_MS || "7000"), 10) || 7_000
 );
+const EXTRACTOR_RETRY_WAIT_MS = Math.max(
+  1_000,
+  Number.parseInt(String(process.env.REPACK_BROWSER_EXTRACTOR_RETRY_WAIT_MS || "2500"), 10) || 2_500
+);
+const EXTRACTOR_NETWORK_IDLE_WAIT_MS = Math.max(
+  500,
+  Number.parseInt(String(process.env.REPACK_BROWSER_EXTRACTOR_NETWORK_IDLE_WAIT_MS || "1500"), 10) || 1_500
+);
 
 type ExtractorCandidate = {
   ingestUrl: string;
@@ -355,6 +363,7 @@ async function runBrowserExtraction(input: {
         addInitScript?: (script: () => void) => Promise<void>;
         on: (event: string, handler: (arg: unknown) => void) => void;
         goto: (url: string, options: unknown) => Promise<unknown>;
+        waitForLoadState?: (state: string, options?: { timeout?: number }) => Promise<void>;
         waitForTimeout: (ms: number) => Promise<void>;
         evaluate: <T>(handler: () => T | Promise<T>) => Promise<T>;
         close: () => Promise<void>;
@@ -498,6 +507,37 @@ async function runBrowserExtraction(input: {
     await page.addInitScript(extractorInitScript);
   }
 
+  const drainDomCandidates = async () => {
+    const drained = await page.evaluate(() => {
+      const drain = (
+        window as unknown as {
+          __tfExtractorDrain?: () => { urls: string[]; dom: string[] };
+        }
+      ).__tfExtractorDrain;
+      return typeof drain === "function" ? drain() : { urls: [], dom: [] };
+    });
+
+    for (const rawValue of [...(drained?.urls || []), ...(drained?.dom || [])]) {
+      const rawUrl = normalizeHttpUrl(String(rawValue || "").trim());
+      if (!rawUrl) continue;
+      const targetUrl = unwrapProxyTarget(rawUrl) || rawUrl;
+      if (!looksLikeManifestUrl(targetUrl)) continue;
+      const referrerUrl = extractProxyReferrer(rawUrl) || sourceUrl;
+      const ingestUrl = buildBackendProxyUrl({
+        sourceUrl: targetUrl,
+        requestOrigin,
+        referrerUrl,
+      });
+      pushCandidate(candidates, {
+        ingestUrl,
+        referrerUrl,
+        targetUrl,
+        slotServerId: input.slotServerId,
+        via: "dom",
+      });
+    }
+  };
+
   page.on("request", (requestArg: unknown) => {
     try {
       const request = requestArg as {
@@ -600,35 +640,16 @@ async function runBrowserExtraction(input: {
       waitUntil: "domcontentloaded",
       timeout: Math.max(7_000, Math.min(35_000, input.timeoutMs)),
     });
+    if (typeof page.waitForLoadState === "function") {
+      await page.waitForLoadState("networkidle", {
+        timeout: Math.min(5_000, EXTRACTOR_NETWORK_IDLE_WAIT_MS),
+      }).catch(() => {});
+    }
     await page.waitForTimeout(Math.max(2_000, Math.min(12_000, EXTRACTOR_WAIT_MS)));
-
-    const drained = await page.evaluate(() => {
-      const drain = (
-        window as unknown as {
-          __tfExtractorDrain?: () => { urls: string[]; dom: string[] };
-        }
-      ).__tfExtractorDrain;
-      return typeof drain === "function" ? drain() : { urls: [], dom: [] };
-    });
-
-    for (const rawValue of [...(drained?.urls || []), ...(drained?.dom || [])]) {
-      const rawUrl = normalizeHttpUrl(String(rawValue || "").trim());
-      if (!rawUrl) continue;
-      const targetUrl = unwrapProxyTarget(rawUrl) || rawUrl;
-      if (!looksLikeManifestUrl(targetUrl)) continue;
-      const referrerUrl = extractProxyReferrer(rawUrl) || sourceUrl;
-      const ingestUrl = buildBackendProxyUrl({
-        sourceUrl: targetUrl,
-        requestOrigin,
-        referrerUrl,
-      });
-      pushCandidate(candidates, {
-        ingestUrl,
-        referrerUrl,
-        targetUrl,
-        slotServerId: input.slotServerId,
-        via: "dom",
-      });
+    await drainDomCandidates();
+    if (!candidates.size) {
+      await page.waitForTimeout(Math.min(6_000, EXTRACTOR_RETRY_WAIT_MS));
+      await drainDomCandidates();
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error || "browser-extraction-failed");

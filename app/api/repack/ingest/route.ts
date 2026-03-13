@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 
 import { supabaseAdmin } from "../../_supabase";
 import { extractBrowserIngestCandidates } from "@/lib/repack-browser-extractor";
-import { resolveRepackIngestUrl } from "@/lib/repack-ingest-resolver";
 import { resolveInternalPlayerOrigin, toAbsoluteInternalUrl } from "@/lib/repack-ingest-gateway";
 import {
   getSlotSourceUrlFromRow,
@@ -17,10 +16,6 @@ export const dynamic = "force-dynamic";
 
 const DEFAULT_RESOLVE_TIMEOUT_MS =
   Math.max(12_000, Number.parseInt(String(process.env.REPACK_RESOLVE_TIMEOUT_MS || "12000"), 10) || 12_000);
-const DEFAULT_MAX_CANDIDATES = Math.min(
-  24,
-  Math.max(16, Number.parseInt(String(process.env.REPACK_RESOLVE_MAX_CANDIDATES || "16"), 10) || 16)
-);
 const DEFAULT_FETCH_TIMEOUT_MS = Math.max(
   12_000,
   Number.parseInt(String(process.env.REPACK_AGENT_PREFLIGHT_TIMEOUT_MS || "12000"), 10) || 12_000
@@ -199,14 +194,6 @@ async function enrichMatchRowWithDuplicateSiblingStreams(row: MatchRow) {
 
 function isSlotServerId(value: number): value is SlotServerId {
   return value === 1 || value === 2 || value === 3 || value === 4;
-}
-
-function safeOrigin(rawUrl: string) {
-  try {
-    return new URL(rawUrl).origin;
-  } catch {
-    return "";
-  }
 }
 
 function resolveManifestUrl(raw: string, baseUrl: string) {
@@ -388,67 +375,6 @@ async function fetchStrictMediaManifest(fetchUrl: string, headers?: Record<strin
   } satisfies FetchManifestResult;
 }
 
-function buildInternalEmbedProxyUrl(input: {
-  sourceUrl: string;
-  internalOrigin: string;
-  referrerUrl?: string | null;
-}) {
-  const sourceUrl = String(input.sourceUrl || "").trim();
-  if (!isValidHttpUrl(sourceUrl)) return "";
-  const proxyUrl = new URL("/api/embed-proxy", input.internalOrigin);
-  proxyUrl.searchParams.set("url", sourceUrl);
-  proxyUrl.searchParams.set("depth", "0");
-  proxyUrl.searchParams.set("backend", "1");
-  const referrerUrl = String(input.referrerUrl || "").trim();
-  if (isValidHttpUrl(referrerUrl)) proxyUrl.searchParams.set("ref", referrerUrl);
-  return proxyUrl.toString();
-}
-
-function rewriteManifestForEmbedProxy(input: {
-  manifest: string;
-  baseUrl: string;
-  internalOrigin: string;
-  referrerUrl: string;
-}) {
-  const lines = String(input.manifest || "").split(/\r?\n/);
-  const out: string[] = [];
-
-  const rewriteUri = (raw: string) => {
-    const trimmed = String(raw || "").trim();
-    if (!trimmed) return trimmed;
-    if (/^data:/i.test(trimmed)) return trimmed;
-    if (trimmed.startsWith("/api/embed-proxy") || trimmed.includes("/api/embed-proxy?")) {
-      return toAbsoluteInternalUrl(trimmed, input.internalOrigin);
-    }
-    try {
-      const absolute = new URL(trimmed, input.baseUrl).toString();
-      if (!isValidHttpUrl(absolute)) return trimmed;
-      return buildInternalEmbedProxyUrl({
-        sourceUrl: absolute,
-        internalOrigin: input.internalOrigin,
-        referrerUrl: input.referrerUrl,
-      });
-    } catch {
-      return trimmed;
-    }
-  };
-
-  for (const line of lines) {
-    const trimmed = String(line || "").trim();
-    if (!trimmed) {
-      out.push(line);
-      continue;
-    }
-    if (trimmed.startsWith("#")) {
-      out.push(line.replace(/URI="([^"]+)"/gi, (_match, rawUri) => `URI="${rewriteUri(rawUri)}"`));
-      continue;
-    }
-    out.push(rewriteUri(trimmed));
-  }
-
-  return out.join("\n");
-}
-
 function absolutizeManifestUrls(manifest: string, baseUrl: string, internalOrigin: string) {
   const lines = String(manifest || "").split(/\r?\n/);
   const out: string[] = [];
@@ -492,10 +418,14 @@ async function tryBrowserExtractorManifest(input: {
     slotServerId: input.slotServer,
     timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
   });
+  const candidatesFound = Array.isArray(extracted.candidates) ? extracted.candidates.length : 0;
   if (!extracted.ok || !Array.isArray(extracted.candidates) || !extracted.candidates.length) {
     return {
       ok: false as const,
       error: extracted.error || "browser-extraction-empty",
+      playbackUrl: String(extracted.playbackUrl || "").trim(),
+      candidatesFound,
+      candidatesTried: 0,
       ingestUrl: "",
       referrerUrl: "",
       targetUrl: "",
@@ -505,6 +435,7 @@ async function tryBrowserExtractorManifest(input: {
   }
 
   let lastError = extracted.error || "browser-extraction-empty";
+  let candidatesTried = 0;
   for (const candidate of extracted.candidates) {
     const ingestUrl = String(candidate.ingestUrl || "").trim();
     const targetUrl = String(candidate.targetUrl || "").trim();
@@ -522,6 +453,7 @@ async function tryBrowserExtractorManifest(input: {
       continue;
     }
 
+    candidatesTried += 1;
     const fetchUrl = toAbsoluteInternalUrl(ingestUrl, input.internalOrigin);
     const manifest = await fetchStrictMediaManifest(fetchUrl);
     if (!manifest.ok) {
@@ -532,6 +464,9 @@ async function tryBrowserExtractorManifest(input: {
     return {
       ok: true as const,
       error: "",
+      playbackUrl: String(extracted.playbackUrl || "").trim(),
+      candidatesFound,
+      candidatesTried,
       ingestUrl,
       referrerUrl,
       targetUrl: targetUrl || ingestUrl,
@@ -543,6 +478,9 @@ async function tryBrowserExtractorManifest(input: {
   return {
     ok: false as const,
     error: lastError || "browser-extraction-no-verified-manifest",
+    playbackUrl: String(extracted.playbackUrl || "").trim(),
+    candidatesFound,
+    candidatesTried,
     ingestUrl: "",
     referrerUrl: "",
     targetUrl: "",
@@ -604,104 +542,22 @@ export async function GET(req: Request) {
         "x-repack-source-url": sourceUrl,
         "x-repack-upstream-url": browserExtracted.ingestUrl,
         "x-repack-extractor": "browser",
+        "x-repack-extractor-candidates-found": String(browserExtracted.candidatesFound),
+        "x-repack-extractor-candidates-tried": String(browserExtracted.candidatesTried),
       },
     });
   }
-
-  const resolved = await resolveRepackIngestUrl({
-    sourceUrl,
-    requestOrigin: internalOrigin,
-    slotServerId: slotServer,
-    preferProxyIngest: true,
-    referrerUrl: sourceUrl,
-    timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
-    maxCandidates: DEFAULT_MAX_CANDIDATES,
-    allowCandidate: ({ candidateUrl, referrerUrl }) =>
-      isIngestCandidateAlignedWithSlotServer({
-        slotServerId: slotServer,
-        sourceUrl,
-        ingestUrl: candidateUrl,
-        probeReferrerUrl: referrerUrl,
-        probePlaylistUrl: candidateUrl,
-      }),
-  });
-
-  const resolvedIngestUrl = String(resolved.ingestUrl || "").trim();
-  if (resolved.resolver.resolverState !== "ok" || !isValidHttpUrl(resolvedIngestUrl)) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: browserExtracted.error
-          ? `browser-${browserExtracted.error};resolver-${resolved.reason}`
-          : `resolver-${resolved.reason}`,
-        resolver: resolved.resolver,
+  return NextResponse.json(
+    {
+      ok: false,
+      error: `browser-${browserExtracted.error || "extraction-failed"}`,
+      extractor: {
+        mode: "browser-only",
+        playbackUrl: browserExtracted.playbackUrl || null,
+        candidatesFound: browserExtracted.candidatesFound,
+        candidatesTried: browserExtracted.candidatesTried,
       },
-      { status: 502 }
-    );
-  }
-
-  if (
-    !isIngestCandidateAlignedWithSlotServer({
-      slotServerId: slotServer,
-      sourceUrl,
-      ingestUrl: resolvedIngestUrl,
-      probeReferrerUrl: resolved.probeEvidence?.referrerUrl || null,
-      probePlaylistUrl: resolved.probeEvidence?.playlistUrl || null,
-    })
-  ) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "ingest-source-mismatch",
-        resolver: resolved.resolver,
-      },
-      { status: 502 }
-    );
-  }
-
-  const manifestHeaders =
-    resolved.mode === "backend_proxy_ingest"
-      ? undefined
-      : {
-          referer: String(resolved.probeEvidence?.referrerUrl || sourceUrl).trim(),
-          origin: safeOrigin(String(resolved.probeEvidence?.referrerUrl || sourceUrl).trim()),
-        };
-  const fetchUrl =
-    resolved.mode === "backend_proxy_ingest"
-      ? toAbsoluteInternalUrl(resolvedIngestUrl, internalOrigin)
-      : resolvedIngestUrl;
-
-  const manifest = await fetchStrictMediaManifest(fetchUrl, manifestHeaders);
-  if (!manifest.ok) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: manifest.error,
-        upstreamIngestUrl: resolvedIngestUrl,
-      },
-      { status: 502 }
-    );
-  }
-
-  const manifestBody =
-    resolved.mode === "backend_proxy_ingest"
-      ? absolutizeManifestUrls(manifest.body, manifest.finalUrl || fetchUrl, internalOrigin)
-      : rewriteManifestForEmbedProxy({
-          manifest: manifest.body,
-          baseUrl: manifest.finalUrl || fetchUrl,
-          internalOrigin,
-          referrerUrl: String(resolved.probeEvidence?.referrerUrl || sourceUrl).trim() || sourceUrl,
-        });
-
-  return new Response(manifestBody, {
-    status: 200,
-    headers: {
-      "content-type": "application/vnd.apple.mpegurl; charset=utf-8",
-      "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
-      "x-repack-gateway": "1",
-      "x-repack-slot-server": String(slotServer),
-      "x-repack-source-url": sourceUrl,
-      "x-repack-upstream-url": resolvedIngestUrl,
     },
-  });
+    { status: 502 }
+  );
 }
