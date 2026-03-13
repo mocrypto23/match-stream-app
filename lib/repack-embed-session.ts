@@ -176,6 +176,15 @@ function safeOrigin(rawUrl: string) {
   }
 }
 
+function sameOrigin(leftUrl: string, rightUrl: string) {
+  if (!isValidHttpUrl(leftUrl) || !isValidHttpUrl(rightUrl)) return false;
+  try {
+    return new URL(leftUrl).origin === new URL(rightUrl).origin;
+  } catch {
+    return false;
+  }
+}
+
 function hostMatchesAnySuffix(hostname: string, suffixes: string[]) {
   const host = String(hostname || "").trim().toLowerCase().replace(/\.$/, "");
   if (!host) return false;
@@ -422,6 +431,22 @@ function buildPlaybackProxyUrl(input: {
   return `${String(input.requestOrigin || "").replace(/\/+$/, "")}/api/embed-proxy?${params.toString()}`;
 }
 
+function buildSessionRelayFetchUrl(input: {
+  requestOrigin: string;
+  targetUrl: string;
+  referrerUrl?: string | null;
+}) {
+  const targetUrl = normalizeHttpUrl(input.targetUrl);
+  const requestOrigin = normalizeHttpUrl(input.requestOrigin);
+  if (!targetUrl || !requestOrigin) return "";
+  if (sameOrigin(targetUrl, requestOrigin)) return targetUrl;
+  return buildPlaybackProxyUrl({
+    sourceUrl: unwrapProxyTarget(targetUrl) || targetUrl,
+    requestOrigin,
+    referrerUrl: input.referrerUrl,
+  });
+}
+
 function unwrapProxyTarget(rawUrl: string) {
   let current = String(rawUrl || "").trim();
   for (let depth = 0; depth < 4; depth += 1) {
@@ -567,6 +592,62 @@ async function fetchTextDocument(input: { url: string; referrerUrl?: string; tim
       ok: false,
       status: 0,
       body: "",
+      finalUrl: normalizeHttpUrl(input.url),
+      targetUrl: unwrapProxyTarget(normalizeHttpUrl(input.url)) || normalizeHttpUrl(input.url),
+      contentType: "",
+      error: error instanceof Error ? error.message : String(error || "fetch-failed"),
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function fetchBinaryDocument(input: { url: string; referrerUrl?: string; timeoutMs?: number }) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(),
+    Math.max(
+      2_000,
+      Number.parseInt(String(input.timeoutMs || SESSION_PAGE_FETCH_TIMEOUT_MS), 10) || SESSION_PAGE_FETCH_TIMEOUT_MS
+    )
+  );
+  try {
+    const response = await fetch(input.url, {
+      method: "GET",
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        accept: "*/*",
+        "user-agent": DEFAULT_USER_AGENT,
+        ...(isValidHttpUrl(String(input.referrerUrl || "").trim())
+          ? {
+              referer: String(input.referrerUrl || "").trim(),
+              origin: safeOrigin(String(input.referrerUrl || "").trim()),
+            }
+          : {}),
+      },
+    });
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const finalUrl = normalizeHttpUrl(response.url || input.url) || normalizeHttpUrl(input.url);
+    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+    const targetUrl =
+      normalizeHttpUrl(String(response.headers.get("x-embed-proxy-target") || "").trim()) ||
+      unwrapProxyTarget(finalUrl) ||
+      finalUrl;
+    return {
+      ok: response.ok,
+      status: response.status,
+      bodyBase64: bytes.toString("base64"),
+      finalUrl,
+      targetUrl,
+      contentType,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      bodyBase64: "",
       finalUrl: normalizeHttpUrl(input.url),
       targetUrl: unwrapProxyTarget(normalizeHttpUrl(input.url)) || normalizeHttpUrl(input.url),
       contentType: "",
@@ -1418,14 +1499,20 @@ class LiveEmbedSession {
     return { ok: false, playbackUrl: this.playbackUrl, candidates: [], error: this.lastError || "live-embed-empty" };
   }
 
-  async fetchText(targetUrl: string, timeoutMs: number): Promise<SessionTextResult> {
+  async fetchText(
+    input: { targetUrl: string; fetchUrl?: string; referrerUrl?: string | null },
+    timeoutMs: number
+  ): Promise<SessionTextResult> {
     if (!ENABLE_LIVE_EMBED_SESSION) {
       return { ok: false, status: 0, contentType: "", body: "", finalUrl: "", error: "live-embed-session-disabled" };
     }
-    const normalizedTargetUrl = normalizeHttpUrl(targetUrl);
+    const normalizedTargetUrl = normalizeHttpUrl(input.targetUrl);
     if (!normalizedTargetUrl) {
       return { ok: false, status: 0, contentType: "", body: "", finalUrl: "", error: "invalid-live-embed-text-url" };
     }
+    const normalizedFetchUrl = normalizeHttpUrl(input.fetchUrl || normalizedTargetUrl) || normalizedTargetUrl;
+    const normalizedReferrerUrl =
+      normalizeHttpUrl(input.referrerUrl || this.fallbackReferrer || this.sourceUrl) || this.sourceUrl;
 
     try {
       await this.ensureStarted(timeoutMs);
@@ -1486,19 +1573,61 @@ class LiveEmbedSession {
           }
         },
         {
-          targetUrl: normalizedTargetUrl,
+          targetUrl: normalizedFetchUrl,
           timeoutMs: Math.max(4_000, Math.min(30_000, timeoutMs)),
         }
       );
 
-      const finalUrl = normalizeHttpUrl(String(fetched?.finalUrl || normalizedTargetUrl)) || normalizedTargetUrl;
-      const body = String(fetched?.body || "");
-      const contentType = String(fetched?.contentType || "");
-      const ok = !!fetched?.ok;
+      let finalUrl = normalizeHttpUrl(String(fetched?.finalUrl || normalizedTargetUrl)) || normalizedTargetUrl;
+      let body = String(fetched?.body || "");
+      let contentType = String(fetched?.contentType || "");
+      let ok = !!fetched?.ok;
+      let error = String(fetched?.error || "");
+
+      const shouldRelay =
+        !ok || !body.trim() || !looksLikeManifestResponse(contentType, body, unwrapProxyTarget(finalUrl) || finalUrl);
+      if (shouldRelay) {
+        const relayUrl = buildSessionRelayFetchUrl({
+          requestOrigin: this.requestOrigin,
+          targetUrl: normalizedFetchUrl,
+          referrerUrl: normalizedReferrerUrl,
+        });
+        if (relayUrl) {
+          const relayed = await fetchTextDocument({
+            url: relayUrl,
+            referrerUrl: normalizedReferrerUrl,
+            timeoutMs,
+          });
+          const relayedFinalUrl =
+            normalizeHttpUrl(relayed.targetUrl || "") ||
+            unwrapProxyTarget(relayed.finalUrl || "") ||
+            normalizedTargetUrl;
+          const relayedLooksLikeManifest = looksLikeManifestResponse(
+            relayed.contentType,
+            relayed.body,
+            relayedFinalUrl
+          );
+          if (relayed.ok && relayed.body.trim() && relayedLooksLikeManifest) {
+            ok = true;
+            body = relayed.body;
+            contentType = relayed.contentType;
+            finalUrl = relayedFinalUrl;
+            error = "";
+          } else if (!ok) {
+            ok = relayed.ok;
+            body = relayed.body;
+            contentType = relayed.contentType;
+            finalUrl = relayedFinalUrl;
+            error = String(relayed.error || (relayed.ok ? "manifest-not-hls" : `text-http-${relayed.status || 0}`));
+          }
+        }
+      }
+
       if (ok && looksLikeManifestResponse(contentType, body, finalUrl)) {
         this.rememberCandidate({
-          targetUrl: finalUrl,
-          referrerUrl: this.fallbackReferrer,
+          fetchUrl: normalizedFetchUrl,
+          targetUrl: unwrapProxyTarget(finalUrl) || finalUrl,
+          referrerUrl: normalizedReferrerUrl,
           manifestBody: body,
           manifestBaseUrl: finalUrl,
           via: "network-manifest",
@@ -1511,7 +1640,7 @@ class LiveEmbedSession {
         contentType,
         body,
         finalUrl,
-        error: String(fetched?.error || ""),
+        error,
       };
     } catch (error) {
       return {
@@ -1525,14 +1654,19 @@ class LiveEmbedSession {
     }
   }
 
-  async fetchAsset(assetUrl: string, timeoutMs: number): Promise<SessionAssetResult> {
+  async fetchAsset(
+    input: { assetUrl: string; referrerUrl?: string | null },
+    timeoutMs: number
+  ): Promise<SessionAssetResult> {
     if (!ENABLE_LIVE_EMBED_SESSION) {
       return { ok: false, status: 0, contentType: "", bodyBase64: "", error: "live-embed-session-disabled" };
     }
-    const normalizedAssetUrl = normalizeHttpUrl(assetUrl);
+    const normalizedAssetUrl = normalizeHttpUrl(input.assetUrl);
     if (!normalizedAssetUrl) {
       return { ok: false, status: 0, contentType: "", bodyBase64: "", error: "invalid-live-embed-asset-url" };
     }
+    const normalizedReferrerUrl =
+      normalizeHttpUrl(input.referrerUrl || this.fallbackReferrer || this.sourceUrl) || this.sourceUrl;
 
     try {
       await this.ensureStarted(timeoutMs);
@@ -1547,6 +1681,29 @@ class LiveEmbedSession {
     }
 
     try {
+      const relayUrl = buildSessionRelayFetchUrl({
+        requestOrigin: this.requestOrigin,
+        targetUrl: normalizedAssetUrl,
+        referrerUrl: normalizedReferrerUrl,
+      });
+      if (relayUrl) {
+        const relayed = await fetchBinaryDocument({
+          url: relayUrl,
+          referrerUrl: normalizedReferrerUrl,
+          timeoutMs,
+        });
+        if (relayed.ok && relayed.bodyBase64) {
+          this.touch();
+          return {
+            ok: true,
+            status: relayed.status,
+            contentType: relayed.contentType,
+            bodyBase64: relayed.bodyBase64,
+            error: "",
+          };
+        }
+      }
+
       const fetched = await page.evaluate(
         async ({ assetUrl: targetUrl, timeoutMs: browserTimeoutMs }) => {
           try {
@@ -1682,10 +1839,19 @@ export async function fetchLiveEmbedText(input: {
   requestOrigin: string;
   slotServerId?: SlotServerId;
   targetUrl: string;
+  fetchUrl?: string;
+  referrerUrl?: string | null;
   timeoutMs: number;
 }) {
   const session = getSession(input);
-  return session.fetchText(input.targetUrl, input.timeoutMs);
+  return session.fetchText(
+    {
+      targetUrl: input.targetUrl,
+      fetchUrl: input.fetchUrl,
+      referrerUrl: input.referrerUrl,
+    },
+    input.timeoutMs
+  );
 }
 
 export async function fetchLiveEmbedAsset(input: {
@@ -1693,10 +1859,17 @@ export async function fetchLiveEmbedAsset(input: {
   requestOrigin: string;
   slotServerId?: SlotServerId;
   assetUrl: string;
+  referrerUrl?: string | null;
   timeoutMs: number;
 }) {
   const session = getSession(input);
-  return session.fetchAsset(input.assetUrl, input.timeoutMs);
+  return session.fetchAsset(
+    {
+      assetUrl: input.assetUrl,
+      referrerUrl: input.referrerUrl,
+    },
+    input.timeoutMs
+  );
 }
 
 export type { SessionCandidate as LiveEmbedSessionCandidate };

@@ -22,6 +22,7 @@ export async function GET(req: Request) {
   const url = new URL(req.url);
   const sourceUrl = String(url.searchParams.get("sourceUrl") || "").trim();
   const assetUrl = String(url.searchParams.get("assetUrl") || "").trim();
+  const referrerUrl = String(url.searchParams.get("referrerUrl") || "").trim();
   const slotServer = toSlotServerId(url.searchParams.get("slotServer"));
   if (!slotServer) {
     return NextResponse.json({ ok: false, error: "invalid-slot-server" }, { status: 400 });
@@ -42,6 +43,7 @@ export async function GET(req: Request) {
     requestOrigin: internalOrigin,
     slotServerId: slotServer,
     assetUrl,
+    referrerUrl: isValidHttpUrl(referrerUrl) ? referrerUrl : undefined,
     timeoutMs: DEFAULT_SESSION_ASSET_TIMEOUT_MS,
   });
   if (!fetched.ok || !String(fetched.bodyBase64 || "").trim()) {

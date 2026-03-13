@@ -403,12 +403,16 @@ function buildSessionAssetUrl(input: {
   slotServer: SlotServerId;
   sourceUrl: string;
   assetUrl: string;
+  referrerUrl?: string;
 }) {
   if (!isValidHttpUrl(input.internalOrigin) || !isValidHttpUrl(input.sourceUrl) || !isValidHttpUrl(input.assetUrl)) return "";
   const params = new URLSearchParams();
   params.set("slotServer", String(input.slotServer));
   params.set("sourceUrl", input.sourceUrl);
   params.set("assetUrl", input.assetUrl);
+  if (isValidHttpUrl(String(input.referrerUrl || "").trim())) {
+    params.set("referrerUrl", String(input.referrerUrl || "").trim());
+  }
   return `${String(input.internalOrigin || "").replace(/\/+$/, "")}/api/repack/session-asset?${params.toString()}`;
 }
 
@@ -444,6 +448,7 @@ function rewriteManifestForSessionMirror(
       slotServer,
       sourceUrl,
       assetUrl: unwrapped,
+      referrerUrl: baseUrl,
     });
   };
 
@@ -474,6 +479,7 @@ async function resolveSessionCandidateMediaManifest(input: {
 }) {
   let currentUrl = String(input.targetUrl || "").trim();
   let currentFetchUrl = pickSessionFetchUrl(input.fetchUrl, currentUrl, input.internalOrigin);
+  let currentReferrerUrl = String(input.referrerUrl || input.sourceUrl).trim() || input.sourceUrl;
   let currentBody = String(input.manifestBody || "").trim();
 
   for (let depth = 0; depth < 3; depth += 1) {
@@ -482,7 +488,9 @@ async function resolveSessionCandidateMediaManifest(input: {
         sourceUrl: input.sourceUrl,
         requestOrigin: input.internalOrigin,
         slotServerId: input.slotServer,
-        targetUrl: currentFetchUrl,
+        targetUrl: currentUrl,
+        fetchUrl: currentFetchUrl,
+        referrerUrl: currentReferrerUrl,
         timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
       });
       if (!fetched.ok || !looksLikeManifestResponse(fetched.contentType, fetched.body, fetched.finalUrl || currentUrl)) {
@@ -513,6 +521,7 @@ async function resolveSessionCandidateMediaManifest(input: {
     }
 
     const nextVariantUrl = inheritEmbeddedManifestAuth(variantUrl, currentUrl);
+    currentReferrerUrl = currentUrl;
     currentUrl = unwrapProxyTarget(nextVariantUrl) || nextVariantUrl;
     currentFetchUrl = nextVariantUrl;
     currentBody = "";
