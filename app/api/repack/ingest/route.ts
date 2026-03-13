@@ -1,14 +1,12 @@
 import { NextResponse } from "next/server";
 
 import { supabaseAdmin } from "../../_supabase";
-import { extractBrowserIngestCandidates } from "@/lib/repack-browser-extractor";
-import { resolveInternalPlayerOrigin, toAbsoluteInternalUrl } from "@/lib/repack-ingest-gateway";
-import { buildPlayerv2Candidates } from "@/lib/repack-ingest-resolver";
-import { extractPlayerv2BrowserSnapshot } from "@/lib/repack-playerv2-browser";
+import { extractLiveEmbedSessionSnapshot, fetchLiveEmbedText } from "@/lib/repack-embed-session";
+import { resolveInternalPlayerOrigin } from "@/lib/repack-ingest-gateway";
 import {
   getSlotSourceUrlFromRow,
-  isIngestCandidateAlignedWithSlotServer,
   isAllowedSourceForSlotServer,
+  isIngestCandidateAlignedWithSlotServer,
   isValidHttpUrl,
   type SlotServerId,
 } from "@/lib/server-source-policy";
@@ -18,12 +16,10 @@ export const dynamic = "force-dynamic";
 
 const DEFAULT_RESOLVE_TIMEOUT_MS =
   Math.max(20_000, Number.parseInt(String(process.env.REPACK_RESOLVE_TIMEOUT_MS || "20000"), 10) || 20_000);
-const DEFAULT_FETCH_TIMEOUT_MS = Math.max(
-  20_000,
-  Number.parseInt(String(process.env.REPACK_AGENT_PREFLIGHT_TIMEOUT_MS || "20000"), 10) || 20_000
+const VERIFIED_MANIFEST_CACHE_TTL_MS = Math.max(
+  5_000,
+  Number.parseInt(String(process.env.REPACK_VERIFIED_MANIFEST_CACHE_TTL_MS || "15000"), 10) || 15_000
 );
-const DEFAULT_USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 
 type MatchRow = {
   id: number;
@@ -39,45 +35,33 @@ type MatchRow = {
   stream_url_4?: string | null;
 };
 
-type FetchManifestResult =
+type CachedManifestEntry = {
+  manifestBody: string;
+  finalUrl: string;
+  targetUrl: string;
+  referrerUrl: string;
+  updatedAt: number;
+};
+
+type ResolvedManifestResult =
   | {
       ok: true;
-      body: string;
-      contentType: string;
+      manifestBody: string;
       finalUrl: string;
-      fetchUrl: string;
+      targetUrl: string;
+      referrerUrl: string;
+      playbackUrl: string;
+      candidatesFound: number;
+      candidatesTried: number;
     }
   | {
       ok: false;
       error: string;
-      status: number;
-      fetchUrl: string;
-      finalUrl: string;
-      body: string;
-      contentType: string;
+      playbackUrl: string;
+      candidatesFound: number;
+      candidatesTried: number;
     };
 
-type CachedManifestEntry = {
-  manifestBody: string;
-  finalUrl: string;
-  ingestUrl: string;
-  referrerUrl: string;
-  targetUrl: string;
-  updatedAt: number;
-};
-
-const VERIFIED_MANIFEST_CACHE_TTL_MS = Math.max(
-  8_000,
-  Number.parseInt(String(process.env.REPACK_VERIFIED_MANIFEST_CACHE_TTL_MS || "45000"), 10) || 45_000
-);
-const VERIFIED_MANIFEST_CACHE_FAST_PATH_MS = Math.max(
-  2_500,
-  Number.parseInt(String(process.env.REPACK_VERIFIED_MANIFEST_CACHE_FAST_PATH_MS || "5500"), 10) || 5_500
-);
-const VERIFIED_MANIFEST_WORKER_CACHE_MAX_AGE_MS = Math.max(
-  1_000,
-  Number.parseInt(String(process.env.REPACK_VERIFIED_MANIFEST_WORKER_CACHE_MAX_AGE_MS || "3500"), 10) || 3_500
-);
 const recentVerifiedManifestByKey = new Map<string, CachedManifestEntry>();
 
 function toInt(raw: unknown) {
@@ -108,19 +92,6 @@ function normalizeTeamAliasForCompare(value: unknown, opts?: { stripGeo?: boolea
       /(?:\u0627\u0644\u0633\u0639\u0648\u062f\u064a|\u0627\u0644\u0645\u0635\u0631\u064a|\u0627\u0644\u0627\u0645\u0627\u0631\u0627\u062a\u064a|\u0627\u0644\u0625\u0645\u0627\u0631\u0627\u062a\u064a|\u0627\u0644\u0645\u063a\u0631\u0628\u064a|\u0627\u0644\u062c\u0632\u0627\u0626\u0631\u064a|\u0627\u0644\u0642\u0637\u0631\u064a|\u0627\u0644\u0643\u0648\u064a\u062a\u064a|\u0627\u0644\u0628\u062d\u0631\u064a\u0646\u064a|\u0627\u0644\u0639\u0645\u0627\u0646\u064a|\u0627\u0644\u0639\u0631\u0627\u0642\u064a|\u0627\u0644\u0633\u0648\u0631\u064a|\u0627\u0644\u0627\u0631\u062f\u0646\u064a|\u0627\u0644\u0623\u0631\u062f\u0646\u064a|\u0627\u0644\u0644\u0628\u0646\u0627\u0646\u064a|\u0627\u0644\u0644\u064a\u0628\u064a|\u0627\u0644\u062a\u0648\u0646\u0633\u064a|\u0627\u0644\u0641\u0644\u0633\u0637\u064a\u0646\u064a|\u0627\u0644\u0645\u0648\u0631\u064a\u062a\u0627\u0646\u064a)$/g,
       ""
     );
-  }
-  if (/^(?:\u0627\u0644\u0646\u062c\u0645\u0627\u0644\u0627\u062d\u0645\u0631|\u0633\u0631\u0641\u064a\u0646\u0627\u0632\u0641\u064a\u0632\u062f\u0627|redstar(?:belgrade)?|crvenazvezda)$/i.test(s)) {
-    return "redstarbelgrade";
-  }
-  if (/^(?:\u063a\u0644\u0637\u0647\u0633\u0631\u0627\u064a|\u062c\u0627\u0644\u0627\u062a\u0627\u0633\u0631\u0627\u064a|galatasaray)$/i.test(s)) {
-    return "galatasaray";
-  }
-  if (
-    /^(?:\u064a\u0627\u063a\u064a\u0644\u0648\u0646\u064a\u0627\u0628\u064a\u0627\u0648\u064a\u0633\u062a\u0648\u0643|\u064a\u0627\u063a\u064a\u0644\u0648\u0646\u064a\u0627\u0628\u064a\u0627\u0648\u064a\u0633\u062a\u0648\u0643|\u062c\u0627\u063a\u064a\u0644\u0648\u0646\u064a\u0627\u0628\u064a\u0627\u0644\u064a\u0633\u062a\u0648\u0643|\u062c\u0627\u062c\u064a\u0644\u0648\u0646\u064a\u0627\u0628\u064a\u0627\u0644\u064a\u0633\u062a\u0648\u0643|\u0628\u064a\u0627\u0644\u064a\u0633\u062a\u0648\u0643|\u0628\u064a\u0627\u0648\u064a\u0633\u062a\u0648\u0643|jagiellonia(?:bialystok)?|bialystok)$/i.test(
-      s
-    )
-  ) {
-    return "jagielloniabialystok";
   }
   return s.trim();
 }
@@ -240,24 +211,26 @@ function safeDecodeURIComponent(value: string) {
   }
 }
 
-function looksLikePlayerv2SourceUrl(rawUrl: string) {
-  if (!isValidHttpUrl(rawUrl)) return false;
-  try {
-    return String(new URL(rawUrl).pathname || "").toLowerCase().includes("/playerv2.php");
-  } catch {
-    return false;
-  }
-}
-
 function unwrapProxyTarget(rawUrl: string) {
-  if (!isValidHttpUrl(rawUrl)) return "";
-  try {
-    const parsed = new URL(rawUrl);
-    if (!String(parsed.pathname || "").toLowerCase().includes("/api/embed-proxy")) return parsed.toString();
-    return String(safeDecodeURIComponent(parsed.searchParams.get("url") || "") || "").trim();
-  } catch {
-    return "";
+  let current = String(rawUrl || "").trim();
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!isValidHttpUrl(current)) return "";
+    try {
+      const parsed = new URL(current);
+      if (!String(parsed.pathname || "").toLowerCase().includes("/api/embed-proxy")) return parsed.toString();
+      let target = String(parsed.searchParams.get("url") || "").trim();
+      for (let decodeDepth = 0; decodeDepth < 3; decodeDepth += 1) {
+        const decoded = safeDecodeURIComponent(target).trim();
+        if (decoded === target) break;
+        target = decoded;
+      }
+      if (!isValidHttpUrl(target)) return "";
+      current = target;
+    } catch {
+      return "";
+    }
   }
+  return isValidHttpUrl(current) ? current : "";
 }
 
 function looksLikeManifestResponse(contentType: string, body: string, finalUrl: string) {
@@ -313,7 +286,6 @@ function hasMediaSegments(manifest: string, baseUrl: string) {
       if (!trimmed.startsWith("#EXT-X-STREAM-INF")) previousExtInf = false;
       continue;
     }
-
     const absolute = resolveManifestUrl(trimmed, baseUrl);
     if (!absolute) continue;
     if (previousExtInf) return true;
@@ -356,36 +328,6 @@ function pickVariantManifestUrl(manifest: string, baseUrl: string) {
     return left.order - right.order;
   });
   return variants[0]?.url || "";
-}
-
-function buildBackendProxyUrl(input: {
-  sourceUrl: string;
-  internalOrigin: string;
-  referrerUrl?: string | null;
-}) {
-  if (!isValidHttpUrl(input.sourceUrl) || !isValidHttpUrl(input.internalOrigin)) return "";
-  const params = new URLSearchParams();
-  params.set("url", input.sourceUrl);
-  params.set("depth", "0");
-  params.set("backend", "1");
-  const ref = String(input.referrerUrl || "").trim();
-  if (isValidHttpUrl(ref)) params.set("ref", ref);
-  return `${String(input.internalOrigin || "").replace(/\/+$/, "")}/api/embed-proxy?${params.toString()}`;
-}
-
-function buildPlaybackProxyUrl(input: {
-  sourceUrl: string;
-  internalOrigin: string;
-  referrerUrl?: string | null;
-}) {
-  if (!isValidHttpUrl(input.sourceUrl) || !isValidHttpUrl(input.internalOrigin)) return "";
-  const params = new URLSearchParams();
-  params.set("url", input.sourceUrl);
-  params.set("depth", "0");
-  params.set("stable", "1");
-  const ref = String(input.referrerUrl || "").trim();
-  if (isValidHttpUrl(ref)) params.set("ref", ref);
-  return `${String(input.internalOrigin || "").replace(/\/+$/, "")}/api/embed-proxy?${params.toString()}`;
 }
 
 function inheritEasybroadcastManifestAuth(rawChildAbsoluteUrl: string, baseUrl: string) {
@@ -456,132 +398,42 @@ function inheritEmbeddedManifestAuth(rawChildAbsoluteUrl: string, baseUrl: strin
   return inheritYallashotManifestAuth(inheritEasybroadcastManifestAuth(rawChildAbsoluteUrl, baseUrl), baseUrl);
 }
 
-async function fetchManifestOnce(fetchUrl: string, headers?: Record<string, string>): Promise<FetchManifestResult> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), DEFAULT_FETCH_TIMEOUT_MS);
-  try {
-    const response = await fetch(fetchUrl, {
-      method: "GET",
-      cache: "no-store",
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
-        "user-agent": DEFAULT_USER_AGENT,
-        ...(headers || {}),
-      },
-    });
-    const body = await response.text();
-    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
-    const finalUrl = response.url || fetchUrl;
-    if (!response.ok) {
-      return {
-        ok: false,
-        error: `manifest-http-${response.status || 0}`,
-        status: response.status,
-        fetchUrl,
-        finalUrl,
-        body,
-        contentType,
-      };
-    }
-    if (!looksLikeManifestResponse(contentType, body, finalUrl)) {
-      return {
-        ok: false,
-        error: "manifest-not-hls",
-        status: response.status,
-        fetchUrl,
-        finalUrl,
-        body,
-        contentType,
-      };
-    }
-    return {
-      ok: true,
-      body,
-      contentType,
-      finalUrl,
-      fetchUrl,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: `manifest-fetch-failed:${error instanceof Error ? error.message : String(error)}`,
-      status: 0,
-      fetchUrl,
-      finalUrl: fetchUrl,
-      body: "",
-      contentType: "",
-    };
-  } finally {
-    clearTimeout(timeoutId);
-  }
+function buildSessionAssetUrl(input: {
+  internalOrigin: string;
+  slotServer: SlotServerId;
+  sourceUrl: string;
+  assetUrl: string;
+}) {
+  if (!isValidHttpUrl(input.internalOrigin) || !isValidHttpUrl(input.sourceUrl) || !isValidHttpUrl(input.assetUrl)) return "";
+  const params = new URLSearchParams();
+  params.set("slotServer", String(input.slotServer));
+  params.set("sourceUrl", input.sourceUrl);
+  params.set("assetUrl", input.assetUrl);
+  return `${String(input.internalOrigin || "").replace(/\/+$/, "")}/api/repack/session-asset?${params.toString()}`;
 }
 
-async function fetchStrictMediaManifest(fetchUrl: string, headers?: Record<string, string>) {
-  let currentUrl = fetchUrl;
-  for (let depth = 0; depth < 3; depth += 1) {
-    const fetched = await fetchManifestOnce(currentUrl, headers);
-    if (!fetched.ok) return fetched;
-    if (hasMediaSegments(fetched.body, fetched.finalUrl)) return fetched;
-
-    const variantUrl = pickVariantManifestUrl(fetched.body, fetched.finalUrl);
-    if (!variantUrl) {
-      return {
-        ok: false,
-        error: "manifest-no-media-playlist",
-        status: 502,
-        fetchUrl: currentUrl,
-        finalUrl: fetched.finalUrl,
-        body: fetched.body,
-        contentType: fetched.contentType,
-      } satisfies FetchManifestResult;
-    }
-    currentUrl = variantUrl;
-  }
-
-  return {
-    ok: false,
-    error: "manifest-recursion-limit",
-    status: 502,
-    fetchUrl,
-    finalUrl: fetchUrl,
-    body: "",
-    contentType: "",
-  } satisfies FetchManifestResult;
-}
-
-function absolutizeManifestUrls(
+function rewriteManifestForSessionMirror(
   manifest: string,
   baseUrl: string,
   internalOrigin: string,
-  referrerUrl?: string | null
+  sourceUrl: string,
+  slotServer: SlotServerId
 ) {
   const lines = String(manifest || "").split(/\r?\n/);
   const out: string[] = [];
-  const stableReferrer = isValidHttpUrl(String(referrerUrl || "").trim()) ? String(referrerUrl || "").trim() : "";
-  const manifestReferrer = isValidHttpUrl(baseUrl) ? baseUrl : stableReferrer;
 
-  const absolutize = (raw: string, overrideReferrer?: string) => {
-    const value = String(raw || "").trim();
-    if (!value || /^data:/i.test(value)) return value;
-    try {
-      const resolved = new URL(value, baseUrl).toString();
-      const absolute = inheritEmbeddedManifestAuth(resolved, baseUrl);
-      if (!isValidHttpUrl(absolute)) return value;
-      if (absolute.startsWith(internalOrigin)) {
-        return toAbsoluteInternalUrl(absolute, internalOrigin);
-      }
-      return (
-        buildBackendProxyUrl({
-          sourceUrl: absolute,
-          internalOrigin,
-          referrerUrl: overrideReferrer || manifestReferrer || stableReferrer || baseUrl,
-        }) || absolute
-      );
-    } catch {
-      return value;
-    }
+  const rewriteAssetUrl = (raw: string) => {
+    const absolute = resolveManifestUrl(raw, baseUrl);
+    if (!absolute) return raw;
+    const inherited = inheritEmbeddedManifestAuth(absolute, baseUrl);
+    const unwrapped = unwrapProxyTarget(inherited) || inherited;
+    if (!isValidHttpUrl(unwrapped)) return raw;
+    return buildSessionAssetUrl({
+      internalOrigin,
+      slotServer,
+      sourceUrl,
+      assetUrl: unwrapped,
+    });
   };
 
   for (const line of lines) {
@@ -591,315 +443,156 @@ function absolutizeManifestUrls(
       continue;
     }
     if (trimmed.startsWith("#")) {
-      out.push(
-        line.replace(/URI="([^"]+)"/gi, (_match, rawUri) => `URI="${absolutize(rawUri, manifestReferrer || stableReferrer)}"`)
-      );
+      out.push(line.replace(/URI="([^"]+)"/gi, (_match, rawUri) => `URI="${rewriteAssetUrl(rawUri)}"`));
       continue;
     }
-    out.push(absolutize(trimmed, manifestReferrer || stableReferrer));
+    out.push(rewriteAssetUrl(trimmed));
   }
 
   return out.join("\n");
 }
 
-function manifestContainsUnsafeInternalUrls(manifest: string, baseUrl: string, internalOrigin: string) {
-  const inspectUrl = (raw: string) => {
-    const absolute = resolveManifestUrl(raw, baseUrl);
-    if (!absolute || !absolute.startsWith(internalOrigin)) return false;
-    try {
-      const pathname = String(new URL(absolute).pathname || "").toLowerCase();
-      return !pathname.includes("/api/embed-proxy");
-    } catch {
-      return true;
-    }
-  };
-
-  for (const line of String(manifest || "").split(/\r?\n/)) {
-    const trimmed = String(line || "").trim();
-    if (!trimmed) continue;
-    if (!trimmed.startsWith("#")) {
-      if (inspectUrl(trimmed)) return true;
-      continue;
-    }
-    for (const match of trimmed.matchAll(/URI="([^"]+)"/gi)) {
-      if (inspectUrl(String(match[1] || "").trim())) return true;
-    }
-  }
-  return false;
-}
-
-async function fetchPlayerv2HtmlForCandidates(sourceUrl: string, internalOrigin: string) {
-  const fetchHtml = async (fetchUrl: string, referrerUrl?: string) => {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), Math.min(DEFAULT_FETCH_TIMEOUT_MS, 12_000));
-    try {
-      const response = await fetch(fetchUrl, {
-        method: "GET",
-        cache: "no-store",
-        redirect: "follow",
-        signal: controller.signal,
-        headers: {
-          accept: "text/html,application/xhtml+xml,application/javascript,text/javascript,text/plain,*/*",
-          "user-agent": DEFAULT_USER_AGENT,
-          ...(isValidHttpUrl(String(referrerUrl || "").trim())
-            ? {
-                referer: String(referrerUrl || "").trim(),
-                origin: new URL(String(referrerUrl || "").trim()).origin,
-              }
-            : {}),
-        },
-      });
-      if (!response.ok) return "";
-      return await response.text().catch(() => "");
-    } catch {
-      return "";
-    } finally {
-      clearTimeout(timeoutId);
-    }
-  };
-
-  const playbackProxyUrl = buildPlaybackProxyUrl({
-    sourceUrl,
-    internalOrigin,
-    referrerUrl: sourceUrl,
-  });
-  const htmlViaProxy = playbackProxyUrl ? await fetchHtml(toAbsoluteInternalUrl(playbackProxyUrl, internalOrigin), sourceUrl) : "";
-  if (String(htmlViaProxy || "").trim()) return htmlViaProxy;
-  return fetchHtml(sourceUrl, sourceUrl);
-}
-
-async function tryBrowserExtractorManifest(input: {
+async function resolveSessionCandidateMediaManifest(input: {
   sourceUrl: string;
   slotServer: SlotServerId;
   internalOrigin: string;
+  targetUrl: string;
+  fetchUrl?: string;
+  referrerUrl: string;
+  manifestBody?: string;
 }) {
-  const extracted = await extractBrowserIngestCandidates({
+  let currentUrl = String(input.targetUrl || "").trim();
+  let currentFetchUrl = String(input.fetchUrl || input.targetUrl || "").trim() || currentUrl;
+  let currentBody = String(input.manifestBody || "").trim();
+
+  for (let depth = 0; depth < 3; depth += 1) {
+    if (!currentBody) {
+      const fetched = await fetchLiveEmbedText({
+        sourceUrl: input.sourceUrl,
+        requestOrigin: input.internalOrigin,
+        slotServerId: input.slotServer,
+        targetUrl: currentFetchUrl,
+        timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
+      });
+      if (!fetched.ok || !looksLikeManifestResponse(fetched.contentType, fetched.body, fetched.finalUrl || currentUrl)) {
+        return {
+          ok: false as const,
+          error: fetched.error || `manifest-http-${fetched.status || 0}`,
+        };
+      }
+      currentBody = fetched.body;
+      currentFetchUrl = fetched.finalUrl || currentFetchUrl;
+      currentUrl = unwrapProxyTarget(currentFetchUrl) || currentUrl;
+    }
+
+    if (hasMediaSegments(currentBody, currentUrl)) {
+      return {
+        ok: true as const,
+        body: currentBody,
+        finalUrl: currentUrl,
+      };
+    }
+
+    const variantUrl = pickVariantManifestUrl(currentBody, currentUrl);
+    if (!variantUrl) {
+      return {
+        ok: false as const,
+        error: "manifest-no-media-playlist",
+      };
+    }
+
+    const nextVariantUrl = inheritEmbeddedManifestAuth(variantUrl, currentUrl);
+    currentUrl = unwrapProxyTarget(nextVariantUrl) || nextVariantUrl;
+    currentFetchUrl = nextVariantUrl;
+    currentBody = "";
+  }
+
+  return {
+    ok: false as const,
+    error: "manifest-recursion-limit",
+  };
+}
+
+async function resolveSessionBackedManifest(input: {
+  sourceUrl: string;
+  slotServer: SlotServerId;
+  internalOrigin: string;
+}): Promise<ResolvedManifestResult> {
+  const snapshot = await extractLiveEmbedSessionSnapshot({
     sourceUrl: input.sourceUrl,
     requestOrigin: input.internalOrigin,
     slotServerId: input.slotServer,
     timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
   });
-  const mergedCandidates = Array.isArray(extracted.candidates) ? [...extracted.candidates] : [];
-  let playerv2SnapshotError = "";
-  const freshPlayerv2CandidateKeys = new Set<string>();
-  if (input.slotServer === 2 && looksLikePlayerv2SourceUrl(input.sourceUrl)) {
-    const liveBrowserCandidates = await extractPlayerv2BrowserSnapshot({
-      sourceUrl: input.sourceUrl,
-      requestOrigin: input.internalOrigin,
-      timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
-    }).catch(() => ({
+  const playbackUrl = String(snapshot.playbackUrl || "").trim();
+  const candidates = Array.isArray(snapshot.candidates) ? snapshot.candidates : [];
+  if (!candidates.length) {
+    return {
       ok: false,
-      candidates: [] as Array<{
-        ingestUrl: string;
-        targetUrl: string;
-        referrerUrl: string;
-        manifestBody?: string;
-        manifestBaseUrl?: string;
-      }>,
-      error: "playerv2-browser-failed",
-    }));
-    playerv2SnapshotError = String(liveBrowserCandidates.error || "").trim();
-    if (liveBrowserCandidates.ok && Array.isArray(liveBrowserCandidates.candidates) && liveBrowserCandidates.candidates.length) {
-      const promoted = liveBrowserCandidates.candidates
-        .map((candidate) => {
-          const ingestUrl = String(candidate.ingestUrl || "").trim();
-          const targetUrl = String(candidate.targetUrl || unwrapProxyTarget(ingestUrl) || ingestUrl).trim();
-          return {
-            ingestUrl,
-            referrerUrl: String(candidate.referrerUrl || input.sourceUrl).trim() || input.sourceUrl,
-            targetUrl,
-            manifestBody: String(candidate.manifestBody || "").trim() || undefined,
-            manifestBaseUrl: String(candidate.manifestBaseUrl || targetUrl || ingestUrl).trim() || undefined,
-            score: Number.MAX_SAFE_INTEGER,
-            via: "network-manifest" as const,
-          };
-        })
-        .filter((candidate) => isValidHttpUrl(candidate.ingestUrl));
-      if (promoted.length) {
-        const deduped = new Map<string, (typeof mergedCandidates)[number]>();
-        for (const candidate of [...promoted, ...mergedCandidates]) {
-          const key = String(candidate.ingestUrl || "").trim().toLowerCase();
-          if (!key || deduped.has(key)) continue;
-          deduped.set(key, candidate);
-        }
-        mergedCandidates.splice(0, mergedCandidates.length, ...Array.from(deduped.values()));
-      }
-    }
-    const hasLiveManifestBody = mergedCandidates.some((candidate) => String(candidate.manifestBody || "").trim());
-    if (!hasLiveManifestBody) {
-      const playerv2Html = await fetchPlayerv2HtmlForCandidates(input.sourceUrl, input.internalOrigin);
-      const freshPlayerv2Candidates = playerv2Html
-        ? await buildPlayerv2Candidates(
-            input.sourceUrl,
-            playerv2Html,
-            Math.min(DEFAULT_RESOLVE_TIMEOUT_MS, 8_000),
-            input.internalOrigin
-          ).catch(() => [] as string[])
-        : [];
-      if (freshPlayerv2Candidates.length) {
-        const generated = freshPlayerv2Candidates
-          .map((rawCandidate) => {
-            const rawIngestUrl = String(rawCandidate || "").trim();
-            const ingestUrl =
-              (isValidHttpUrl(rawIngestUrl) && rawIngestUrl.includes("/api/embed-proxy")
-                ? rawIngestUrl
-                : buildBackendProxyUrl({
-                    sourceUrl: rawIngestUrl,
-                    internalOrigin: input.internalOrigin,
-                    referrerUrl: input.sourceUrl,
-                  })) || rawIngestUrl;
-            const key = String(ingestUrl || "").trim().toLowerCase();
-            if (key) freshPlayerv2CandidateKeys.add(key);
-            return {
-              ingestUrl,
-              referrerUrl: input.sourceUrl,
-              targetUrl: String(unwrapProxyTarget(ingestUrl) || rawIngestUrl).trim(),
-              score: Number.MAX_SAFE_INTEGER - 1,
-              via: "network-request" as const,
-            };
-          })
-          .filter((candidate) => isValidHttpUrl(candidate.ingestUrl));
-        if (generated.length) {
-          const deduped = new Map<string, (typeof mergedCandidates)[number]>();
-          for (const candidate of [...generated, ...mergedCandidates]) {
-            const key = String(candidate.ingestUrl || "").trim().toLowerCase();
-            if (!key || deduped.has(key)) continue;
-            deduped.set(key, candidate);
-          }
-          mergedCandidates.splice(0, mergedCandidates.length, ...Array.from(deduped.values()));
-        }
-      }
-    }
-  }
-  const isSlot2Playerv2 = input.slotServer === 2 && looksLikePlayerv2SourceUrl(input.sourceUrl);
-  const manifestBodyCandidates = mergedCandidates.filter((candidate) => String(candidate.manifestBody || "").trim());
-  const orderedCandidates =
-    isSlot2Playerv2 && manifestBodyCandidates.length
-      ? [...manifestBodyCandidates, ...mergedCandidates.filter((candidate) => !String(candidate.manifestBody || "").trim())]
-      : mergedCandidates;
-  const candidatesFound = orderedCandidates.length;
-  if (!candidatesFound) {
-    return {
-      ok: false as const,
-      error: extracted.error || "browser-extraction-empty",
-      playbackUrl: String(extracted.playbackUrl || "").trim(),
-      candidatesFound,
+      error: snapshot.error || "embed-session-empty",
+      playbackUrl,
+      candidatesFound: 0,
       candidatesTried: 0,
-      ingestUrl: "",
-      referrerUrl: "",
-      targetUrl: "",
-      manifestBody: "",
-      finalUrl: "",
     };
-  }
-  if (isSlot2Playerv2 && !manifestBodyCandidates.length) {
-    if (!freshPlayerv2CandidateKeys.size) {
-    return {
-      ok: false as const,
-      error: playerv2SnapshotError || extracted.error || "browser-manifest-body-missing",
-      playbackUrl: String(extracted.playbackUrl || "").trim(),
-      candidatesFound,
-      candidatesTried: 0,
-      ingestUrl: "",
-      referrerUrl: "",
-      targetUrl: "",
-      manifestBody: "",
-      finalUrl: "",
-    };
-    }
   }
 
-  let lastError = extracted.error || "browser-extraction-empty";
   let candidatesTried = 0;
-  for (const candidate of orderedCandidates) {
-    const ingestUrl = String(candidate.ingestUrl || "").trim();
+  let lastError = snapshot.error || "embed-session-empty";
+  for (const candidate of candidates) {
     const targetUrl = String(candidate.targetUrl || "").trim();
-    const referrerUrl = String(candidate.referrerUrl || targetUrl || input.sourceUrl).trim() || input.sourceUrl;
-    const candidateManifestBody = String(candidate.manifestBody || "").trim();
-    const candidateManifestBaseUrl = String(candidate.manifestBaseUrl || ingestUrl || targetUrl || "").trim();
-    if (!isValidHttpUrl(ingestUrl)) continue;
+    const referrerUrl = String(candidate.referrerUrl || input.sourceUrl).trim() || input.sourceUrl;
+    if (!isValidHttpUrl(targetUrl)) continue;
     if (
       !isIngestCandidateAlignedWithSlotServer({
         slotServerId: input.slotServer,
         sourceUrl: input.sourceUrl,
-        ingestUrl,
+        ingestUrl: targetUrl,
         probeReferrerUrl: referrerUrl,
-        probePlaylistUrl: targetUrl || ingestUrl,
+        probePlaylistUrl: targetUrl,
       })
     ) {
       continue;
     }
 
     candidatesTried += 1;
-    if (
-      candidateManifestBody &&
-      looksLikeManifestResponse("application/vnd.apple.mpegurl", candidateManifestBody, candidateManifestBaseUrl) &&
-      !manifestContainsUnsafeInternalUrls(candidateManifestBody, candidateManifestBaseUrl || ingestUrl, input.internalOrigin)
-    ) {
-      const manifestBaseUrl = candidateManifestBaseUrl || ingestUrl;
-      if (hasMediaSegments(candidateManifestBody, manifestBaseUrl)) {
-        return {
-          ok: true as const,
-          error: "",
-          playbackUrl: String(extracted.playbackUrl || "").trim(),
-          candidatesFound,
-          candidatesTried,
-          ingestUrl,
-          referrerUrl,
-          targetUrl: targetUrl || ingestUrl,
-          finalUrl: manifestBaseUrl,
-          manifestBody: absolutizeManifestUrls(candidateManifestBody, manifestBaseUrl, input.internalOrigin, referrerUrl),
-        };
-      }
-    }
-
-    const candidateKey = ingestUrl.toLowerCase();
-    if (isSlot2Playerv2 && manifestBodyCandidates.length && !candidateManifestBody) {
-      lastError = lastError || "browser-manifest-body-missing";
-      continue;
-    }
-    if (isSlot2Playerv2 && !candidateManifestBody && !freshPlayerv2CandidateKeys.has(candidateKey)) {
-      lastError = lastError || "browser-manifest-body-missing";
-      continue;
-    }
-
-    const fetchUrl = toAbsoluteInternalUrl(ingestUrl, input.internalOrigin);
-    const manifest = await fetchStrictMediaManifest(fetchUrl);
-    if (!manifest.ok) {
-      lastError = manifest.error || lastError;
+    const resolved = await resolveSessionCandidateMediaManifest({
+      sourceUrl: input.sourceUrl,
+      slotServer: input.slotServer,
+      internalOrigin: input.internalOrigin,
+      targetUrl,
+      fetchUrl: candidate.fetchUrl,
+      referrerUrl,
+      manifestBody: candidate.manifestBody,
+    });
+    if (!resolved.ok) {
+      lastError = resolved.error || lastError;
       continue;
     }
 
     return {
-      ok: true as const,
-      error: "",
-      playbackUrl: String(extracted.playbackUrl || "").trim(),
-      candidatesFound,
-      candidatesTried,
-      ingestUrl,
-      referrerUrl,
-      targetUrl: targetUrl || ingestUrl,
-      finalUrl: manifest.finalUrl || fetchUrl,
-      manifestBody: absolutizeManifestUrls(
-        manifest.body,
-        manifest.finalUrl || fetchUrl,
+      ok: true,
+      manifestBody: rewriteManifestForSessionMirror(
+        resolved.body,
+        resolved.finalUrl,
         input.internalOrigin,
-        referrerUrl
+        input.sourceUrl,
+        input.slotServer
       ),
+      finalUrl: resolved.finalUrl,
+      targetUrl,
+      referrerUrl,
+      playbackUrl,
+      candidatesFound: candidates.length,
+      candidatesTried,
     };
   }
 
   return {
-    ok: false as const,
-    error: lastError || "browser-extraction-no-verified-manifest",
-    playbackUrl: String(extracted.playbackUrl || "").trim(),
-    candidatesFound,
+    ok: false,
+    error: lastError || "embed-session-no-verified-manifest",
+    playbackUrl,
+    candidatesFound: candidates.length,
     candidatesTried,
-    ingestUrl: "",
-    referrerUrl: "",
-    targetUrl: "",
-    manifestBody: "",
-    finalUrl: "",
   };
 }
 
@@ -914,20 +607,6 @@ function getRecentVerifiedManifestCache(cacheKey: string) {
     recentVerifiedManifestByKey.delete(cacheKey);
     return null;
   }
-  return entry;
-}
-
-function getRecentVerifiedManifestCacheFast(cacheKey: string) {
-  const entry = getRecentVerifiedManifestCache(cacheKey);
-  if (!entry) return null;
-  if (Date.now() - entry.updatedAt > VERIFIED_MANIFEST_CACHE_FAST_PATH_MS) return null;
-  return entry;
-}
-
-function getRecentVerifiedManifestCacheForWorker(cacheKey: string) {
-  const entry = getRecentVerifiedManifestCache(cacheKey);
-  if (!entry) return null;
-  if (Date.now() - entry.updatedAt > VERIFIED_MANIFEST_WORKER_CACHE_MAX_AGE_MS) return null;
   return entry;
 }
 
@@ -973,40 +652,20 @@ export async function GET(req: Request) {
   }
 
   const manifestCacheKey = buildManifestCacheKey(matchId, slotServer, sourceUrl);
-  const isWorkerFetch = String(req.headers.get("x-repack-worker-fetch") || "").trim() === "1";
-  const isFastCachePreferred = slotServer === 2 && looksLikePlayerv2SourceUrl(sourceUrl);
-  const fastCachedManifest = !isWorkerFetch && isFastCachePreferred ? getRecentVerifiedManifestCacheFast(manifestCacheKey) : null;
-  if (fastCachedManifest) {
-    return new Response(fastCachedManifest.manifestBody, {
-      status: 200,
-      headers: {
-        "content-type": "application/vnd.apple.mpegurl; charset=utf-8",
-        "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
-        "x-repack-gateway": "1",
-        "x-repack-slot-server": String(slotServer),
-        "x-repack-source-url": sourceUrl,
-        "x-repack-upstream-url": fastCachedManifest.ingestUrl,
-        "x-repack-extractor": "browser-cached-fast",
-        "x-repack-extractor-candidates-found": "0",
-        "x-repack-extractor-candidates-tried": "0",
-      },
-    });
-  }
-  const browserExtracted = await tryBrowserExtractorManifest({
+  const resolved = await resolveSessionBackedManifest({
     sourceUrl,
     slotServer,
     internalOrigin,
   });
-  if (browserExtracted.ok) {
+  if (resolved.ok) {
     setRecentVerifiedManifestCache(manifestCacheKey, {
-      manifestBody: browserExtracted.manifestBody,
-      finalUrl: browserExtracted.finalUrl,
-      ingestUrl: browserExtracted.ingestUrl,
-      referrerUrl: browserExtracted.referrerUrl,
-      targetUrl: browserExtracted.targetUrl,
+      manifestBody: resolved.manifestBody,
+      finalUrl: resolved.finalUrl,
+      targetUrl: resolved.targetUrl,
+      referrerUrl: resolved.referrerUrl,
       updatedAt: Date.now(),
     });
-    return new Response(browserExtracted.manifestBody, {
+    return new Response(resolved.manifestBody, {
       status: 200,
       headers: {
         "content-type": "application/vnd.apple.mpegurl; charset=utf-8",
@@ -1014,16 +673,15 @@ export async function GET(req: Request) {
         "x-repack-gateway": "1",
         "x-repack-slot-server": String(slotServer),
         "x-repack-source-url": sourceUrl,
-        "x-repack-upstream-url": browserExtracted.ingestUrl,
-        "x-repack-extractor": "browser",
-        "x-repack-extractor-candidates-found": String(browserExtracted.candidatesFound),
-        "x-repack-extractor-candidates-tried": String(browserExtracted.candidatesTried),
+        "x-repack-upstream-url": resolved.targetUrl,
+        "x-repack-extractor": "embed-session",
+        "x-repack-extractor-candidates-found": String(resolved.candidatesFound),
+        "x-repack-extractor-candidates-tried": String(resolved.candidatesTried),
       },
     });
   }
-  const cachedManifest = isWorkerFetch
-    ? getRecentVerifiedManifestCacheForWorker(manifestCacheKey)
-    : getRecentVerifiedManifestCache(manifestCacheKey);
+
+  const cachedManifest = getRecentVerifiedManifestCache(manifestCacheKey);
   if (cachedManifest) {
     return new Response(cachedManifest.manifestBody, {
       status: 200,
@@ -1033,22 +691,23 @@ export async function GET(req: Request) {
         "x-repack-gateway": "1",
         "x-repack-slot-server": String(slotServer),
         "x-repack-source-url": sourceUrl,
-        "x-repack-upstream-url": cachedManifest.ingestUrl,
-        "x-repack-extractor": "browser-cached",
-        "x-repack-extractor-candidates-found": String(browserExtracted.candidatesFound),
-        "x-repack-extractor-candidates-tried": String(browserExtracted.candidatesTried),
+        "x-repack-upstream-url": cachedManifest.targetUrl,
+        "x-repack-extractor": "embed-session-cached",
+        "x-repack-extractor-candidates-found": String(resolved.candidatesFound),
+        "x-repack-extractor-candidates-tried": String(resolved.candidatesTried),
       },
     });
   }
+
   return NextResponse.json(
     {
       ok: false,
-      error: `browser-${browserExtracted.error || "extraction-failed"}`,
+      error: `embed-session-${resolved.error || "resolution-failed"}`,
       extractor: {
-        mode: "browser-only",
-        playbackUrl: browserExtracted.playbackUrl || null,
-        candidatesFound: browserExtracted.candidatesFound,
-        candidatesTried: browserExtracted.candidatesTried,
+        mode: "embed-session",
+        playbackUrl: resolved.playbackUrl || null,
+        candidatesFound: resolved.candidatesFound,
+        candidatesTried: resolved.candidatesTried,
       },
     },
     { status: 502 }

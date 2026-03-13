@@ -106,14 +106,6 @@ function normalizeCandidateUrl(raw, playerOrigin) {
   return "";
 }
 
-function buildBrowserAssetFetchUrl(playerOrigin, sourceUrl, assetUrl) {
-  if (!isHttpUrl(playerOrigin) || !isHttpUrl(sourceUrl) || !isHttpUrl(assetUrl)) return "";
-  const params = new URLSearchParams();
-  params.set("sourceUrl", sourceUrl);
-  params.set("assetUrl", assetUrl);
-  return `${String(playerOrigin || "").replace(/\/+$/, "")}/api/repack/browser-asset?${params.toString()}`;
-}
-
 function safeDecodeURIComponent(value) {
   try {
     return decodeURIComponent(String(value || ""));
@@ -712,26 +704,12 @@ class MirrorJob {
       }
     };
 
-    const browserAssetUrl =
-      this.serverId === 2 ? buildBrowserAssetFetchUrl(this.manager.config.playerOrigin, this.sourceUrl, record.sourceUrl) : "";
-    const fetchOrder = [browserAssetUrl, record.sourceUrl].filter(Boolean);
     let bytes = null;
     let contentType = inferContentTypeFromName(record.remoteName);
-    let lastError = null;
     try {
-      for (const fetchUrl of fetchOrder) {
-        try {
-          const fetched = await fetchAssetBytes(fetchUrl);
-          bytes = fetched.bytes;
-          contentType = fetched.contentType;
-          break;
-        } catch (error) {
-          lastError = error;
-        }
-      }
-      if (!bytes) {
-        throw lastError instanceof Error ? lastError : new Error(String(lastError || "asset-fetch-failed"));
-      }
+      const fetched = await fetchAssetBytes(record.sourceUrl);
+      bytes = fetched.bytes;
+      contentType = fetched.contentType;
       const cacheControl = record.kind === "segment" ? DEFAULT_SEGMENT_CACHE_CONTROL : DEFAULT_KEY_CACHE_CONTROL;
       await this.manager.r2.send(
         new PutObjectCommand({
