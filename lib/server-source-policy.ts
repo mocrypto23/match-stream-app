@@ -206,7 +206,9 @@ export function isIngestCandidateAlignedWithSlotServer(input: {
   if (proxyEmbeddedRef) {
     const proxyRefHost = extractHost(proxyEmbeddedRef);
     if (!proxyRefHost) return false;
-    if (!hostMatchesAnySuffix(proxyRefHost, allowlist)) return false;
+    if (!hostMatchesAnySuffix(proxyRefHost, allowlist) && !looksLikeEmbeddedPlayerOrStreamTarget(proxyEmbeddedRef)) {
+      return false;
+    }
   }
   const targetUrl = unwrapEmbedProxyTarget(ingestUrl) || ingestUrl;
   const targetHost = extractHost(targetUrl);
