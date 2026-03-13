@@ -106,6 +106,14 @@ function normalizeCandidateUrl(raw, playerOrigin) {
   return "";
 }
 
+function buildBrowserAssetFetchUrl(playerOrigin, sourceUrl, assetUrl) {
+  if (!isHttpUrl(playerOrigin) || !isHttpUrl(sourceUrl) || !isHttpUrl(assetUrl)) return "";
+  const params = new URLSearchParams();
+  params.set("sourceUrl", sourceUrl);
+  params.set("assetUrl", assetUrl);
+  return `${String(playerOrigin || "").replace(/\/+$/, "")}/api/repack/browser-asset?${params.toString()}`;
+}
+
 function safeDecodeURIComponent(value) {
   try {
     return decodeURIComponent(String(value || ""));
@@ -677,24 +685,52 @@ class MirrorJob {
 
   async uploadAsset(record) {
     const startedAt = Date.now();
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.manager.config.assetFetchTimeoutMs);
-    try {
-      const response = await fetch(record.sourceUrl, {
-        method: "GET",
-        cache: "no-store",
-        redirect: "follow",
-        signal: controller.signal,
-        headers: {
-          "user-agent": DEFAULT_USER_AGENT,
-        },
-      });
-      if (!response.ok) {
-        throw new Error(`asset-http-${response.status || 0}`);
+    const fetchAssetBytes = async (fetchUrl) => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), this.manager.config.assetFetchTimeoutMs);
+      try {
+        const response = await fetch(fetchUrl, {
+          method: "GET",
+          cache: "no-store",
+          redirect: "follow",
+          signal: controller.signal,
+          headers: {
+            "user-agent": DEFAULT_USER_AGENT,
+          },
+        });
+        if (!response.ok) {
+          throw new Error(`asset-http-${response.status || 0}`);
+        }
+        return {
+          bytes: Buffer.from(await response.arrayBuffer()),
+          contentType:
+            normalizeHeaderValue(response.headers.get("content-type")) || inferContentTypeFromName(record.remoteName),
+        };
+      } finally {
+        clearTimeout(timeoutId);
       }
-      const bytes = Buffer.from(await response.arrayBuffer());
-      const contentType =
-        normalizeHeaderValue(response.headers.get("content-type")) || inferContentTypeFromName(record.remoteName);
+    };
+
+    const browserAssetUrl =
+      this.serverId === 2 ? buildBrowserAssetFetchUrl(this.manager.config.playerOrigin, this.sourceUrl, record.sourceUrl) : "";
+    const fetchOrder = [browserAssetUrl, record.sourceUrl].filter(Boolean);
+    let bytes = null;
+    let contentType = inferContentTypeFromName(record.remoteName);
+    let lastError = null;
+    try {
+      for (const fetchUrl of fetchOrder) {
+        try {
+          const fetched = await fetchAssetBytes(fetchUrl);
+          bytes = fetched.bytes;
+          contentType = fetched.contentType;
+          break;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      if (!bytes) {
+        throw lastError instanceof Error ? lastError : new Error(String(lastError || "asset-fetch-failed"));
+      }
       const cacheControl = record.kind === "segment" ? DEFAULT_SEGMENT_CACHE_CONTROL : DEFAULT_KEY_CACHE_CONTROL;
       await this.manager.r2.send(
         new PutObjectCommand({
@@ -714,8 +750,6 @@ class MirrorJob {
     } catch (error) {
       this.manager.metrics.uploadErrors += 1;
       throw error;
-    } finally {
-      clearTimeout(timeoutId);
     }
   }
 

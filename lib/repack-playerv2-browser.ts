@@ -70,6 +70,14 @@ type BrowserStringCandidateResult = {
   error: string;
 };
 
+type BrowserAssetResult = {
+  ok: boolean;
+  status: number;
+  contentType: string;
+  bodyBase64: string;
+  error: string;
+};
+
 type PlaywrightBrowser = {
   newContext: (input: unknown) => Promise<PlaywrightContext>;
 };
@@ -615,6 +623,98 @@ class LivePlayerv2Session {
     return { ok: false, candidates: [], error: this.lastError || "browser-extraction-empty" };
   }
 
+  async fetchAsset(assetUrl: string, timeoutMs: number): Promise<BrowserAssetResult> {
+    if (!ENABLE_BROWSER_EXTRACTION) {
+      return { ok: false, status: 0, contentType: "", bodyBase64: "", error: "browser-extractor-disabled" };
+    }
+    const normalizedAssetUrl = normalizeHttpUrl(assetUrl);
+    if (!normalizedAssetUrl) {
+      return { ok: false, status: 0, contentType: "", bodyBase64: "", error: "invalid-browser-asset-url" };
+    }
+
+    try {
+      await this.ensureStarted(timeoutMs);
+      this.startMaintenanceLoop();
+    } catch {
+      return { ok: false, status: 0, contentType: "", bodyBase64: "", error: this.lastError || "browser-extraction-failed" };
+    }
+
+    const page = this.page;
+    if (!page || page.isClosed?.()) {
+      return { ok: false, status: 0, contentType: "", bodyBase64: "", error: this.lastError || "browser-page-closed" };
+    }
+
+    try {
+      const fetched = await page.evaluate(
+        async ({ assetUrl: targetUrl, timeoutMs: browserTimeoutMs }) => {
+          try {
+            const controller = new AbortController();
+            const timeoutId = window.setTimeout(() => controller.abort(), browserTimeoutMs);
+            const response = await fetch(targetUrl, {
+              method: "GET",
+              cache: "no-store",
+              credentials: "include",
+              signal: controller.signal,
+            }).finally(() => window.clearTimeout(timeoutId));
+            const contentType = String(response.headers.get("content-type") || "").trim();
+            if (!response.ok) {
+              return {
+                ok: false,
+                status: Number(response.status || 0),
+                contentType,
+                bodyBase64: "",
+                error: `asset-http-${Number(response.status || 0)}`,
+              };
+            }
+
+            const blob = await response.blob();
+            const dataUrl = await new Promise<string>((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onloadend = () => resolve(String(reader.result || ""));
+              reader.onerror = () => reject(new Error("browser-asset-file-reader-failed"));
+              reader.readAsDataURL(blob);
+            });
+            const bodyBase64 = String(dataUrl || "").split(",", 2)[1] || "";
+            return {
+              ok: true,
+              status: Number(response.status || 200),
+              contentType,
+              bodyBase64,
+              error: "",
+            };
+          } catch (error) {
+            return {
+              ok: false,
+              status: 0,
+              contentType: "",
+              bodyBase64: "",
+              error: error instanceof Error ? error.message : String(error || "browser-asset-fetch-failed"),
+            };
+          }
+        },
+        {
+          assetUrl: normalizedAssetUrl,
+          timeoutMs: Math.max(4_000, Math.min(30_000, timeoutMs)),
+        }
+      );
+      return {
+        ok: !!fetched?.ok,
+        status: Number(fetched?.status || 0),
+        contentType: String(fetched?.contentType || ""),
+        bodyBase64: String(fetched?.bodyBase64 || ""),
+        error: String(fetched?.error || ""),
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        status: 0,
+        contentType: "",
+        bodyBase64: "",
+        error: error instanceof Error ? error.message : String(error || "browser-asset-fetch-failed"),
+      };
+    }
+  }
+
   async close() {
     const page = this.page;
     const context = this.browserContext;
@@ -680,4 +780,14 @@ export async function extractPlayerv2BrowserCandidates(input: {
     candidates: result.candidates.map((candidate) => candidate.ingestUrl),
     error: result.error,
   };
+}
+
+export async function fetchPlayerv2AssetThroughBrowser(input: {
+  sourceUrl: string;
+  requestOrigin: string;
+  assetUrl: string;
+  timeoutMs: number;
+}) {
+  const session = getSession(input);
+  return session.fetchAsset(input.assetUrl, input.timeoutMs);
 }
