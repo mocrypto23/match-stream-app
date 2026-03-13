@@ -225,10 +225,13 @@ export function isIngestCandidateAlignedWithSlotServer(input: {
 
   if (hostMatchesAnySuffix(targetHost, allowlist)) return true;
 
+  // Some upstream pages legitimately embed their player chain on a foreign
+  // host. If the chain started from an allowed source page for this slot and
+  // the target is still a player/stream hop, keep following it.
+  if (looksLikeEmbeddedPlayerOrStreamTarget(targetUrl)) return true;
+
   const targetMappedSlot = findSlotServerByHost(targetHost);
   if (targetMappedSlot && targetMappedSlot !== slotServerId) return false;
-
-  if (looksLikeEmbeddedPlayerOrStreamTarget(targetUrl)) return true;
 
   return true;
 }

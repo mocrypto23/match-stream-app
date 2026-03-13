@@ -823,7 +823,7 @@ async function runBrowserExtraction(input: {
           text: fetched.body,
           pageUrl,
           sourceUrl: sourcePageUrl,
-          referrerUrl: next.referrerUrl,
+          referrerUrl: sourcePageUrl,
           depth: next.depth,
         });
       }
@@ -950,7 +950,7 @@ async function runBrowserExtraction(input: {
             text: body,
             pageUrl: responseUrl,
             sourceUrl: targetUrl,
-            referrerUrl,
+            referrerUrl: targetUrl,
             depth: 1,
           });
         }
