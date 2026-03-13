@@ -558,11 +558,13 @@ async function runBrowserExtraction(input: {
     return { ok: false, playbackUrl: "", error: "invalid-browser-extractor-input", candidates: [] };
   }
 
-  const playbackUrl = buildPlaybackProxyUrl({
-    sourceUrl,
-    requestOrigin,
-    referrerUrl: sourceUrl,
-  });
+  const playbackUrl = isDirectCrawlPreferred(sourceUrl)
+    ? sourceUrl
+    : buildPlaybackProxyUrl({
+        sourceUrl,
+        requestOrigin,
+        referrerUrl: sourceUrl,
+      });
   if (!playbackUrl) {
     return { ok: false, playbackUrl: "", error: "browser-extractor-invalid-playback-url", candidates: [] };
   }
