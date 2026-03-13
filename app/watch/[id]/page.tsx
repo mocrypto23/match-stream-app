@@ -6423,12 +6423,15 @@ export default function WatchPage() {
     if (!idNum || !match?.id) return;
     if (shouldBlockStream) return;
     const controller = new AbortController();
-    const orderedUiServers = [1, 2, 3, 4] as UiServerId[];
-    for (const uiServer of orderedUiServers) {
-      const slotServer = getSlotServerIdForUiServer(uiServer);
-      if (strictBootstrapAttemptedBySlot[slotServer]) continue;
-      void bootstrapStrictUiServer(uiServer, controller.signal);
-    }
+    void (async () => {
+      const orderedUiServers = [1, 2, 3, 4] as UiServerId[];
+      for (const uiServer of orderedUiServers) {
+        if (controller.signal.aborted) return;
+        const slotServer = getSlotServerIdForUiServer(uiServer);
+        if (strictBootstrapAttemptedBySlot[slotServer]) continue;
+        await bootstrapStrictUiServer(uiServer, controller.signal);
+      }
+    })();
     return () => {
       controller.abort();
     };
