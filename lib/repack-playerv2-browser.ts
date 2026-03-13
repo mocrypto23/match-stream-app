@@ -73,6 +73,7 @@ type PlaywrightContext = {
 
 type PlaywrightPage = {
   on: (event: string, handler: (arg: unknown) => void) => void;
+  evaluate: <T, Arg = unknown>(pageFunction: string | ((arg: Arg) => T | Promise<T>), arg?: Arg) => Promise<T>;
   goto: (url: string, options: unknown) => Promise<unknown>;
   waitForTimeout: (ms: number) => Promise<void>;
   close: () => Promise<void>;
@@ -396,6 +397,73 @@ class LivePlayerv2Session {
     await this.reloadPromise;
   }
 
+  async hydrateCandidateBodiesInPage() {
+    const page = this.page;
+    if (!page || page.isClosed?.()) return;
+    const pendingTargets = this.snapshotCandidates()
+      .filter((candidate) => !candidate.manifestBody)
+      .slice(0, 3)
+      .map((candidate) => candidate.targetUrl)
+      .filter((targetUrl) => looksLikePlayerv2ManifestCandidate(targetUrl));
+    if (!pendingTargets.length) return;
+
+    try {
+      const fetched = await page.evaluate(
+        async (urls: string[]) => {
+          const out: Array<{ targetUrl: string; finalUrl: string; status: number; body: string }> = [];
+          for (const targetUrl of urls) {
+            try {
+              const controller = new AbortController();
+              const timeoutId = window.setTimeout(() => controller.abort(), 5000);
+              const response = await fetch(targetUrl, {
+                method: "GET",
+                cache: "no-store",
+                credentials: "include",
+                signal: controller.signal,
+                headers: {
+                  accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
+                },
+              }).finally(() => window.clearTimeout(timeoutId));
+              const body = await response.text().catch(() => "");
+              out.push({
+                targetUrl,
+                finalUrl: String(response.url || targetUrl),
+                status: Number(response.status || 0),
+                body,
+              });
+            } catch {
+              out.push({
+                targetUrl,
+                finalUrl: targetUrl,
+                status: 0,
+                body: "",
+              });
+            }
+          }
+          return out;
+        },
+        pendingTargets
+      );
+
+      for (const item of Array.isArray(fetched) ? fetched : []) {
+        const targetUrl = normalizeHttpUrl(String(item?.targetUrl || "").trim());
+        const finalUrl = normalizeHttpUrl(String(item?.finalUrl || targetUrl).trim()) || targetUrl;
+        const body = String(item?.body || "").trim();
+        const status = Number(item?.status || 0);
+        if (!targetUrl || status < 200 || status >= 300) continue;
+        if (!looksLikeManifestResponse("application/vnd.apple.mpegurl", body, finalUrl)) continue;
+        this.rememberCandidate({
+          targetUrl,
+          referrerUrl: this.fallbackReferrer,
+          manifestBody: body,
+          manifestBaseUrl: finalUrl,
+        });
+      }
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : String(error || "candidate-body-hydration-failed");
+    }
+  }
+
   async snapshot(timeoutMs: number): Promise<BrowserCandidateResult> {
     if (!ENABLE_BROWSER_EXTRACTION) {
       return { ok: false, candidates: [], error: "browser-extractor-disabled" };
@@ -434,6 +502,9 @@ class LivePlayerv2Session {
         newestAgeMs === null ||
         newestAgeMs >= SESSION_PREEMPTIVE_REFRESH_MS ||
         !this.hasFreshCandidate(now);
+      if (!freshManifestCandidates.length && candidates.length) {
+        await this.hydrateCandidateBodiesInPage();
+      }
       if (shouldReload && now - this.lastReloadAt >= SESSION_RELOAD_COOLDOWN_MS) {
         await this.maybeReload(timeoutMs).catch(() => {});
       }
