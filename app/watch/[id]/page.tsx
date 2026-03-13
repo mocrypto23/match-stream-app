@@ -5354,6 +5354,7 @@ export default function WatchPage() {
   const candidatesRef = useRef<string[]>([]);
   const selectedCandidateRef = useRef(0);
   const selectedServerRef = useRef(4);
+  const strictUserSelectedServerRef = useRef(false);
   const recoveryTimerRef = useRef<number | null>(null);
   const recoveryAttemptRef = useRef(0);
   const strictRetryStepRef = useRef(0);
@@ -6236,6 +6237,27 @@ export default function WatchPage() {
     if (R2_STRICT_MODE) return;
     if (!validServers.some((s) => s.n === selectedServer) && validServers.length) setSelectedServer(validServers[0].n);
   }, [validServers, selectedServer]);
+  useEffect(() => {
+    if (!R2_STRICT_MODE) return;
+    if (strictUserSelectedServerRef.current) return;
+    const selectedEntry = strictR2StatusBySlot.get(selectedServer);
+    const selectedOption = serverOptions.find((s) => s.n === selectedServer);
+    const selectedHasReadyUrl = !!selectedOption?.url && isValidHttpUrl(selectedOption.url);
+    const cachedReady = strictLastReadyUrlByServerRef.current[selectedServer];
+    const selectedCanReuseCached =
+      !selectedHasReadyUrl &&
+      !!cachedReady?.url &&
+      Date.now() - cachedReady.updatedAt <= STRICT_R2_READY_URL_GRACE_MS &&
+      isTransientStrictR2State(selectedEntry);
+    if (selectedHasReadyUrl || selectedCanReuseCached) return;
+    const firstReady = serverOptions.find((option) => option.url && isValidHttpUrl(option.url));
+    if (firstReady && firstReady.n !== selectedServer) {
+      setSelectedServer(firstReady.n);
+    }
+  }, [serverOptions, selectedServer, strictR2StatusBySlot]);
+  useEffect(() => {
+    strictUserSelectedServerRef.current = false;
+  }, [idNum]);
   useEffect(() => {
     if (!R2_STRICT_MODE) return;
     // Keep the user's chosen server pinned in strict mode. Auto-switching makes
@@ -8602,7 +8624,11 @@ export default function WatchPage() {
             return (
               <button
                 key={s.n}
-                onClick={() => canSelect && setSelectedServer(s.n)}
+                onClick={() => {
+                  if (!canSelect) return;
+                  strictUserSelectedServerRef.current = true;
+                  setSelectedServer(s.n);
+                }}
                 disabled={!canSelect}
                 className={[
                   "px-4 py-2 rounded-xl font-black text-sm border transition-all min-w-[108px] text-center",

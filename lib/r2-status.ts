@@ -674,6 +674,20 @@ export async function buildMatchR2Status(input: {
       }
 
       if (recentSeedRejected) {
+        if (probed.segmentProbe === "ok") {
+          return {
+            uiServer,
+            slotServer,
+            state: "warming",
+            playlistUrl,
+            segmentProbe: "ok",
+            lastSequenceAgeMs: sequenceAgeMs,
+            resolverState: "ok",
+            resolveReason: "seed-rejected-hold",
+            reason: `seed-rejected-hold:${recentSeedState?.reason || "unknown"}:${probed.reason}`,
+            updatedAt: nowIso(nowMs),
+          };
+        }
         clearRecentReadyState(matchSlotKey);
         return {
           uiServer,
