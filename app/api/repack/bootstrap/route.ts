@@ -71,15 +71,6 @@ type BootstrapServerResult = {
   probeEvidence: RepackIngestResolution["probeEvidence"];
 };
 
-function canAcceptProtectedProxySoftResult(ingest: RepackIngestResolution) {
-  if (ingest.mode !== "backend_proxy_ingest") return false;
-  if (!isValidHttpUrl(String(ingest.ingestUrl || "").trim())) return false;
-  if (String(ingest.reason || "").trim() !== "resolved-proxy-candidate-soft") return false;
-  const playlistStatus = Number.parseInt(String(ingest.probeEvidence?.playlistStatus || 0), 10) || 0;
-  const segmentStatus = Number.parseInt(String(ingest.probeEvidence?.segmentStatus || 0), 10) || 0;
-  return playlistStatus >= 200 && playlistStatus < 300 && segmentStatus === 403;
-}
-
 function toInt(raw: unknown) {
   const value = Number.parseInt(String(raw ?? ""), 10);
   return Number.isFinite(value) ? value : NaN;

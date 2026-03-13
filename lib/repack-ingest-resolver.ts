@@ -1625,29 +1625,6 @@ function shouldRetryProtectedCandidateViaProxy(reason: string) {
   return /^(?:playlist|segment|variant)-http-(?:0|401|403|406|429|5\d{2})$/i.test(String(reason || "").trim());
 }
 
-function canSoftAcceptProtectedSegmentProbe(input: {
-  candidateUrl: string;
-  reason: string;
-  evidence?: ProbeResult["evidence"] | null;
-  mode: RepackIngestMode;
-}) {
-  if (input.mode !== "backend_proxy_ingest") return false;
-  if (!/^segment-http-(?:401|403)$/i.test(String(input.reason || "").trim())) return false;
-  const playlistStatus = Number.parseInt(String(input.evidence?.playlistStatus || 0), 10) || 0;
-  if (playlistStatus < 200 || playlistStatus >= 300) return false;
-  const targetUrl = extractEmbedProxyTargetUrl(input.candidateUrl) || input.candidateUrl;
-  if (!isValidHttpUrl(targetUrl)) return false;
-  try {
-    const u = new URL(targetUrl);
-    const host = u.hostname.toLowerCase();
-    const pathname = String(u.pathname || "").toLowerCase();
-    if ((host.endsWith(".yallashot.us") || host === "yallashot.us") && pathname.includes("/kooora/")) return true;
-    if (pathname.includes("/albaplayer/")) return true;
-    if (host.includes("yallashoot") || host.includes("yallalive")) return true;
-  } catch {}
-  return false;
-}
-
 async function probeCandidate(input: {
   candidateUrl: string;
   timeoutMs: number;
@@ -2249,7 +2226,6 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
   let candidatesProbed = 0;
   let lastProbeReason = "probe-failed";
   let lastEvidence: RepackIngestResolution["probeEvidence"] = null;
-  let softAcceptedResult: RepackIngestResolution | null = null;
 
   while (pending.length && candidatesProbed < maxCandidates) {
     const item = pending.shift();
@@ -2293,31 +2269,6 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
     const stableSourceReferrer =
       normalizeHttpUrl(item.referrerUrl || sourceFetch.finalUrl || sourceUrl) || sourceUrl;
     const extraCandidateReferrer = normalizeHttpUrl(finalProbe.evidence?.playlistUrl || "") || stableSourceReferrer;
-    if (canSoftAcceptProtectedSegmentProbe({
-      candidateUrl: item.candidateUrl,
-      reason: finalProbe.reason,
-      evidence: finalProbe.evidence,
-      mode: item.mode,
-    })) {
-      softAcceptedResult = {
-        mode: item.mode,
-        ingestUrl: item.candidateUrl,
-        reason: "resolved-proxy-candidate",
-        resolver: {
-          stage: "done",
-          candidatesFound: rankedSeedPool.length,
-          candidatesProbed,
-          selectedCandidate: item.candidateUrl,
-          selectedKind: item.mode,
-          rejectReason: "protected-segment-via-proxy",
-          resolverState: "ok",
-        },
-        probeEvidence: finalProbe.evidence
-          ? { ...finalProbe.evidence, referrerUrl: stableSourceReferrer }
-          : null,
-      };
-      return softAcceptedResult;
-    }
     lastProbeReason = finalProbe.reason || "probe-failed";
     lastEvidence = finalProbe.evidence;
     if (
@@ -2397,10 +2348,6 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       );
       pending.push(...rankedExtra);
     }
-  }
-
-  if (softAcceptedResult) {
-    return softAcceptedResult;
   }
 
   const resolverState: RepackResolverState = rankedSeedPool.length ? "probe-failed" : "no-candidate";

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { supabaseAdmin } from "../../_supabase";
+import { extractBrowserIngestCandidates } from "@/lib/repack-browser-extractor";
 import { resolveRepackIngestUrl } from "@/lib/repack-ingest-resolver";
 import { resolveInternalPlayerOrigin, toAbsoluteInternalUrl } from "@/lib/repack-ingest-gateway";
 import {
@@ -480,6 +481,76 @@ function absolutizeManifestUrls(manifest: string, baseUrl: string, internalOrigi
   return out.join("\n");
 }
 
+async function tryBrowserExtractorManifest(input: {
+  sourceUrl: string;
+  slotServer: SlotServerId;
+  internalOrigin: string;
+}) {
+  const extracted = await extractBrowserIngestCandidates({
+    sourceUrl: input.sourceUrl,
+    requestOrigin: input.internalOrigin,
+    slotServerId: input.slotServer,
+    timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
+  });
+  if (!extracted.ok || !Array.isArray(extracted.candidates) || !extracted.candidates.length) {
+    return {
+      ok: false as const,
+      error: extracted.error || "browser-extraction-empty",
+      ingestUrl: "",
+      referrerUrl: "",
+      targetUrl: "",
+      manifestBody: "",
+      finalUrl: "",
+    };
+  }
+
+  let lastError = extracted.error || "browser-extraction-empty";
+  for (const candidate of extracted.candidates) {
+    const ingestUrl = String(candidate.ingestUrl || "").trim();
+    const targetUrl = String(candidate.targetUrl || "").trim();
+    const referrerUrl = String(candidate.referrerUrl || targetUrl || input.sourceUrl).trim() || input.sourceUrl;
+    if (!isValidHttpUrl(ingestUrl)) continue;
+    if (
+      !isIngestCandidateAlignedWithSlotServer({
+        slotServerId: input.slotServer,
+        sourceUrl: input.sourceUrl,
+        ingestUrl,
+        probeReferrerUrl: referrerUrl,
+        probePlaylistUrl: targetUrl || ingestUrl,
+      })
+    ) {
+      continue;
+    }
+
+    const fetchUrl = toAbsoluteInternalUrl(ingestUrl, input.internalOrigin);
+    const manifest = await fetchStrictMediaManifest(fetchUrl);
+    if (!manifest.ok) {
+      lastError = manifest.error || lastError;
+      continue;
+    }
+
+    return {
+      ok: true as const,
+      error: "",
+      ingestUrl,
+      referrerUrl,
+      targetUrl: targetUrl || ingestUrl,
+      finalUrl: manifest.finalUrl || fetchUrl,
+      manifestBody: absolutizeManifestUrls(manifest.body, manifest.finalUrl || fetchUrl, input.internalOrigin),
+    };
+  }
+
+  return {
+    ok: false as const,
+    error: lastError || "browser-extraction-no-verified-manifest",
+    ingestUrl: "",
+    referrerUrl: "",
+    targetUrl: "",
+    manifestBody: "",
+    finalUrl: "",
+  };
+}
+
 async function fetchMatchRow(matchId: number) {
   const { data, error } = await supabaseAdmin
     .from("match-stream-app")
@@ -517,6 +588,26 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok: false, error: "source-not-allowed" }, { status: 502 });
   }
 
+  const browserExtracted = await tryBrowserExtractorManifest({
+    sourceUrl,
+    slotServer,
+    internalOrigin,
+  });
+  if (browserExtracted.ok) {
+    return new Response(browserExtracted.manifestBody, {
+      status: 200,
+      headers: {
+        "content-type": "application/vnd.apple.mpegurl; charset=utf-8",
+        "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
+        "x-repack-gateway": "1",
+        "x-repack-slot-server": String(slotServer),
+        "x-repack-source-url": sourceUrl,
+        "x-repack-upstream-url": browserExtracted.ingestUrl,
+        "x-repack-extractor": "browser",
+      },
+    });
+  }
+
   const resolved = await resolveRepackIngestUrl({
     sourceUrl,
     requestOrigin: internalOrigin,
@@ -540,7 +631,9 @@ export async function GET(req: Request) {
     return NextResponse.json(
       {
         ok: false,
-        error: `resolver-${resolved.reason}`,
+        error: browserExtracted.error
+          ? `browser-${browserExtracted.error};resolver-${resolved.reason}`
+          : `resolver-${resolved.reason}`,
         resolver: resolved.resolver,
       },
       { status: 502 }
