@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { supabaseAdmin } from "../../_supabase";
 import { extractBrowserIngestCandidates } from "@/lib/repack-browser-extractor";
 import { resolveInternalPlayerOrigin, toAbsoluteInternalUrl } from "@/lib/repack-ingest-gateway";
-import { extractPlayerv2BrowserCandidates } from "@/lib/repack-playerv2-browser";
+import { extractPlayerv2BrowserSnapshot } from "@/lib/repack-playerv2-browser";
 import {
   getSlotSourceUrlFromRow,
   isIngestCandidateAlignedWithSlotServer,
@@ -505,20 +505,32 @@ async function tryBrowserExtractorManifest(input: {
   });
   const mergedCandidates = Array.isArray(extracted.candidates) ? [...extracted.candidates] : [];
   if (input.slotServer === 2 && looksLikePlayerv2SourceUrl(input.sourceUrl)) {
-    const liveBrowserCandidates = await extractPlayerv2BrowserCandidates({
+    const liveBrowserCandidates = await extractPlayerv2BrowserSnapshot({
       sourceUrl: input.sourceUrl,
       requestOrigin: input.internalOrigin,
       timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
-    }).catch(() => ({ ok: false, candidates: [] as string[], error: "playerv2-browser-failed" }));
+    }).catch(() => ({
+      ok: false,
+      candidates: [] as Array<{
+        ingestUrl: string;
+        targetUrl: string;
+        referrerUrl: string;
+        manifestBody?: string;
+        manifestBaseUrl?: string;
+      }>,
+      error: "playerv2-browser-failed",
+    }));
     if (liveBrowserCandidates.ok && Array.isArray(liveBrowserCandidates.candidates) && liveBrowserCandidates.candidates.length) {
       const promoted = liveBrowserCandidates.candidates
-        .map((candidateUrl) => {
-          const ingestUrl = String(candidateUrl || "").trim();
-          const targetUrl = String(unwrapProxyTarget(ingestUrl) || ingestUrl).trim();
+        .map((candidate) => {
+          const ingestUrl = String(candidate.ingestUrl || "").trim();
+          const targetUrl = String(candidate.targetUrl || unwrapProxyTarget(ingestUrl) || ingestUrl).trim();
           return {
             ingestUrl,
-            referrerUrl: input.sourceUrl,
+            referrerUrl: String(candidate.referrerUrl || input.sourceUrl).trim() || input.sourceUrl,
             targetUrl,
+            manifestBody: String(candidate.manifestBody || "").trim() || undefined,
+            manifestBaseUrl: String(candidate.manifestBaseUrl || targetUrl || ingestUrl).trim() || undefined,
             score: Number.MAX_SAFE_INTEGER,
             via: "network-manifest" as const,
           };
