@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { supabaseAdmin } from "../../_supabase";
 import { extractBrowserIngestCandidates } from "@/lib/repack-browser-extractor";
 import { resolveInternalPlayerOrigin, toAbsoluteInternalUrl } from "@/lib/repack-ingest-gateway";
+import { extractPlayerv2BrowserCandidates } from "@/lib/repack-playerv2-browser";
 import {
   getSlotSourceUrlFromRow,
   isIngestCandidateAlignedWithSlotServer,
@@ -202,6 +203,34 @@ function resolveManifestUrl(raw: string, baseUrl: string) {
   try {
     const absolute = new URL(value, baseUrl).toString();
     return isValidHttpUrl(absolute) ? absolute : "";
+  } catch {
+    return "";
+  }
+}
+
+function safeDecodeURIComponent(value: string) {
+  try {
+    return decodeURIComponent(String(value || ""));
+  } catch {
+    return String(value || "");
+  }
+}
+
+function looksLikePlayerv2SourceUrl(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    return String(new URL(rawUrl).pathname || "").toLowerCase().includes("/playerv2.php");
+  } catch {
+    return false;
+  }
+}
+
+function unwrapProxyTarget(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return "";
+  try {
+    const parsed = new URL(rawUrl);
+    if (!String(parsed.pathname || "").toLowerCase().includes("/api/embed-proxy")) return parsed.toString();
+    return String(safeDecodeURIComponent(parsed.searchParams.get("url") || "") || "").trim();
   } catch {
     return "";
   }
@@ -474,8 +503,40 @@ async function tryBrowserExtractorManifest(input: {
     slotServerId: input.slotServer,
     timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
   });
-  const candidatesFound = Array.isArray(extracted.candidates) ? extracted.candidates.length : 0;
-  if (!extracted.ok || !Array.isArray(extracted.candidates) || !extracted.candidates.length) {
+  const mergedCandidates = Array.isArray(extracted.candidates) ? [...extracted.candidates] : [];
+  if (input.slotServer === 2 && looksLikePlayerv2SourceUrl(input.sourceUrl)) {
+    const liveBrowserCandidates = await extractPlayerv2BrowserCandidates({
+      sourceUrl: input.sourceUrl,
+      requestOrigin: input.internalOrigin,
+      timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
+    }).catch(() => ({ ok: false, candidates: [] as string[], error: "playerv2-browser-failed" }));
+    if (liveBrowserCandidates.ok && Array.isArray(liveBrowserCandidates.candidates) && liveBrowserCandidates.candidates.length) {
+      const promoted = liveBrowserCandidates.candidates
+        .map((candidateUrl) => {
+          const ingestUrl = String(candidateUrl || "").trim();
+          const targetUrl = String(unwrapProxyTarget(ingestUrl) || ingestUrl).trim();
+          return {
+            ingestUrl,
+            referrerUrl: input.sourceUrl,
+            targetUrl,
+            score: Number.MAX_SAFE_INTEGER,
+            via: "network-manifest" as const,
+          };
+        })
+        .filter((candidate) => isValidHttpUrl(candidate.ingestUrl));
+      if (promoted.length) {
+        const deduped = new Map<string, (typeof mergedCandidates)[number]>();
+        for (const candidate of [...promoted, ...mergedCandidates]) {
+          const key = String(candidate.ingestUrl || "").trim().toLowerCase();
+          if (!key || deduped.has(key)) continue;
+          deduped.set(key, candidate);
+        }
+        mergedCandidates.splice(0, mergedCandidates.length, ...Array.from(deduped.values()));
+      }
+    }
+  }
+  const candidatesFound = mergedCandidates.length;
+  if (!candidatesFound) {
     return {
       ok: false as const,
       error: extracted.error || "browser-extraction-empty",
@@ -492,7 +553,7 @@ async function tryBrowserExtractorManifest(input: {
 
   let lastError = extracted.error || "browser-extraction-empty";
   let candidatesTried = 0;
-  for (const candidate of extracted.candidates) {
+  for (const candidate of mergedCandidates) {
     const ingestUrl = String(candidate.ingestUrl || "").trim();
     const targetUrl = String(candidate.targetUrl || "").trim();
     const referrerUrl = String(candidate.referrerUrl || targetUrl || input.sourceUrl).trim() || input.sourceUrl;
