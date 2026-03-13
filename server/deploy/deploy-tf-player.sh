@@ -57,8 +57,10 @@ echo 'NEXT_PUBLIC_IFRAME_PLAYER_ORIGIN=' >> "$ENV_FILE"
 npm ci --no-audit --no-fund
 npm run build
 pm2 restart tf-player --update-env || PORT=3000 NODE_ENV=production pm2 start npm --name tf-player -- start
-pm2 restart tf-repackager --update-env || NODE_ENV=production pm2 start npm --name tf-repackager -- run repackager:start
-pm2 restart tf-repack-prewarm --update-env || NODE_ENV=production pm2 start npm --name tf-repack-prewarm -- run repack-prewarm:start
+pm2 delete tf-repackager >/dev/null 2>&1 || true
+NODE_ENV=production pm2 start server/repackager/index.js --name tf-repackager --cwd "$APP_DIR"
+pm2 delete tf-repack-prewarm >/dev/null 2>&1 || true
+NODE_ENV=production pm2 start server/prewarm/index.js --name tf-repack-prewarm --cwd "$APP_DIR"
 pm2 save
 sudo systemctl start nginx || true
 
