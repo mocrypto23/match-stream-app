@@ -437,6 +437,32 @@ function absolutizeManifestUrls(
   return out.join("\n");
 }
 
+function manifestContainsUnsafeInternalUrls(manifest: string, baseUrl: string, internalOrigin: string) {
+  const inspectUrl = (raw: string) => {
+    const absolute = resolveManifestUrl(raw, baseUrl);
+    if (!absolute || !absolute.startsWith(internalOrigin)) return false;
+    try {
+      const pathname = String(new URL(absolute).pathname || "").toLowerCase();
+      return !pathname.includes("/api/embed-proxy");
+    } catch {
+      return true;
+    }
+  };
+
+  for (const line of String(manifest || "").split(/\r?\n/)) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) continue;
+    if (!trimmed.startsWith("#")) {
+      if (inspectUrl(trimmed)) return true;
+      continue;
+    }
+    for (const match of trimmed.matchAll(/URI="([^"]+)"/gi)) {
+      if (inspectUrl(String(match[1] || "").trim())) return true;
+    }
+  }
+  return false;
+}
+
 async function tryBrowserExtractorManifest(input: {
   sourceUrl: string;
   slotServer: SlotServerId;
@@ -486,7 +512,11 @@ async function tryBrowserExtractorManifest(input: {
     }
 
     candidatesTried += 1;
-    if (candidateManifestBody && looksLikeManifestResponse("application/vnd.apple.mpegurl", candidateManifestBody, candidateManifestBaseUrl)) {
+    if (
+      candidateManifestBody &&
+      looksLikeManifestResponse("application/vnd.apple.mpegurl", candidateManifestBody, candidateManifestBaseUrl) &&
+      !manifestContainsUnsafeInternalUrls(candidateManifestBody, candidateManifestBaseUrl || ingestUrl, input.internalOrigin)
+    ) {
       const manifestBaseUrl = candidateManifestBaseUrl || ingestUrl;
       if (hasMediaSegments(candidateManifestBody, manifestBaseUrl)) {
         return {
