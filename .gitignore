@@ -60,3 +60,10 @@ pnpm-debug.log*
 # Local SSH helpers (temporary binaries)
 plink.exe
 pscp.exe
+
+# Local scratch files
+/.tmp-ssh/
+/.tools/
+/.vscode/
+/remote-diag.cmd
+/tmp-*
