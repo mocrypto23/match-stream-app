@@ -201,6 +201,17 @@ function isDirectCrawlPreferred(rawUrl: string) {
   }
 }
 
+function shouldUseStableProxyPlayback(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  if (isLikelyAlbaLandingUrl(rawUrl)) return true;
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    return hostMatchesAnySuffix(host, ["sportsurges.cc", "livekora.vip", "koooralive.click", "kooraxx.com"]);
+  } catch {
+    return false;
+  }
+}
+
 function buildSlugVariants(rawSlug: string) {
   const slug = String(rawSlug || "").trim().replace(/^\/+|\/+$/g, "");
   if (!slug) return [] as string[];
@@ -803,13 +814,14 @@ class LiveEmbedSession {
     this.sourceUrl = normalizeHttpUrl(input.sourceUrl);
     this.requestOrigin = normalizeHttpUrl(input.requestOrigin);
     this.slotServerId = input.slotServerId;
-    this.playbackUrl = isDirectCrawlPreferred(this.sourceUrl)
-      ? this.sourceUrl
-      : buildPlaybackProxyUrl({
+    const shouldProxyPlayback = shouldUseStableProxyPlayback(this.sourceUrl) || !isDirectCrawlPreferred(this.sourceUrl);
+    this.playbackUrl = shouldProxyPlayback
+      ? buildPlaybackProxyUrl({
           sourceUrl: this.sourceUrl,
           requestOrigin: this.requestOrigin,
           referrerUrl: this.sourceUrl,
-        });
+        })
+      : this.sourceUrl;
     this.fallbackReferrer = this.sourceUrl;
     this.key = `${canonicalizeUrl(this.sourceUrl)}|${canonicalizeUrl(this.requestOrigin)}|${String(this.slotServerId || "")}`;
   }
@@ -1022,13 +1034,14 @@ class LiveEmbedSession {
       visited.add(key);
       crawledPages += 1;
 
-      const pageFetchUrl = isDirectCrawlPreferred(next.pageUrl)
-        ? next.pageUrl
-        : buildPlaybackProxyUrl({
+      const shouldProxyPageFetch = shouldUseStableProxyPlayback(next.pageUrl) || !isDirectCrawlPreferred(next.pageUrl);
+      const pageFetchUrl = shouldProxyPageFetch
+        ? buildPlaybackProxyUrl({
             sourceUrl: next.pageUrl,
             requestOrigin: this.requestOrigin,
             referrerUrl: next.referrerUrl,
-          });
+          })
+        : next.pageUrl;
       if (!pageFetchUrl) continue;
 
       const fetched = await fetchTextDocument({
