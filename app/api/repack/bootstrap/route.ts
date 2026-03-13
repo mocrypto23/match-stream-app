@@ -477,13 +477,13 @@ export async function POST(req: Request) {
     results.push(input);
   };
 
-  for (const uiServer of uiServers) {
+  const processUiServer = async (uiServer: UiServerId): Promise<BootstrapServerResult> => {
     const slotServer = getSlotServerIdForUiServer(uiServer);
     const rawSourceUrl = String(getSlotSourceUrlFromRow(row, slotServer) || "").trim();
     const sourceUrl = await maybeHydrateSlotSourceUrl(slotServer, rawSourceUrl);
 
     if (mode !== "r2_strict") {
-      pushResult({
+      return {
         uiServer,
         slotServer,
         accepted: false,
@@ -497,12 +497,11 @@ export async function POST(req: Request) {
           ingestUrl: null,
         },
         probeEvidence: null,
-      });
-      continue;
+      };
     }
 
     if (!sourceUrl || !isValidHttpUrl(sourceUrl)) {
-      pushResult({
+      return {
         uiServer,
         slotServer,
         accepted: false,
@@ -516,12 +515,11 @@ export async function POST(req: Request) {
           ingestUrl: null,
         },
         probeEvidence: null,
-      });
-      continue;
+      };
     }
 
     if (!isAllowedSourceForSlotServer(slotServer, sourceUrl)) {
-      pushResult({
+      return {
         uiServer,
         slotServer,
         accepted: false,
@@ -535,13 +533,12 @@ export async function POST(req: Request) {
           ingestUrl: null,
         },
         probeEvidence: null,
-      });
-      continue;
+      };
     }
 
     const capability = getServerCapability(slotServer);
     if (!capability?.repackEligible) {
-      pushResult({
+      return {
         uiServer,
         slotServer,
         accepted: false,
@@ -555,12 +552,11 @@ export async function POST(req: Request) {
           ingestUrl: null,
         },
         probeEvidence: null,
-      });
-      continue;
+      };
     }
 
     if (!repackFlags.enabled) {
-      pushResult({
+      return {
         uiServer,
         slotServer,
         accepted: false,
@@ -574,12 +570,11 @@ export async function POST(req: Request) {
           ingestUrl: null,
         },
         probeEvidence: null,
-      });
-      continue;
+      };
     }
 
     if (!repackFlags.repackServers.has(slotServer)) {
-      pushResult({
+      return {
         uiServer,
         slotServer,
         accepted: false,
@@ -593,8 +588,7 @@ export async function POST(req: Request) {
           ingestUrl: null,
         },
         probeEvidence: null,
-      });
-      continue;
+      };
     }
 
     const gatewayIngestUrl = buildRepackGatewayManifestUrl({
@@ -604,7 +598,7 @@ export async function POST(req: Request) {
     });
     const verifiedGateway = await verifyGatewayManifest(gatewayIngestUrl);
     if (!verifiedGateway.ok) {
-      pushResult({
+      return {
         uiServer,
         slotServer,
         accepted: false,
@@ -618,8 +612,7 @@ export async function POST(req: Request) {
           ingestUrl: gatewayIngestUrl,
         },
         probeEvidence: null,
-      });
-      continue;
+      };
     }
 
     const upstream = await postSeedToAgent({
@@ -634,7 +627,7 @@ export async function POST(req: Request) {
     const accepted = Boolean(upstream.body?.accepted);
     const reason = String(upstream.body?.reason || (accepted ? "ok" : "seed-rejected"));
 
-    pushResult({
+    return {
       uiServer,
       slotServer,
       accepted,
@@ -652,7 +645,12 @@ export async function POST(req: Request) {
         ingestUrl: gatewayIngestUrl,
       },
       probeEvidence: null,
-    });
+    };
+  };
+
+  const processedResults = await Promise.all(uiServers.map((uiServer) => processUiServer(uiServer)));
+  for (const result of processedResults) {
+    pushResult(result);
   }
 
   const r2Status = await buildMatchR2Status({
