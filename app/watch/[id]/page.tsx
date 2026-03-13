@@ -6351,9 +6351,12 @@ export default function WatchPage() {
       const statusEntry = strictR2StatusBySlot.get(slotServer);
       const playlistUrl = String(statusEntry?.playlistUrl || "").trim();
       const terminalReason = String(statusEntry?.reason || "");
+      const isGraceReady =
+        String(statusEntry?.resolveReason || "").trim() === "recent-ready-grace" ||
+        terminalReason.startsWith("r2-ready-grace:");
       const statusUpdatedAtMs = Number.parseInt(String(new Date(statusEntry?.updatedAt || "").getTime()), 10);
       const hasRecentStatus = Number.isFinite(statusUpdatedAtMs) && Date.now() - statusUpdatedAtMs < STRICT_BOOTSTRAP_RECENT_WINDOW_MS;
-      if (statusEntry?.state === "ready" && isValidHttpUrl(playlistUrl)) {
+      if (statusEntry?.state === "ready" && isValidHttpUrl(playlistUrl) && !isGraceReady) {
         markStrictBootstrapPending([slotServer], false);
         markStrictBootstrapAttempted([slotServer]);
         return;
