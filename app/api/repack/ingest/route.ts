@@ -575,7 +575,13 @@ async function tryBrowserExtractorManifest(input: {
       }
     }
   }
-  const candidatesFound = mergedCandidates.length;
+  const isSlot2Playerv2 = input.slotServer === 2 && looksLikePlayerv2SourceUrl(input.sourceUrl);
+  const manifestBodyCandidates = mergedCandidates.filter((candidate) => String(candidate.manifestBody || "").trim());
+  const orderedCandidates =
+    isSlot2Playerv2 && manifestBodyCandidates.length
+      ? [...manifestBodyCandidates, ...mergedCandidates.filter((candidate) => !String(candidate.manifestBody || "").trim())]
+      : mergedCandidates;
+  const candidatesFound = orderedCandidates.length;
   if (!candidatesFound) {
     return {
       ok: false as const,
@@ -593,7 +599,7 @@ async function tryBrowserExtractorManifest(input: {
 
   let lastError = extracted.error || "browser-extraction-empty";
   let candidatesTried = 0;
-  for (const candidate of mergedCandidates) {
+  for (const candidate of orderedCandidates) {
     const ingestUrl = String(candidate.ingestUrl || "").trim();
     const targetUrl = String(candidate.targetUrl || "").trim();
     const referrerUrl = String(candidate.referrerUrl || targetUrl || input.sourceUrl).trim() || input.sourceUrl;
@@ -633,6 +639,11 @@ async function tryBrowserExtractorManifest(input: {
           manifestBody: absolutizeManifestUrls(candidateManifestBody, manifestBaseUrl, input.internalOrigin, referrerUrl),
         };
       }
+    }
+
+    if (isSlot2Playerv2 && manifestBodyCandidates.length && !candidateManifestBody) {
+      lastError = lastError || "browser-manifest-body-missing";
+      continue;
     }
 
     const fetchUrl = toAbsoluteInternalUrl(ingestUrl, input.internalOrigin);

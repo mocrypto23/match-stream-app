@@ -224,6 +224,13 @@ class LivePlayerv2Session {
     return sortCandidates(Array.from(this.candidates.values())).slice(0, SESSION_MAX_CANDIDATES);
   }
 
+  snapshotCandidatesWithManifestBody(maxAgeMs: number, now = Date.now()) {
+    return this.snapshotCandidates().filter((candidate) => {
+      if (!candidate.manifestBody) return false;
+      return Math.max(0, now - candidate.seenAt) <= maxAgeMs;
+    });
+  }
+
   rememberCandidate(input: {
     targetUrl: string;
     referrerUrl?: string | null;
@@ -408,8 +415,18 @@ class LivePlayerv2Session {
       this.touch();
       const now = Date.now();
       const candidates = this.snapshotCandidates();
+      const freshManifestCandidates = this.snapshotCandidatesWithManifestBody(SESSION_STALE_MS, now);
+      const reusableManifestCandidates = this.snapshotCandidatesWithManifestBody(SESSION_STALE_RETURN_MAX_AGE_MS, now);
       const newestAgeMs = this.newestCandidateAgeMs(now);
-      if (candidates.length && newestAgeMs !== null && newestAgeMs <= SESSION_STALE_MS) {
+      if (freshManifestCandidates.length) {
+        return { ok: true, candidates, error: "" };
+      }
+      if (
+        reusableManifestCandidates.length &&
+        candidates.length &&
+        newestAgeMs !== null &&
+        newestAgeMs <= SESSION_PREEMPTIVE_REFRESH_MS
+      ) {
         return { ok: true, candidates, error: "" };
       }
       const shouldReload =
@@ -428,7 +445,11 @@ class LivePlayerv2Session {
     }
 
     const staleCandidates = this.snapshotCandidates();
+    const staleManifestCandidates = this.snapshotCandidatesWithManifestBody(SESSION_STALE_RETURN_MAX_AGE_MS);
     const newestAgeMs = this.newestCandidateAgeMs();
+    if (staleManifestCandidates.length) {
+      return { ok: true, candidates: staleCandidates, error: "" };
+    }
     if (staleCandidates.length && newestAgeMs !== null && newestAgeMs <= SESSION_STALE_RETURN_MAX_AGE_MS) {
       return { ok: true, candidates: staleCandidates, error: "" };
     }
