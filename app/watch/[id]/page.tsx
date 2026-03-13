@@ -112,9 +112,9 @@ const P2P_PROFILE = (() => {
   return "balanced" as const;
 })();
 const AUTO_RECOVERY_SCHEDULE_MS = [5000, 10000, 20000, 30000] as const;
-const STRICT_R2_BACKOFF_MS = [2000, 4000, 8000] as const;
-const STRICT_R2_BREAKER_OPEN_MS = 25_000;
-const STRICT_R2_READY_URL_GRACE_MS = 45_000;
+const STRICT_R2_BACKOFF_MS = [2000, 4000, 8000, 15000] as const;
+const STRICT_R2_BREAKER_OPEN_MS = 30_000;
+const STRICT_R2_READY_URL_GRACE_MS = 90_000;
 const STRICT_BOOTSTRAP_RECENT_WINDOW_MS = 20_000;
 const NETWORK_FATAL_WINDOW_MS = 12_000;
 const RESOLVE_COOLDOWN_MS = 1500;
@@ -1069,6 +1069,21 @@ function buildClientRepackFlags(matchRepack: MatchRow["repack"]): ClientRepackFl
     publicBaseUrl:
       String(matchRepack?.publicBaseUrl || "").trim().replace(/\/+$/, "") || fallback.publicBaseUrl,
   };
+}
+
+function isTransientStrictR2State(entry?: R2StatusServerEntry | null) {
+  if (!entry) return false;
+  if (entry.state === "ready" || entry.state === "warming") return true;
+  if (entry.state !== "down") return false;
+  const combined = `${String(entry.reason || "").toLowerCase()} ${String(entry.resolveReason || "").toLowerCase()}`;
+  return !(
+    combined.includes("missing-source") ||
+    combined.includes("source-not-allowed") ||
+    combined.includes("blocked-outside-window") ||
+    combined.includes("seed-rejected") ||
+    combined.includes("early-stop-finished") ||
+    combined.includes("invalid-match-id")
+  );
 }
 
 function getOrCreateViewerSessionId() {
@@ -5793,9 +5808,7 @@ export default function WatchPage() {
           setStrictRecoveryState("breaker_open");
           setStrictBreakerUntilMs(breakerUntil);
           strictRetryStepRef.current = STRICT_R2_BACKOFF_MS.length;
-          applyCandidatesPreservingSelection([]);
-          setResolverError(NO_STREAM_SELECTED_SERVER_MESSAGE);
-          setPlayerError("تعذر تشغيل R2 الآن. تم إيقاف المحاولات مؤقتًا، اضغط إعادة المحاولة.");
+          setPlayerError("تعذر تشغيل R2 الآن مؤقتًا... سنحافظ على آخر حالة مستقرة ونعاود المحاولة تلقائيًا.");
           pushDiag(`strict breaker open (${reason})`);
           strictBreakerTimerRef.current = window.setTimeout(() => {
             strictBreakerTimerRef.current = null;
@@ -6225,14 +6238,8 @@ export default function WatchPage() {
   }, [validServers, selectedServer]);
   useEffect(() => {
     if (!R2_STRICT_MODE) return;
-    const readyServers = serverOptions.filter((s) => {
-      if (!s.url || !isValidHttpUrl(s.url)) return false;
-      const entry = strictR2StatusBySlot.get(s.n);
-      return entry?.state === "ready";
-    });
-    if (!readyServers.length) return;
-    if (readyServers.some((s) => s.n === selectedServer)) return;
-    setSelectedServer(readyServers[0].n);
+    // Keep the user's chosen server pinned in strict mode. Auto-switching makes
+    // short-lived R2 warm/degrade transitions look like hard failures.
   }, [serverOptions, selectedServer, strictR2StatusBySlot]);
 
   useEffect(() => {
@@ -6299,7 +6306,7 @@ export default function WatchPage() {
     !selectedReadyUrl &&
     !!cachedStrictReady?.url &&
     Date.now() - cachedStrictReady.updatedAt <= STRICT_R2_READY_URL_GRACE_MS &&
-    (selectedStrictStatus?.state === "warming" || selectedStrictStatus?.state === "ready");
+    isTransientStrictR2State(selectedStrictStatus);
   const selectedUrl = canReuseStrictCachedUrl ? String(cachedStrictReady?.url || "") : selectedReadyUrl;
   const selectedResolveUrl = useMemo(() => {
     if (!R2_STRICT_MODE || !isRepackPlaylistUrl(selectedUrl)) return selectedUrl;
@@ -7795,6 +7802,12 @@ export default function WatchPage() {
         setSelectedCandidate(nextIndex);
         setPlayerError(`تعثر المصدر الحالي (${reason})، جاري التحويل تلقائيًا للمصدر التالي.`);
       } else {
+        if (R2_STRICT_MODE) {
+          setPlayerError("انقطاع مؤقت في R2... جاري إعادة المزامنة.");
+          scheduleResolveRecovery(`player-exhausted:${reason}`, true);
+          hidePlayerLoading();
+          return;
+        }
         if (selectedServer === 5) {
           const elapsedMs = Date.now() - playbackAttemptStartedAt;
           const hasVisual = server5VisualStarted || hasServer5VisualStart();
@@ -8536,8 +8549,7 @@ export default function WatchPage() {
         ? `جاري تجهيز البث الآن. ${prematchHalfHourNotice}`
         : prematchHalfHourNotice
       : "";
-  const shouldShowPrematchPendingNotice =
-    !shouldBlockStream && !selectedHlsUrl && !resolverLoading && !!prematchPendingNotice;
+  const shouldShowPrematchPendingNotice = !selectedHlsUrl && !!prematchPendingNotice;
   const noStreamLabel = selectedUrl ? NO_STREAM_SELECTED_SERVER_MESSAGE : "لا يوجد بث";
   const home = match?.home_team ?? "الفريق الأول";
   const away = match?.away_team ?? "الفريق الثاني";

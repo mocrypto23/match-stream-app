@@ -239,15 +239,41 @@ function unwrapProxyTarget(rawUrl: string) {
 function looksLikeManifestResponse(contentType: string, body: string, finalUrl: string) {
   const ct = String(contentType || "").toLowerCase();
   const text = String(body || "");
-  const url = String(finalUrl || "").toLowerCase();
   if (/^\s*#extm3u/m.test(text)) return true;
   if (ct.includes("application/vnd.apple.mpegurl") || ct.includes("application/x-mpegurl")) return true;
-  return url.includes(".m3u8");
+  return isLikelyChildPlaylistUrl(finalUrl);
 }
 
 function isLikelyChildPlaylistUrl(rawUrl: string) {
-  const value = String(rawUrl || "").toLowerCase();
-  return value.includes(".m3u8");
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    const pathname = String(parsed.pathname || "").toLowerCase();
+    const search = String(parsed.search || "").toLowerCase();
+    const combined = `${pathname}${search}`;
+    if (/\.(?:ts|m4s|m4a|mp4|aac|mp3|vtt)(?:$|[?#])/i.test(pathname)) return false;
+    if (combined.includes(".mpd")) return false;
+    if (combined.includes(".m3u8")) return true;
+    if (
+      pathname.includes("/kooora/") ||
+      pathname.includes("/playlist/") ||
+      pathname.includes("/manifest/") ||
+      pathname.includes("/stream/") ||
+      pathname.includes("/live/") ||
+      pathname.includes("/hls/")
+    ) {
+      return true;
+    }
+    return (
+      search.includes("token=") ||
+      search.includes("sid=") ||
+      search.includes("session") ||
+      search.includes("playlist") ||
+      search.includes("m3u8")
+    );
+  } catch {
+    return false;
+  }
 }
 
 function hasMediaSegments(manifest: string, baseUrl: string) {
@@ -267,7 +293,6 @@ function hasMediaSegments(manifest: string, baseUrl: string) {
     const absolute = resolveManifestUrl(trimmed, baseUrl);
     if (!absolute) continue;
     if (previousExtInf) return true;
-    if (!isLikelyChildPlaylistUrl(absolute)) return true;
     previousExtInf = false;
   }
   return false;

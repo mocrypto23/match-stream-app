@@ -307,7 +307,6 @@ function hasMediaSegments(manifestText: string, baseUrl: string) {
     const absolute = resolveManifestUrl(trimmed, baseUrl);
     if (!absolute) continue;
     if (previousExtInf) return true;
-    if (!looksLikeManifestUrl(absolute)) return true;
     previousExtInf = false;
   }
   return false;
@@ -354,10 +353,9 @@ function pickVariantManifestUrls(manifestText: string, baseUrl: string, maxItems
 function looksLikeManifestResponse(contentType: string, body: string, finalUrl: string) {
   const ct = String(contentType || "").toLowerCase();
   const text = String(body || "");
-  const url = String(finalUrl || "").toLowerCase();
   if (/^\s*#extm3u/m.test(text)) return true;
   if (ct.includes("application/vnd.apple.mpegurl") || ct.includes("application/x-mpegurl")) return true;
-  return url.includes(".m3u8");
+  return looksLikeManifestUrl(finalUrl);
 }
 
 function buildPlaybackProxyUrl(input: {

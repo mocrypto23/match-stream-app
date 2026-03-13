@@ -15,12 +15,13 @@ import { computeMatchWindowState, getMatchWindowConfig, parseMatchStartMs } from
 const DEFAULT_R2_PROBE_TIMEOUT_MS = 2400;
 const DEFAULT_SEGMENT_PROBE_TIMEOUT_MS = 3200;
 const DEFAULT_SEED_WARMING_WINDOW_MS = 120_000;
-const DEFAULT_MAX_SEED_WARMING_MS = 18_000;
-const DEFAULT_READY_GRACE_MS = 10_000;
-const DEFAULT_STALE_SEQUENCE_GUARD_MS = 30_000;
-const DEFAULT_AGENT_READY_PUBLISH_GRACE_MS = 18_000;
-const DEFAULT_AGENT_WARMING_PUBLISH_GRACE_MS = 45_000;
-const DEFAULT_AGENT_SEED_GRACE_MS = 25_000;
+const DEFAULT_MAX_SEED_WARMING_MS = 30_000;
+const DEFAULT_READY_GRACE_MS = 25_000;
+const DEFAULT_STALE_SEQUENCE_GUARD_MS = 45_000;
+const DEFAULT_AGENT_READY_PUBLISH_GRACE_MS = 28_000;
+const DEFAULT_AGENT_WARMING_PUBLISH_GRACE_MS = 75_000;
+const DEFAULT_AGENT_SEED_GRACE_MS = 40_000;
+const DEFAULT_AGENT_DEGRADED_HOLD_MS = 90_000;
 const SEQUENCE_STATE_TTL_MS = 10 * 60 * 1000;
 const STALE_SEQUENCE_CONFIRMATION_COUNT = 3;
 
@@ -118,8 +119,28 @@ function deriveAgentSignal(job: AgentDiagJob | null, nowMs: number) {
   const readyPublishGraceMs = deriveAgentPublishGraceMs(job, DEFAULT_AGENT_READY_PUBLISH_GRACE_MS);
   const warmingPublishGraceMs = deriveAgentPublishGraceMs(job, DEFAULT_AGENT_WARMING_PUBLISH_GRACE_MS);
   const seedGraceMs = Math.max(DEFAULT_AGENT_SEED_GRACE_MS, Math.floor(readyPublishGraceMs * 0.8));
+  const degradedHoldMs = Math.max(DEFAULT_AGENT_DEGRADED_HOLD_MS, warmingPublishGraceMs);
 
   if (state === "degraded") {
+    if (lastPublishAgeMs !== null && lastPublishAgeMs <= readyPublishGraceMs) {
+      return {
+        state: "ready" as R2ServerState,
+        reason: `agent-degraded-recent-publish:${String(job.degradedReason || "unknown").trim() || "unknown"}`,
+        resolverState: "ok" as const,
+        resolveReason: "agent-degraded-recent-publish",
+      };
+    }
+    if (
+      (lastPublishAgeMs !== null && lastPublishAgeMs <= degradedHoldMs) ||
+      (lastSeedAgeMs !== null && lastSeedAgeMs <= seedGraceMs)
+    ) {
+      return {
+        state: "warming" as R2ServerState,
+        reason: `agent-degraded-hold:${String(job.degradedReason || "unknown").trim() || "unknown"}`,
+        resolverState: "ok" as const,
+        resolveReason: "agent-degraded-hold",
+      };
+    }
     return {
       state: "down" as R2ServerState,
       reason: `agent-degraded:${String(job.degradedReason || "unknown").trim() || "unknown"}`,

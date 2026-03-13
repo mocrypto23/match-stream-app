@@ -121,10 +121,9 @@ function inferContentTypeFromName(name, fallback = "application/octet-stream") {
 function looksLikeManifestResponse(contentType, body, finalUrl) {
   const ct = String(contentType || "").toLowerCase();
   const text = String(body || "");
-  const url = String(finalUrl || "").toLowerCase();
   if (/^\s*#extm3u/m.test(text)) return true;
   if (ct.includes("application/vnd.apple.mpegurl") || ct.includes("application/x-mpegurl")) return true;
-  return url.includes(".m3u8");
+  return isLikelyChildPlaylistUrl(finalUrl);
 }
 
 function parseTargetDurationSecFromPlaylist(manifestText) {
@@ -182,7 +181,8 @@ function isLikelyChildPlaylistUrl(rawUrl) {
       pathname.includes("/live/") ||
       pathname.includes("/playlist/") ||
       pathname.includes("/manifest/") ||
-      pathname.includes("/stream/")
+      pathname.includes("/stream/") ||
+      pathname.includes("/kooora/")
     ) {
       return true;
     }
@@ -254,7 +254,6 @@ function hasMediaSegments(manifestText, baseUrl) {
     const absolute = resolveManifestUrl(trimmed, baseUrl);
     if (!absolute) continue;
     if (previousExtInf) return true;
-    if (!isLikelyChildPlaylistUrl(absolute)) return true;
     previousExtInf = false;
   }
   return false;

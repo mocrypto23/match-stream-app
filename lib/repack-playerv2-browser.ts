@@ -13,6 +13,13 @@ const SESSION_STALE_MS = Math.max(
   4_000,
   Number.parseInt(String(process.env.REPACK_PLAYERV2_SESSION_STALE_MS || "18000"), 10) || 18_000
 );
+const SESSION_PREEMPTIVE_REFRESH_MS = Math.max(
+  4_000,
+  Math.min(
+    SESSION_STALE_MS - 2_000,
+    Number.parseInt(String(process.env.REPACK_PLAYERV2_SESSION_PREEMPTIVE_REFRESH_MS || "12000"), 10) || 12_000
+  )
+);
 const SESSION_WAIT_AFTER_GOTO_MS = Math.max(
   1_000,
   Number.parseInt(String(process.env.REPACK_PLAYERV2_BROWSER_WAIT_MS || "3500"), 10) || 3_500
@@ -28,6 +35,10 @@ const SESSION_MAX_COUNT = Math.max(
 const SESSION_MAX_CANDIDATES = Math.max(
   4,
   Number.parseInt(String(process.env.REPACK_PLAYERV2_SESSION_MAX_CANDIDATES || "24"), 10) || 24
+);
+const SESSION_STALE_RETURN_MAX_AGE_MS = Math.max(
+  SESSION_STALE_MS + 6_000,
+  Number.parseInt(String(process.env.REPACK_PLAYERV2_SESSION_STALE_RETURN_MAX_AGE_MS || "42000"), 10) || 42_000
 );
 
 type LiveCandidate = {
@@ -198,6 +209,15 @@ class LivePlayerv2Session {
 
   hasFreshCandidate(now = Date.now()) {
     return Array.from(this.candidates.values()).some((candidate) => now - candidate.seenAt <= SESSION_STALE_MS);
+  }
+
+  newestCandidateAgeMs(now = Date.now()) {
+    let newestAgeMs: number | null = null;
+    for (const candidate of this.candidates.values()) {
+      const ageMs = Math.max(0, now - candidate.seenAt);
+      newestAgeMs = newestAgeMs === null ? ageMs : Math.min(newestAgeMs, ageMs);
+    }
+    return newestAgeMs;
   }
 
   snapshotCandidates() {
@@ -386,11 +406,18 @@ class LivePlayerv2Session {
     const deadline = Date.now() + Math.max(2_500, Math.min(25_000, timeoutMs));
     while (Date.now() < deadline) {
       this.touch();
+      const now = Date.now();
       const candidates = this.snapshotCandidates();
-      if (candidates.length && this.hasFreshCandidate()) {
+      const newestAgeMs = this.newestCandidateAgeMs(now);
+      if (candidates.length && newestAgeMs !== null && newestAgeMs <= SESSION_STALE_MS) {
         return { ok: true, candidates, error: "" };
       }
-      if (!this.hasFreshCandidate() && Date.now() - this.lastReloadAt >= SESSION_RELOAD_COOLDOWN_MS) {
+      const shouldReload =
+        !candidates.length ||
+        newestAgeMs === null ||
+        newestAgeMs >= SESSION_PREEMPTIVE_REFRESH_MS ||
+        !this.hasFreshCandidate(now);
+      if (shouldReload && now - this.lastReloadAt >= SESSION_RELOAD_COOLDOWN_MS) {
         await this.maybeReload(timeoutMs).catch(() => {});
       }
       if (this.page && !this.page.isClosed?.()) {
@@ -401,7 +428,8 @@ class LivePlayerv2Session {
     }
 
     const staleCandidates = this.snapshotCandidates();
-    if (staleCandidates.length) {
+    const newestAgeMs = this.newestCandidateAgeMs();
+    if (staleCandidates.length && newestAgeMs !== null && newestAgeMs <= SESSION_STALE_RETURN_MAX_AGE_MS) {
       return { ok: true, candidates: staleCandidates, error: "" };
     }
     return { ok: false, candidates: [], error: this.lastError || "browser-extraction-empty" };
