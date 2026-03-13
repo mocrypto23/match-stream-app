@@ -16,10 +16,10 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const DEFAULT_RESOLVE_TIMEOUT_MS =
-  Math.max(12_000, Number.parseInt(String(process.env.REPACK_RESOLVE_TIMEOUT_MS || "12000"), 10) || 12_000);
+  Math.max(20_000, Number.parseInt(String(process.env.REPACK_RESOLVE_TIMEOUT_MS || "20000"), 10) || 20_000);
 const DEFAULT_FETCH_TIMEOUT_MS = Math.max(
-  12_000,
-  Number.parseInt(String(process.env.REPACK_AGENT_PREFLIGHT_TIMEOUT_MS || "12000"), 10) || 12_000
+  20_000,
+  Number.parseInt(String(process.env.REPACK_AGENT_PREFLIGHT_TIMEOUT_MS || "20000"), 10) || 20_000
 );
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
