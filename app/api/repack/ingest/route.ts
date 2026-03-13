@@ -453,8 +453,9 @@ function absolutizeManifestUrls(
   const lines = String(manifest || "").split(/\r?\n/);
   const out: string[] = [];
   const stableReferrer = isValidHttpUrl(String(referrerUrl || "").trim()) ? String(referrerUrl || "").trim() : "";
+  const manifestReferrer = isValidHttpUrl(baseUrl) ? baseUrl : stableReferrer;
 
-  const absolutize = (raw: string) => {
+  const absolutize = (raw: string, overrideReferrer?: string) => {
     const value = String(raw || "").trim();
     if (!value || /^data:/i.test(value)) return value;
     try {
@@ -467,7 +468,7 @@ function absolutizeManifestUrls(
         buildBackendProxyUrl({
           sourceUrl: absolute,
           internalOrigin,
-          referrerUrl: stableReferrer || baseUrl,
+          referrerUrl: overrideReferrer || manifestReferrer || stableReferrer || baseUrl,
         }) || absolute
       );
     } catch {
@@ -482,10 +483,12 @@ function absolutizeManifestUrls(
       continue;
     }
     if (trimmed.startsWith("#")) {
-      out.push(line.replace(/URI="([^"]+)"/gi, (_match, rawUri) => `URI="${absolutize(rawUri)}"`));
+      out.push(
+        line.replace(/URI="([^"]+)"/gi, (_match, rawUri) => `URI="${absolutize(rawUri, manifestReferrer || stableReferrer)}"`)
+      );
       continue;
     }
-    out.push(absolutize(trimmed));
+    out.push(absolutize(trimmed, manifestReferrer || stableReferrer));
   }
 
   return out.join("\n");

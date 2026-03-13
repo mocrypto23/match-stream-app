@@ -195,7 +195,7 @@ class LivePlayerv2Session {
   constructor(input: { sourceUrl: string; requestOrigin: string }) {
     this.sourceUrl = normalizeHttpUrl(input.sourceUrl);
     this.requestOrigin = normalizeHttpUrl(input.requestOrigin);
-    this.fallbackReferrer = safeOriginWithSlash(this.sourceUrl) || this.sourceUrl;
+    this.fallbackReferrer = this.sourceUrl || safeOriginWithSlash(this.sourceUrl);
     this.key = `${canonicalizeUrl(this.sourceUrl)}|${canonicalizeUrl(this.requestOrigin)}`;
   }
 
