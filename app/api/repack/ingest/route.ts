@@ -56,6 +56,21 @@ type FetchManifestResult =
       contentType: string;
     };
 
+type CachedManifestEntry = {
+  manifestBody: string;
+  finalUrl: string;
+  ingestUrl: string;
+  referrerUrl: string;
+  targetUrl: string;
+  updatedAt: number;
+};
+
+const VERIFIED_MANIFEST_CACHE_TTL_MS = Math.max(
+  8_000,
+  Number.parseInt(String(process.env.REPACK_VERIFIED_MANIFEST_CACHE_TTL_MS || "18000"), 10) || 18_000
+);
+const recentVerifiedManifestByKey = new Map<string, CachedManifestEntry>();
+
 function toInt(raw: unknown) {
   const value = Number.parseInt(String(raw ?? ""), 10);
   return Number.isFinite(value) ? value : NaN;
@@ -686,6 +701,24 @@ async function tryBrowserExtractorManifest(input: {
   };
 }
 
+function buildManifestCacheKey(matchId: number, slotServer: SlotServerId, sourceUrl: string) {
+  return `${matchId}:${slotServer}:${String(sourceUrl || "").trim().toLowerCase()}`;
+}
+
+function getRecentVerifiedManifestCache(cacheKey: string) {
+  const entry = recentVerifiedManifestByKey.get(cacheKey);
+  if (!entry) return null;
+  if (Date.now() - entry.updatedAt > VERIFIED_MANIFEST_CACHE_TTL_MS) {
+    recentVerifiedManifestByKey.delete(cacheKey);
+    return null;
+  }
+  return entry;
+}
+
+function setRecentVerifiedManifestCache(cacheKey: string, entry: CachedManifestEntry) {
+  recentVerifiedManifestByKey.set(cacheKey, entry);
+}
+
 async function fetchMatchRow(matchId: number) {
   const { data, error } = await supabaseAdmin
     .from("match-stream-app")
@@ -723,12 +756,21 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok: false, error: "source-not-allowed" }, { status: 502 });
   }
 
+  const manifestCacheKey = buildManifestCacheKey(matchId, slotServer, sourceUrl);
   const browserExtracted = await tryBrowserExtractorManifest({
     sourceUrl,
     slotServer,
     internalOrigin,
   });
   if (browserExtracted.ok) {
+    setRecentVerifiedManifestCache(manifestCacheKey, {
+      manifestBody: browserExtracted.manifestBody,
+      finalUrl: browserExtracted.finalUrl,
+      ingestUrl: browserExtracted.ingestUrl,
+      referrerUrl: browserExtracted.referrerUrl,
+      targetUrl: browserExtracted.targetUrl,
+      updatedAt: Date.now(),
+    });
     return new Response(browserExtracted.manifestBody, {
       status: 200,
       headers: {
@@ -739,6 +781,23 @@ export async function GET(req: Request) {
         "x-repack-source-url": sourceUrl,
         "x-repack-upstream-url": browserExtracted.ingestUrl,
         "x-repack-extractor": "browser",
+        "x-repack-extractor-candidates-found": String(browserExtracted.candidatesFound),
+        "x-repack-extractor-candidates-tried": String(browserExtracted.candidatesTried),
+      },
+    });
+  }
+  const cachedManifest = getRecentVerifiedManifestCache(manifestCacheKey);
+  if (cachedManifest) {
+    return new Response(cachedManifest.manifestBody, {
+      status: 200,
+      headers: {
+        "content-type": "application/vnd.apple.mpegurl; charset=utf-8",
+        "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
+        "x-repack-gateway": "1",
+        "x-repack-slot-server": String(slotServer),
+        "x-repack-source-url": sourceUrl,
+        "x-repack-upstream-url": cachedManifest.ingestUrl,
+        "x-repack-extractor": "browser-cached",
         "x-repack-extractor-candidates-found": String(browserExtracted.candidatesFound),
         "x-repack-extractor-candidates-tried": String(browserExtracted.candidatesTried),
       },
