@@ -8494,14 +8494,14 @@ export default function WatchPage() {
   const streamStartNotice = (() => {
     if (!LIVE_ONLY_PLAYBACK) {
       return streamOpenLabel
-        ? `سيبدأ البث في الساعة ${streamOpenLabel} (قبل ساعة المباراة بنصف ساعة)`
-        : "سيبدأ البث قبل ساعة المباراة بنصف ساعة";
+        ? `سيبدأ البث في الساعة ${streamOpenLabel} (قبل المباراة بنصف ساعة)`
+        : "سيبدأ البث قبل المباراة بنصف ساعة";
     }
     if (!matchWindow.hasStart) return "البث غير متاح لأن موعد المباراة غير محدد.";
     if (matchWindow.openAtMs !== null && nowMs < matchWindow.openAtMs) {
       return streamOpenLabel
-        ? `سيبدأ البث في الساعة ${streamOpenLabel} (قبل ساعة المباراة بنصف ساعة)`
-        : "سيبدأ البث قبل ساعة المباراة بنصف ساعة";
+        ? `سيبدأ البث في الساعة ${streamOpenLabel} (قبل المباراة بنصف ساعة)`
+        : "سيبدأ البث قبل المباراة بنصف ساعة";
     }
     if (matchWindow.closeAtMs !== null && nowMs > matchWindow.closeAtMs) {
       return "انتهت نافذة البث لهذه المباراة.";

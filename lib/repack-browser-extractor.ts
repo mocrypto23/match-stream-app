@@ -119,6 +119,63 @@ function safeOrigin(rawUrl: string) {
   }
 }
 
+function hostMatchesAnySuffix(hostname: string, suffixes: string[]) {
+  const host = String(hostname || "").trim().toLowerCase().replace(/\.$/, "");
+  if (!host) return false;
+  return suffixes.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
+}
+
+function isDirectCrawlPreferred(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    const host = new URL(rawUrl).hostname.toLowerCase();
+    return hostMatchesAnySuffix(host, ["sportsurges.cc", "livekora.vip", "koooralive.click", "kooraxx.com"]);
+  } catch {
+    return false;
+  }
+}
+
+function buildSlugVariants(rawSlug: string) {
+  const slug = String(rawSlug || "").trim().replace(/^\/+|\/+$/g, "");
+  if (!slug) return [] as string[];
+  const normalized = slug.toLowerCase();
+  const withoutLeadingOne = normalized.startsWith("1") ? normalized.slice(1) : normalized;
+  const dashed = withoutLeadingOne.replace(/([a-z]+)(\d+)/i, "$1-$2");
+  return Array.from(new Set([normalized, withoutLeadingOne, dashed, `1${withoutLeadingOne}`].filter(Boolean)));
+}
+
+function expandLivekoraSportsurgesVariants(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return [] as string[];
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    if (!hostMatchesAnySuffix(host, ["sportsurges.cc", "livekora.vip", "koooralive.click", "kooraxx.com"])) {
+      return [] as string[];
+    }
+
+    const pathParts = String(parsed.pathname || "")
+      .split("/")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const pageSlug = pathParts[0] === "albaplayer" ? pathParts[1] || "" : pathParts[0] || "";
+    const slugVariants = buildSlugVariants(pageSlug);
+    const origin = parsed.origin;
+    const out = new Set<string>();
+
+    for (const slug of slugVariants) {
+      out.add(`${origin}/${slug}/`);
+      out.add(`${origin}/albaplayer/${slug}/`);
+      for (const serv of ["0", "1", "2", "3", "4"]) {
+        out.add(`${origin}/albaplayer/${slug}/?serv=${serv}`);
+      }
+    }
+
+    return Array.from(out).filter((item) => isValidHttpUrl(item));
+  } catch {
+    return [] as string[];
+  }
+}
+
 function looksLikeStaticAssetUrl(rawUrl: string) {
   if (!isValidHttpUrl(rawUrl)) return false;
   try {
@@ -780,21 +837,23 @@ async function runBrowserExtraction(input: {
       visited.add(key);
       crawledPages += 1;
 
-      const playbackPageUrl = buildPlaybackProxyUrl({
-        sourceUrl: next.pageUrl,
-        requestOrigin,
-        referrerUrl: next.referrerUrl,
-      });
-      if (!playbackPageUrl) continue;
+      const pageFetchUrl = isDirectCrawlPreferred(next.pageUrl)
+        ? next.pageUrl
+        : buildPlaybackProxyUrl({
+            sourceUrl: next.pageUrl,
+            requestOrigin,
+            referrerUrl: next.referrerUrl,
+          });
+      if (!pageFetchUrl) continue;
 
       const fetched = await fetchTextDocument({
-        url: playbackPageUrl,
+        url: pageFetchUrl,
         referrerUrl: next.referrerUrl,
         timeoutMs: Math.min(EXTRACTOR_PAGE_FETCH_TIMEOUT_MS, input.timeoutMs),
       });
       if (!fetched.ok || !fetched.body) continue;
 
-      const pageUrl = fetched.finalUrl || playbackPageUrl;
+      const pageUrl = fetched.finalUrl || pageFetchUrl;
       const sourcePageUrl = fetched.targetUrl || next.pageUrl;
       if (looksLikeManifestResponse(fetched.contentType, fetched.body, sourcePageUrl)) {
         if (hasMediaSegments(fetched.body, sourcePageUrl)) {
@@ -833,6 +892,9 @@ async function runBrowserExtraction(input: {
   enqueuePageSeed(sourceUrl, sourceUrl, 0);
   for (const livehdVariant of expandLivehdTvServVariants(sourceUrl).slice(0, 4)) {
     enqueuePageSeed(livehdVariant, sourceUrl, 0);
+  }
+  for (const livekoraVariant of expandLivekoraSportsurgesVariants(sourceUrl).slice(0, 16)) {
+    enqueuePageSeed(livekoraVariant, sourceUrl, 0);
   }
 
   const drainDomCandidates = async () => {
