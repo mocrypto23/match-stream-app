@@ -67,7 +67,11 @@ type CachedManifestEntry = {
 
 const VERIFIED_MANIFEST_CACHE_TTL_MS = Math.max(
   8_000,
-  Number.parseInt(String(process.env.REPACK_VERIFIED_MANIFEST_CACHE_TTL_MS || "18000"), 10) || 18_000
+  Number.parseInt(String(process.env.REPACK_VERIFIED_MANIFEST_CACHE_TTL_MS || "45000"), 10) || 45_000
+);
+const VERIFIED_MANIFEST_CACHE_FAST_PATH_MS = Math.max(
+  2_500,
+  Number.parseInt(String(process.env.REPACK_VERIFIED_MANIFEST_CACHE_FAST_PATH_MS || "5500"), 10) || 5_500
 );
 const recentVerifiedManifestByKey = new Map<string, CachedManifestEntry>();
 
@@ -364,6 +368,74 @@ function buildBackendProxyUrl(input: {
   return `${String(input.internalOrigin || "").replace(/\/+$/, "")}/api/embed-proxy?${params.toString()}`;
 }
 
+function inheritEasybroadcastManifestAuth(rawChildAbsoluteUrl: string, baseUrl: string) {
+  try {
+    const child = new URL(rawChildAbsoluteUrl);
+    const parent = new URL(baseUrl);
+    const childHost = child.hostname.toLowerCase();
+    if (!(childHost === "cdn.live.easybroadcast.io" || childHost.endsWith(".easybroadcast.io"))) {
+      return rawChildAbsoluteUrl;
+    }
+    if (child.searchParams.get("token")) return rawChildAbsoluteUrl;
+
+    const token = String(parent.searchParams.get("token") || "").trim();
+    const expires = String(parent.searchParams.get("expires") || "").trim();
+    const tokenPath = String(parent.searchParams.get("token_path") || "").trim();
+    if (!token || !expires) return rawChildAbsoluteUrl;
+
+    if (tokenPath) {
+      const decoded = safeDecodeURIComponent(tokenPath).trim().replace(/\/+$/, "");
+      if (decoded && !child.pathname.toLowerCase().startsWith(decoded.toLowerCase())) {
+        return rawChildAbsoluteUrl;
+      }
+    }
+
+    child.searchParams.set("token", token);
+    child.searchParams.set("expires", expires);
+    if (tokenPath) child.searchParams.set("token_path", tokenPath);
+    return child.toString();
+  } catch {
+    return rawChildAbsoluteUrl;
+  }
+}
+
+function inheritYallashotManifestAuth(rawChildAbsoluteUrl: string, baseUrl: string) {
+  try {
+    const child = new URL(rawChildAbsoluteUrl);
+    const parent = new URL(baseUrl);
+    const childHost = child.hostname.toLowerCase();
+    const parentHost = parent.hostname.toLowerCase();
+    const childPath = String(child.pathname || "").toLowerCase();
+    const parentPath = String(parent.pathname || "").toLowerCase();
+    const isYallashotPair =
+      (childHost === "yallashot.us" || childHost.endsWith(".yallashot.us")) &&
+      (parentHost === "yallashot.us" || parentHost.endsWith(".yallashot.us")) &&
+      (childPath.includes("/kooora/") || parentPath.includes("/kooora/"));
+    if (!isYallashotPair) return rawChildAbsoluteUrl;
+
+    const token = String(parent.searchParams.get("token") || "").trim();
+    const parentSid = String(parent.searchParams.get("sid") || "").trim();
+    const sessionId = String(parent.searchParams.get("session_id") || "").trim();
+    const sid = parentSid || sessionId;
+    if (!token || !sid) return rawChildAbsoluteUrl;
+    if (!child.searchParams.get("token")) child.searchParams.set("token", token);
+    if (!child.searchParams.get("sid")) child.searchParams.set("sid", sid);
+    if (!child.searchParams.get("session_id") && sessionId) child.searchParams.set("session_id", sessionId);
+
+    const ts = String(parent.searchParams.get("ts") || "").trim();
+    const nonce = String(parent.searchParams.get("nonce") || "").trim();
+    if (ts && !child.searchParams.get("ts")) child.searchParams.set("ts", ts);
+    if (nonce && !child.searchParams.get("nonce")) child.searchParams.set("nonce", nonce);
+    return child.toString();
+  } catch {
+    return rawChildAbsoluteUrl;
+  }
+}
+
+function inheritEmbeddedManifestAuth(rawChildAbsoluteUrl: string, baseUrl: string) {
+  return inheritYallashotManifestAuth(inheritEasybroadcastManifestAuth(rawChildAbsoluteUrl, baseUrl), baseUrl);
+}
+
 async function fetchManifestOnce(fetchUrl: string, headers?: Record<string, string>): Promise<FetchManifestResult> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), DEFAULT_FETCH_TIMEOUT_MS);
@@ -474,7 +546,8 @@ function absolutizeManifestUrls(
     const value = String(raw || "").trim();
     if (!value || /^data:/i.test(value)) return value;
     try {
-      const absolute = new URL(value, baseUrl).toString();
+      const resolved = new URL(value, baseUrl).toString();
+      const absolute = inheritEmbeddedManifestAuth(resolved, baseUrl);
       if (!isValidHttpUrl(absolute)) return value;
       if (absolute.startsWith(internalOrigin)) {
         return toAbsoluteInternalUrl(absolute, internalOrigin);
@@ -547,6 +620,7 @@ async function tryBrowserExtractorManifest(input: {
     timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
   });
   const mergedCandidates = Array.isArray(extracted.candidates) ? [...extracted.candidates] : [];
+  let playerv2SnapshotError = "";
   if (input.slotServer === 2 && looksLikePlayerv2SourceUrl(input.sourceUrl)) {
     const liveBrowserCandidates = await extractPlayerv2BrowserSnapshot({
       sourceUrl: input.sourceUrl,
@@ -563,6 +637,7 @@ async function tryBrowserExtractorManifest(input: {
       }>,
       error: "playerv2-browser-failed",
     }));
+    playerv2SnapshotError = String(liveBrowserCandidates.error || "").trim();
     if (liveBrowserCandidates.ok && Array.isArray(liveBrowserCandidates.candidates) && liveBrowserCandidates.candidates.length) {
       const promoted = liveBrowserCandidates.candidates
         .map((candidate) => {
@@ -601,6 +676,20 @@ async function tryBrowserExtractorManifest(input: {
     return {
       ok: false as const,
       error: extracted.error || "browser-extraction-empty",
+      playbackUrl: String(extracted.playbackUrl || "").trim(),
+      candidatesFound,
+      candidatesTried: 0,
+      ingestUrl: "",
+      referrerUrl: "",
+      targetUrl: "",
+      manifestBody: "",
+      finalUrl: "",
+    };
+  }
+  if (isSlot2Playerv2 && !manifestBodyCandidates.length) {
+    return {
+      ok: false as const,
+      error: playerv2SnapshotError || extracted.error || "browser-manifest-body-missing",
       playbackUrl: String(extracted.playbackUrl || "").trim(),
       candidatesFound,
       candidatesTried: 0,
@@ -715,6 +804,13 @@ function getRecentVerifiedManifestCache(cacheKey: string) {
   return entry;
 }
 
+function getRecentVerifiedManifestCacheFast(cacheKey: string) {
+  const entry = getRecentVerifiedManifestCache(cacheKey);
+  if (!entry) return null;
+  if (Date.now() - entry.updatedAt > VERIFIED_MANIFEST_CACHE_FAST_PATH_MS) return null;
+  return entry;
+}
+
 function setRecentVerifiedManifestCache(cacheKey: string, entry: CachedManifestEntry) {
   recentVerifiedManifestByKey.set(cacheKey, entry);
 }
@@ -757,6 +853,24 @@ export async function GET(req: Request) {
   }
 
   const manifestCacheKey = buildManifestCacheKey(matchId, slotServer, sourceUrl);
+  const isFastCachePreferred = slotServer === 2 && looksLikePlayerv2SourceUrl(sourceUrl);
+  const fastCachedManifest = isFastCachePreferred ? getRecentVerifiedManifestCacheFast(manifestCacheKey) : null;
+  if (fastCachedManifest) {
+    return new Response(fastCachedManifest.manifestBody, {
+      status: 200,
+      headers: {
+        "content-type": "application/vnd.apple.mpegurl; charset=utf-8",
+        "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
+        "x-repack-gateway": "1",
+        "x-repack-slot-server": String(slotServer),
+        "x-repack-source-url": sourceUrl,
+        "x-repack-upstream-url": fastCachedManifest.ingestUrl,
+        "x-repack-extractor": "browser-cached-fast",
+        "x-repack-extractor-candidates-found": "0",
+        "x-repack-extractor-candidates-tried": "0",
+      },
+    });
+  }
   const browserExtracted = await tryBrowserExtractorManifest({
     sourceUrl,
     slotServer,

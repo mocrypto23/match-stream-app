@@ -36,6 +36,14 @@ const SESSION_MAX_CANDIDATES = Math.max(
   4,
   Number.parseInt(String(process.env.REPACK_PLAYERV2_SESSION_MAX_CANDIDATES || "24"), 10) || 24
 );
+const SESSION_MAINTENANCE_INTERVAL_MS = Math.max(
+  1_500,
+  Number.parseInt(String(process.env.REPACK_PLAYERV2_SESSION_MAINTENANCE_INTERVAL_MS || "4000"), 10) || 4_000
+);
+const SESSION_MAINTENANCE_TIMEOUT_MS = Math.max(
+  8_000,
+  Number.parseInt(String(process.env.REPACK_PLAYERV2_SESSION_MAINTENANCE_TIMEOUT_MS || "18000"), 10) || 18_000
+);
 const SESSION_STALE_RETURN_MAX_AGE_MS = Math.max(
   SESSION_STALE_MS + 6_000,
   Number.parseInt(String(process.env.REPACK_PLAYERV2_SESSION_STALE_RETURN_MAX_AGE_MS || "42000"), 10) || 42_000
@@ -75,6 +83,7 @@ type PlaywrightPage = {
   on: (event: string, handler: (arg: unknown) => void) => void;
   evaluate: <T, Arg = unknown>(pageFunction: string | ((arg: Arg) => T | Promise<T>), arg?: Arg) => Promise<T>;
   goto: (url: string, options: unknown) => Promise<unknown>;
+  waitForLoadState?: (state: string, options?: { timeout?: number }) => Promise<void>;
   waitForTimeout: (ms: number) => Promise<void>;
   close: () => Promise<void>;
   isClosed?: () => boolean;
@@ -191,6 +200,8 @@ class LivePlayerv2Session {
   page: PlaywrightPage | null = null;
   startPromise: Promise<void> | null = null;
   reloadPromise: Promise<void> | null = null;
+  maintenancePromise: Promise<void> | null = null;
+  maintenanceTimer: ReturnType<typeof setInterval> | null = null;
   candidates = new Map<string, LiveCandidate>();
 
   constructor(input: { sourceUrl: string; requestOrigin: string }) {
@@ -359,7 +370,15 @@ class LivePlayerv2Session {
       waitUntil: "domcontentloaded",
       timeout: Math.max(6_000, Math.min(30_000, timeoutMs)),
     });
+    if (typeof page.waitForLoadState === "function") {
+      await page
+        .waitForLoadState("networkidle", {
+          timeout: Math.max(1_500, Math.min(8_000, SESSION_WAIT_AFTER_GOTO_MS + 2_000)),
+        })
+        .catch(() => {});
+    }
     await page.waitForTimeout(Math.max(1_000, Math.min(8_000, SESSION_WAIT_AFTER_GOTO_MS)));
+    await this.hydrateCandidateBodiesInPage();
     this.lastReloadAt = Date.now();
     this.state = "running";
   }
@@ -379,6 +398,7 @@ class LivePlayerv2Session {
         });
     }
     await this.startPromise;
+    this.startMaintenanceLoop();
   }
 
   async maybeReload(timeoutMs: number) {
@@ -395,6 +415,51 @@ class LivePlayerv2Session {
         this.reloadPromise = null;
       });
     await this.reloadPromise;
+  }
+
+  startMaintenanceLoop() {
+    if (this.maintenanceTimer) return;
+    this.maintenanceTimer = setInterval(() => {
+      void this.maintain();
+    }, SESSION_MAINTENANCE_INTERVAL_MS);
+  }
+
+  async maintain() {
+    if (this.maintenancePromise) return this.maintenancePromise;
+    this.maintenancePromise = this.performMaintenance().finally(() => {
+      this.maintenancePromise = null;
+    });
+    return this.maintenancePromise;
+  }
+
+  async performMaintenance() {
+    if (this.state === "closed") return;
+    if (this.isIdle()) {
+      await this.close();
+      return;
+    }
+    const page = this.page;
+    if (!page || page.isClosed?.()) return;
+
+    const now = Date.now();
+    const manifestCandidates = this.snapshotCandidatesWithManifestBody(SESSION_STALE_MS, now);
+    const allCandidates = this.snapshotCandidates();
+    const newestAgeMs = this.newestCandidateAgeMs(now);
+    if (!manifestCandidates.length && allCandidates.length) {
+      await this.hydrateCandidateBodiesInPage();
+    }
+
+    const refreshedNow = Date.now();
+    const refreshedManifestCandidates = this.snapshotCandidatesWithManifestBody(SESSION_STALE_MS, refreshedNow);
+    const refreshedNewestAgeMs = this.newestCandidateAgeMs(refreshedNow);
+    const shouldReload =
+      !refreshedManifestCandidates.length ||
+      refreshedNewestAgeMs === null ||
+      refreshedNewestAgeMs >= SESSION_PREEMPTIVE_REFRESH_MS ||
+      !this.hasFreshCandidate(refreshedNow);
+    if (shouldReload && refreshedNow - this.lastReloadAt >= SESSION_RELOAD_COOLDOWN_MS) {
+      await this.maybeReload(SESSION_MAINTENANCE_TIMEOUT_MS).catch(() => {});
+    }
   }
 
   async hydrateCandidateBodiesInPage() {
@@ -474,6 +539,7 @@ class LivePlayerv2Session {
 
     try {
       await this.ensureStarted(timeoutMs);
+      await this.maintain();
     } catch {
       return { ok: false, candidates: [], error: this.lastError || "browser-extraction-failed" };
     }
@@ -522,7 +588,7 @@ class LivePlayerv2Session {
       return { ok: true, candidates: staleCandidates, error: "" };
     }
     if (staleCandidates.length && newestAgeMs !== null && newestAgeMs <= SESSION_STALE_RETURN_MAX_AGE_MS) {
-      return { ok: true, candidates: staleCandidates, error: "" };
+      return { ok: false, candidates: staleCandidates, error: this.lastError || "browser-manifest-body-missing" };
     }
     return { ok: false, candidates: [], error: this.lastError || "browser-extraction-empty" };
   }
@@ -530,6 +596,8 @@ class LivePlayerv2Session {
   async close() {
     const page = this.page;
     const context = this.browserContext;
+    if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
+    this.maintenanceTimer = null;
     this.page = null;
     this.browserContext = null;
     this.state = "closed";

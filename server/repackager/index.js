@@ -38,6 +38,21 @@ function toBool(raw, fallback = false) {
   return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+function isRetryableManifestReason(reason) {
+  const value = String(reason || "").trim().toLowerCase();
+  if (!value) return false;
+  if (value.startsWith("manifest-fetch-failed:")) return true;
+  const match = value.match(/manifest-http-(\d+)/);
+  if (!match || !match[1]) return false;
+  const status = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(status)) return false;
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
 function parseMatchStartMs(raw) {
   const value = String(raw || "").trim();
   if (!value) return null;
@@ -544,7 +559,10 @@ class MirrorJob {
   async fetchManifestDocument() {
     const fetchManifestOnce = async (fetchUrl) => {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), this.manager.config.manifestFetchTimeoutMs);
+      const timeoutMs = isStrictGatewayIngestUrl(fetchUrl, this.matchId, this.serverId)
+        ? this.manager.config.strictGatewayManifestFetchTimeoutMs
+        : this.manager.config.manifestFetchTimeoutMs;
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
       try {
         const response = await fetch(fetchUrl, {
           method: "GET",
@@ -596,9 +614,32 @@ class MirrorJob {
       }
     };
 
+    const fetchManifestWithRetry = async (fetchUrl) => {
+      const retries = isStrictGatewayIngestUrl(fetchUrl, this.matchId, this.serverId)
+        ? this.manager.config.strictGatewayManifestFetchRetries
+        : this.manager.config.manifestFetchRetries;
+      let lastResult = null;
+      for (let attempt = 0; attempt <= retries; attempt += 1) {
+        const fetched = await fetchManifestOnce(fetchUrl);
+        if (fetched.ok) return fetched;
+        lastResult = fetched;
+        if (attempt >= retries || !isRetryableManifestReason(fetched.reason)) return fetched;
+        await sleep(this.manager.config.manifestFetchRetryDelayMs * (attempt + 1));
+      }
+      return (
+        lastResult || {
+          ok: false,
+          reason: "manifest-fetch-failed:retry-exhausted",
+          body: "",
+          contentType: "",
+          finalUrl: fetchUrl,
+        }
+      );
+    };
+
     let currentUrl = this.ingestUrl;
     for (let depth = 0; depth < 3; depth += 1) {
-      const fetched = await fetchManifestOnce(currentUrl);
+      const fetched = await fetchManifestWithRetry(currentUrl);
       if (!fetched.ok) return fetched;
       if (hasMediaSegments(fetched.body, fetched.finalUrl)) return fetched;
 
@@ -622,6 +663,16 @@ class MirrorJob {
       contentType: "",
       finalUrl: this.ingestUrl,
     };
+  }
+
+  shouldHoldTransientManifestFailure(reason, nowMs) {
+    if (!isRetryableManifestReason(reason)) return false;
+    if (!this.lastPublishAt) return false;
+    const dynamicHoldMs =
+      Number.isFinite(this.lastObservedTargetDurationSec) && this.lastObservedTargetDurationSec > 0
+        ? Math.max(this.manager.config.transientManifestFailureHoldMs, Math.round(this.lastObservedTargetDurationSec * 1000 * 8))
+        : this.manager.config.transientManifestFailureHoldMs;
+    return nowMs - this.lastPublishAt <= dynamicHoldMs;
   }
 
   async uploadAsset(record) {
@@ -713,19 +764,26 @@ class MirrorJob {
 
     const manifest = await this.fetchManifestDocument();
     if (!manifest.ok) {
-      this.lastErrorAt = Date.now();
+      const nowMs = Date.now();
+      const holdTransientFailure = this.shouldHoldTransientManifestFailure(manifest.reason, nowMs);
+      this.lastErrorAt = nowMs;
       this.lastError = manifest.reason;
-      this.consecutiveSourceErrors += 1;
-      if (this.consecutiveSourceErrors >= this.manager.config.maxConsecutiveFailures) {
+      if (!holdTransientFailure) {
+        this.consecutiveSourceErrors += 1;
+      } else {
+        this.state = "running";
+      }
+      if (!holdTransientFailure && this.consecutiveSourceErrors >= this.manager.config.maxConsecutiveFailures) {
         this.state = "degraded";
         this.degradedReason = manifest.reason;
-        this.degradedAt = Date.now();
+        this.degradedAt = nowMs;
       }
       this.manager.metrics.lastError = manifest.reason;
       this.manager.log("warn", "mirror sync failed", {
         job: this.key,
         reason: manifest.reason,
         syncReason: reason,
+        heldTransientFailure: holdTransientFailure,
       });
       return { ok: false, reason: manifest.reason };
     }
@@ -1061,8 +1119,16 @@ function loadConfig() {
     finishedDebounceMs: finishedDebounceMinutes * 60 * 1000,
     earlyStopSegmentFailStreak: toInt(process.env.REPACK_EARLY_STOP_SEGMENT_FAIL_STREAK, 4, 1),
     manifestFetchTimeoutMs: Math.max(20_000, toInt(process.env.REPACK_AGENT_PREFLIGHT_TIMEOUT_MS, 20_000, 1500)),
+    strictGatewayManifestFetchTimeoutMs: Math.max(
+      30_000,
+      toInt(process.env.REPACK_AGENT_STRICT_GATEWAY_TIMEOUT_MS, 45_000, 5_000)
+    ),
+    manifestFetchRetries: toInt(process.env.REPACK_AGENT_MANIFEST_FETCH_RETRIES, 1, 0),
+    strictGatewayManifestFetchRetries: toInt(process.env.REPACK_AGENT_STRICT_GATEWAY_RETRIES, 2, 0),
+    manifestFetchRetryDelayMs: toInt(process.env.REPACK_AGENT_MANIFEST_FETCH_RETRY_DELAY_MS, 1200, 100),
     assetFetchTimeoutMs: Math.max(12_000, toInt(process.env.REPACK_AGENT_ASSET_FETCH_TIMEOUT_MS, 16_000, 2000)),
     maxConsecutiveFailures: toInt(process.env.REPACK_AGENT_MAX_START_FAILURES, 4, 2),
+    transientManifestFailureHoldMs: toInt(process.env.REPACK_AGENT_TRANSIENT_MANIFEST_HOLD_MS, 90_000, 5_000),
     staleInputSequenceMs: toInt(process.env.REPACK_STALE_INPUT_SEQUENCE_MS, 15_000, 5000),
     publicBaseUrl: String(process.env.REPACK_PUBLIC_BASE_URL || "https://r2.tf-player.site/live").trim().replace(/\/+$/, ""),
     playerOrigin: String(
