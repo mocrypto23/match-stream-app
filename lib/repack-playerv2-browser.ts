@@ -128,6 +128,21 @@ function buildInternalEmbedProxyUrl(input: {
   return `${String(input.requestOrigin || "").replace(/\/+$/, "")}/api/embed-proxy?${params.toString()}`;
 }
 
+function buildStablePlaybackProxyUrl(input: {
+  sourceUrl: string;
+  requestOrigin: string;
+  referrerUrl?: string | null;
+}) {
+  if (!isValidHttpUrl(input.sourceUrl) || !isValidHttpUrl(input.requestOrigin)) return "";
+  const params = new URLSearchParams();
+  params.set("url", input.sourceUrl);
+  params.set("depth", "0");
+  params.set("stable", "1");
+  const ref = normalizeHttpUrl(input.referrerUrl || input.sourceUrl);
+  if (ref) params.set("ref", ref);
+  return `${String(input.requestOrigin || "").replace(/\/+$/, "")}/api/embed-proxy?${params.toString()}`;
+}
+
 function looksLikePlayerv2ManifestCandidate(rawUrl: string) {
   if (!isValidHttpUrl(rawUrl)) return false;
   try {
@@ -189,6 +204,7 @@ async function sleep(ms: number) {
 class LivePlayerv2Session {
   key: string;
   sourceUrl: string;
+  navigationUrl: string;
   requestOrigin: string;
   fallbackReferrer: string;
   lastTouchedAt = Date.now();
@@ -207,6 +223,12 @@ class LivePlayerv2Session {
   constructor(input: { sourceUrl: string; requestOrigin: string }) {
     this.sourceUrl = normalizeHttpUrl(input.sourceUrl);
     this.requestOrigin = normalizeHttpUrl(input.requestOrigin);
+    this.navigationUrl =
+      buildStablePlaybackProxyUrl({
+        sourceUrl: this.sourceUrl,
+        requestOrigin: this.requestOrigin,
+        referrerUrl: this.sourceUrl,
+      }) || this.sourceUrl;
     this.fallbackReferrer = this.sourceUrl || safeOriginWithSlash(this.sourceUrl);
     this.key = `${canonicalizeUrl(this.sourceUrl)}|${canonicalizeUrl(this.requestOrigin)}`;
   }
@@ -366,7 +388,7 @@ class LivePlayerv2Session {
     this.page = page;
     this.state = "starting";
     this.bindPage(page);
-    await page.goto(this.sourceUrl, {
+    await page.goto(this.navigationUrl, {
       waitUntil: "domcontentloaded",
       timeout: Math.max(6_000, Math.min(30_000, timeoutMs)),
     });
