@@ -412,6 +412,17 @@ function buildSessionAssetUrl(input: {
   return `${String(input.internalOrigin || "").replace(/\/+$/, "")}/api/repack/session-asset?${params.toString()}`;
 }
 
+function pickSessionFetchUrl(fetchUrl: string | undefined, targetUrl: string, internalOrigin: string) {
+  const normalizedTargetUrl = String(targetUrl || "").trim();
+  const normalizedFetchUrl = String(fetchUrl || "").trim();
+  if (!isValidHttpUrl(normalizedFetchUrl) || !isValidHttpUrl(normalizedTargetUrl)) return normalizedTargetUrl;
+  try {
+    const parsed = new URL(normalizedFetchUrl);
+    if (parsed.origin === String(internalOrigin || "").replace(/\/+$/, "")) return normalizedFetchUrl;
+  } catch {}
+  return normalizedTargetUrl;
+}
+
 function rewriteManifestForSessionMirror(
   manifest: string,
   baseUrl: string,
@@ -462,7 +473,7 @@ async function resolveSessionCandidateMediaManifest(input: {
   manifestBody?: string;
 }) {
   let currentUrl = String(input.targetUrl || "").trim();
-  let currentFetchUrl = String(input.fetchUrl || input.targetUrl || "").trim() || currentUrl;
+  let currentFetchUrl = pickSessionFetchUrl(input.fetchUrl, currentUrl, input.internalOrigin);
   let currentBody = String(input.manifestBody || "").trim();
 
   for (let depth = 0; depth < 3; depth += 1) {
