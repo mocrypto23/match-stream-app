@@ -249,7 +249,7 @@ function isLivehdTvPageUrl(rawUrl: string) {
   }
 }
 
-function expandLivehdTvServVariants(rawUrl: string) {
+export function expandLivehdTvServVariants(rawUrl: string) {
   if (!isLivehdTvPageUrl(rawUrl)) return [] as string[];
   try {
     const u = new URL(rawUrl);
@@ -514,7 +514,7 @@ function unpackDeanPackerPayloads(text: string) {
   return out;
 }
 
-function extractCandidatesFromText(text: string, baseUrl: string) {
+export function extractCandidatesFromText(text: string, baseUrl: string) {
   const out = new Set<string>();
   const html = String(text || "");
   const normalized = html
@@ -787,7 +787,7 @@ function extractPlayerv2ConfigFromHtml(html: string, pageUrl: string): Playerv2C
   };
 }
 
-function extractEmbedProxyTargetUrl(rawUrl: string) {
+export function extractEmbedProxyTargetUrl(rawUrl: string) {
   if (!isValidHttpUrl(rawUrl)) return "";
   try {
     const u = new URL(rawUrl);
@@ -800,7 +800,7 @@ function extractEmbedProxyTargetUrl(rawUrl: string) {
   }
 }
 
-function looksLikePlayerv2PageUrl(rawUrl: string) {
+export function looksLikePlayerv2PageUrl(rawUrl: string) {
   if (!isValidHttpUrl(rawUrl)) return false;
   try {
     const u = new URL(rawUrl);
@@ -810,7 +810,7 @@ function looksLikePlayerv2PageUrl(rawUrl: string) {
   }
 }
 
-function looksLikePlayerv2Html(html: string) {
+export function looksLikePlayerv2Html(html: string) {
   const text = normalizeHtmlForScan(html).toLowerCase();
   return (
     text.includes("window.tabsconfig") ||
@@ -935,7 +935,7 @@ function extractBeinAjaxCandidates(html: string, sourceUrl: string) {
   return Array.from(out);
 }
 
-async function fetchBeinAjaxResolvedCandidates(sourceUrl: string, sourceHtml: string, timeoutMs: number) {
+export async function fetchBeinAjaxResolvedCandidates(sourceUrl: string, sourceHtml: string, timeoutMs: number) {
   if (!isBeinLiveMatchPageUrl(sourceUrl)) return [] as string[];
   const ctx = extractBeinAjaxContext(sourceHtml, sourceUrl);
   if (!ctx.matchId || !ctx.ajaxUrl) return [] as string[];
@@ -1064,7 +1064,7 @@ async function requestPlayerv2Token(input: {
   }
 }
 
-async function buildPlayerv2Candidates(sourceUrl: string, html: string, timeoutMs: number, requestOrigin: string) {
+export async function buildPlayerv2Candidates(sourceUrl: string, html: string, timeoutMs: number, requestOrigin: string) {
   const config = extractPlayerv2ConfigFromHtml(html, sourceUrl);
   if (!config.paths.length || !config.domains.length) {
     const fallbackOnly = buildPlayerv2ChannelFallbackCandidates(sourceUrl).filter((candidate) => isValidHttpUrl(candidate));
@@ -1379,7 +1379,7 @@ function shouldWrapCandidateForInternalProxy(candidateUrl: string, sourceUrl: st
   }
 }
 
-function isLikelyAlbaLandingUrl(rawUrl: string) {
+export function isLikelyAlbaLandingUrl(rawUrl: string) {
   if (!isValidHttpUrl(rawUrl)) return false;
   try {
     const u = new URL(rawUrl);

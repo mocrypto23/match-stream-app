@@ -1,4 +1,13 @@
 import { isValidHttpUrl, type SlotServerId } from "./server-source-policy";
+import {
+  buildPlayerv2Candidates,
+  expandLivehdTvServVariants,
+  extractCandidatesFromText,
+  fetchBeinAjaxResolvedCandidates,
+  isLikelyAlbaLandingUrl,
+  looksLikePlayerv2Html,
+  looksLikePlayerv2PageUrl,
+} from "./repack-ingest-resolver";
 
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
@@ -20,6 +29,18 @@ const EXTRACTOR_RETRY_WAIT_MS = Math.max(
 const EXTRACTOR_NETWORK_IDLE_WAIT_MS = Math.max(
   500,
   Number.parseInt(String(process.env.REPACK_BROWSER_EXTRACTOR_NETWORK_IDLE_WAIT_MS || "1500"), 10) || 1_500
+);
+const EXTRACTOR_PAGE_FETCH_TIMEOUT_MS = Math.max(
+  3_000,
+  Number.parseInt(String(process.env.REPACK_BROWSER_EXTRACTOR_PAGE_FETCH_TIMEOUT_MS || "9000"), 10) || 9_000
+);
+const EXTRACTOR_MAX_CRAWL_PAGES = Math.max(
+  4,
+  Number.parseInt(String(process.env.REPACK_BROWSER_EXTRACTOR_MAX_CRAWL_PAGES || "12"), 10) || 12
+);
+const EXTRACTOR_MAX_CRAWL_DEPTH = Math.max(
+  1,
+  Number.parseInt(String(process.env.REPACK_BROWSER_EXTRACTOR_MAX_CRAWL_DEPTH || "3"), 10) || 3
 );
 
 type ExtractorCandidate = {
@@ -49,6 +70,12 @@ type CandidateInput = {
   body?: string;
   slotServerId?: SlotServerId;
   via: ExtractorCandidate["via"];
+};
+
+type PageSeed = {
+  pageUrl: string;
+  referrerUrl: string;
+  depth: number;
 };
 
 const candidateCache = new Map<string, CandidateCacheEntry>();
@@ -81,6 +108,80 @@ function safeDecodeURIComponent(value: string) {
     return decodeURIComponent(String(value || ""));
   } catch {
     return String(value || "");
+  }
+}
+
+function safeOrigin(rawUrl: string) {
+  try {
+    return new URL(rawUrl).origin;
+  } catch {
+    return "";
+  }
+}
+
+function looksLikeStaticAssetUrl(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    const pathname = String(new URL(rawUrl).pathname || "").toLowerCase();
+    return /\.(?:css|js|mjs|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf|eot|map|json|xml|txt|pdf)(?:$|[?#])/i.test(
+      pathname
+    );
+  } catch {
+    return false;
+  }
+}
+
+function looksLikeExtractableTextBody(contentType: string, body: string) {
+  const ct = String(contentType || "").toLowerCase();
+  const text = String(body || "");
+  if (!text.trim()) return false;
+  if (
+    ct.includes("text/html") ||
+    ct.includes("application/xhtml+xml") ||
+    ct.includes("javascript") ||
+    ct.includes("ecmascript") ||
+    ct.includes("application/json") ||
+    ct.includes("text/plain")
+  ) {
+    return true;
+  }
+  return /^\s*(?:<!doctype\s+html|<html|<head|<body|<script|<iframe|<div|\{|\[)/i.test(text);
+}
+
+function looksLikeNavigableStreamPage(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  if (looksLikeManifestUrl(rawUrl) || looksLikeStaticAssetUrl(rawUrl)) return false;
+  if (isLikelyAlbaLandingUrl(rawUrl) || looksLikePlayerv2PageUrl(rawUrl)) return true;
+  try {
+    const parsed = new URL(rawUrl);
+    const pathname = String(parsed.pathname || "").toLowerCase();
+    if (/^\/tv\/[^/?#]+\/?$/i.test(pathname)) return true;
+    if (pathname.includes("/matches/")) return true;
+    if (pathname.includes("/albaplayer/")) return true;
+    if (pathname.includes("/playerv2.php")) return true;
+    if (pathname.includes("heartbeat-controller.php")) return true;
+    if (pathname.includes("/embed") || pathname.includes("/player") || pathname.includes("/iframe")) return true;
+    if (pathname.includes("admin-ajax.php") || pathname.includes("ajax.php")) return true;
+    if (pathname.endsWith(".html") || pathname.endsWith(".php")) return true;
+    if (parsed.searchParams.has("serv") || parsed.searchParams.has("server")) return true;
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host.endsWith(".livehd77.pro") ||
+      host === "livehd77.pro" ||
+      host.endsWith(".bein-live.com") ||
+      host === "bein-live.com" ||
+      host.endsWith(".sportsurges.cc") ||
+      host === "sportsurges.cc" ||
+      host.endsWith(".yallashoot2026.com") ||
+      host === "yallashoot2026.com" ||
+      host.endsWith(".yallashot.us") ||
+      host === "yallashot.us"
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
   }
 }
 
@@ -332,6 +433,59 @@ async function loadBrowser() {
   return browserPromise;
 }
 
+async function fetchTextDocument(input: { url: string; referrerUrl?: string; timeoutMs?: number }) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(),
+    Math.max(2_000, Number.parseInt(String(input.timeoutMs || EXTRACTOR_PAGE_FETCH_TIMEOUT_MS), 10) || EXTRACTOR_PAGE_FETCH_TIMEOUT_MS)
+  );
+  try {
+    const response = await fetch(input.url, {
+      method: "GET",
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        accept: "text/html,application/xhtml+xml,application/javascript,text/javascript,application/json,text/plain,*/*",
+        "user-agent": DEFAULT_USER_AGENT,
+        ...(isValidHttpUrl(String(input.referrerUrl || "").trim())
+          ? {
+              referer: String(input.referrerUrl || "").trim(),
+              origin: safeOrigin(String(input.referrerUrl || "").trim()),
+            }
+          : {}),
+      },
+    });
+    const body = await response.text();
+    const finalUrl = normalizeHttpUrl(response.url || input.url) || normalizeHttpUrl(input.url);
+    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+    const targetUrl =
+      normalizeHttpUrl(String(response.headers.get("x-embed-proxy-target") || "").trim()) ||
+      unwrapProxyTarget(finalUrl) ||
+      finalUrl;
+    return {
+      ok: response.ok,
+      status: response.status,
+      body,
+      finalUrl,
+      targetUrl,
+      contentType,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      body: "",
+      finalUrl: normalizeHttpUrl(input.url),
+      targetUrl: unwrapProxyTarget(normalizeHttpUrl(input.url)) || normalizeHttpUrl(input.url),
+      contentType: "",
+      error: error instanceof Error ? error.message : String(error || "fetch-failed"),
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function runBrowserExtraction(input: {
   sourceUrl: string;
   requestOrigin: string;
@@ -373,6 +527,9 @@ async function runBrowserExtraction(input: {
   };
 
   const candidates = new Map<string, ExtractorCandidate>();
+  const pageSeeds = new Map<string, PageSeed>();
+  const pageQueue: PageSeed[] = [];
+  const pendingTasks = new Set<Promise<void>>();
   const context = await browser.newContext({
     ignoreHTTPSErrors: true,
     locale: "ar-EG",
@@ -507,6 +664,177 @@ async function runBrowserExtraction(input: {
     await page.addInitScript(extractorInitScript);
   }
 
+  const enqueuePageSeed = (rawUrl: string, referrerUrl: string, depth: number) => {
+    const normalizedRawUrl = normalizeHttpUrl(rawUrl);
+    if (!normalizedRawUrl) return;
+    const pageUrl = unwrapProxyTarget(normalizedRawUrl) || normalizedRawUrl;
+    if (!looksLikeNavigableStreamPage(pageUrl)) return;
+    const safeReferrer =
+      normalizeHttpUrl(extractProxyReferrer(normalizedRawUrl) || referrerUrl || sourceUrl) || sourceUrl;
+    const key = canonicalizeUrl(pageUrl) || pageUrl.toLowerCase();
+    if (!key) return;
+    const next: PageSeed = {
+      pageUrl,
+      referrerUrl: safeReferrer,
+      depth,
+    };
+    const previous = pageSeeds.get(key);
+    if (previous && previous.depth <= depth) return;
+    pageSeeds.set(key, next);
+    pageQueue.push(next);
+  };
+
+  const registerUrl = (inputValue: {
+    rawUrl: string;
+    referrerUrl: string;
+    via: CandidateInput["via"];
+    body?: string;
+    depth?: number;
+  }) => {
+    const rawUrl = normalizeHttpUrl(inputValue.rawUrl);
+    if (!rawUrl) return;
+    const targetUrl = unwrapProxyTarget(rawUrl) || rawUrl;
+    const referrerUrl =
+      normalizeHttpUrl(extractProxyReferrer(rawUrl) || inputValue.referrerUrl || sourceUrl) || sourceUrl;
+    if (looksLikeManifestUrl(targetUrl)) {
+      const ingestUrl = buildBackendProxyUrl({
+        sourceUrl: targetUrl,
+        requestOrigin,
+        referrerUrl,
+      });
+      pushCandidate(candidates, {
+        ingestUrl,
+        referrerUrl,
+        targetUrl,
+        body: inputValue.body,
+        slotServerId: input.slotServerId,
+        via: inputValue.via,
+      });
+      return;
+    }
+    enqueuePageSeed(targetUrl, referrerUrl, Math.max(0, Number(inputValue.depth || 0)));
+  };
+
+  const registerExtractedText = async (inputValue: {
+    text: string;
+    pageUrl: string;
+    sourceUrl: string;
+    referrerUrl: string;
+    depth: number;
+  }) => {
+    const pageUrl = normalizeHttpUrl(inputValue.pageUrl);
+    const sourcePageUrl = normalizeHttpUrl(inputValue.sourceUrl) || pageUrl;
+    const referrerUrl = normalizeHttpUrl(inputValue.referrerUrl || sourcePageUrl) || sourceUrl;
+    if (!pageUrl || !sourcePageUrl || !String(inputValue.text || "").trim()) return;
+
+    for (const candidateUrl of extractCandidatesFromText(inputValue.text, pageUrl)) {
+      registerUrl({
+        rawUrl: candidateUrl,
+        referrerUrl,
+        via: "dom",
+        depth: inputValue.depth + 1,
+      });
+    }
+
+    const beinCandidates = await fetchBeinAjaxResolvedCandidates(
+      sourcePageUrl,
+      inputValue.text,
+      Math.min(EXTRACTOR_PAGE_FETCH_TIMEOUT_MS, input.timeoutMs)
+    );
+    for (const candidateUrl of beinCandidates) {
+      registerUrl({
+        rawUrl: candidateUrl,
+        referrerUrl: sourcePageUrl,
+        via: "dom",
+        depth: inputValue.depth + 1,
+      });
+    }
+
+    if (looksLikePlayerv2PageUrl(sourcePageUrl) || looksLikePlayerv2Html(inputValue.text)) {
+      const playerv2Candidates = await buildPlayerv2Candidates(
+        sourcePageUrl,
+        inputValue.text,
+        Math.min(EXTRACTOR_PAGE_FETCH_TIMEOUT_MS, input.timeoutMs),
+        requestOrigin
+      );
+      for (const candidateUrl of playerv2Candidates) {
+        registerUrl({
+          rawUrl: candidateUrl,
+          referrerUrl: sourcePageUrl,
+          via: "dom",
+          depth: inputValue.depth + 1,
+        });
+      }
+    }
+  };
+
+  const crawlQueuedPages = async () => {
+    let crawledPages = 0;
+    const visited = new Set<string>();
+    while (pageQueue.length && crawledPages < EXTRACTOR_MAX_CRAWL_PAGES) {
+      const next = pageQueue.shift();
+      if (!next) continue;
+      if (next.depth > EXTRACTOR_MAX_CRAWL_DEPTH) continue;
+      const key = canonicalizeUrl(next.pageUrl) || next.pageUrl.toLowerCase();
+      if (!key || visited.has(key)) continue;
+      visited.add(key);
+      crawledPages += 1;
+
+      const playbackPageUrl = buildPlaybackProxyUrl({
+        sourceUrl: next.pageUrl,
+        requestOrigin,
+        referrerUrl: next.referrerUrl,
+      });
+      if (!playbackPageUrl) continue;
+
+      const fetched = await fetchTextDocument({
+        url: playbackPageUrl,
+        referrerUrl: next.referrerUrl,
+        timeoutMs: Math.min(EXTRACTOR_PAGE_FETCH_TIMEOUT_MS, input.timeoutMs),
+      });
+      if (!fetched.ok || !fetched.body) continue;
+
+      const pageUrl = fetched.finalUrl || playbackPageUrl;
+      const sourcePageUrl = fetched.targetUrl || next.pageUrl;
+      if (looksLikeManifestResponse(fetched.contentType, fetched.body, sourcePageUrl)) {
+        if (hasMediaSegments(fetched.body, sourcePageUrl)) {
+          registerUrl({
+            rawUrl: sourcePageUrl,
+            referrerUrl: next.referrerUrl,
+            via: "dom",
+            body: fetched.body,
+            depth: next.depth,
+          });
+          continue;
+        }
+        for (const variantUrl of pickVariantManifestUrls(fetched.body, sourcePageUrl)) {
+          registerUrl({
+            rawUrl: variantUrl,
+            referrerUrl: sourcePageUrl,
+            via: "dom",
+            depth: next.depth + 1,
+          });
+        }
+        continue;
+      }
+
+      if (looksLikeExtractableTextBody(fetched.contentType, fetched.body)) {
+        await registerExtractedText({
+          text: fetched.body,
+          pageUrl,
+          sourceUrl: sourcePageUrl,
+          referrerUrl: next.referrerUrl,
+          depth: next.depth,
+        });
+      }
+    }
+  };
+
+  enqueuePageSeed(sourceUrl, sourceUrl, 0);
+  for (const livehdVariant of expandLivehdTvServVariants(sourceUrl).slice(0, 4)) {
+    enqueuePageSeed(livehdVariant, sourceUrl, 0);
+  }
+
   const drainDomCandidates = async () => {
     const drained = await page.evaluate(() => {
       const drain = (
@@ -520,20 +848,11 @@ async function runBrowserExtraction(input: {
     for (const rawValue of [...(drained?.urls || []), ...(drained?.dom || [])]) {
       const rawUrl = normalizeHttpUrl(String(rawValue || "").trim());
       if (!rawUrl) continue;
-      const targetUrl = unwrapProxyTarget(rawUrl) || rawUrl;
-      if (!looksLikeManifestUrl(targetUrl)) continue;
-      const referrerUrl = extractProxyReferrer(rawUrl) || sourceUrl;
-      const ingestUrl = buildBackendProxyUrl({
-        sourceUrl: targetUrl,
-        requestOrigin,
-        referrerUrl,
-      });
-      pushCandidate(candidates, {
-        ingestUrl,
-        referrerUrl,
-        targetUrl,
-        slotServerId: input.slotServerId,
+      registerUrl({
+        rawUrl,
+        referrerUrl: extractProxyReferrer(rawUrl) || sourceUrl,
         via: "dom",
+        depth: 1,
       });
     }
   };
@@ -547,29 +866,22 @@ async function runBrowserExtraction(input: {
       const requestUrl = normalizeHttpUrl(request.url());
       if (!requestUrl) return;
       const targetUrl = unwrapProxyTarget(requestUrl) || requestUrl;
-      if (!looksLikeManifestUrl(targetUrl)) return;
       const headers = typeof request.headers === "function" ? request.headers() : {};
       const referrerUrl =
         extractProxyReferrer(requestUrl) ||
         normalizeHttpUrl(String(headers?.referer || headers?.referrer || "").trim()) ||
         sourceUrl;
-      const ingestUrl = buildBackendProxyUrl({
-        sourceUrl: targetUrl,
-        requestOrigin,
+      registerUrl({
+        rawUrl: targetUrl,
         referrerUrl,
-      });
-      pushCandidate(candidates, {
-        ingestUrl,
-        referrerUrl,
-        targetUrl,
-        slotServerId: input.slotServerId,
         via: "network-request",
+        depth: 1,
       });
     } catch {}
   });
 
   page.on("response", (responseArg: unknown) => {
-    void (async () => {
+    const task = (async () => {
       try {
         const response = responseArg as {
           url: () => string;
@@ -588,9 +900,7 @@ async function runBrowserExtraction(input: {
           normalizeHttpUrl(headers["x-embed-proxy-target"] || "") ||
           unwrapProxyTarget(responseUrl) ||
           responseUrl;
-        if (!looksLikeManifestUrl(targetUrl) && !contentType.includes("mpegurl")) return;
         const body = typeof response.text === "function" ? await response.text().catch(() => "") : "";
-        if (!looksLikeManifestResponse(contentType, body, targetUrl)) return;
         const requestHeaders =
           typeof response.request === "function" && typeof response.request()?.headers === "function"
             ? response.request()?.headers?.() || {}
@@ -600,39 +910,56 @@ async function runBrowserExtraction(input: {
           normalizeHttpUrl(String(requestHeaders?.referer || requestHeaders?.referrer || "").trim()) ||
           sourceUrl;
 
-        if (hasMediaSegments(body, targetUrl)) {
-          const ingestUrl = buildBackendProxyUrl({
-            sourceUrl: targetUrl,
-            requestOrigin,
-            referrerUrl,
-          });
-          pushCandidate(candidates, {
-            ingestUrl,
-            referrerUrl,
-            targetUrl,
-            body,
-            slotServerId: input.slotServerId,
-            via: "network-manifest",
-          });
+        if (looksLikeManifestResponse(contentType, body, targetUrl)) {
+          if (hasMediaSegments(body, targetUrl)) {
+            const ingestUrl = buildBackendProxyUrl({
+              sourceUrl: targetUrl,
+              requestOrigin,
+              referrerUrl,
+            });
+            pushCandidate(candidates, {
+              ingestUrl,
+              referrerUrl,
+              targetUrl,
+              body,
+              slotServerId: input.slotServerId,
+              via: "network-manifest",
+            });
+            return;
+          }
+
+          for (const variantUrl of pickVariantManifestUrls(body, targetUrl)) {
+            const ingestUrl = buildBackendProxyUrl({
+              sourceUrl: variantUrl,
+              requestOrigin,
+              referrerUrl: targetUrl,
+            });
+            pushCandidate(candidates, {
+              ingestUrl,
+              referrerUrl: targetUrl,
+              targetUrl: variantUrl,
+              slotServerId: input.slotServerId,
+              via: "network-manifest",
+            });
+          }
           return;
         }
 
-        for (const variantUrl of pickVariantManifestUrls(body, targetUrl)) {
-          const ingestUrl = buildBackendProxyUrl({
-            sourceUrl: variantUrl,
-            requestOrigin,
-            referrerUrl: targetUrl,
-          });
-          pushCandidate(candidates, {
-            ingestUrl,
-            referrerUrl: targetUrl,
-            targetUrl: variantUrl,
-            slotServerId: input.slotServerId,
-            via: "network-manifest",
+        if (looksLikeExtractableTextBody(contentType, body) || looksLikeNavigableStreamPage(targetUrl)) {
+          await registerExtractedText({
+            text: body,
+            pageUrl: responseUrl,
+            sourceUrl: targetUrl,
+            referrerUrl,
+            depth: 1,
           });
         }
       } catch {}
     })();
+    pendingTasks.add(task);
+    void task.finally(() => {
+      pendingTasks.delete(task);
+    });
   });
 
   try {
@@ -650,6 +977,12 @@ async function runBrowserExtraction(input: {
     if (!candidates.size) {
       await page.waitForTimeout(Math.min(6_000, EXTRACTOR_RETRY_WAIT_MS));
       await drainDomCandidates();
+    }
+    if (pendingTasks.size) {
+      await Promise.allSettled(Array.from(pendingTasks));
+    }
+    if (!candidates.size || pageQueue.length) {
+      await crawlQueuedPages();
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error || "browser-extraction-failed");
