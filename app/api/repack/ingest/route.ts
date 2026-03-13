@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { supabaseAdmin } from "../../_supabase";
 import { extractBrowserIngestCandidates } from "@/lib/repack-browser-extractor";
 import { resolveInternalPlayerOrigin, toAbsoluteInternalUrl } from "@/lib/repack-ingest-gateway";
+import { buildPlayerv2Candidates } from "@/lib/repack-ingest-resolver";
 import { extractPlayerv2BrowserSnapshot } from "@/lib/repack-playerv2-browser";
 import {
   getSlotSourceUrlFromRow,
@@ -368,6 +369,21 @@ function buildBackendProxyUrl(input: {
   return `${String(input.internalOrigin || "").replace(/\/+$/, "")}/api/embed-proxy?${params.toString()}`;
 }
 
+function buildPlaybackProxyUrl(input: {
+  sourceUrl: string;
+  internalOrigin: string;
+  referrerUrl?: string | null;
+}) {
+  if (!isValidHttpUrl(input.sourceUrl) || !isValidHttpUrl(input.internalOrigin)) return "";
+  const params = new URLSearchParams();
+  params.set("url", input.sourceUrl);
+  params.set("depth", "0");
+  params.set("stable", "1");
+  const ref = String(input.referrerUrl || "").trim();
+  if (isValidHttpUrl(ref)) params.set("ref", ref);
+  return `${String(input.internalOrigin || "").replace(/\/+$/, "")}/api/embed-proxy?${params.toString()}`;
+}
+
 function inheritEasybroadcastManifestAuth(rawChildAbsoluteUrl: string, baseUrl: string) {
   try {
     const child = new URL(rawChildAbsoluteUrl);
@@ -608,6 +624,46 @@ function manifestContainsUnsafeInternalUrls(manifest: string, baseUrl: string, i
   return false;
 }
 
+async function fetchPlayerv2HtmlForCandidates(sourceUrl: string, internalOrigin: string) {
+  const fetchHtml = async (fetchUrl: string, referrerUrl?: string) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), Math.min(DEFAULT_FETCH_TIMEOUT_MS, 12_000));
+    try {
+      const response = await fetch(fetchUrl, {
+        method: "GET",
+        cache: "no-store",
+        redirect: "follow",
+        signal: controller.signal,
+        headers: {
+          accept: "text/html,application/xhtml+xml,application/javascript,text/javascript,text/plain,*/*",
+          "user-agent": DEFAULT_USER_AGENT,
+          ...(isValidHttpUrl(String(referrerUrl || "").trim())
+            ? {
+                referer: String(referrerUrl || "").trim(),
+                origin: new URL(String(referrerUrl || "").trim()).origin,
+              }
+            : {}),
+        },
+      });
+      if (!response.ok) return "";
+      return await response.text().catch(() => "");
+    } catch {
+      return "";
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
+
+  const playbackProxyUrl = buildPlaybackProxyUrl({
+    sourceUrl,
+    internalOrigin,
+    referrerUrl: sourceUrl,
+  });
+  const htmlViaProxy = playbackProxyUrl ? await fetchHtml(toAbsoluteInternalUrl(playbackProxyUrl, internalOrigin), sourceUrl) : "";
+  if (String(htmlViaProxy || "").trim()) return htmlViaProxy;
+  return fetchHtml(sourceUrl, sourceUrl);
+}
+
 async function tryBrowserExtractorManifest(input: {
   sourceUrl: string;
   slotServer: SlotServerId;
@@ -621,6 +677,7 @@ async function tryBrowserExtractorManifest(input: {
   });
   const mergedCandidates = Array.isArray(extracted.candidates) ? [...extracted.candidates] : [];
   let playerv2SnapshotError = "";
+  const freshPlayerv2CandidateKeys = new Set<string>();
   if (input.slotServer === 2 && looksLikePlayerv2SourceUrl(input.sourceUrl)) {
     const liveBrowserCandidates = await extractPlayerv2BrowserSnapshot({
       sourceUrl: input.sourceUrl,
@@ -664,6 +721,51 @@ async function tryBrowserExtractorManifest(input: {
         mergedCandidates.splice(0, mergedCandidates.length, ...Array.from(deduped.values()));
       }
     }
+    const hasLiveManifestBody = mergedCandidates.some((candidate) => String(candidate.manifestBody || "").trim());
+    if (!hasLiveManifestBody) {
+      const playerv2Html = await fetchPlayerv2HtmlForCandidates(input.sourceUrl, input.internalOrigin);
+      const freshPlayerv2Candidates = playerv2Html
+        ? await buildPlayerv2Candidates(
+            input.sourceUrl,
+            playerv2Html,
+            Math.min(DEFAULT_RESOLVE_TIMEOUT_MS, 8_000),
+            input.internalOrigin
+          ).catch(() => [] as string[])
+        : [];
+      if (freshPlayerv2Candidates.length) {
+        const generated = freshPlayerv2Candidates
+          .map((rawCandidate) => {
+            const rawIngestUrl = String(rawCandidate || "").trim();
+            const ingestUrl =
+              (isValidHttpUrl(rawIngestUrl) && rawIngestUrl.includes("/api/embed-proxy")
+                ? rawIngestUrl
+                : buildBackendProxyUrl({
+                    sourceUrl: rawIngestUrl,
+                    internalOrigin: input.internalOrigin,
+                    referrerUrl: input.sourceUrl,
+                  })) || rawIngestUrl;
+            const key = String(ingestUrl || "").trim().toLowerCase();
+            if (key) freshPlayerv2CandidateKeys.add(key);
+            return {
+              ingestUrl,
+              referrerUrl: input.sourceUrl,
+              targetUrl: String(unwrapProxyTarget(ingestUrl) || rawIngestUrl).trim(),
+              score: Number.MAX_SAFE_INTEGER - 1,
+              via: "network-request" as const,
+            };
+          })
+          .filter((candidate) => isValidHttpUrl(candidate.ingestUrl));
+        if (generated.length) {
+          const deduped = new Map<string, (typeof mergedCandidates)[number]>();
+          for (const candidate of [...generated, ...mergedCandidates]) {
+            const key = String(candidate.ingestUrl || "").trim().toLowerCase();
+            if (!key || deduped.has(key)) continue;
+            deduped.set(key, candidate);
+          }
+          mergedCandidates.splice(0, mergedCandidates.length, ...Array.from(deduped.values()));
+        }
+      }
+    }
   }
   const isSlot2Playerv2 = input.slotServer === 2 && looksLikePlayerv2SourceUrl(input.sourceUrl);
   const manifestBodyCandidates = mergedCandidates.filter((candidate) => String(candidate.manifestBody || "").trim());
@@ -687,6 +789,7 @@ async function tryBrowserExtractorManifest(input: {
     };
   }
   if (isSlot2Playerv2 && !manifestBodyCandidates.length) {
+    if (!freshPlayerv2CandidateKeys.size) {
     return {
       ok: false as const,
       error: playerv2SnapshotError || extracted.error || "browser-manifest-body-missing",
@@ -699,6 +802,7 @@ async function tryBrowserExtractorManifest(input: {
       manifestBody: "",
       finalUrl: "",
     };
+    }
   }
 
   let lastError = extracted.error || "browser-extraction-empty";
@@ -745,7 +849,12 @@ async function tryBrowserExtractorManifest(input: {
       }
     }
 
+    const candidateKey = ingestUrl.toLowerCase();
     if (isSlot2Playerv2 && manifestBodyCandidates.length && !candidateManifestBody) {
+      lastError = lastError || "browser-manifest-body-missing";
+      continue;
+    }
+    if (isSlot2Playerv2 && !candidateManifestBody && !freshPlayerv2CandidateKeys.has(candidateKey)) {
       lastError = lastError || "browser-manifest-body-missing";
       continue;
     }
