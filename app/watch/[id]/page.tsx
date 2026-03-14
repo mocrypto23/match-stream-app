@@ -5679,8 +5679,10 @@ export default function WatchPage() {
 
   const applyCandidatesPreservingSelection = useCallback((nextCandidates: string[]) => {
     const server = selectedServerRef.current;
+    const strictR2Server = R2_STRICT_MODE && server >= 1 && server <= 4;
     const normalizedCandidates = (() => {
       const base = dedupeUrls(nextCandidates || []);
+      if (strictR2Server) return base.filter((candidate) => isValidHttpUrl(candidate));
       const repackBypassActive =
         server >= 1 && server <= 4 && repackBypassServersRef.current.has(server);
       if (!repackBypassActive) return base;
@@ -7445,6 +7447,7 @@ export default function WatchPage() {
   ]);
 
   const selectedHlsUrl = candidates[selectedCandidate] || "";
+  const isStrictR2Playback = R2_STRICT_MODE && selectedServer >= 1 && selectedServer <= 4;
 
   useEffect(() => {
     const video = videoRef.current;
@@ -7486,6 +7489,268 @@ export default function WatchPage() {
   );
 
   useEffect(() => {
+    if (!isStrictR2Playback) return;
+    const video = videoRef.current;
+    if (!video) return;
+
+    let cancel = false;
+    let hls: Hls | null = null;
+    let retryTimer: number | null = null;
+    let stallTimer: number | null = null;
+    let fatalRetries = 0;
+    let manifestFingerprint = "";
+    let manifestFingerprintAt = 0;
+
+    const clearRetryTimer = () => {
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+    };
+    const queueRetry = (fn: () => void, delayMs: number) => {
+      clearRetryTimer();
+      retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        if (!cancel) fn();
+      }, delayMs);
+    };
+    const resetMedia = () => {
+      ignorePauseTrackingRef.current = true;
+      try { video.pause(); } catch { }
+      video.removeAttribute("src");
+      video.load();
+      queueRetry(() => {
+        ignorePauseTrackingRef.current = false;
+      }, 0);
+    };
+    const hideLoading = () => setPlayerLoading(false);
+    const markProgress = () => {
+      const currentTime = Number(video.currentTime);
+      if (Number.isFinite(currentTime) && currentTime >= 0) lastProgressRef.current = currentTime;
+      lastProgressAtRef.current = Date.now();
+    };
+    const syncVolumeUiState = () => {
+      try {
+        video.dispatchEvent(new Event("volumechange"));
+      } catch { }
+    };
+    const keepMutedAutoplay = () => {
+      video.muted = true;
+      video.defaultMuted = true;
+      video.setAttribute("muted", "");
+      syncVolumeUiState();
+    };
+    const playMutedSafely = () => {
+      if (cancel) return;
+      keepMutedAutoplay();
+      video.play().catch(() => { });
+    };
+    const softRecover = (reason: string) => {
+      if (cancel || userPausedRef.current) return;
+      setPlayerError("انقطاع مؤقت في R2... جاري إعادة المزامنة.");
+      setStrictPlaybackDiag((prev) => (prev === reason ? prev : reason));
+      try { hls?.startLoad(); } catch { }
+      queueRetry(() => {
+        if (cancel || userPausedRef.current) return;
+        try { hls?.startLoad(); } catch { }
+        playMutedSafely();
+      }, 350);
+    };
+    const onLoaded = () => {
+      if (cancel) return;
+      markProgress();
+      setPlayerError(null);
+      setResolverError(null);
+      setStrictPlaybackDiag(null);
+      hideLoading();
+      playMutedSafely();
+    };
+    const onWaiting = () => {
+      if (cancel) return;
+      const stalledFor = Date.now() - lastProgressAtRef.current;
+      if (stalledFor >= REPACK_HLS_WAITING_RECOVERY_MIN_STALL_MS) {
+        softRecover("strict-waiting");
+      }
+    };
+    const onPlaying = () => {
+      if (cancel) return;
+      userPausedRef.current = false;
+      markProgress();
+      setPlayerError(null);
+      setResolverError(null);
+      setStrictPlaybackDiag(null);
+      hideLoading();
+    };
+    const onPause = () => {
+      if (ignorePauseTrackingRef.current) return;
+      userPausedRef.current = true;
+    };
+    const onTimeUpdate = () => {
+      if (cancel) return;
+      markProgress();
+    };
+
+    resetMedia();
+    hideLoading();
+    setStrictPlaybackDiag(null);
+    setPlayerError(null);
+
+    if (shouldBlockStream || !selectedHlsUrl) {
+      setHlsInstance(null);
+      return () => {
+        clearRetryTimer();
+        if (stallTimer !== null) window.clearInterval(stallTimer);
+        resetMedia();
+      };
+    }
+
+    userPausedRef.current = false;
+    setPlayerLoading(true);
+    keepMutedAutoplay();
+    markProgress();
+
+    video.addEventListener("loadeddata", onLoaded);
+    video.addEventListener("canplay", onLoaded);
+    video.addEventListener("waiting", onWaiting);
+    video.addEventListener("playing", onPlaying);
+    video.addEventListener("pause", onPause);
+    video.addEventListener("timeupdate", onTimeUpdate);
+
+    const nativeHlsPlayback = shouldUseNativeHls(video);
+    if (nativeHlsPlayback) {
+      video.src = selectedHlsUrl;
+      video.load();
+      playMutedSafely();
+    } else if (Hls.isSupported()) {
+      const instance = new Hls({
+        enableWorker: true,
+        lowLatencyMode: true,
+        backBufferLength: 30,
+        liveDurationInfinity: true,
+        liveSyncDurationCount: REPACK_HLS_LIVE_SYNC_COUNT,
+        liveMaxLatencyDurationCount: REPACK_HLS_LIVE_MAX_LATENCY_COUNT,
+        manifestLoadingMaxRetry: 6,
+        levelLoadingMaxRetry: 6,
+        fragLoadingMaxRetry: 8,
+        startPosition: -1,
+        startFragPrefetch: true,
+        maxBufferHole: 1.2,
+        maxLiveSyncPlaybackRate: 1,
+      });
+      hls = instance;
+      setHlsInstance(instance);
+
+      instance.on(Hls.Events.MEDIA_ATTACHED, () => {
+        if (cancel) return;
+        instance.loadSource(selectedHlsUrl);
+      });
+      instance.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (cancel) return;
+        fatalRetries = 0;
+        manifestFingerprint = "";
+        manifestFingerprintAt = Date.now();
+        onLoaded();
+      });
+      instance.on(Hls.Events.LEVEL_LOADED, (_event, data) => {
+        if (cancel || !isRepackPlaylistUrl(selectedHlsUrl)) return;
+        const details = (data as { details?: { startSN?: number; endSN?: number; fragments?: Array<{ relurl?: string; url?: string }> } })
+          ?.details;
+        const startSN = Number(details?.startSN);
+        const endSN = Number(details?.endSN);
+        let fingerprint = "";
+        if (Number.isFinite(startSN) || Number.isFinite(endSN)) {
+          fingerprint = `${Number.isFinite(startSN) ? startSN : "na"}:${Number.isFinite(endSN) ? endSN : "na"}`;
+        } else if (Array.isArray(details?.fragments) && details.fragments.length) {
+          fingerprint = details.fragments
+            .slice(-2)
+            .map((frag) => String(frag?.relurl || frag?.url || "").trim())
+            .filter(Boolean)
+            .join("|");
+        }
+        if (!fingerprint) return;
+        const now = Date.now();
+        if (manifestFingerprint !== fingerprint) {
+          manifestFingerprint = fingerprint;
+          manifestFingerprintAt = now;
+          return;
+        }
+        if (now - manifestFingerprintAt < REPACK_STALE_PLAYLIST_MAX_IDLE_MS) return;
+        if (now - lastProgressAtRef.current < REPACK_STALE_PROGRESS_GUARD_MS) return;
+        setStrictPlaybackDiag((prev) => (prev === "strict-stale-playlist" ? prev : "strict-stale-playlist"));
+        softRecover("strict-stale-playlist");
+      });
+      instance.on(Hls.Events.ERROR, (_event, data) => {
+        if (cancel || !data.fatal) return;
+        const responseCode = Number((data as { response?: { code?: number } })?.response?.code || 0);
+        const diagMessage = `strict fatal ${String(data.type || "unknown")} / ${String(data.details || "unknown")}${
+          responseCode ? ` / http ${responseCode}` : ""
+        }`;
+        setStrictPlaybackDiag((prev) => (prev === diagMessage ? prev : diagMessage));
+        fatalRetries += 1;
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && fatalRetries <= 4) {
+          setPlayerError("خطأ وسائط في R2... جاري الإصلاح.");
+          queueRetry(() => {
+            try { instance.recoverMediaError(); } catch { }
+            playMutedSafely();
+          }, Math.min(2400, 400 + fatalRetries * 400));
+          return;
+        }
+        if (fatalRetries <= 6) {
+          setPlayerError("انقطاع مؤقت في R2... جاري إعادة المزامنة.");
+          queueRetry(() => {
+            try { instance.stopLoad(); } catch { }
+            try { instance.startLoad(-1); } catch { }
+            playMutedSafely();
+          }, Math.min(3200, 600 + fatalRetries * 450));
+          return;
+        }
+        setPlayerError("تعذر تشغيل R2 الآن... جاري إعادة المحاولة.");
+        queueRetry(() => {
+          try { instance.stopLoad(); } catch { }
+          try { instance.loadSource(selectedHlsUrl); } catch { }
+          try { instance.startLoad(-1); } catch { }
+          playMutedSafely();
+        }, 2400);
+      });
+      instance.attachMedia(video);
+    } else {
+      setPlayerError("متصفحك لا يدعم تشغيل HLS داخليًا.");
+      hideLoading();
+    }
+
+    stallTimer = window.setInterval(() => {
+      if (cancel || video.paused || video.seeking) return;
+      const currentTime = Number(video.currentTime);
+      if (Number.isFinite(currentTime) && currentTime > lastProgressRef.current + 0.05) {
+        lastProgressRef.current = currentTime;
+        lastProgressAtRef.current = Date.now();
+        return;
+      }
+      const stalledFor = Date.now() - lastProgressAtRef.current;
+      if (stalledFor >= STALL_FREEZE_MS) {
+        softRecover("strict-stall");
+      }
+    }, 1500);
+
+    return () => {
+      cancel = true;
+      clearRetryTimer();
+      if (stallTimer !== null) window.clearInterval(stallTimer);
+      video.removeEventListener("loadeddata", onLoaded);
+      video.removeEventListener("canplay", onLoaded);
+      video.removeEventListener("waiting", onWaiting);
+      video.removeEventListener("playing", onPlaying);
+      video.removeEventListener("pause", onPause);
+      video.removeEventListener("timeupdate", onTimeUpdate);
+      try { hls?.destroy(); } catch { }
+      setHlsInstance(null);
+      resetMedia();
+      setPlayerLoading(false);
+    };
+  }, [isStrictR2Playback, selectedHlsUrl, selectedServer, shouldBlockStream]);
+
+  useEffect(() => {
+    if (isStrictR2Playback) return;
     const video = videoRef.current;
     if (!video) return;
     let cancel = false;
