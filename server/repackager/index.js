@@ -274,6 +274,60 @@ function hasMediaSegments(manifestText, baseUrl) {
   return false;
 }
 
+function filterUnavailableSegmentsFromManifest(manifestText, missingRemoteNames) {
+  const blocked = new Set(
+    Array.from(missingRemoteNames || [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+  );
+  if (!blocked.size) return String(manifestText || "");
+
+  const lines = String(manifestText || "").split(/\r?\n/);
+  const out = [];
+  let pendingSegmentTags = [];
+
+  for (const line of lines) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) {
+      if (pendingSegmentTags.length) pendingSegmentTags.push(line);
+      else out.push(line);
+      continue;
+    }
+
+    if (trimmed.startsWith("#EXTINF") || trimmed.startsWith("#EXT-X-BYTERANGE")) {
+      pendingSegmentTags.push(line);
+      continue;
+    }
+
+    if (!trimmed.startsWith("#")) {
+      const remoteName = path.basename(trimmed);
+      if (blocked.has(remoteName)) {
+        pendingSegmentTags = [];
+        continue;
+      }
+      if (pendingSegmentTags.length) {
+        out.push(...pendingSegmentTags);
+        pendingSegmentTags = [];
+      }
+      out.push(line);
+      continue;
+    }
+
+    if (pendingSegmentTags.length && (trimmed.startsWith("#EXT-X-DISCONTINUITY") || trimmed.startsWith("#EXT-X-PROGRAM-DATE-TIME"))) {
+      pendingSegmentTags.push(line);
+      continue;
+    }
+
+    if (pendingSegmentTags.length) {
+      out.push(...pendingSegmentTags);
+      pendingSegmentTags = [];
+    }
+    out.push(line);
+  }
+
+  return out.join("\n");
+}
+
 function buildStrictGatewayIngestUrlKey(matchId, serverId) {
   return `m${matchId}:s${serverId}`;
 }
@@ -816,18 +870,38 @@ class MirrorJob {
     }
 
     try {
+      const failedUploads = [];
       await mapLimit(uploads, this.manager.config.mirrorAssetConcurrency, async (record) => {
-        await this.uploadAsset(record);
+        try {
+          await this.uploadAsset(record);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          failedUploads.push({ record, message });
+        }
       });
+      const fatalUpload = failedUploads.find(({ record }) => record.kind !== "segment");
+      if (fatalUpload) {
+        throw new Error(fatalUpload.message);
+      }
+
+      let publishManifestBody = rewritten.manifestBody;
+      if (failedUploads.length) {
+        const missingRemoteNames = new Set(failedUploads.map(({ record }) => record.remoteName));
+        publishManifestBody = filterUnavailableSegmentsFromManifest(rewritten.manifestBody, missingRemoteNames);
+        if (!hasMediaSegments(publishManifestBody, this.playlistUrl)) {
+          throw new Error(failedUploads[0].message);
+        }
+      }
+
       await this.cleanupStaleAssets(nowMs, rewritten.currentAssetUrls);
 
-      const fingerprint = hashHex(rewritten.manifestBody);
+      const fingerprint = hashHex(publishManifestBody);
       const shouldPublish =
         fingerprint !== this.lastPublishedPlaylistFingerprint ||
         !this.lastPublishAt ||
         nowMs - this.lastPublishAt >= this.manager.config.playlistPublishMinIntervalMs;
       if (shouldPublish) {
-        await this.uploadManifest(rewritten.manifestBody);
+        await this.uploadManifest(publishManifestBody);
         this.lastPublishedPlaylistFingerprint = fingerprint;
       }
 
