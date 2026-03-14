@@ -221,9 +221,16 @@ async function extractDirectLivekoraManifest(
     const manifestUrl = normalizeHttpUrl(String(extracted?.manifestUrl || "").trim());
     const manifestBody = String(extracted?.manifestBody || "");
     const referrerUrl = normalizeHttpUrl(String(extracted?.referrerUrl || "").trim()) || channelUrl;
+    if (manifestUrl) {
+      primeRuntimeHint(input, {
+        targetUrl: manifestUrl,
+        fetchUrl: manifestUrl,
+        referrerUrl,
+      });
+    }
 
     if (!extracted?.ok || !manifestUrl || !manifestBody || !hasMediaSegments(manifestBody, manifestUrl)) {
-      console.error(`[livekora-direct-empty] ${JSON.stringify({ sourceUrl: input.sourceUrl, channelUrl, extracted })}`);
+      console.error(`[livekora-direct-partial] ${JSON.stringify({ sourceUrl: input.sourceUrl, channelUrl, extracted })}`);
       return null;
     }
 
@@ -490,21 +497,6 @@ export const albaRuntimeAdapter: RuntimeAdapter = {
   currentManifest: async (input, queryOptions) => {
     const directResolved = await extractDirectLivekoraManifest(input, queryOptions);
     if (directResolved?.ok) return directResolved;
-    if (isLivekoraFamilyUrl(input.sourceUrl)) {
-      return {
-        ok: false,
-        error: "direct-livekora-manifest-empty",
-        playbackUrl: normalizeLivekoraChannelUrl(input.sourceUrl),
-        currentSource: "",
-        mediaSequence: null,
-        targetDurationSec: 0,
-        refreshed: false,
-        rotated: false,
-        adapterKind: "alba",
-        candidatesFound: 0,
-        candidatesTried: 0,
-      };
-    }
     const peek = albaBaseAdapter.peekStatus(input);
     if (peek.state !== "ready" && (!peek.currentSource || peek.sourceCount === 0)) {
       for (const candidate of await deriveAlbaHintCandidates(input)) {
