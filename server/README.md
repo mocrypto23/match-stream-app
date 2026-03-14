@@ -15,7 +15,7 @@ This folder is a recovery kit for running `tf-player.site` on OVH again from scr
 - Forces player-host env safety:
   - `NEXT_PUBLIC_FORCE_IFRAME_PLAYER=0`
   - `NEXT_PUBLIC_IFRAME_PLAYER_ORIGIN=`
-- Starts both `tf-repackager` and `tf-repack-prewarm` unconditionally.
+- Starts `livekora-r2-agent`.
 
 3. `server/recovery/OVH_RECOVERY.md`
 - End-to-end recovery steps for fresh VPS.

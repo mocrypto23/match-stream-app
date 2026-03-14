@@ -1,6 +1,3 @@
-import { execFile } from "node:child_process";
-import path from "node:path";
-
 import { fetchLiveEmbedText } from "@/lib/repack-embed-session";
 import { extractCandidatesFromText, isLikelyAlbaLandingUrl } from "@/lib/repack-ingest-resolver";
 import { getSourceFamilyForSlotServer, isValidHttpUrl } from "@/lib/server-source-policy";
@@ -17,25 +14,6 @@ import {
 } from "./shared";
 
 const LIVEKORA_FAMILY_BASE_HOSTS = ["sportsurges.cc", "livekora.vip", "koooralive.click", "kooraxx.com"] as const;
-const DIRECT_LIVEKORA_MANIFEST_CACHE_TTL_MS = 4_000;
-const DIRECT_LIVEKORA_BROWSER_TIMEOUT_MS = 12_000;
-
-type DirectLivekoraManifestCacheEntry = {
-  expiresAt: number;
-  result: RuntimeManifestResult;
-};
-
-const directLivekoraManifestCache = new Map<string, DirectLivekoraManifestCacheEntry>();
-const directLivekoraManifestInflight = new Map<string, Promise<RuntimeManifestResult | null>>();
-
-type DirectLivekoraExtractorOutput = {
-  ok: boolean;
-  manifestUrl?: string;
-  manifestBody?: string;
-  referrerUrl?: string;
-  playbackUrl?: string;
-  error?: string;
-};
 
 function looksLikeAlbaSource(rawUrl: string) {
   try {
@@ -69,259 +47,12 @@ function isLivekoraFamilyUrl(rawUrl: string) {
   }
 }
 
-function normalizeLivekoraChannelUrl(sourceUrl: string) {
-  try {
-    const parsed = new URL(String(sourceUrl || "").trim());
-    if (!isLivekoraFamilyHost(parsed.hostname)) return parsed.toString();
-    const parts = String(parsed.pathname || "")
-      .split("/")
-      .map((item) => item.trim())
-      .filter(Boolean);
-    const slug = String(parts[0] === "albaplayer" ? parts[1] || "" : parts[0] || "").trim();
-    if (!slug) return parsed.toString();
-    parsed.pathname = `/${slug}/`;
-    parsed.search = "";
-    return parsed.toString();
-  } catch {
-    return String(sourceUrl || "").trim();
-  }
-}
-
 function resolveLivekoraIframeUrl(rawUrl: string, baseUrl: string) {
   try {
     const absolute = new URL(String(rawUrl || "").trim(), baseUrl).toString();
     return isValidHttpUrl(absolute) ? absolute : "";
   } catch {
     return "";
-  }
-}
-
-function parseMediaSequence(manifestText: string) {
-  const match = String(manifestText || "").match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/i);
-  if (!match?.[1]) return null;
-  const value = Number.parseInt(match[1], 10);
-  return Number.isFinite(value) ? value : null;
-}
-
-function parseTargetDurationSec(manifestText: string) {
-  for (const line of String(manifestText || "").split(/\r?\n/)) {
-    const match = String(line || "").trim().match(/^#EXT-X-TARGETDURATION:(\d+(?:\.\d+)?)/i);
-    if (!match?.[1]) continue;
-    const value = Number.parseFloat(match[1]);
-    if (Number.isFinite(value) && value > 0) return value;
-  }
-  return 0;
-}
-
-function hasMediaSegments(manifestText: string, baseUrl: string) {
-  let previousExtInf = false;
-  for (const line of String(manifestText || "").split(/\r?\n/)) {
-    const trimmed = String(line || "").trim();
-    if (!trimmed) continue;
-    if (trimmed.startsWith("#EXTINF")) {
-      previousExtInf = true;
-      continue;
-    }
-    if (trimmed.startsWith("#")) {
-      if (!trimmed.startsWith("#EXT-X-STREAM-INF")) previousExtInf = false;
-      continue;
-    }
-    try {
-      const absolute = new URL(trimmed, baseUrl).toString();
-      if (absolute && previousExtInf) return true;
-    } catch {}
-    previousExtInf = false;
-  }
-  return false;
-}
-
-function readDirectLivekoraManifestCache(input: RuntimeAdapterInput, waitForMediaSequence?: number | null) {
-  const key = buildDirectLivekoraCacheKey(input);
-  const cached = directLivekoraManifestCache.get(key);
-  if (!cached || cached.expiresAt <= Date.now()) {
-    if (cached) directLivekoraManifestCache.delete(key);
-    return null;
-  }
-  if (
-    Number.isFinite(Number(waitForMediaSequence)) &&
-    cached.result.ok &&
-    cached.result.mediaSequence !== null &&
-    cached.result.mediaSequence <= Number(waitForMediaSequence)
-  ) {
-    return null;
-  }
-  return cached.result;
-}
-
-function writeDirectLivekoraManifestCache(input: RuntimeAdapterInput, result: RuntimeManifestResult) {
-  const key = buildDirectLivekoraCacheKey(input);
-  directLivekoraManifestCache.set(key, {
-    expiresAt: Date.now() + DIRECT_LIVEKORA_MANIFEST_CACHE_TTL_MS,
-    result,
-  });
-}
-
-function buildDirectLivekoraCacheKey(input: RuntimeAdapterInput) {
-  return `${input.slotServer}|${normalizeLivekoraChannelUrl(input.sourceUrl)}`;
-}
-
-async function runDirectLivekoraExtractor(channelUrl: string): Promise<DirectLivekoraExtractorOutput | null> {
-  const scriptPath = path.join(process.cwd(), "server", "livekora-direct-extract.js");
-  return await new Promise((resolve) => {
-    execFile(
-      process.execPath,
-      [scriptPath, channelUrl],
-      {
-        cwd: process.cwd(),
-        timeout: DIRECT_LIVEKORA_BROWSER_TIMEOUT_MS + 8_000,
-        maxBuffer: 4 * 1024 * 1024,
-      },
-      (error, stdout) => {
-        if (error) {
-          resolve(null);
-          return;
-        }
-        const raw = String(stdout || "")
-          .split(/\r?\n/)
-          .map((line) => line.trim())
-          .filter(Boolean)
-          .at(-1);
-        if (!raw) {
-          resolve(null);
-          return;
-        }
-        try {
-          const parsed = JSON.parse(raw) as DirectLivekoraExtractorOutput;
-          resolve(parsed);
-        } catch {
-          resolve(null);
-        }
-      }
-    );
-  });
-}
-
-async function extractDirectLivekoraManifest(
-  input: RuntimeAdapterInput,
-  queryOptions?: { waitForMediaSequence?: number | null }
-): Promise<RuntimeManifestResult | null> {
-  if (!isLivekoraFamilyUrl(input.sourceUrl)) return null;
-  const cached = readDirectLivekoraManifestCache(input, queryOptions?.waitForMediaSequence);
-  if (cached) return cached;
-  const cacheKey = buildDirectLivekoraCacheKey(input);
-  const inflight = directLivekoraManifestInflight.get(cacheKey);
-  if (inflight) {
-    return inflight;
-  }
-  const pending = (async () => {
-    const channelUrl = normalizeLivekoraChannelUrl(input.sourceUrl);
-    if (!isValidHttpUrl(channelUrl)) return null;
-
-    const extracted = await runDirectLivekoraExtractor(channelUrl);
-    const manifestUrl = normalizeHttpUrl(String(extracted?.manifestUrl || "").trim());
-    const manifestBody = String(extracted?.manifestBody || "");
-    const referrerUrl = normalizeHttpUrl(String(extracted?.referrerUrl || "").trim()) || channelUrl;
-    if (manifestUrl) {
-      primeRuntimeHint(input, {
-        targetUrl: manifestUrl,
-        fetchUrl: manifestUrl,
-        referrerUrl,
-      });
-    }
-
-    if (!extracted?.ok || !manifestUrl || !manifestBody || !hasMediaSegments(manifestBody, manifestUrl)) {
-      console.error(`[livekora-direct-partial] ${JSON.stringify({ sourceUrl: input.sourceUrl, channelUrl, extracted })}`);
-      return null;
-    }
-
-    const result: RuntimeManifestResult = {
-      ok: true,
-      manifestBody: rewriteManifestForSessionMirror(
-        manifestBody,
-        manifestUrl,
-        input.internalOrigin,
-        input.sourceUrl,
-        input.slotServer
-      ),
-      finalUrl: manifestUrl,
-      targetUrl: manifestUrl,
-      fetchUrl: manifestUrl,
-      referrerUrl,
-      playbackUrl: channelUrl,
-      currentSource: manifestUrl,
-      mediaSequence: parseMediaSequence(manifestBody),
-      targetDurationSec: parseTargetDurationSec(manifestBody),
-      refreshed: false,
-      rotated: false,
-      adapterKind: "alba",
-      candidatesFound: 1,
-      candidatesTried: 1,
-      sessionOwned: true,
-    };
-    writeDirectLivekoraManifestCache(input, result);
-    return result;
-  })();
-  directLivekoraManifestInflight.set(cacheKey, pending);
-  try {
-    return await pending;
-  } finally {
-    directLivekoraManifestInflight.delete(cacheKey);
-  }
-}
-
-async function fetchDirectLivekoraAsset(input: {
-  assetUrl: string;
-  referrerUrl?: string | null;
-  timeoutMs?: number;
-}) {
-  const assetUrl = normalizeHttpUrl(input.assetUrl);
-  if (!assetUrl) {
-    return { ok: false, status: 0, contentType: "", bodyBase64: "", error: "invalid-asset-url" };
-  }
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), Math.max(4_000, Number(input.timeoutMs || 12_000)));
-  try {
-    const headers: Record<string, string> = {
-      accept: "*/*",
-    };
-    const normalizedReferrerUrl = normalizeHttpUrl(input.referrerUrl || "");
-    if (normalizedReferrerUrl) {
-      headers.referer = normalizedReferrerUrl;
-    }
-    const response = await fetch(assetUrl, {
-      method: "GET",
-      cache: "no-store",
-      redirect: "follow",
-      signal: controller.signal,
-      headers,
-    });
-    if (!response.ok) {
-      return {
-        ok: false,
-        status: Number(response.status || 0),
-        contentType: String(response.headers.get("content-type") || ""),
-        bodyBase64: "",
-        error: `asset-http-${Number(response.status || 0)}`,
-      };
-    }
-    const bytes = Buffer.from(await response.arrayBuffer());
-    return {
-      ok: true,
-      status: Number(response.status || 200),
-      contentType: String(response.headers.get("content-type") || "application/octet-stream"),
-      bodyBase64: bytes.toString("base64"),
-      error: "",
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      status: 0,
-      contentType: "",
-      bodyBase64: "",
-      error: error instanceof Error ? error.message : String(error || "asset-fetch-failed"),
-    };
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 
@@ -495,8 +226,6 @@ const albaBaseAdapter = buildSessionOwnedRuntimeAdapter(
 export const albaRuntimeAdapter: RuntimeAdapter = {
   ...albaBaseAdapter,
   currentManifest: async (input, queryOptions) => {
-    const directResolved = await extractDirectLivekoraManifest(input, queryOptions);
-    if (directResolved?.ok) return directResolved;
     const peek = albaBaseAdapter.peekStatus(input);
     if (peek.state !== "ready" && (!peek.currentSource || peek.sourceCount === 0)) {
       for (const candidate of await deriveAlbaHintCandidates(input)) {
@@ -536,13 +265,5 @@ export const albaRuntimeAdapter: RuntimeAdapter = {
     }
     return resolved;
   },
-  fetchAsset: async (input) => {
-    const directFetched = await fetchDirectLivekoraAsset({
-      assetUrl: input.assetUrl,
-      referrerUrl: input.referrerUrl || normalizeLivekoraChannelUrl(input.sourceUrl),
-      timeoutMs: input.timeoutMs,
-    });
-    if (directFetched.ok) return directFetched;
-    return albaBaseAdapter.fetchAsset(input);
-  },
+  fetchAsset: (input) => albaBaseAdapter.fetchAsset(input),
 };

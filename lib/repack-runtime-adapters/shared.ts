@@ -427,7 +427,7 @@ function buildSessionAssetUrl(input: {
   params.set("sourceUrl", input.sourceUrl);
   params.set("assetUrl", input.assetUrl);
   if (isValidHttpUrl(String(input.referrerUrl || "").trim())) params.set("referrerUrl", String(input.referrerUrl || "").trim());
-  return `${String(input.internalOrigin || "").replace(/\/+$/, "")}/api/repack/session-asset?${params.toString()}`;
+  return `${String(input.internalOrigin || "").replace(/\/+$/, "")}/api/livekora/session-asset?${params.toString()}`;
 }
 
 function pickSessionFetchUrl(fetchUrl: string | undefined, targetUrl: string, internalOrigin: string) {

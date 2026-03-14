@@ -6,8 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "repackager:start": "node server/repackager/index.js",
-    "repack-prewarm:start": "node server/prewarm/index.js",
+    "livekora-r2-agent:start": "node server/livekora-r2-agent/index.js",
     "lint": "eslint",
     "cleanup:server-slots": "node scripts/cleanup-server-slot-mismatch.js"
   },

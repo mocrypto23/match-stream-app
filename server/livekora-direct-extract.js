@@ -1,7 +1,7 @@
 const { chromium } = require("playwright");
 
 const channelUrl = String(process.argv[2] || "").trim();
-const BROWSER_TIMEOUT_MS = 12000;
+const BROWSER_TIMEOUT_MS = 20000;
 
 function normalizeHttpUrl(rawUrl) {
   try {
@@ -34,6 +34,28 @@ function hasMediaSegments(manifestText, baseUrl) {
   return false;
 }
 
+function looksLikeManifestUrl(rawUrl) {
+  const url = normalizeHttpUrl(rawUrl);
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    const pathname = String(parsed.pathname || "").toLowerCase();
+    const search = String(parsed.search || "").toLowerCase();
+    const combined = `${pathname}${search}`;
+    if (/\.(?:ts|m4s|mp4|aac|mp3|vtt)(?:$|[?#])/i.test(pathname)) return false;
+    if (combined.includes(".m3u8")) return true;
+    return (
+      pathname.includes("/hls/") ||
+      pathname.includes("/playlist/") ||
+      pathname.includes("/manifest/") ||
+      search.includes("playlist") ||
+      search.includes("m3u8")
+    );
+  } catch {
+    return false;
+  }
+}
+
 async function main() {
   if (!channelUrl) {
     console.log(JSON.stringify({ ok: false, error: "missing-channel-url" }));
@@ -58,7 +80,9 @@ async function main() {
 
   const page = await context.newPage();
   let lastManifestUrl = "";
+  let lastManifestRequestHeaders = {};
   let manifestResolved = false;
+  const pendingTasks = new Set();
 
   const emitAndExit = async (payload) => {
     if (manifestResolved) return;
@@ -70,31 +94,45 @@ async function main() {
     process.exit(0);
   };
 
+  page.on("request", (request) => {
+    const url = normalizeHttpUrl(request.url());
+    if (!url || !looksLikeManifestUrl(url)) return;
+    lastManifestRequestHeaders = request.headers();
+  });
+
   page.on("console", (message) => {
     const text = String(message.text() || "");
     const match = text.match(/loadSource:(https?:\/\/\S+)/i);
     const candidate = normalizeHttpUrl(match && match[1] ? match[1] : "");
-    if (candidate) {
+    if (candidate && looksLikeManifestUrl(candidate)) {
       lastManifestUrl = candidate;
     }
   });
 
-  page.on("response", async (response) => {
-    if (manifestResolved) return;
-    const url = normalizeHttpUrl(response.url());
-    if (!url || !/\.m3u8(?:$|[?#])|\/hls\/|\/stream\/|\/live\/|amazonaws/i.test(url)) return;
-    lastManifestUrl = url;
-    try {
-      const body = await response.text().catch(() => "");
-      if (!body.trim() || !hasMediaSegments(body, url)) return;
-      await emitAndExit({
-        ok: true,
-        manifestUrl: url,
-        manifestBody: body,
-        referrerUrl: normalizeHttpUrl(page.url()) || channelUrl,
-        playbackUrl: channelUrl,
-      });
-    } catch {}
+  page.on("response", (response) => {
+    const task = (async () => {
+      if (manifestResolved) return;
+      const url = normalizeHttpUrl(response.url());
+      const contentType = String(response.headers()["content-type"] || "").toLowerCase();
+      if (!url || (!looksLikeManifestUrl(url) && !contentType.includes("mpegurl"))) return;
+      lastManifestUrl = url;
+      try {
+        const body = await response.text().catch(() => "");
+        if (!body.trim() || !/^\s*#extm3u/m.test(body) || !hasMediaSegments(body, url)) return;
+        await emitAndExit({
+          ok: true,
+          manifestUrl: url,
+          manifestBody: body,
+          referrerUrl: normalizeHttpUrl(page.url()) || channelUrl,
+          manifestRequestHeaders: lastManifestRequestHeaders,
+          playbackUrl: channelUrl,
+        });
+      } catch {}
+    })();
+    pendingTasks.add(task);
+    task.finally(() => {
+      pendingTasks.delete(task);
+    });
   });
 
   let timeoutResult = null;
@@ -103,7 +141,10 @@ async function main() {
       waitUntil: "domcontentloaded",
       timeout: 20000,
     });
-    await page.waitForTimeout(12000);
+    await page.waitForTimeout(BROWSER_TIMEOUT_MS);
+    if (!manifestResolved && pendingTasks.size) {
+      await Promise.allSettled(Array.from(pendingTasks));
+    }
   } catch (error) {
     timeoutResult = {
       ok: false,
@@ -111,6 +152,7 @@ async function main() {
       manifestUrl: lastManifestUrl,
       manifestBody: "",
       referrerUrl: normalizeHttpUrl(page.url()) || channelUrl,
+      manifestRequestHeaders: lastManifestRequestHeaders,
       playbackUrl: channelUrl,
     };
   }
@@ -121,6 +163,7 @@ async function main() {
       manifestUrl: lastManifestUrl,
       manifestBody: "",
       referrerUrl: normalizeHttpUrl(page.url()) || channelUrl,
+      manifestRequestHeaders: lastManifestRequestHeaders,
       playbackUrl: channelUrl,
     };
   }
@@ -139,6 +182,7 @@ main().catch(async (error) => {
       manifestUrl: "",
       manifestBody: "",
       referrerUrl: "",
+      manifestRequestHeaders: {},
       playbackUrl: channelUrl,
     })
   );
