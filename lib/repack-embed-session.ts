@@ -320,6 +320,22 @@ function looksLikeNavigableStreamPage(rawUrl: string) {
   }
 }
 
+function isBeinLiveMatchPageUrl(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    const pathname = String(parsed.pathname || "").toLowerCase();
+    return (host === "bein-live.com" || host.endsWith(".bein-live.com")) && pathname.includes("/matches/");
+  } catch {
+    return false;
+  }
+}
+
+function shouldNavigateSeedInBrowser(rawUrl: string) {
+  return isLikelyAlbaLandingUrl(rawUrl) || looksLikePlayerv2PageUrl(rawUrl) || isBeinLiveMatchPageUrl(rawUrl);
+}
+
 function looksLikeManifestUrl(rawUrl: string) {
   if (!isValidHttpUrl(rawUrl)) return false;
   try {
@@ -1046,6 +1062,11 @@ class LiveEmbedSession {
       visited.add(key);
       crawledPages += 1;
 
+      if (shouldNavigateSeedInBrowser(next.pageUrl) && this.page && !this.page.isClosed?.()) {
+        const navigated = await this.navigateSeedInBrowser(next, timeoutMs);
+        if (navigated) continue;
+      }
+
       const pageFetchUrl = isDirectCrawlPreferred(next.pageUrl)
         ? pickPreferredDirectPlaybackUrl(next.pageUrl)
         : buildPlaybackProxyUrl({
@@ -1096,6 +1117,58 @@ class LiveEmbedSession {
           depth: next.depth,
         });
       }
+    }
+  }
+
+  async navigateSeedInBrowser(seed: PageSeed, timeoutMs: number) {
+    const page = this.page;
+    if (!page || page.isClosed?.()) return false;
+    const playbackUrl = isDirectCrawlPreferred(seed.pageUrl)
+      ? pickPreferredDirectPlaybackUrl(seed.pageUrl)
+      : buildPlaybackProxyUrl({
+          sourceUrl: seed.pageUrl,
+          requestOrigin: this.requestOrigin,
+          referrerUrl: seed.referrerUrl,
+        });
+    if (!playbackUrl) return false;
+
+    try {
+      await page.goto(playbackUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: Math.max(7_000, Math.min(35_000, timeoutMs)),
+      });
+      if (typeof page.waitForLoadState === "function") {
+        await page.waitForLoadState("networkidle", {
+          timeout: Math.min(5_000, SESSION_NETWORK_IDLE_WAIT_MS),
+        }).catch(() => {});
+      }
+      await page.waitForTimeout(Math.max(2_000, Math.min(8_000, SESSION_WAIT_MS)));
+      await this.drainDomCandidates();
+      if (this.pendingTasks.size) {
+        await Promise.allSettled(Array.from(this.pendingTasks));
+      }
+      const html = await page
+        .evaluate(() => {
+          try {
+            return document.documentElement?.outerHTML || document.body?.outerHTML || "";
+          } catch {
+            return "";
+          }
+        })
+        .catch(() => "");
+      if (String(html || "").trim()) {
+        await this.registerExtractedText({
+          text: String(html || ""),
+          pageUrl: playbackUrl,
+          sourceUrl: seed.pageUrl,
+          referrerUrl: seed.referrerUrl,
+          depth: seed.depth,
+        });
+      }
+      return true;
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : String(error || "seed-browser-navigation-failed");
+      return false;
     }
   }
 
