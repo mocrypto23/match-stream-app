@@ -684,6 +684,12 @@ async function loadBrowser() {
     process.once("SIGINT", closeSilently);
     process.once("beforeExit", closeSilently);
   }
+  if (browserClosingPromise) {
+    await browserClosingPromise.catch(() => {});
+  }
+  if (browserInstance) {
+    return browserPromise || Promise.resolve(browserInstance);
+  }
   if (!browserPromise) {
     browserPromise = (async () => {
       const { chromium } = (await import("playwright")) as { chromium: { launch: (input: unknown) => Promise<unknown> } };
@@ -705,16 +711,15 @@ async function loadBrowser() {
 async function closeBrowser() {
   if (browserClosingPromise) return browserClosingPromise;
   const browser = browserInstance;
+  browserInstance = null;
+  browserPromise = null;
   if (!browser) {
-    browserPromise = null;
     return Promise.resolve();
   }
   browserClosingPromise = (async () => {
     try {
       await browser.close?.().catch(() => {});
     } finally {
-      browserInstance = null;
-      browserPromise = null;
       browserClosingPromise = null;
     }
   })();
@@ -2067,27 +2072,51 @@ class LiveEmbedSession {
         throw new Error("invalid-live-embed-session-input");
       }
 
-      const browser = (await loadBrowser()) as PlaywrightBrowser;
-      const context = await browser.newContext({
-        ignoreHTTPSErrors: true,
-        locale: "ar-EG",
-        userAgent: DEFAULT_USER_AGENT,
-        viewport: { width: 1440, height: 900 },
-        extraHTTPHeaders: {
-          "accept-language": "ar,en-US;q=0.9,en;q=0.8",
-        },
-      });
-      const extractorInitScript = createExtractorInitScript();
-      if (typeof context.addInitScript === "function") {
-        await context.addInitScript(extractorInitScript);
+      let context: PlaywrightContext | null = null;
+      let page: PlaywrightPage | null = null;
+      let lastContextError: unknown = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const browser = (await loadBrowser()) as PlaywrightBrowser;
+          context = await browser.newContext({
+            ignoreHTTPSErrors: true,
+            locale: "ar-EG",
+            userAgent: DEFAULT_USER_AGENT,
+            viewport: { width: 1440, height: 900 },
+            extraHTTPHeaders: {
+              "accept-language": "ar,en-US;q=0.9,en;q=0.8",
+            },
+          });
+          const extractorInitScript = createExtractorInitScript();
+          if (typeof context.addInitScript === "function") {
+            await context.addInitScript(extractorInitScript);
+          }
+          page = await context.newPage();
+          if (typeof page.addInitScript === "function") {
+            await page.addInitScript(extractorInitScript);
+          }
+          this.browserContext = context;
+          this.page = page;
+          await this.attachPageHandlers(page);
+          lastContextError = null;
+          break;
+        } catch (error) {
+          lastContextError = error;
+          await page?.close().catch(() => {});
+          await context?.close().catch(() => {});
+          this.page = null;
+          this.browserContext = null;
+          const message = error instanceof Error ? error.message : String(error || "");
+          if (attempt === 0 && /target page, context or browser has been closed/i.test(message)) {
+            await closeBrowser().catch(() => {});
+            continue;
+          }
+          throw error;
+        }
       }
-      const page = await context.newPage();
-      if (typeof page.addInitScript === "function") {
-        await page.addInitScript(extractorInitScript);
+      if (!page || !context) {
+        throw (lastContextError instanceof Error ? lastContextError : new Error("live-embed-browser-context-failed"));
       }
-      this.browserContext = context;
-      this.page = page;
-      await this.attachPageHandlers(page);
 
       try {
         await this.primePage(timeoutMs);
