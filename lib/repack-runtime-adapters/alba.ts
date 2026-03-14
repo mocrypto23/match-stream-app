@@ -75,6 +75,15 @@ function normalizeLivekoraChannelUrl(sourceUrl: string) {
   }
 }
 
+function resolveLivekoraIframeUrl(rawUrl: string, baseUrl: string) {
+  try {
+    const absolute = new URL(String(rawUrl || "").trim(), baseUrl).toString();
+    return isValidHttpUrl(absolute) ? absolute : "";
+  } catch {
+    return "";
+  }
+}
+
 function parseMediaSequence(manifestText: string) {
   const match = String(manifestText || "").match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/i);
   if (!match?.[1]) return null;
@@ -212,6 +221,21 @@ async function extractDirectLivekoraManifest(
       });
       referrerUrl = normalizeHttpUrl(page.url()) || channelUrl;
       await Promise.race([foundPromise, page.waitForTimeout(Math.max(4_000, DIRECT_LIVEKORA_BROWSER_TIMEOUT_MS - 2_000))]);
+
+      if (!manifestBody) {
+        const iframeSrc = resolveLivekoraIframeUrl(
+          (await page.locator("iframe#streamFrame, iframe[src]").first().getAttribute("src").catch(() => "")) || "",
+          page.url() || channelUrl
+        );
+        if (iframeSrc && iframeSrc !== normalizeHttpUrl(page.url())) {
+          await page.goto(iframeSrc, {
+            waitUntil: "domcontentloaded",
+            timeout: DIRECT_LIVEKORA_BROWSER_TIMEOUT_MS,
+          });
+          referrerUrl = normalizeHttpUrl(page.url()) || iframeSrc;
+          await Promise.race([foundPromise, page.waitForTimeout(6_000)]);
+        }
+      }
 
       if (!manifestBody && manifestUrl) {
         const controller = new AbortController();
