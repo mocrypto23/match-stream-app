@@ -8,6 +8,7 @@ import {
   type SlotServerId,
 } from "./server-source-policy";
 import type { MatchR2Status, R2ServerState, R2StatusServerEntry } from "./r2-status-types";
+import { buildRepackGatewayManifestUrl } from "./repack-ingest-gateway";
 import { getRepackSeedRuntimeState } from "./repack-runtime-state";
 import type { StreamMode } from "./stream-mode";
 import { computeMatchWindowState, getMatchWindowConfig, parseMatchStartMs } from "./match-window";
@@ -46,6 +47,14 @@ type PlaylistProbeResult = {
   segmentProbe: "ok" | "fail";
   mediaSequence: number | null;
   segmentUrl: string | null;
+};
+
+type SessionManifestProbeResult = {
+  state: "ready" | "warming" | "down";
+  reason: string;
+  resolverState: "ok" | "no-candidate" | "probe-failed" | "missing-source" | "unknown";
+  recoverable: boolean;
+  adapter: string | null;
 };
 
 type AgentDiagJob = {
@@ -397,6 +406,103 @@ async function probeR2Playlist(playlistUrl: string, timeoutMs: number): Promise<
   }
 }
 
+async function probeSessionManifest(matchId: number, slotServer: SlotServerId, timeoutMs: number): Promise<SessionManifestProbeResult> {
+  const targetUrl = buildRepackGatewayManifestUrl({
+    matchId,
+    slotServer,
+  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(targetUrl, {
+      method: "GET",
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        accept: "application/vnd.apple.mpegurl,application/x-mpegurl,application/json,text/plain,*/*",
+      },
+    });
+    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+    const runtimeAdapter = String(response.headers.get("x-repack-runtime-adapter") || "").trim() || null;
+    const body = await response.text().catch(() => "");
+    if (response.ok) {
+      const looksLikeManifest =
+        body.includes("#EXTM3U") ||
+        contentType.includes("application/vnd.apple.mpegurl") ||
+        contentType.includes("application/x-mpegurl");
+      if (looksLikeManifest) {
+        return {
+          state: "ready",
+          reason: "session-manifest-ready",
+          resolverState: "ok",
+          recoverable: true,
+          adapter: runtimeAdapter,
+        };
+      }
+      return {
+        state: "warming",
+        reason: "session-manifest-non-hls",
+        resolverState: "probe-failed",
+        recoverable: true,
+        adapter: runtimeAdapter,
+      };
+    }
+
+    let payload: Record<string, unknown> | null = null;
+    if (contentType.includes("application/json")) {
+      payload = JSON.parse(body || "null") as Record<string, unknown> | null;
+    }
+    const extractor = payload && typeof payload.extractor === "object" && payload.extractor ? (payload.extractor as Record<string, unknown>) : null;
+    const error = String((payload && "error" in payload ? payload.error : "") || "").trim() || `session-manifest-http-${response.status || 0}`;
+    const adapter = String((extractor && "adapter" in extractor ? extractor.adapter : runtimeAdapter) || "").trim() || null;
+    if (error.includes("missing-source")) {
+      return {
+        state: "down",
+        reason: "missing-source",
+        resolverState: "missing-source",
+        recoverable: false,
+        adapter,
+      };
+    }
+    if (error.includes("source-not-allowed")) {
+      return {
+        state: "down",
+        reason: "source-not-allowed",
+        resolverState: "unknown",
+        recoverable: false,
+        adapter,
+      };
+    }
+    if (error.includes("no-candidate")) {
+      return {
+        state: "warming",
+        reason: error,
+        resolverState: "no-candidate",
+        recoverable: true,
+        adapter,
+      };
+    }
+    return {
+      state: "warming",
+      reason: error,
+      resolverState: "probe-failed",
+      recoverable: true,
+      adapter,
+    };
+  } catch {
+    return {
+      state: "warming",
+      reason: "session-manifest-fetch-failed",
+      resolverState: "probe-failed",
+      recoverable: true,
+      adapter: null,
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 function resolveStateFromRecentSeed(
   matchId: number,
   slotServer: SlotServerId,
@@ -531,7 +637,28 @@ export async function buildMatchR2Status(input: {
         };
       }
 
-      if (!matchWindow.inWindow) {
+      const recentReadyAgeMs = getRecentReadyAgeMs(matchSlotKey, nowMs);
+      const hasRecentReadyGrace = Number.isFinite(recentReadyAgeMs) && recentReadyAgeMs !== null && recentReadyAgeMs <= readyGraceMs;
+      const recentSeedState = getRepackSeedRuntimeState(matchId, slotServer);
+      const recentAcceptedAt =
+        recentSeedState?.accepted && Number.isFinite(recentSeedState.acceptedAt)
+          ? Number(recentSeedState.acceptedAt)
+          : null;
+      const recentAcceptedAgeMs =
+        recentAcceptedAt !== null && Number.isFinite(recentAcceptedAt) ? Math.max(0, nowMs - recentAcceptedAt) : null;
+      const recentSeedRejected =
+        !!recentSeedState &&
+        !recentSeedState.accepted &&
+        nowMs - recentSeedState.updatedAt <= DEFAULT_SEED_WARMING_WINDOW_MS;
+      const agentSignal = deriveAgentSignal(agentJob, nowMs);
+      const sessionProbe = await probeSessionManifest(matchId, slotServer, Math.max(900, Math.min(2600, probeTimeoutMs)));
+      const allowRuntimeDrivenStatus =
+        sessionProbe.state !== "down" ||
+        !!agentSignal ||
+        hasRecentReadyGrace ||
+        (recentAcceptedAgeMs !== null && recentAcceptedAgeMs <= DEFAULT_SEED_WARMING_WINDOW_MS);
+
+      if (!matchWindow.inWindow && !allowRuntimeDrivenStatus) {
         clearEarlyStopState(matchSlotKey);
         clearRecentReadyState(matchSlotKey);
         return {
@@ -562,19 +689,6 @@ export async function buildMatchR2Status(input: {
       const probed = await probeR2Playlist(playlistUrl, Math.max(probeTimeoutMs, segmentProbeTimeoutMs));
       const sequenceAgeMs = noteSequenceAndGetAgeMs(playlistUrl, probed.mediaSequence, nowMs);
       const consecutiveSegmentFails = noteSegmentProbeFailure(matchSlotKey, probed.segmentProbe === "fail", nowMs);
-      const recentReadyAgeMs = getRecentReadyAgeMs(matchSlotKey, nowMs);
-      const hasRecentReadyGrace = Number.isFinite(recentReadyAgeMs) && recentReadyAgeMs !== null && recentReadyAgeMs <= readyGraceMs;
-      const recentSeedState = getRepackSeedRuntimeState(matchId, slotServer);
-      const recentAcceptedAt =
-        recentSeedState?.accepted && Number.isFinite(recentSeedState.acceptedAt)
-          ? Number(recentSeedState.acceptedAt)
-          : null;
-      const recentAcceptedAgeMs =
-        recentAcceptedAt !== null && Number.isFinite(recentAcceptedAt) ? Math.max(0, nowMs - recentAcceptedAt) : null;
-      const recentSeedRejected =
-        !!recentSeedState &&
-        !recentSeedState.accepted &&
-        nowMs - recentSeedState.updatedAt <= DEFAULT_SEED_WARMING_WINDOW_MS;
       const finishedDebounced =
         shouldEarlyStopFinished &&
         finishedSeenAt !== null &&
@@ -624,7 +738,6 @@ export async function buildMatchR2Status(input: {
         };
       }
 
-      const agentSignal = deriveAgentSignal(agentJob, nowMs);
       if (agentSignal?.state === "ready") {
         noteRecentReadyState(matchSlotKey, nowMs);
         return {
@@ -658,6 +771,21 @@ export async function buildMatchR2Status(input: {
         };
       }
 
+      if (sessionProbe.state === "ready") {
+        return {
+          uiServer,
+          slotServer,
+          state: "warming",
+          playlistUrl,
+          segmentProbe: probed.segmentProbe === "ok" ? "ok" : "unknown",
+          lastSequenceAgeMs: sequenceAgeMs,
+          resolverState: sessionProbe.resolverState,
+          resolveReason: sessionProbe.reason,
+          reason: `session-active:${sessionProbe.reason}:${probed.reason}`,
+          updatedAt: nowIso(nowMs),
+        };
+      }
+
       if (agentSignal?.state === "warming") {
         return {
           uiServer,
@@ -673,18 +801,36 @@ export async function buildMatchR2Status(input: {
         };
       }
 
+      if (sessionProbe.state === "warming" && (matchWindow.inWindow || recentAcceptedAgeMs !== null || !!agentSignal)) {
+        return {
+          uiServer,
+          slotServer,
+          state: "warming",
+          playlistUrl,
+          segmentProbe: probed.segmentProbe === "ok" ? "ok" : "unknown",
+          lastSequenceAgeMs: sequenceAgeMs,
+          resolverState: sessionProbe.resolverState,
+          resolveReason: sessionProbe.reason,
+          reason: `session-warming:${sessionProbe.reason}:${probed.reason}`,
+          updatedAt: nowIso(nowMs),
+        };
+      }
+
       if (recentSeedRejected) {
-        if (probed.segmentProbe === "ok") {
+        if (probed.segmentProbe === "ok" || sessionProbe.state !== "down") {
           return {
             uiServer,
             slotServer,
             state: "warming",
             playlistUrl,
-            segmentProbe: "ok",
+            segmentProbe: probed.segmentProbe === "ok" ? "ok" : "unknown",
             lastSequenceAgeMs: sequenceAgeMs,
-            resolverState: "ok",
-            resolveReason: "seed-rejected-hold",
-            reason: `seed-rejected-hold:${recentSeedState?.reason || "unknown"}:${probed.reason}`,
+            resolverState: sessionProbe.state !== "down" ? sessionProbe.resolverState : "ok",
+            resolveReason: sessionProbe.state !== "down" ? sessionProbe.reason : "seed-rejected-hold",
+            reason:
+              sessionProbe.state !== "down"
+                ? `session-hold:${sessionProbe.reason}:${probed.reason}`
+                : `seed-rejected-hold:${recentSeedState?.reason || "unknown"}:${probed.reason}`,
             updatedAt: nowIso(nowMs),
           };
         }
@@ -703,14 +849,23 @@ export async function buildMatchR2Status(input: {
         };
       }
 
-      const fallbackReason = staleSequenceConfirmed ? "r2-sequence-stale" : probed.reason;
+      const fallbackReason =
+        staleSequenceConfirmed
+          ? "r2-sequence-stale"
+          : sessionProbe.state !== "down"
+            ? sessionProbe.reason
+            : probed.reason;
       const seeded = resolveStateFromRecentSeed(matchId, slotServer, fallbackReason, nowMs, maxSeedWarmingMs);
       const fallbackResolverState =
-        seeded.resolverState === "unknown" && probed.segmentProbe === "fail"
+        seeded.resolverState === "unknown" && sessionProbe.state !== "down"
+          ? sessionProbe.resolverState
+          : seeded.resolverState === "unknown" && probed.segmentProbe === "fail"
           ? "probe-failed"
           : seeded.resolverState;
       const fallbackResolveReason =
-        seeded.resolverState === "unknown" && probed.segmentProbe === "fail"
+        seeded.resolverState === "unknown" && sessionProbe.state !== "down"
+          ? sessionProbe.reason
+          : seeded.resolverState === "unknown" && probed.segmentProbe === "fail"
           ? probed.reason
           : seeded.resolveReason;
       if (seeded.state === "down") clearRecentReadyState(matchSlotKey);
