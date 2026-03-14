@@ -73,6 +73,10 @@ const SESSION_MAINTENANCE_INTERVAL_MS = Math.max(
   1_500,
   Number.parseInt(String(process.env.REPACK_LIVE_EMBED_SESSION_MAINTENANCE_INTERVAL_MS || "4000"), 10) || 4_000
 );
+const PLAYERV2_RUNTIME_CANDIDATE_MAX_AGE_MS = Math.max(
+  4_000,
+  Number.parseInt(String(process.env.REPACK_PLAYERV2_RUNTIME_CANDIDATE_MAX_AGE_MS || "12000"), 10) || 12_000
+);
 
 type SessionCandidate = {
   fetchUrl?: string;
@@ -566,6 +570,11 @@ function scoreCandidate(input: {
   return score;
 }
 
+function getCandidateRetentionMs(slotServerId?: SlotServerId) {
+  if (slotServerId === 2) return PLAYERV2_RUNTIME_CANDIDATE_MAX_AGE_MS;
+  return SESSION_STALE_RETURN_MAX_AGE_MS;
+}
+
 async function loadBrowser() {
   if (!browserPromise) {
     browserPromise = (async () => {
@@ -875,9 +884,25 @@ class LiveEmbedSession {
     return Array.from(this.candidates.values()).some((candidate) => now - candidate.seenAt <= SESSION_STALE_MS);
   }
 
+  pruneStaleCandidates(now = Date.now()) {
+    const maxAgeMs = getCandidateRetentionMs(this.slotServerId);
+    for (const [key, candidate] of this.candidates.entries()) {
+      if (Math.max(0, now - candidate.seenAt) <= maxAgeMs) continue;
+      this.candidates.delete(key);
+    }
+  }
+
   snapshotCandidates() {
+    this.pruneStaleCandidates();
+    const now = Date.now();
     return [...this.candidates.values()]
       .sort((left, right) => {
+        if (this.slotServerId === 2) {
+          const leftIsFresh = now - left.seenAt <= SESSION_STALE_MS;
+          const rightIsFresh = now - right.seenAt <= SESSION_STALE_MS;
+          if (rightIsFresh !== leftIsFresh) return rightIsFresh ? 1 : -1;
+          if (right.seenAt !== left.seenAt) return right.seenAt - left.seenAt;
+        }
         if (!!right.manifestBody !== !!left.manifestBody) return right.manifestBody ? 1 : -1;
         if (right.score !== left.score) return right.score - left.score;
         return right.seenAt - left.seenAt;
@@ -1181,10 +1206,30 @@ class LiveEmbedSession {
           __tfExtractorDrain?: () => { urls: string[]; dom: string[] };
         }
       ).__tfExtractorDrain;
-      return typeof drain === "function" ? drain() : { urls: [], dom: [] };
+      const runtime = (
+        window as unknown as {
+          __tfRepackYalla?: {
+            getState?: () => {
+              activeSource?: string;
+              sources?: string[];
+            };
+          };
+        }
+      ).__tfRepackYalla;
+      const runtimeState = typeof runtime?.getState === "function" ? runtime.getState() : null;
+      return {
+        ...(typeof drain === "function" ? drain() : { urls: [], dom: [] }),
+        runtimeSources: Array.isArray(runtimeState?.sources) ? runtimeState.sources : [],
+        activeSource: String(runtimeState?.activeSource || ""),
+      };
     });
 
-    for (const rawValue of [...(drained?.urls || []), ...(drained?.dom || [])]) {
+    for (const rawValue of [
+      ...(drained?.urls || []),
+      ...(drained?.dom || []),
+      ...(drained?.runtimeSources || []),
+      drained?.activeSource || "",
+    ]) {
       const rawUrl = normalizeHttpUrl(String(rawValue || "").trim());
       if (!rawUrl) continue;
       this.registerUrl({
@@ -1194,6 +1239,31 @@ class LiveEmbedSession {
         depth: 1,
       });
     }
+  }
+
+  async refreshEmbedRuntime(reason: string) {
+    const page = this.page;
+    if (!page || page.isClosed?.()) return false;
+    const refreshed = await page
+      .evaluate((refreshReason) => {
+        const runtime = (
+          window as unknown as {
+            __tfRepackYalla?: {
+              refreshCurrent?: (reason?: string) => boolean;
+            };
+          }
+        ).__tfRepackYalla;
+        return typeof runtime?.refreshCurrent === "function" ? runtime.refreshCurrent(refreshReason) : false;
+      }, reason)
+      .catch(() => false);
+    if (!refreshed) return false;
+    await page.waitForTimeout(Math.max(1_250, Math.min(4_000, SESSION_RETRY_WAIT_MS)));
+    await this.drainDomCandidates();
+    if (this.pendingTasks.size) {
+      await Promise.allSettled(Array.from(this.pendingTasks));
+    }
+    await this.hydrateCandidateBodiesInPage();
+    return true;
   }
 
   async hydrateCandidateBodiesInPage() {
@@ -1505,6 +1575,7 @@ class LiveEmbedSession {
     this.maintenancePromise = (async () => {
       const page = this.page;
       if (!page || page.isClosed?.()) return;
+      this.pruneStaleCandidates();
       const now = Date.now();
       const newestAgeMs = this.newestCandidateAgeMs(now);
       const shouldHydrate = this.snapshotCandidates().some((candidate) => !candidate.manifestBody);
@@ -1517,6 +1588,9 @@ class LiveEmbedSession {
         newestAgeMs >= SESSION_PREEMPTIVE_REFRESH_MS ||
         !this.hasFreshCandidate(now) ||
         (this.lastActivityAt > 0 && now - this.lastActivityAt >= SESSION_PREEMPTIVE_REFRESH_MS);
+      if (this.slotServerId === 2 && (newestAgeMs === null || newestAgeMs >= SESSION_PREEMPTIVE_REFRESH_MS)) {
+        await this.refreshEmbedRuntime("session_maintain").catch(() => {});
+      }
       if (shouldReload) {
         await this.maybeReload(Math.max(8_000, SESSION_WAIT_MS + SESSION_RETRY_WAIT_MS)).catch(() => {});
       }
@@ -1544,6 +1618,7 @@ class LiveEmbedSession {
     const deadline = Date.now() + Math.max(2_500, Math.min(25_000, timeoutMs));
     while (Date.now() < deadline) {
       this.touch();
+      this.pruneStaleCandidates();
       const now = Date.now();
       const candidates = this.snapshotCandidates();
       const freshManifestCandidates = this.snapshotCandidatesWithManifestBody(SESSION_STALE_MS, now);
@@ -1568,6 +1643,9 @@ class LiveEmbedSession {
         !this.hasFreshCandidate(now);
       if (!freshManifestCandidates.length && candidates.length) {
         await this.hydrateCandidateBodiesInPage();
+      }
+      if (this.slotServerId === 2 && (!freshManifestCandidates.length || newestAgeMs === null || newestAgeMs >= SESSION_PREEMPTIVE_REFRESH_MS)) {
+        await this.refreshEmbedRuntime("snapshot_refresh").catch(() => {});
       }
       if (shouldReload) {
         await this.maybeReload(timeoutMs).catch(() => {});
@@ -1597,7 +1675,7 @@ class LiveEmbedSession {
   }
 
   async fetchText(
-    input: { targetUrl: string; fetchUrl?: string; referrerUrl?: string | null },
+    input: { targetUrl: string; fetchUrl?: string; referrerUrl?: string | null; retryDepth?: number },
     timeoutMs: number
   ): Promise<SessionTextResult> {
     if (!ENABLE_LIVE_EMBED_SESSION) {
@@ -1610,6 +1688,7 @@ class LiveEmbedSession {
     const normalizedFetchUrl = normalizeHttpUrl(input.fetchUrl || normalizedTargetUrl) || normalizedTargetUrl;
     const normalizedReferrerUrl =
       normalizeHttpUrl(input.referrerUrl || this.fallbackReferrer || this.sourceUrl) || this.sourceUrl;
+    const retryDepth = Math.max(0, Number.parseInt(String(input.retryDepth || 0), 10) || 0);
 
     try {
       await this.ensureStarted(timeoutMs);
@@ -1680,6 +1759,7 @@ class LiveEmbedSession {
       let contentType = String(fetched?.contentType || "");
       let ok = !!fetched?.ok;
       let error = String(fetched?.error || "");
+      let status = Number(fetched?.status || 0);
 
       const shouldRelay = !ok || !body.trim() || !hasHlsManifestBody(contentType, body);
       if (shouldRelay) {
@@ -1705,12 +1785,43 @@ class LiveEmbedSession {
             contentType = relayed.contentType;
             finalUrl = relayedFinalUrl;
             error = "";
+            status = Number(relayed.status || status || 200);
           } else if (!ok) {
             ok = relayed.ok;
             body = relayed.body;
             contentType = relayed.contentType;
             finalUrl = relayedFinalUrl;
             error = String(relayed.error || (relayed.ok ? "manifest-not-hls" : `text-http-${relayed.status || 0}`));
+            status = Number(relayed.status || status || 0);
+          }
+        }
+      }
+
+      if ((!ok || !hasHlsManifestBody(contentType, body)) && this.slotServerId === 2 && retryDepth < 1) {
+        const errorText = String(error || "");
+        const shouldRetryWithRuntimeRefresh =
+          status === 0 ||
+          status === 403 ||
+          status === 404 ||
+          errorText.includes("text-http-403") ||
+          errorText.includes("text-http-404");
+        if (shouldRetryWithRuntimeRefresh && (await this.refreshEmbedRuntime("manifest_retry"))) {
+          const retryCandidate = this.snapshotCandidates().find(
+            (candidate) =>
+              candidate.fetchUrl &&
+              candidate.fetchUrl !== normalizedFetchUrl &&
+              Math.max(0, Date.now() - candidate.seenAt) <= SESSION_STALE_MS
+          );
+          if (retryCandidate?.fetchUrl) {
+            return this.fetchText(
+              {
+                targetUrl: retryCandidate.targetUrl,
+                fetchUrl: retryCandidate.fetchUrl,
+                referrerUrl: retryCandidate.referrerUrl,
+                retryDepth: retryDepth + 1,
+              },
+              timeoutMs
+            );
           }
         }
       }
@@ -1728,7 +1839,7 @@ class LiveEmbedSession {
       this.touch();
       return {
         ok,
-        status: Number(fetched?.status || 0),
+        status,
         contentType,
         body,
         finalUrl,

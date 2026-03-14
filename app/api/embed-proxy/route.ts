@@ -1827,6 +1827,18 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number, s
     return playStream(source, currentSourceIndex);
   };
 
+  window.__tfRepackYalla = {
+    getState: () => ({
+      path: currentPath,
+      tabIndex: currentTabIndex,
+      sourceIdx: currentSourceIndex,
+      activeSource: currentSources[currentSourceIndex] || "",
+      sources: Array.isArray(currentSources) ? currentSources.slice() : [],
+    }),
+    refreshCurrent: (reason = "external_refresh") => refreshTabStream(reason),
+    rotateCurrent: (reason = "external_rotate") => rotateSource(reason),
+  };
+
   const playTab = async (tab, idx, force = false) => {
     if (!tab || !tab.path) return false;
     if (!force && Date.now() - lastStartAt < 500) return false;
