@@ -140,7 +140,7 @@ function buildUpstreamFetchHeaders(requestHeaders, referrerUrl, accept) {
 
 async function fetchManifestWithHeaders(manifestUrl, requestHeaders, referrerUrl) {
   const normalizedManifestUrl = normalizeHttpUrl(manifestUrl);
-  if (!normalizedManifestUrl) return { finalUrl: "", manifestBody: "", error: "invalid-manifest-url" };
+  if (!normalizedManifestUrl) return { finalUrl: "", manifestBody: "", error: "invalid-manifest-url", snippet: "" };
   const headers = buildUpstreamFetchHeaders(
     requestHeaders,
     referrerUrl,
@@ -157,25 +157,35 @@ async function fetchManifestWithHeaders(manifestUrl, requestHeaders, referrerUrl
         headers,
       });
       if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) {
-        return { body: "", error: `http-${Number(response.status || 0)}` };
+        return { body: "", error: `http-${Number(response.status || 0)}`, snippet: String(response.data || "").slice(0, 160) };
       }
       const body = String(response.data || "");
-      return { body: body.trim() ? body : "", error: body.trim() ? "" : "empty-body" };
+      return { body: body.trim() ? body : "", error: body.trim() ? "" : "empty-body", snippet: body.slice(0, 160) };
     } catch (error) {
-      return { body: "", error: error instanceof Error ? error.message : String(error || "axios-fetch-failed") };
+      return {
+        body: "",
+        error: error instanceof Error ? error.message : String(error || "axios-fetch-failed"),
+        snippet: "",
+      };
     }
   };
 
   const primary = await fetchText(normalizedManifestUrl);
   let body = primary.body;
   if (!body || !/^\s*#extm3u/m.test(body)) {
-    return { finalUrl: normalizedManifestUrl, manifestBody: "", error: primary.error || "not-manifest" };
+    return {
+      finalUrl: normalizedManifestUrl,
+      manifestBody: "",
+      error: primary.error || "not-manifest",
+      snippet: primary.snippet || "",
+    };
   }
   if (hasMediaSegments(body, normalizedManifestUrl)) {
     return {
       finalUrl: normalizedManifestUrl,
       manifestBody: body,
       error: "",
+      snippet: body.slice(0, 160),
     };
   }
 
@@ -185,17 +195,24 @@ async function fetchManifestWithHeaders(manifestUrl, requestHeaders, referrerUrl
       finalUrl: normalizedManifestUrl,
       manifestBody: body,
       error: "",
+      snippet: body.slice(0, 160),
     };
   }
   const variant = await fetchText(variantUrl);
   const variantBody = variant.body;
   if (!variantBody || !/^\s*#extm3u/m.test(variantBody)) {
-    return { finalUrl: variantUrl, manifestBody: "", error: variant.error || "variant-not-manifest" };
+    return {
+      finalUrl: variantUrl,
+      manifestBody: "",
+      error: variant.error || "variant-not-manifest",
+      snippet: variant.snippet || "",
+    };
   }
   return {
     finalUrl: variantUrl,
     manifestBody: variantBody,
     error: "",
+    snippet: variantBody.slice(0, 160),
   };
 }
 
@@ -492,6 +509,7 @@ async function main() {
       let finalManifestUrl = lastManifestUrl;
       let finalManifestBody = lastManifestBody;
       let helperFetchError = "";
+      let helperFetchSnippet = "";
       if (finalManifestUrl && !finalManifestBody) {
         try {
           const fetchedManifest = await fetchManifestWithHeaders(
@@ -500,6 +518,7 @@ async function main() {
             lastReferrerUrl || lastPlaybackUrl || sourceUrl
           );
           helperFetchError = String((fetchedManifest && fetchedManifest.error) || "").trim();
+          helperFetchSnippet = String((fetchedManifest && fetchedManifest.snippet) || "").slice(0, 160);
           if (fetchedManifest && fetchedManifest.finalUrl && fetchedManifest.manifestBody) {
             finalManifestUrl = fetchedManifest.finalUrl;
             finalManifestBody = fetchedManifest.manifestBody;
@@ -518,6 +537,7 @@ async function main() {
           manifestRequestHeaders: lastManifestRequestHeaders,
           playbackUrl: lastPlaybackUrl || sourceUrl,
           helperFetchError,
+          helperFetchSnippet,
         })
       );
     }
