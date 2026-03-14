@@ -2120,12 +2120,12 @@ class LiveEmbedSession {
   }
 
   async ensureStarted(timeoutMs: number) {
-    if (this.page && !this.page.isClosed?.() && this.browserContext) {
-      this.startMaintenanceLoop();
-      return;
-    }
     if (this.startPromise) {
       await this.startPromise;
+      return;
+    }
+    if (this.page && !this.page.isClosed?.() && this.browserContext) {
+      this.startMaintenanceLoop();
       return;
     }
     this.startPromise = (async () => {
