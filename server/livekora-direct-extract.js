@@ -100,7 +100,7 @@ async function main() {
       waitUntil: "domcontentloaded",
       timeout: 20000,
     });
-    await page.waitForTimeout(8000);
+    await page.waitForTimeout(12000);
   } catch (error) {
     await finish({
       ok: false,
