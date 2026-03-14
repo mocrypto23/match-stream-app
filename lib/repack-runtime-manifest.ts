@@ -169,6 +169,10 @@ async function resolveRuntimeManifestForRequest(req: Request) {
   const url = new URL(req.url);
   const matchId = toInt(url.searchParams.get("matchId"));
   const slotServer = toInt(url.searchParams.get("slotServer"));
+  const waitForMediaSequence = toInt(url.searchParams.get("waitForMediaSequence"));
+  const waitTimeoutMs = toInt(url.searchParams.get("waitTimeoutMs"));
+  const forceRefresh = String(url.searchParams.get("forceRefresh") || "").trim() === "1";
+  const allowRotate = String(url.searchParams.get("allowRotate") || "1").trim() !== "0";
   if (!Number.isFinite(matchId) || matchId <= 0) {
     return NextResponse.json({ ok: false, error: "invalid-match-id" }, { status: 400 });
   }
@@ -194,11 +198,19 @@ async function resolveRuntimeManifestForRequest(req: Request) {
     slotServer,
     internalOrigin,
   });
-  const resolved = await adapter.resolve({
-    sourceUrl,
-    slotServer,
-    internalOrigin,
-  });
+  const resolved = await adapter.currentManifest(
+    {
+      sourceUrl,
+      slotServer,
+      internalOrigin,
+    },
+    {
+      waitForMediaSequence: Number.isFinite(waitForMediaSequence) ? waitForMediaSequence : null,
+      waitTimeoutMs: Number.isFinite(waitTimeoutMs) ? waitTimeoutMs : null,
+      forceRefresh,
+      allowRotate,
+    }
+  );
 
   if (resolved.ok) {
     return new Response(resolved.manifestBody, {
@@ -215,6 +227,11 @@ async function resolveRuntimeManifestForRequest(req: Request) {
         "x-repack-upstream-final-url": resolved.finalUrl,
         "x-repack-extractor": "embed-session",
         "x-repack-runtime-adapter": resolved.adapterKind,
+        "x-repack-runtime-current-source": resolved.currentSource,
+        "x-repack-runtime-media-sequence": String(resolved.mediaSequence ?? ""),
+        "x-repack-runtime-target-duration": String(resolved.targetDurationSec || 0),
+        "x-repack-runtime-refreshed": resolved.refreshed ? "1" : "0",
+        "x-repack-runtime-rotated": resolved.rotated ? "1" : "0",
         "x-repack-extractor-candidates-found": String(resolved.candidatesFound),
         "x-repack-extractor-candidates-tried": String(resolved.candidatesTried),
       },
@@ -229,6 +246,11 @@ async function resolveRuntimeManifestForRequest(req: Request) {
         mode: "embed-session",
         adapter: resolved.adapterKind,
         playbackUrl: resolved.playbackUrl || null,
+        currentSource: resolved.currentSource || null,
+        mediaSequence: resolved.mediaSequence,
+        targetDurationSec: resolved.targetDurationSec || 0,
+        refreshed: resolved.refreshed,
+        rotated: resolved.rotated,
         candidatesFound: resolved.candidatesFound,
         candidatesTried: resolved.candidatesTried,
       },

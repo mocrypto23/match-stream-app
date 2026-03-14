@@ -113,6 +113,29 @@ type SessionAssetResult = {
   error: string;
 };
 
+type SessionRuntimeState = {
+  key: string;
+  state: "starting" | "running" | "closed";
+  lastError: string;
+  playbackUrl: string;
+  lastTouchedAt: number;
+  lastActivityAt: number;
+  candidateCount: number;
+  freshCandidateCount: number;
+  freshManifestCount: number;
+  runtimePath: string;
+  runtimeActiveSource: string;
+  runtimeSources: string[];
+  runtimeUpdatedAt: number;
+  activeManifestUrl: string;
+  activeManifestFetchUrl: string;
+  activeManifestReferrerUrl: string;
+  activeManifestUpdatedAt: number;
+  activeMediaSequence: number | null;
+  activeTargetDurationSec: number;
+  candidates: SessionCandidate[];
+};
+
 type PageSeed = {
   pageUrl: string;
   referrerUrl: string;
@@ -147,6 +170,20 @@ function normalizeHttpUrl(raw: unknown) {
   const value = String(raw || "").trim();
   if (!value || !isValidHttpUrl(value)) return "";
   return value;
+}
+
+function dedupeUrls(values: string[]) {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values || []) {
+    const normalized = normalizeHttpUrl(value);
+    if (!normalized) continue;
+    const key = canonicalizeUrl(normalized) || normalized.toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(normalized);
+  }
+  return out;
 }
 
 function canonicalizeUrl(raw: string) {
@@ -403,6 +440,24 @@ function hasMediaSegments(manifestText: string, baseUrl: string) {
     previousExtInf = false;
   }
   return false;
+}
+
+function parseMediaSequence(manifestText: string) {
+  const match = String(manifestText || "").match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/i);
+  if (!match || !match[1]) return null;
+  const value = Number.parseInt(match[1], 10);
+  return Number.isFinite(value) ? value : null;
+}
+
+function parseTargetDurationSec(manifestText: string) {
+  for (const line of String(manifestText || "").split(/\r?\n/)) {
+    const trimmed = String(line || "").trim();
+    const match = trimmed.match(/^#EXT-X-TARGETDURATION:(\d+(?:\.\d+)?)/i);
+    if (!match || !match[1]) continue;
+    const value = Number.parseFloat(match[1]);
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+  return 0;
 }
 
 function pickVariantManifestUrls(manifestText: string, baseUrl: string, maxItems = 6) {
@@ -847,6 +902,16 @@ class LiveEmbedSession {
   pageSeeds = new Map<string, PageSeed>();
   pageQueue: PageSeed[] = [];
   pendingTasks = new Set<Promise<void>>();
+  runtimePath = "";
+  runtimeActiveSource = "";
+  runtimeSources: string[] = [];
+  runtimeUpdatedAt = 0;
+  activeManifestUrl = "";
+  activeManifestFetchUrl = "";
+  activeManifestReferrerUrl = "";
+  activeManifestUpdatedAt = 0;
+  activeMediaSequence: number | null = null;
+  activeTargetDurationSec = 0;
 
   constructor(input: { sourceUrl: string; requestOrigin: string; slotServerId?: SlotServerId }) {
     this.sourceUrl = normalizeHttpUrl(input.sourceUrl);
@@ -917,6 +982,69 @@ class LiveEmbedSession {
     });
   }
 
+  rememberRuntimeSources(input: { path?: string; activeSource?: string; sources?: string[] }) {
+    const runtimePath = String(input.path || "").trim();
+    const runtimeActiveSource = normalizeHttpUrl(input.activeSource || "");
+    const runtimeSources = dedupeUrls([
+      ...(Array.isArray(input.sources) ? input.sources : []),
+      runtimeActiveSource,
+    ]);
+    if (!runtimePath && !runtimeActiveSource && !runtimeSources.length) return;
+    if (runtimePath) this.runtimePath = runtimePath;
+    if (runtimeActiveSource) this.runtimeActiveSource = runtimeActiveSource;
+    if (runtimeSources.length) this.runtimeSources = runtimeSources;
+    this.runtimeUpdatedAt = Date.now();
+  }
+
+  rememberActiveManifest(input: {
+    targetUrl: string;
+    fetchUrl?: string;
+    referrerUrl?: string | null;
+    manifestBody: string;
+  }) {
+    const targetUrl = normalizeHttpUrl(input.targetUrl);
+    const fetchUrl = normalizeHttpUrl(input.fetchUrl || targetUrl) || targetUrl;
+    const referrerUrl = normalizeHttpUrl(input.referrerUrl || this.fallbackReferrer || this.sourceUrl) || this.sourceUrl;
+    const manifestBody = String(input.manifestBody || "").trim();
+    if (!targetUrl || !manifestBody || !hasMediaSegments(manifestBody, targetUrl)) return;
+    this.activeManifestUrl = targetUrl;
+    this.activeManifestFetchUrl = fetchUrl;
+    this.activeManifestReferrerUrl = referrerUrl;
+    this.activeManifestUpdatedAt = Date.now();
+    this.activeMediaSequence = parseMediaSequence(manifestBody);
+    this.activeTargetDurationSec = parseTargetDurationSec(manifestBody);
+    if (!this.runtimeActiveSource) this.runtimeActiveSource = targetUrl;
+  }
+
+  getRuntimeState(now = Date.now()): SessionRuntimeState {
+    this.pruneStaleCandidates(now);
+    const candidates = this.snapshotCandidates();
+    const freshManifestCandidates = this.snapshotCandidatesWithManifestBody(SESSION_STALE_MS, now);
+    const freshCandidateCount = candidates.filter((candidate) => now - candidate.seenAt <= SESSION_STALE_MS).length;
+    return {
+      key: this.key,
+      state: this.state,
+      lastError: this.lastError,
+      playbackUrl: this.playbackUrl,
+      lastTouchedAt: this.lastTouchedAt,
+      lastActivityAt: this.lastActivityAt,
+      candidateCount: candidates.length,
+      freshCandidateCount,
+      freshManifestCount: freshManifestCandidates.length,
+      runtimePath: this.runtimePath,
+      runtimeActiveSource: this.runtimeActiveSource,
+      runtimeSources: this.runtimeSources.slice(),
+      runtimeUpdatedAt: this.runtimeUpdatedAt,
+      activeManifestUrl: this.activeManifestUrl,
+      activeManifestFetchUrl: this.activeManifestFetchUrl,
+      activeManifestReferrerUrl: this.activeManifestReferrerUrl,
+      activeManifestUpdatedAt: this.activeManifestUpdatedAt,
+      activeMediaSequence: this.activeMediaSequence,
+      activeTargetDurationSec: this.activeTargetDurationSec,
+      candidates,
+    };
+  }
+
   rememberCandidate(input: {
     fetchUrl?: string;
     targetUrl: string;
@@ -976,6 +1104,14 @@ class LiveEmbedSession {
 
     this.lastActivityAt = now;
     this.lastError = "";
+    if (manifestBody && hasMediaSegments(manifestBody, manifestBaseUrl || targetUrl)) {
+      this.rememberActiveManifest({
+        targetUrl,
+        fetchUrl,
+        referrerUrl,
+        manifestBody,
+      });
+    }
   }
 
   enqueuePageSeed(rawUrl: string, referrerUrl: string, depth: number) {
@@ -1210,6 +1346,7 @@ class LiveEmbedSession {
         window as unknown as {
           __tfRepackYalla?: {
             getState?: () => {
+              path?: string;
               activeSource?: string;
               sources?: string[];
             };
@@ -1221,7 +1358,14 @@ class LiveEmbedSession {
         ...(typeof drain === "function" ? drain() : { urls: [], dom: [] }),
         runtimeSources: Array.isArray(runtimeState?.sources) ? runtimeState.sources : [],
         activeSource: String(runtimeState?.activeSource || ""),
+        runtimePath: String(runtimeState?.path || ""),
       };
+    });
+
+    this.rememberRuntimeSources({
+      path: String(drained?.runtimePath || ""),
+      activeSource: String(drained?.activeSource || ""),
+      sources: Array.isArray(drained?.runtimeSources) ? drained.runtimeSources : [],
     });
 
     for (const rawValue of [
@@ -1257,6 +1401,31 @@ class LiveEmbedSession {
       }, reason)
       .catch(() => false);
     if (!refreshed) return false;
+    await page.waitForTimeout(Math.max(1_250, Math.min(4_000, SESSION_RETRY_WAIT_MS)));
+    await this.drainDomCandidates();
+    if (this.pendingTasks.size) {
+      await Promise.allSettled(Array.from(this.pendingTasks));
+    }
+    await this.hydrateCandidateBodiesInPage();
+    return true;
+  }
+
+  async rotateEmbedRuntime(reason: string) {
+    const page = this.page;
+    if (!page || page.isClosed?.()) return false;
+    const rotated = await page
+      .evaluate((rotateReason) => {
+        const runtime = (
+          window as unknown as {
+            __tfRepackYalla?: {
+              rotateCurrent?: (reason?: string) => boolean;
+            };
+          }
+        ).__tfRepackYalla;
+        return typeof runtime?.rotateCurrent === "function" ? runtime.rotateCurrent(rotateReason) : false;
+      }, reason)
+      .catch(() => false);
+    if (!rotated) return false;
     await page.waitForTimeout(Math.max(1_250, Math.min(4_000, SESSION_RETRY_WAIT_MS)));
     await this.drainDomCandidates();
     if (this.pendingTasks.size) {
@@ -2037,6 +2206,19 @@ export async function extractLiveEmbedSessionSnapshot(input: {
   return session.snapshot(input.timeoutMs);
 }
 
+export async function ensureLiveEmbedSessionRuntime(input: {
+  sourceUrl: string;
+  requestOrigin: string;
+  slotServerId?: SlotServerId;
+  timeoutMs: number;
+}) {
+  const session = getSession(input);
+  await session.ensureStarted(input.timeoutMs);
+  await session.maintain();
+  session.touch();
+  return session.getRuntimeState();
+}
+
 export async function fetchLiveEmbedText(input: {
   sourceUrl: string;
   requestOrigin: string;
@@ -2075,6 +2257,42 @@ export async function fetchLiveEmbedAsset(input: {
   );
 }
 
+export async function refreshLiveEmbedRuntime(input: {
+  sourceUrl: string;
+  requestOrigin: string;
+  slotServerId?: SlotServerId;
+  timeoutMs: number;
+  reason?: string;
+}) {
+  const session = getSession(input);
+  await session.ensureStarted(input.timeoutMs);
+  const refreshed = await session.refreshEmbedRuntime(String(input.reason || "runtime_refresh"));
+  session.touch();
+  return {
+    ok: refreshed,
+    refreshed,
+    state: session.getRuntimeState(),
+  };
+}
+
+export async function rotateLiveEmbedRuntime(input: {
+  sourceUrl: string;
+  requestOrigin: string;
+  slotServerId?: SlotServerId;
+  timeoutMs: number;
+  reason?: string;
+}) {
+  const session = getSession(input);
+  await session.ensureStarted(input.timeoutMs);
+  const rotated = await session.rotateEmbedRuntime(String(input.reason || "runtime_rotate"));
+  session.touch();
+  return {
+    ok: rotated,
+    rotated,
+    state: session.getRuntimeState(),
+  };
+}
+
 export function peekLiveEmbedSessionState(input: {
   sourceUrl: string;
   requestOrigin: string;
@@ -2101,7 +2319,17 @@ export function peekLiveEmbedSessionState(input: {
     candidateCount: candidates.length,
     freshCandidateCount,
     freshManifestCount: freshManifestCandidates.length,
+    runtimePath: session.runtimePath,
+    runtimeActiveSource: session.runtimeActiveSource,
+    runtimeSources: session.runtimeSources.slice(),
+    runtimeUpdatedAt: session.runtimeUpdatedAt,
+    activeManifestUrl: session.activeManifestUrl,
+    activeManifestFetchUrl: session.activeManifestFetchUrl,
+    activeManifestReferrerUrl: session.activeManifestReferrerUrl,
+    activeManifestUpdatedAt: session.activeManifestUpdatedAt,
+    activeMediaSequence: session.activeMediaSequence,
+    activeTargetDurationSec: session.activeTargetDurationSec,
   };
 }
 
-export type { SessionCandidate as LiveEmbedSessionCandidate };
+export type { SessionCandidate as LiveEmbedSessionCandidate, SessionRuntimeState as LiveEmbedSessionRuntimeState };

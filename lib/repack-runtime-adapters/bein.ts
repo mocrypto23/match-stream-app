@@ -2,7 +2,7 @@ import { getSourceFamilyForSlotServer } from "@/lib/server-source-policy";
 
 import {
   DEFAULT_RUNTIME_MANIFEST_MAX_AGE_MS,
-  resolveSessionBackedManifest,
+  buildSessionOwnedRuntimeAdapter,
   type RuntimeAdapter,
 } from "./shared";
 
@@ -17,17 +17,16 @@ function looksLikeBeinSource(rawUrl: string) {
   }
 }
 
-export const beinRuntimeAdapter: RuntimeAdapter = {
-  kind: "bein",
-  matches: (input) =>
+export const beinRuntimeAdapter: RuntimeAdapter = buildSessionOwnedRuntimeAdapter(
+  "bein",
+  (input) =>
     input.slotServer === 1 || looksLikeBeinSource(input.sourceUrl) || getSourceFamilyForSlotServer(input.slotServer) === "bein",
-  resolve: async (input) =>
-    resolveSessionBackedManifest(input, {
-      adapterKind: "bein",
-      candidateMaxAgeMs: DEFAULT_RUNTIME_MANIFEST_MAX_AGE_MS,
-      maxCandidatesToTry: 6,
-      preferUrlIncludes: [".m3u8", "easybroadcast", "token=", "/manifest/", "/playlist/"],
-      preferReferrerIncludes: ["bein-live", "/matches/"],
-      preferManifestIncludes: ["#extm3u", "#ext-x-targetduration"],
-    }),
-};
+  {
+    adapterKind: "bein",
+    candidateMaxAgeMs: DEFAULT_RUNTIME_MANIFEST_MAX_AGE_MS,
+    maxCandidatesToTry: 6,
+    preferUrlIncludes: [".m3u8", "easybroadcast", "token=", "/manifest/", "/playlist/"],
+    preferReferrerIncludes: ["bein-live", "/matches/"],
+    preferManifestIncludes: ["#extm3u", "#ext-x-targetduration"],
+  }
+);

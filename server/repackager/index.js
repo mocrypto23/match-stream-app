@@ -465,9 +465,11 @@ class MirrorJob {
     this.consecutiveSourceErrors = 0;
     this.lastObservedTargetDurationSec = 0;
     this.lastPlaylistMediaSeq = null;
+    this.lastRuntimeMediaSequence = null;
+    this.lastRuntimeCurrentSource = "";
     this.lastPublishedPlaylistFingerprint = "";
     this.assetsBySourceUrl = new Map();
-    this.pollTimer = null;
+    this.syncTimer = null;
     this.monitorTimer = null;
     this.syncPromise = null;
     this.totalPlaylistPublishes = 0;
@@ -499,9 +501,7 @@ class MirrorJob {
     if (this.manager.config.purgeRemoteOnStart) {
       await this.manager.purgeRemotePrefix(this.remotePrefix, this.manager.config.purgeStopMaxKeys);
     }
-    this.pollTimer = setInterval(() => {
-      void this.syncNow("poll");
-    }, this.manager.config.uploadPollMs);
+    this.scheduleNextSync(0, "start");
     this.monitorTimer = setInterval(() => {
       void this.healthSweep();
     }, 5000);
@@ -510,9 +510,9 @@ class MirrorJob {
 
   async stop() {
     this.state = "stopped";
-    if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.syncTimer) clearTimeout(this.syncTimer);
     if (this.monitorTimer) clearInterval(this.monitorTimer);
-    this.pollTimer = null;
+    this.syncTimer = null;
     this.monitorTimer = null;
     if (this.manager.config.purgeRemoteOnStop) {
       await this.manager.purgeRemotePrefix(this.remotePrefix, this.manager.config.purgeStopMaxKeys);
@@ -564,13 +564,33 @@ class MirrorJob {
     }
   }
 
+  scheduleNextSync(delayMs, reason = "scheduled") {
+    if (this.state === "stopped") return;
+    if (this.syncTimer) clearTimeout(this.syncTimer);
+    this.syncTimer = setTimeout(() => {
+      this.syncTimer = null;
+      if (this.state === "stopped") return;
+      void this.syncNow(reason);
+    }, Math.max(0, delayMs));
+  }
+
   async syncNow(reason) {
     if (this.syncPromise) return this.syncPromise;
     this.syncPromise = this.performSync(reason)
       .catch((error) => ({
         ok: false,
         reason: error instanceof Error ? error.message : String(error),
+        nextDelayMs: this.manager.config.uploadPollMs,
       }))
+      .then((result) => {
+        if (this.state !== "stopped") {
+          this.scheduleNextSync(
+            Number.isFinite(result.nextDelayMs) ? result.nextDelayMs : this.manager.config.uploadPollMs,
+            "runtime"
+          );
+        }
+        return result;
+      })
       .finally(() => {
         this.syncPromise = null;
       });
@@ -655,15 +675,38 @@ class MirrorJob {
   }
 
   async fetchManifestDocument() {
+    const buildFetchUrl = (rawUrl) => {
+      if (!this.isStrictGatewayJob || !isHttpUrl(rawUrl)) return rawUrl;
+      try {
+        const parsed = new URL(rawUrl);
+        if (Number.isFinite(this.lastRuntimeMediaSequence) && this.lastRuntimeMediaSequence !== null) {
+          parsed.searchParams.set("waitForMediaSequence", String(this.lastRuntimeMediaSequence));
+          const waitTimeoutMs = Math.max(
+            1_500,
+            Math.min(
+              this.manager.config.strictGatewayManifestFetchTimeoutMs,
+              Math.round(Math.max(2, this.lastObservedTargetDurationSec || 2) * 1000 * 1.2)
+            )
+          );
+          parsed.searchParams.set("waitTimeoutMs", String(waitTimeoutMs));
+        }
+        parsed.searchParams.set("allowRotate", "1");
+        return parsed.toString();
+      } catch {
+        return rawUrl;
+      }
+    };
+
     const fetchManifestOnce = async (fetchUrl) => {
       const strictGatewayFetch = isStrictGatewayIngestUrl(fetchUrl, this.matchId, this.serverId);
+      const requestUrl = buildFetchUrl(fetchUrl);
       const controller = new AbortController();
       const timeoutMs = strictGatewayFetch
         ? this.manager.config.strictGatewayManifestFetchTimeoutMs
         : this.manager.config.manifestFetchTimeoutMs;
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const response = await fetch(fetchUrl, {
+        const response = await fetch(requestUrl, {
           method: "GET",
           cache: "no-store",
           redirect: "follow",
@@ -676,8 +719,15 @@ class MirrorJob {
         });
         const body = await response.text();
         const contentType = String(response.headers.get("content-type") || "").toLowerCase();
-        const finalUrl = response.url || fetchUrl;
+        const finalUrl = response.url || requestUrl;
         const sessionManifest = String(response.headers.get("x-repack-session-manifest") || "").trim() === "1";
+        const runtimeMediaSequenceRaw = String(response.headers.get("x-repack-runtime-media-sequence") || "").trim();
+        const runtimeTargetDurationRaw = String(response.headers.get("x-repack-runtime-target-duration") || "").trim();
+        const runtimeCurrentSource = normalizeHeaderValue(response.headers.get("x-repack-runtime-current-source"));
+        const runtimeRefreshed = String(response.headers.get("x-repack-runtime-refreshed") || "").trim() === "1";
+        const runtimeRotated = String(response.headers.get("x-repack-runtime-rotated") || "").trim() === "1";
+        const runtimeMediaSequence = runtimeMediaSequenceRaw ? Number.parseInt(runtimeMediaSequenceRaw, 10) : null;
+        const runtimeTargetDurationSec = runtimeTargetDurationRaw ? Number.parseFloat(runtimeTargetDurationRaw) : 0;
         if (!response.ok) {
           return {
             ok: false,
@@ -685,6 +735,11 @@ class MirrorJob {
             body,
             contentType,
             finalUrl,
+            runtimeMediaSequence,
+            runtimeTargetDurationSec,
+            runtimeCurrentSource,
+            runtimeRefreshed,
+            runtimeRotated,
           };
         }
         if (strictGatewayFetch && !sessionManifest) {
@@ -720,6 +775,11 @@ class MirrorJob {
           contentType,
           finalUrl,
           sessionManifest,
+          runtimeMediaSequence,
+          runtimeTargetDurationSec,
+          runtimeCurrentSource,
+          runtimeRefreshed,
+          runtimeRotated,
         };
       } catch (error) {
         return {
@@ -727,7 +787,12 @@ class MirrorJob {
           reason: `manifest-fetch-failed:${error instanceof Error ? error.message : String(error)}`,
           body: "",
           contentType: "",
-          finalUrl: fetchUrl,
+          finalUrl: requestUrl,
+          runtimeMediaSequence: this.lastRuntimeMediaSequence,
+          runtimeTargetDurationSec: this.lastObservedTargetDurationSec,
+          runtimeCurrentSource: this.lastRuntimeCurrentSource,
+          runtimeRefreshed: false,
+          runtimeRotated: false,
         };
       } finally {
         clearTimeout(timeoutId);
@@ -937,7 +1002,21 @@ class MirrorJob {
         syncReason: reason,
         heldTransientFailure: holdTransientFailure,
       });
-      return { ok: false, reason: manifest.reason };
+      return {
+        ok: false,
+        reason: manifest.reason,
+        nextDelayMs: holdTransientFailure ? 600 : Math.max(1_000, this.manager.config.uploadPollMs),
+      };
+    }
+
+    if (Number.isFinite(manifest.runtimeTargetDurationSec) && manifest.runtimeTargetDurationSec > 0) {
+      this.lastObservedTargetDurationSec = manifest.runtimeTargetDurationSec;
+    }
+    if (Number.isFinite(manifest.runtimeMediaSequence)) {
+      this.lastRuntimeMediaSequence = manifest.runtimeMediaSequence;
+    }
+    if (manifest.runtimeCurrentSource) {
+      this.lastRuntimeCurrentSource = manifest.runtimeCurrentSource;
     }
 
     const rewritten = this.rewriteManifestForPublic(manifest.body, manifest.finalUrl);
@@ -995,7 +1074,12 @@ class MirrorJob {
       this.degradedAt = 0;
       this.consecutiveSourceErrors = 0;
       this.lastError = "";
-      return { ok: true, reason: "ok" };
+      const targetDurationMs = Math.max(
+        1_200,
+        Math.min(8_000, Math.round(Math.max(2, this.lastObservedTargetDurationSec || 2) * 1000))
+      );
+      const nextDelayMs = this.isStrictGatewayJob ? 150 : Math.max(600, Math.round(targetDurationMs * 0.45));
+      return { ok: true, reason: "ok", nextDelayMs };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.lastErrorAt = Date.now();
@@ -1011,7 +1095,11 @@ class MirrorJob {
         job: this.key,
         reason: message,
       });
-      return { ok: false, reason: message };
+      return {
+        ok: false,
+        reason: message,
+        nextDelayMs: Math.max(1_000, Math.min(4_000, this.manager.config.uploadPollMs)),
+      };
     }
   }
 }

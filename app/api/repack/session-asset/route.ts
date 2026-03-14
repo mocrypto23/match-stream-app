@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
-import { fetchLiveEmbedAsset } from "@/lib/repack-embed-session";
 import { resolveInternalPlayerOrigin } from "@/lib/repack-ingest-gateway";
+import { pickRuntimeAdapter } from "@/lib/repack-runtime-adapters";
 import { isAllowedSourceForSlotServer, isValidHttpUrl, type SlotServerId } from "@/lib/server-source-policy";
 
 export const runtime = "nodejs";
@@ -38,10 +38,15 @@ export async function GET(req: Request) {
   }
 
   const internalOrigin = resolveInternalPlayerOrigin(req);
-  const fetched = await fetchLiveEmbedAsset({
+  const adapter = pickRuntimeAdapter({
     sourceUrl,
-    requestOrigin: internalOrigin,
-    slotServerId: slotServer,
+    slotServer,
+    internalOrigin,
+  });
+  const fetched = await adapter.fetchAsset({
+    sourceUrl,
+    slotServer,
+    internalOrigin,
     assetUrl,
     referrerUrl: isValidHttpUrl(referrerUrl) ? referrerUrl : undefined,
     timeoutMs: DEFAULT_SESSION_ASSET_TIMEOUT_MS,

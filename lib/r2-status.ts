@@ -428,19 +428,28 @@ async function probeSessionManifest(
     }
     const lastTouchedAgeMs = Math.max(0, Date.now() - Number(snapshot.lastTouchedAt || 0));
     const activeSession = lastTouchedAgeMs <= Math.max(6_000, timeoutMs * 2);
-    if (snapshot.freshManifestCount > 0) {
+    const activeManifestAgeMs =
+      Number.isFinite(snapshot.activeManifestUpdatedAt) && snapshot.activeManifestUpdatedAt > 0
+        ? Math.max(0, Date.now() - Number(snapshot.activeManifestUpdatedAt))
+        : null;
+    const hasRecentActiveManifest =
+      activeManifestAgeMs !== null && activeManifestAgeMs <= Math.max(6_000, timeoutMs * 2);
+    const hasRuntimeSource =
+      !!String(snapshot.runtimeActiveSource || snapshot.activeManifestUrl || "").trim() ||
+      (Array.isArray(snapshot.runtimeSources) && snapshot.runtimeSources.length > 0);
+    if (snapshot.freshManifestCount > 0 || hasRecentActiveManifest) {
       return {
         state: "ready",
-        reason: "session-manifest-ready",
+        reason: hasRecentActiveManifest ? "session-runtime-active-manifest" : "session-manifest-ready",
         resolverState: "ok",
         recoverable: true,
         adapter: null,
       };
     }
-    if (snapshot.freshCandidateCount > 0 || (snapshot.candidateCount > 0 && activeSession)) {
+    if (snapshot.freshCandidateCount > 0 || (snapshot.candidateCount > 0 && activeSession) || hasRuntimeSource) {
       return {
         state: "warming",
-        reason: "session-manifest-candidates",
+        reason: hasRuntimeSource ? "session-runtime-source" : "session-manifest-candidates",
         resolverState: "probe-failed",
         recoverable: true,
         adapter: null,
@@ -637,6 +646,27 @@ export async function buildMatchR2Status(input: {
         (recentAcceptedAgeMs !== null && recentAcceptedAgeMs <= DEFAULT_SEED_WARMING_WINDOW_MS);
 
       if (!matchWindow.inWindow && !allowRuntimeDrivenStatus) {
+        const beforeOpen =
+          matchWindow.hasStart &&
+          matchWindow.openAtMs !== null &&
+          Number.isFinite(matchWindow.openAtMs) &&
+          nowMs < Number(matchWindow.openAtMs);
+        if (beforeOpen) {
+          clearEarlyStopState(matchSlotKey);
+          clearRecentReadyState(matchSlotKey);
+          return {
+            uiServer,
+            slotServer,
+            state: "warming",
+            playlistUrl,
+            segmentProbe: "unknown",
+            lastSequenceAgeMs: null,
+            resolverState: "unknown",
+            resolveReason: "prematch-source-present",
+            reason: "prematch-source-present",
+            updatedAt: nowIso(nowMs),
+          };
+        }
         clearEarlyStopState(matchSlotKey);
         clearRecentReadyState(matchSlotKey);
         return {

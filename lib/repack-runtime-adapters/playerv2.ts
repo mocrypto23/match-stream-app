@@ -2,7 +2,7 @@ import { getSourceFamilyForSlotServer } from "@/lib/server-source-policy";
 
 import {
   PLAYERV2_RUNTIME_MANIFEST_MAX_AGE_MS,
-  resolveSessionBackedManifest,
+  buildSessionOwnedRuntimeAdapter,
   type RuntimeAdapter,
 } from "./shared";
 
@@ -15,18 +15,17 @@ function looksLikePlayerv2Source(rawUrl: string) {
   }
 }
 
-export const playerv2RuntimeAdapter: RuntimeAdapter = {
-  kind: "playerv2",
-  matches: (input) =>
+export const playerv2RuntimeAdapter: RuntimeAdapter = buildSessionOwnedRuntimeAdapter(
+  "playerv2",
+  (input) =>
     input.slotServer === 2 || looksLikePlayerv2Source(input.sourceUrl) || getSourceFamilyForSlotServer(input.slotServer) === "siiir",
-  resolve: async (input) =>
-    resolveSessionBackedManifest(input, {
-      adapterKind: "playerv2",
-      candidateMaxAgeMs: PLAYERV2_RUNTIME_MANIFEST_MAX_AGE_MS,
-      maxCandidatesToTry: 8,
-      forceFreshManifest: true,
-      preferUrlIncludes: ["/kooora/", "token=", "sid=", "nonce=", ".m3u8"],
-      preferReferrerIncludes: ["/playerv2.php", "siiir", "yallashot"],
-      preferManifestIncludes: ["/kooora/", "#extm3u"],
-    }),
-};
+  {
+    adapterKind: "playerv2",
+    candidateMaxAgeMs: PLAYERV2_RUNTIME_MANIFEST_MAX_AGE_MS,
+    maxCandidatesToTry: 8,
+    forceFreshManifest: true,
+    preferUrlIncludes: ["/kooora/", "token=", "sid=", "nonce=", ".m3u8"],
+    preferReferrerIncludes: ["/playerv2.php", "siiir", "yallashot"],
+    preferManifestIncludes: ["/kooora/", "#extm3u"],
+  }
+);
