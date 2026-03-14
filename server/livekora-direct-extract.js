@@ -1,3 +1,4 @@
+const axios = require("axios");
 const { chromium } = require("playwright");
 
 const sourceUrl = String(process.argv[2] || "").trim();
@@ -147,13 +148,15 @@ async function fetchManifestWithHeaders(manifestUrl, requestHeaders, referrerUrl
   );
 
   const fetchText = async (targetUrl) => {
-    const response = await fetch(targetUrl, {
-      method: "GET",
-      redirect: "follow",
+    const response = await axios.get(targetUrl, {
+      responseType: "text",
+      timeout: 15000,
+      maxRedirects: 5,
+      validateStatus: () => true,
       headers,
     });
-    if (!response.ok) return null;
-    const body = await response.text().catch(() => "");
+    if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) return null;
+    const body = String(response.data || "");
     return body.trim() ? body : null;
   };
 
