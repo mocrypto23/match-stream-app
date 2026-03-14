@@ -17,7 +17,7 @@ const ENABLE_LIVE_EMBED_SESSION =
   String(process.env.REPACK_LIVE_EMBED_SESSION_ENABLED || "1").trim() !== "0";
 const SESSION_IDLE_TTL_MS = Math.max(
   20_000,
-  Number.parseInt(String(process.env.REPACK_LIVE_EMBED_SESSION_IDLE_TTL_MS || "120000"), 10) || 120_000
+  Number.parseInt(String(process.env.REPACK_LIVE_EMBED_SESSION_IDLE_TTL_MS || "45000"), 10) || 45_000
 );
 const SESSION_STALE_MS = Math.max(
   4_000,
@@ -64,7 +64,7 @@ const SESSION_MAX_CRAWL_DEPTH = Math.max(
 );
 const SESSION_MAX_COUNT = Math.max(
   2,
-  Number.parseInt(String(process.env.REPACK_LIVE_EMBED_SESSION_MAX_COUNT || "10"), 10) || 10
+  Number.parseInt(String(process.env.REPACK_LIVE_EMBED_SESSION_MAX_COUNT || "4"), 10) || 4
 );
 const SESSION_MAX_CANDIDATES = Math.max(
   4,
@@ -73,6 +73,10 @@ const SESSION_MAX_CANDIDATES = Math.max(
 const SESSION_MAINTENANCE_INTERVAL_MS = Math.max(
   1_500,
   Number.parseInt(String(process.env.REPACK_LIVE_EMBED_SESSION_MAINTENANCE_INTERVAL_MS || "4000"), 10) || 4_000
+);
+const SESSION_NAVIGATION_CONCURRENCY = Math.max(
+  1,
+  Number.parseInt(String(process.env.REPACK_LIVE_EMBED_SESSION_NAVIGATION_CONCURRENCY || "1"), 10) || 1
 );
 const PLAYERV2_RUNTIME_CANDIDATE_MAX_AGE_MS = Math.max(
   4_000,
@@ -185,7 +189,10 @@ let browserPromise: Promise<unknown> | null = null;
 let browserInstance: PlaywrightBrowser | null = null;
 let browserClosingPromise: Promise<void> | null = null;
 let browserCleanupRegistered = false;
+let sessionCleanupTimer: ReturnType<typeof setInterval> | null = null;
 const sessions = new Map<string, LiveEmbedSession>();
+let navigationSlotsInUse = 0;
+const navigationSlotWaiters: Array<() => void> = [];
 
 function normalizeHttpUrl(raw: unknown) {
   const value = String(raw || "").trim();
@@ -678,12 +685,17 @@ async function loadBrowser() {
   if (!browserCleanupRegistered) {
     browserCleanupRegistered = true;
     const closeSilently = () => {
+      if (sessionCleanupTimer) {
+        clearInterval(sessionCleanupTimer);
+        sessionCleanupTimer = null;
+      }
       void closeBrowser();
     };
     process.once("SIGTERM", closeSilently);
     process.once("SIGINT", closeSilently);
     process.once("beforeExit", closeSilently);
   }
+  ensureSessionCleanupTimer();
   if (browserClosingPromise) {
     await browserClosingPromise.catch(() => {});
   }
@@ -728,6 +740,41 @@ async function closeBrowser() {
 
 async function sleep(ms: number) {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withNavigationSlot<T>(task: () => Promise<T>) {
+  if (navigationSlotsInUse >= SESSION_NAVIGATION_CONCURRENCY) {
+    await new Promise<void>((resolve) => {
+      navigationSlotWaiters.push(resolve);
+    });
+  }
+  navigationSlotsInUse += 1;
+  try {
+    return await task();
+  } finally {
+    navigationSlotsInUse = Math.max(0, navigationSlotsInUse - 1);
+    const next = navigationSlotWaiters.shift();
+    if (next) next();
+  }
+}
+
+function ensureSessionCleanupTimer() {
+  if (sessionCleanupTimer) return;
+  const intervalMs = Math.max(5_000, Math.min(15_000, Math.floor(SESSION_IDLE_TTL_MS / 3)));
+  sessionCleanupTimer = setInterval(() => {
+    cleanupIdleSessions();
+  }, intervalMs);
+}
+
+function enforceSessionCapacity(targetSize = SESSION_MAX_COUNT) {
+  if (sessions.size <= targetSize) return;
+  const overflow = [...sessions.values()]
+    .sort((left, right) => left.lastTouchedAt - right.lastTouchedAt)
+    .slice(0, Math.max(0, sessions.size - targetSize));
+  for (const session of overflow) {
+    sessions.delete(session.key);
+    void session.close();
+  }
 }
 
 async function fetchTextDocument(input: { url: string; referrerUrl?: string; timeoutMs?: number }) {
@@ -2005,48 +2052,50 @@ class LiveEmbedSession {
   }
 
   async primePage(timeoutMs: number) {
-    const page = this.page;
-    if (!page || page.isClosed?.()) throw new Error("browser-page-closed");
-    const deadlineAt = Date.now() + Math.max(8_000, Math.min(24_000, timeoutMs));
+    await withNavigationSlot(async () => {
+      const page = this.page;
+      if (!page || page.isClosed?.()) throw new Error("browser-page-closed");
+      const deadlineAt = Date.now() + Math.max(8_000, Math.min(24_000, timeoutMs));
 
-    this.seedSourceVariants();
-    await page.goto(this.playbackUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: Math.max(4_000, Math.min(20_000, deadlineAt - Date.now())),
-    });
-    if (typeof page.waitForLoadState === "function") {
-      const networkIdleBudgetMs = Math.max(1_000, deadlineAt - Date.now());
-      await page.waitForLoadState("networkidle", {
-        timeout: Math.min(networkIdleBudgetMs, 5_000, SESSION_NETWORK_IDLE_WAIT_MS),
-      }).catch(() => {});
-    }
-    const settleBudgetMs = Math.max(0, deadlineAt - Date.now());
-    if (settleBudgetMs > 0) {
-      await page.waitForTimeout(Math.max(750, Math.min(4_000, SESSION_WAIT_MS, settleBudgetMs)));
-    }
-    const challengeWaitBudgetMs = Math.max(
-      0,
-      Math.min(this.slotServerId === 4 ? 8_000 : 12_000, timeoutMs, deadlineAt - Date.now())
-    );
-    await this.waitOutChallengeIfNeeded(challengeWaitBudgetMs).catch(() => false);
-    await this.drainDomCandidates();
-    if (!this.candidates.size && deadlineAt - Date.now() > 0) {
-      await page.waitForTimeout(Math.max(500, Math.min(2_500, SESSION_RETRY_WAIT_MS, deadlineAt - Date.now())));
+      this.seedSourceVariants();
+      await page.goto(this.playbackUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: Math.max(4_000, Math.min(20_000, deadlineAt - Date.now())),
+      });
+      if (typeof page.waitForLoadState === "function") {
+        const networkIdleBudgetMs = Math.max(1_000, deadlineAt - Date.now());
+        await page.waitForLoadState("networkidle", {
+          timeout: Math.min(networkIdleBudgetMs, 5_000, SESSION_NETWORK_IDLE_WAIT_MS),
+        }).catch(() => {});
+      }
+      const settleBudgetMs = Math.max(0, deadlineAt - Date.now());
+      if (settleBudgetMs > 0) {
+        await page.waitForTimeout(Math.max(750, Math.min(4_000, SESSION_WAIT_MS, settleBudgetMs)));
+      }
+      const challengeWaitBudgetMs = Math.max(
+        0,
+        Math.min(this.slotServerId === 4 ? 8_000 : 12_000, timeoutMs, deadlineAt - Date.now())
+      );
+      await this.waitOutChallengeIfNeeded(challengeWaitBudgetMs).catch(() => false);
       await this.drainDomCandidates();
-    }
-    if (this.pendingTasks.size && deadlineAt - Date.now() > 0) {
-      await Promise.race([
-        Promise.allSettled(Array.from(this.pendingTasks)),
-        sleep(Math.max(250, Math.min(3_000, deadlineAt - Date.now()))),
-      ]).catch(() => {});
-    }
-    if ((!this.candidates.size || this.pageQueue.length) && deadlineAt - Date.now() > 0) {
-      await this.crawlQueuedPages(Math.max(3_000, deadlineAt - Date.now()));
-    }
-    if (deadlineAt - Date.now() > 0) {
-      await this.hydrateCandidateBodiesInPage();
-    }
-    this.lastReloadAt = Date.now();
+      if (!this.candidates.size && deadlineAt - Date.now() > 0) {
+        await page.waitForTimeout(Math.max(500, Math.min(2_500, SESSION_RETRY_WAIT_MS, deadlineAt - Date.now())));
+        await this.drainDomCandidates();
+      }
+      if (this.pendingTasks.size && deadlineAt - Date.now() > 0) {
+        await Promise.race([
+          Promise.allSettled(Array.from(this.pendingTasks)),
+          sleep(Math.max(250, Math.min(3_000, deadlineAt - Date.now()))),
+        ]).catch(() => {});
+      }
+      if ((!this.candidates.size || this.pageQueue.length) && deadlineAt - Date.now() > 0) {
+        await this.crawlQueuedPages(Math.max(3_000, deadlineAt - Date.now()));
+      }
+      if (deadlineAt - Date.now() > 0) {
+        await this.hydrateCandidateBodiesInPage();
+      }
+      this.lastReloadAt = Date.now();
+    });
   }
 
   startMaintenanceLoop() {
@@ -2640,12 +2689,14 @@ function getSession(input: { sourceUrl: string; requestOrigin: string; slotServe
   const key = `${canonicalizeUrl(sourceUrl)}|${canonicalizeUrl(requestOrigin)}|${String(input.slotServerId || "")}`;
   let session = sessions.get(key);
   if (!session) {
+    enforceSessionCapacity(Math.max(0, SESSION_MAX_COUNT - 1));
     session = new LiveEmbedSession({
       sourceUrl,
       requestOrigin,
       slotServerId: input.slotServerId,
     });
     sessions.set(key, session);
+    enforceSessionCapacity(SESSION_MAX_COUNT);
   }
   session.touch();
   return session;

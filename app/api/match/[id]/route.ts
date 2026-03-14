@@ -49,7 +49,7 @@ const SERVER5_REFRESH_CACHE_TTL_MS = 90_000;
 const SERVER5_REFRESH_PREMATCH_WINDOW_MS = 90 * 60 * 1000;
 const SERVER5_REFRESH_POSTMATCH_WINDOW_MS = 3 * 60 * 60 * 1000;
 const DUPLICATE_SIBLING_START_WINDOW_MS = 6 * 60 * 60 * 1000;
-const MATCH_BOOTSTRAP_PRIME_TTL_MS = 10_000;
+const MATCH_BOOTSTRAP_PRIME_TTL_MS = 60_000;
 const MATCH_BOOTSTRAP_PRIME_TIMEOUT_MS = 1_200;
 const MATCH_BOOTSTRAP_SYNC_TIMEOUT_MS = 4_200;
 const MATCH_BOOTSTRAP_SETTLE_TIMEOUT_MS = 5_400;
@@ -694,7 +694,7 @@ function shouldBootstrapStrictUiServer(
   if (!entry) return true;
   const reason = String(entry.reason || "");
   if (entry.state === "ready") return false;
-  if (entry.state === "warming") return isSessionDrivenStrictStatusEntry(entry);
+  if (entry.state === "warming") return !isSessionDrivenStrictStatusEntry(entry);
   if (
     reason === "missing-source" ||
     reason === "source-not-allowed" ||
