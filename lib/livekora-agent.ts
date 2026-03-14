@@ -1,11 +1,9 @@
 import { buildLivekoraPublicPlaylistUrl } from "@/lib/live-providers";
 import type { LivekoraAgentStatus, LivekoraStatus } from "@/lib/livekora-types";
-import { computeMatchWindowState, getMatchWindowConfig, parseMatchStartMs } from "@/lib/match-window";
 import type { LivekoraMatchRow } from "@/lib/livekora-match";
 
 const LIVEKORA_AGENT_BIND = String(process.env.LIVEKORA_R2_AGENT_BIND || "127.0.0.1").trim() || "127.0.0.1";
 const LIVEKORA_AGENT_PORT = Number.parseInt(String(process.env.LIVEKORA_R2_AGENT_PORT || "3500"), 10) || 3500;
-const MATCH_WINDOW_CONFIG = getMatchWindowConfig();
 
 function nowIso() {
   return new Date().toISOString();
@@ -90,24 +88,6 @@ export async function buildLivekoraStatus(input: {
       state: "down",
       playlistUrl: null,
       reason: "missing-source",
-      currentSource: null,
-      updatedAt: nowIso(),
-    } satisfies LivekoraStatus;
-  }
-
-  const matchWindow = computeMatchWindowState({
-    matchStartMs: parseMatchStartMs(input.row.match_start),
-    config: MATCH_WINDOW_CONFIG,
-  });
-  if (matchWindow.hasStart && !matchWindow.inWindow) {
-    return {
-      provider: "livekora",
-      mode: "livekora_r2",
-      matchId: input.matchId,
-      sourceUrl,
-      state: "down",
-      playlistUrl: null,
-      reason: "blocked-outside-window",
       currentSource: null,
       updatedAt: nowIso(),
     } satisfies LivekoraStatus;

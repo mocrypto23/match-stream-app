@@ -3,12 +3,9 @@ import { NextResponse } from "next/server";
 import { bootstrapLivekoraAgent, buildLivekoraStatus } from "@/lib/livekora-agent";
 import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
 import { buildLivekoraSessionManifestUrl, pickLivekoraSourceUrl, resolveInternalAppOrigin } from "@/lib/live-providers";
-import { computeMatchWindowState, getMatchWindowConfig, parseMatchStartMs } from "@/lib/match-window";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const MATCH_WINDOW_CONFIG = getMatchWindowConfig();
 
 export async function POST(req: Request) {
   const body = (await req.json().catch(() => null)) as { matchId?: number } | null;
@@ -28,15 +25,6 @@ export async function POST(req: Request) {
   const sourceUrl = pickLivekoraSourceUrl(data);
   if (!sourceUrl) {
     const livekoraStatus = await buildLivekoraStatus({ matchId, row: data, sourceUrl: null });
-    return NextResponse.json({ accepted: false, livekoraStatus }, { status: 409 });
-  }
-
-  const matchWindow = computeMatchWindowState({
-    matchStartMs: parseMatchStartMs(data.match_start),
-    config: MATCH_WINDOW_CONFIG,
-  });
-  if (matchWindow.hasStart && !matchWindow.inWindow) {
-    const livekoraStatus = await buildLivekoraStatus({ matchId, row: data, sourceUrl });
     return NextResponse.json({ accepted: false, livekoraStatus }, { status: 409 });
   }
 
