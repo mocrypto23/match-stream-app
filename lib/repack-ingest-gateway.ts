@@ -43,5 +43,5 @@ export function buildRepackGatewayManifestUrl(input: {
   internalOrigin?: string;
 }) {
   const origin = (input.internalOrigin || resolveInternalPlayerOrigin()).replace(/\/+$/, "");
-  return `${origin}/api/repack/ingest?matchId=${encodeURIComponent(String(input.matchId))}&slotServer=${encodeURIComponent(String(input.slotServer))}`;
+  return `${origin}/api/repack/session-manifest?matchId=${encodeURIComponent(String(input.matchId))}&slotServer=${encodeURIComponent(String(input.slotServer))}`;
 }

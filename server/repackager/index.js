@@ -332,11 +332,16 @@ function buildStrictGatewayIngestUrlKey(matchId, serverId) {
   return `m${matchId}:s${serverId}`;
 }
 
+function isStrictGatewayManifestPathname(pathname) {
+  const normalized = String(pathname || "").toLowerCase();
+  return normalized.includes("/api/repack/ingest") || normalized.includes("/api/repack/session-manifest");
+}
+
 function isStrictGatewayIngestUrl(rawUrl, matchId, serverId) {
   if (!isHttpUrl(rawUrl)) return false;
   try {
     const parsed = new URL(rawUrl);
-    if (!String(parsed.pathname || "").toLowerCase().includes("/api/repack/ingest")) return false;
+    if (!isStrictGatewayManifestPathname(parsed.pathname)) return false;
     const matchParam = Number.parseInt(String(parsed.searchParams.get("matchId") || ""), 10);
     const slotParam = Number.parseInt(String(parsed.searchParams.get("slotServer") || ""), 10);
     return matchParam === matchId && slotParam === serverId;
@@ -497,7 +502,9 @@ class MirrorJob {
       state: this.state,
       sourceUrl: this.sourceUrl,
       ingestUrl: this.ingestUrl,
-      ingestUrlKind: "strict_gateway",
+      ingestUrlKind: String(this.ingestUrl || "").toLowerCase().includes("/api/repack/session-manifest")
+        ? "runtime_session_manifest"
+        : "strict_gateway",
       lastSeedAt: this.lastSeedAt,
       lastPublishAt: this.lastPublishAt || null,
       lastPublishAgeMs: this.lastPublishAt ? Math.max(0, nowMs - this.lastPublishAt) : null,
