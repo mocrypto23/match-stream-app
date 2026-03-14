@@ -489,6 +489,7 @@ async function resolveSessionCandidateMediaManifest(input: {
   referrerUrl: string;
   manifestBody?: string;
   manifestSeenAt?: number;
+  timeoutMs?: number;
 }) {
   let currentUrl = String(input.targetUrl || "").trim();
   let currentFetchUrl = pickSessionFetchUrl(input.fetchUrl, currentUrl, input.internalOrigin);
@@ -502,6 +503,13 @@ async function resolveSessionCandidateMediaManifest(input: {
 
   for (let depth = 0; depth < 3; depth += 1) {
     if (!currentBody) {
+      const timeoutMs = Math.max(
+        4_000,
+        Math.min(
+          DEFAULT_RESOLVE_TIMEOUT_MS,
+          Number.isFinite(Number(input.timeoutMs)) ? Number(input.timeoutMs) : DEFAULT_RESOLVE_TIMEOUT_MS
+        )
+      );
       const fetched = await fetchLiveEmbedText({
         sourceUrl: input.sourceUrl,
         requestOrigin: input.internalOrigin,
@@ -509,7 +517,7 @@ async function resolveSessionCandidateMediaManifest(input: {
         targetUrl: currentUrl,
         fetchUrl: currentFetchUrl,
         referrerUrl: currentReferrerUrl,
-        timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
+        timeoutMs,
       });
       if (!fetched.ok || !looksLikeManifestResponse(fetched.contentType, fetched.body, fetched.finalUrl || currentUrl)) {
         return { ok: false as const, error: fetched.error || `manifest-http-${fetched.status || 0}` };
@@ -883,13 +891,26 @@ export async function resolveRuntimeOwnedManifest(
   let lastTargetDurationSec = 0;
   let lastMediaSequence: number | null = null;
   let lastCandidatesFound = 0;
+  const overallDeadlineAt =
+    Date.now() +
+    Math.max(
+      10_000,
+      Math.min(
+        30_000,
+        DEFAULT_RESOLVE_TIMEOUT_MS +
+          Math.max(0, Math.min(10_000, Number.isFinite(Number(queryOptions?.waitTimeoutMs)) ? Number(queryOptions?.waitTimeoutMs) : 0))
+      )
+    );
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
+    const remainingBudgetMs = overallDeadlineAt - Date.now();
+    if (remainingBudgetMs <= 0) break;
+    const opTimeoutMs = Math.max(4_000, Math.min(DEFAULT_RESOLVE_TIMEOUT_MS, remainingBudgetMs));
     const runtimeState = await ensureLiveEmbedSessionRuntime({
       sourceUrl: input.sourceUrl,
       requestOrigin: input.internalOrigin,
       slotServerId: input.slotServer,
-      timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
+      timeoutMs: opTimeoutMs,
     });
     lastPlaybackUrl = String(runtimeState.playbackUrl || "").trim();
     const currentSource = await currentSourceFromRuntimeState(input, runtimeState, options);
@@ -912,6 +933,7 @@ export async function resolveRuntimeOwnedManifest(
           referrerUrl,
           manifestBody: options.forceFreshManifest || queryOptions?.forceRefresh ? undefined : candidate.manifestBody,
           manifestSeenAt: Number(candidate.seenAt || 0),
+          timeoutMs: opTimeoutMs,
         });
         if (!resolved.ok) {
           lastError = resolved.error || lastError;
@@ -975,7 +997,7 @@ export async function resolveRuntimeOwnedManifest(
           sourceUrl: input.sourceUrl,
           requestOrigin: input.internalOrigin,
           slotServerId: input.slotServer,
-          timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
+          timeoutMs: opTimeoutMs,
           reason: "wait_for_media_sequence",
         }).catch(() => null);
         refreshed = !!refreshedState?.ok;
@@ -989,7 +1011,7 @@ export async function resolveRuntimeOwnedManifest(
         sourceUrl: input.sourceUrl,
         requestOrigin: input.internalOrigin,
         slotServerId: input.slotServer,
-        timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
+        timeoutMs: opTimeoutMs,
         reason: queryOptions?.forceRefresh ? "forced_runtime_refresh" : "manifest_refresh",
       }).catch(() => null);
       refreshed = !!refreshedState?.ok;
@@ -1001,7 +1023,7 @@ export async function resolveRuntimeOwnedManifest(
         sourceUrl: input.sourceUrl,
         requestOrigin: input.internalOrigin,
         slotServerId: input.slotServer,
-        timeoutMs: DEFAULT_RESOLVE_TIMEOUT_MS,
+        timeoutMs: opTimeoutMs,
         reason: "manifest_rotate",
       }).catch(() => null);
       rotated = !!rotatedState?.ok;
