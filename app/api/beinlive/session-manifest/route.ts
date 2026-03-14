@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 
+import { beinliveProvider } from "@/lib/beinlive-provider";
 import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
-import { livekoraProvider, pickLivekoraSourceUrl, resolveInternalAppOrigin } from "@/lib/live-providers";
+import { resolveInternalAppOrigin } from "@/lib/live-providers";
+import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,13 +27,13 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok: false, error: "match-not-found" }, { status: 404 });
   }
 
-  const sourceUrl = pickLivekoraSourceUrl(data);
+  const sourceUrl = await resolveProviderSourceUrl(beinliveProvider, data);
   if (!sourceUrl) {
     return NextResponse.json({ ok: false, error: "missing-source" }, { status: 409 });
   }
 
   const internalOrigin = resolveInternalAppOrigin(req);
-  const resolved = await livekoraProvider.extractCurrentManifest(
+  const resolved = await beinliveProvider.extractCurrentManifest(
     {
       matchId,
       sourceUrl,

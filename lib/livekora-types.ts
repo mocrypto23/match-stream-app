@@ -1,24 +1,5 @@
-export type LivekoraState = "ready" | "warming" | "down";
+import type { StreamAgentStatus, StreamSourceState, StreamSourceStatus } from "@/lib/stream-source-types";
 
-export type LivekoraStatus = {
-  provider: "livekora";
-  mode: "livekora_r2";
-  matchId: number;
-  sourceUrl: string | null;
-  state: LivekoraState;
-  playlistUrl: string | null;
-  reason: string;
-  currentSource: string | null;
-  updatedAt: string;
-};
-
-export type LivekoraAgentStatus = {
-  exists: boolean;
-  matchId: number;
-  state: LivekoraState;
-  playlistUrl: string | null;
-  sourceUrl: string | null;
-  currentSource: string | null;
-  reason: string;
-  updatedAt: string;
-};
+export type LivekoraState = StreamSourceState;
+export type LivekoraStatus = StreamSourceStatus & { provider: "livekora"; label: "livekora vip"; order: 1 };
+export type LivekoraAgentStatus = StreamAgentStatus & { provider: "livekora" };

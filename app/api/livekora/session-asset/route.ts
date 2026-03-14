@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 
+import { beinliveProvider } from "@/lib/beinlive-provider";
 import { livekoraProvider, resolveInternalAppOrigin } from "@/lib/live-providers";
 
 export const runtime = "nodejs";
@@ -21,18 +22,24 @@ function isHttpUrl(raw: string) {
 
 export async function GET(req: Request) {
   const url = new URL(req.url);
+  const providerId = String(url.searchParams.get("provider") || "").trim().toLowerCase();
+  const slotServer = Number.parseInt(String(url.searchParams.get("slotServer") || "").trim(), 10);
   const sourceUrl = String(url.searchParams.get("sourceUrl") || "").trim();
   const assetUrl = String(url.searchParams.get("assetUrl") || "").trim();
   const referrerUrl = String(url.searchParams.get("referrerUrl") || "").trim();
+  const provider =
+    providerId === "beinlive" || slotServer === 1 || beinliveProvider.isAllowedSource(sourceUrl)
+      ? beinliveProvider
+      : livekoraProvider;
 
-  if (!livekoraProvider.isAllowedSource(sourceUrl)) {
+  if (!provider.isAllowedSource(sourceUrl)) {
     return NextResponse.json({ ok: false, error: "source-not-allowed" }, { status: 403 });
   }
   if (!isHttpUrl(assetUrl)) {
     return NextResponse.json({ ok: false, error: "invalid-asset-url" }, { status: 400 });
   }
 
-  const fetched = await livekoraProvider.fetchAsset({
+  const fetched = await provider.fetchAsset({
     matchId: 0,
     sourceUrl,
     internalOrigin: resolveInternalAppOrigin(req),
@@ -58,6 +65,7 @@ export async function GET(req: Request) {
       "content-type": String(fetched.contentType || "application/octet-stream").trim() || "application/octet-stream",
       "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
       "x-livekora-session-asset": "1",
+      "x-r2-session-asset": "1",
     },
   });
 }

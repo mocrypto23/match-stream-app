@@ -20,6 +20,7 @@ const DEFAULT_USER_AGENT =
 const DEFAULT_MANIFEST_CACHE_CONTROL = "no-store, no-cache, must-revalidate, max-age=0";
 const DEFAULT_SEGMENT_CACHE_CONTROL = "public, max-age=3600, s-maxage=86400, immutable";
 const DEFAULT_KEY_CACHE_CONTROL = "public, max-age=60, s-maxage=300";
+const VALID_PROVIDER_IDS = new Set(["livekora", "beinlive"]);
 
 function nowIso() {
   return new Date().toISOString();
@@ -241,8 +242,21 @@ function filterUnavailableSegmentsFromManifest(manifestText, missingRemoteNames)
   return out.join("\n");
 }
 
+function normalizeProviderId(rawValue) {
+  const value = String(rawValue || "").trim().toLowerCase();
+  return VALID_PROVIDER_IDS.has(value) ? value : "livekora";
+}
+
+function normalizePublicPathPrefix(rawValue, providerId) {
+  const fallback = providerId === "beinlive" ? "beinlive" : "livekora";
+  const value = String(rawValue || fallback)
+    .trim()
+    .replace(/^\/+|\/+$/g, "");
+  return value || fallback;
+}
+
 function isSessionManifestPathname(pathname) {
-  return String(pathname || "").toLowerCase().includes("/api/livekora/session-manifest");
+  return /\/api\/[^/]+\/session-manifest$/i.test(String(pathname || "").toLowerCase());
 }
 
 function isSessionManifestUrl(rawUrl) {
@@ -257,7 +271,7 @@ function isSessionManifestUrl(rawUrl) {
 function isSessionAssetUrl(rawUrl) {
   if (!isHttpUrl(rawUrl)) return false;
   try {
-    return String(new URL(rawUrl).pathname || "").toLowerCase().includes("/api/livekora/session-asset");
+    return String(new URL(rawUrl).pathname || "").toLowerCase().includes("/session-asset");
   } catch {
     return false;
   }
@@ -350,10 +364,12 @@ async function mapLimit(items, limit, handler) {
 class LivekoraJob {
   constructor(manager, input) {
     this.manager = manager;
+    this.providerId = normalizeProviderId(input.providerId);
+    this.publicPathPrefix = normalizePublicPathPrefix(input.publicPathPrefix, this.providerId);
     this.matchId = input.matchId;
     this.sourceUrl = input.sourceUrl;
     this.ingestUrl = input.ingestUrl;
-    this.remotePrefix = `${this.manager.config.remoteRoot}/livekora/m${this.matchId}`;
+    this.remotePrefix = `${this.manager.config.remoteRoot}/${this.publicPathPrefix}/m${this.matchId}`;
     this.state = "starting";
     this.createdAt = Date.now();
     this.lastTouchedAt = Date.now();
@@ -375,7 +391,7 @@ class LivekoraJob {
   }
 
   get publicPlaylistUrl() {
-    return `${this.manager.config.publicBaseUrl}/livekora/m${this.matchId}/index.m3u8`;
+    return `${this.manager.config.publicBaseUrl}/${this.publicPathPrefix}/m${this.matchId}/index.m3u8`;
   }
 
   touch() {
@@ -449,6 +465,7 @@ class LivekoraJob {
     const publicState = this.derivePublicStatus(nowMs);
     return {
       exists: true,
+      provider: this.providerId,
       matchId: this.matchId,
       state: publicState.state,
       playlistUrl: publicState.state === "ready" ? this.publicPlaylistUrl : null,
@@ -591,14 +608,18 @@ class LivekoraJob {
             finalUrl,
           };
         }
-        if (isSessionManifestUrl(requestUrl) && String(response.headers.get("x-livekora-session-manifest") || "").trim() !== "1") {
-          return {
-            ok: false,
-            reason: "session-manifest-missing-header",
-            body,
-            contentType,
-            finalUrl,
-          };
+        if (isSessionManifestUrl(requestUrl)) {
+          const genericSessionHeader = String(response.headers.get("x-r2-session-manifest") || "").trim();
+          const legacySessionHeader = String(response.headers.get("x-livekora-session-manifest") || "").trim();
+          if (genericSessionHeader !== "1" && legacySessionHeader !== "1") {
+            return {
+              ok: false,
+              reason: "session-manifest-missing-header",
+              body,
+              contentType,
+              finalUrl,
+            };
+          }
         }
         if (!looksLikeManifestResponse(contentType, body, finalUrl)) {
           return {
@@ -623,9 +644,14 @@ class LivekoraJob {
           body,
           contentType,
           finalUrl,
-          runtimeMediaSequence: Number.parseInt(String(response.headers.get("x-livekora-media-sequence") || "").trim(), 10),
-          runtimeTargetDurationSec: Number.parseFloat(String(response.headers.get("x-livekora-target-duration") || "").trim()),
-          currentSource: normalizeHeaderValue(response.headers.get("x-livekora-current-source")),
+          runtimeMediaSequence: Number.parseInt(
+            String(response.headers.get("x-r2-media-sequence") || response.headers.get("x-livekora-media-sequence") || "").trim(),
+            10
+          ),
+          runtimeTargetDurationSec: Number.parseFloat(
+            String(response.headers.get("x-r2-target-duration") || response.headers.get("x-livekora-target-duration") || "").trim()
+          ),
+          currentSource: normalizeHeaderValue(response.headers.get("x-r2-current-source") || response.headers.get("x-livekora-current-source")),
         };
       } catch (error) {
         return {
@@ -708,7 +734,10 @@ class LivekoraJob {
       if (!response.ok) {
         throw new Error(`asset-http-${response.status || 0}`);
       }
-      if (String(response.headers.get("x-livekora-session-asset") || "").trim() !== "1") {
+      if (
+        String(response.headers.get("x-r2-session-asset") || "").trim() !== "1" &&
+        String(response.headers.get("x-livekora-session-asset") || "").trim() !== "1"
+      ) {
         throw new Error("session-asset-missing-header");
       }
       const bytes = Buffer.from(await response.arrayBuffer());
@@ -901,12 +930,16 @@ class LivekoraManager {
     process.stdout.write(`${JSON.stringify({ ts: nowIso(), level, message, ...extra })}\n`);
   }
 
-  getJob(matchId) {
-    return this.jobs.get(String(matchId)) || null;
+  buildJobKey(providerId, matchId) {
+    return `${normalizeProviderId(providerId)}:${String(matchId)}`;
   }
 
-  async stopJob(matchId) {
-    const key = String(matchId);
+  getJob(providerId, matchId) {
+    return this.jobs.get(this.buildJobKey(providerId, matchId)) || null;
+  }
+
+  async stopJob(providerId, matchId) {
+    const key = this.buildJobKey(providerId, matchId);
     const job = this.jobs.get(key);
     if (!job) return;
     await job.stop();
@@ -951,9 +984,11 @@ class LivekoraManager {
 
   sweepIdleJobs() {
     const nowMs = Date.now();
-    for (const [matchId, job] of this.jobs.entries()) {
+    for (const [jobKey, job] of this.jobs.entries()) {
       if (nowMs - job.lastTouchedAt <= this.config.idleStopMs) continue;
-      void this.stopJob(matchId);
+      void this.stopJob(job.providerId, job.matchId).catch(() => {
+        this.jobs.delete(jobKey);
+      });
     }
   }
 
@@ -961,18 +996,25 @@ class LivekoraManager {
     if (!Number.isFinite(input.matchId) || input.matchId <= 0) {
       return { accepted: false, reason: "invalid-match-id", status: null };
     }
+    const providerId = normalizeProviderId(input.providerId);
+    const publicPathPrefix = normalizePublicPathPrefix(input.publicPathPrefix, providerId);
     if (!isHttpUrl(input.sourceUrl) || !isHttpUrl(input.ingestUrl)) {
       return { accepted: false, reason: "invalid-bootstrap-input", status: null };
     }
 
-    const key = String(input.matchId);
+    const key = this.buildJobKey(providerId, input.matchId);
     let job = this.jobs.get(key);
     if (!job) {
-      job = new LivekoraJob(this, input);
+      job = new LivekoraJob(this, {
+        ...input,
+        providerId,
+        publicPathPrefix,
+      });
       this.jobs.set(key, job);
       await this.purgeRemotePrefix(job.remotePrefix, this.config.purgeStopMaxKeys);
       job.start();
-      this.log("info", "livekora job started", {
+      this.log("info", "r2 mirror job started", {
+        provider: providerId,
         matchId: input.matchId,
         sourceUrl: input.sourceUrl,
       });
@@ -988,11 +1030,13 @@ class LivekoraManager {
     };
   }
 
-  status(matchId) {
-    const job = this.getJob(matchId);
+  status(providerId, matchId) {
+    const normalizedProviderId = normalizeProviderId(providerId);
+    const job = this.getJob(normalizedProviderId, matchId);
     if (!job) {
       return {
         exists: false,
+        provider: normalizedProviderId,
         matchId,
         state: "down",
         playlistUrl: null,
@@ -1010,6 +1054,7 @@ class LivekoraManager {
       now: nowIso(),
       publicBaseUrl: this.config.publicBaseUrl,
       jobs: Array.from(this.jobs.values()).map((job) => ({
+        provider: job.providerId,
         matchId: job.matchId,
         state: job.state,
         lastTouchedAt: job.lastTouchedAt,
@@ -1074,7 +1119,8 @@ async function main() {
       }
       if (method === "GET" && parsed.pathname === "/status") {
         const matchId = Number.parseInt(String(parsed.searchParams.get("matchId") || "").trim(), 10);
-        return sendJson(res, 200, manager.status(matchId));
+        const providerId = normalizeProviderId(parsed.searchParams.get("providerId"));
+        return sendJson(res, 200, manager.status(providerId, matchId));
       }
       if (method === "POST" && parsed.pathname === "/bootstrap") {
         const payload = await readJsonBody(req);

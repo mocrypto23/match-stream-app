@@ -5,7 +5,7 @@ import { useParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import VideoPlayerControls from "@/components/VideoPlayerControls";
-import type { LivekoraStatus } from "@/lib/livekora-types";
+import type { StreamProviderId, StreamSourceStatus } from "@/lib/stream-source-types";
 
 type MatchPayload = {
   id: number;
@@ -16,12 +16,22 @@ type MatchPayload = {
   match_start?: string | null;
   match_day?: string | null;
   status_key?: string | null;
+  stream_url?: string | null;
   stream_url_4?: string | null;
-  livekoraStatus?: LivekoraStatus | null;
+  livekoraStatus?: StreamSourceStatus | null;
   livekoraPlaylistUrl?: string | null;
+  beinliveStatus?: StreamSourceStatus | null;
+  beinlivePlaylistUrl?: string | null;
+  streamSources?: StreamSourceStatus[] | null;
 };
 
+type StatusMap = Record<StreamProviderId, StreamSourceStatus | null>;
+
 const STATUS_POLL_MS = 4_000;
+const PROVIDER_META: Array<{ provider: StreamProviderId; order: number; label: string }> = [
+  { provider: "livekora", order: 1, label: "livekora vip" },
+  { provider: "beinlive", order: 2, label: "bein-live" },
+];
 
 function formatKickoff(value: string | null | undefined) {
   if (!value) return "موعد المباراة غير متوفر";
@@ -37,28 +47,45 @@ function formatKickoff(value: string | null | undefined) {
   }).format(date);
 }
 
-function stateLabel(status: LivekoraStatus | null) {
+function stateLabel(status: StreamSourceStatus | null) {
   if (!status) return "جاري التحميل";
   if (status.state === "ready") return "البث جاهز";
   if (status.state === "warming") return "جاري تجهيز البث";
   return "البث غير جاهز";
 }
 
-function stateTone(status: LivekoraStatus | null) {
+function stateTone(status: StreamSourceStatus | null) {
   if (!status) return "bg-slate-700";
   if (status.state === "ready") return "bg-emerald-600";
   if (status.state === "warming") return "bg-amber-500";
   return "bg-rose-600";
 }
 
+function buildStatusMap(payload: MatchPayload | null): StatusMap {
+  return {
+    livekora: payload?.livekoraStatus || null,
+    beinlive: payload?.beinliveStatus || null,
+  };
+}
+
+function pickInitialProvider(payload: MatchPayload | null) {
+  const statuses = buildStatusMap(payload);
+  const readyProvider = PROVIDER_META.find((item) => statuses[item.provider]?.state === "ready");
+  if (readyProvider) return readyProvider.provider;
+  const withSource = PROVIDER_META.find((item) => String(statuses[item.provider]?.sourceUrl || "").trim());
+  if (withSource) return withSource.provider;
+  return "livekora" satisfies StreamProviderId;
+}
+
 export default function WatchPage() {
   const params = useParams<{ id?: string }>();
   const matchId = Number.parseInt(String(params?.id || "").trim(), 10);
   const [match, setMatch] = useState<MatchPayload | null>(null);
-  const [status, setStatus] = useState<LivekoraStatus | null>(null);
+  const [statusByProvider, setStatusByProvider] = useState<StatusMap>({ livekora: null, beinlive: null });
+  const [selectedProvider, setSelectedProvider] = useState<StreamProviderId>("livekora");
   const [pageError, setPageError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [bootstrapPending, setBootstrapPending] = useState(false);
+  const [bootstrapPendingProvider, setBootstrapPendingProvider] = useState<StreamProviderId | null>(null);
   const [playbackRequested, setPlaybackRequested] = useState(false);
   const [playbackStarting, setPlaybackStarting] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -66,12 +93,43 @@ export default function WatchPage() {
   const waitingOverlayTimerRef = useRef<number | null>(null);
   const hasPlayedRef = useRef(false);
 
+  const sources = useMemo(
+    () =>
+      PROVIDER_META.map((item) => statusByProvider[item.provider]).filter(Boolean).sort((left, right) => {
+        return Number(left?.order || 0) - Number(right?.order || 0);
+      }) as StreamSourceStatus[],
+    [statusByProvider]
+  );
+
+  const activeStatus = useMemo(() => {
+    return sources.find((item) => item.provider === selectedProvider) || sources[0] || null;
+  }, [selectedProvider, sources]);
+
+  const activeProvider = activeStatus?.provider || selectedProvider;
+
   const streamUrl = useMemo(() => {
-    const direct = String(status?.playlistUrl || "").trim();
+    const direct = String(activeStatus?.playlistUrl || "").trim();
     if (direct) return direct;
-    const fallback = String(match?.livekoraPlaylistUrl || "").trim();
+    if (activeProvider === "livekora") {
+      const fallback = String(match?.livekoraPlaylistUrl || "").trim();
+      return fallback || null;
+    }
+    const fallback = String(match?.beinlivePlaylistUrl || "").trim();
     return fallback || null;
-  }, [match?.livekoraPlaylistUrl, status?.playlistUrl]);
+  }, [activeProvider, activeStatus?.playlistUrl, match?.beinlivePlaylistUrl, match?.livekoraPlaylistUrl]);
+
+  const directSourceUrl = useMemo(() => {
+    if (activeProvider === "livekora") return String(match?.stream_url_4 || "").trim() || null;
+    return String(match?.stream_url || "").trim() || null;
+  }, [activeProvider, match?.stream_url, match?.stream_url_4]);
+
+  const applyProviderStatus = useCallback((provider: StreamProviderId, status: StreamSourceStatus | null | undefined) => {
+    if (!status) return;
+    setStatusByProvider((current) => ({
+      ...current,
+      [provider]: status,
+    }));
+  }, []);
 
   const loadMatch = useCallback(async () => {
     if (!Number.isFinite(matchId) || matchId <= 0) {
@@ -89,7 +147,12 @@ export default function WatchPage() {
         throw new Error(String((payload as { error?: string } | null)?.error || "match-load-failed"));
       }
       setMatch(payload);
-      setStatus(payload.livekoraStatus || null);
+      setStatusByProvider(buildStatusMap(payload));
+      setSelectedProvider((current) => {
+        const statuses = buildStatusMap(payload);
+        if (statuses[current]) return current;
+        return pickInitialProvider(payload);
+      });
     } catch (error) {
       setPageError(error instanceof Error ? error.message : "تعذر تحميل المباراة.");
     } finally {
@@ -97,53 +160,73 @@ export default function WatchPage() {
     }
   }, [matchId]);
 
-  const refreshStatus = useCallback(async () => {
-    if (!Number.isFinite(matchId) || matchId <= 0) return;
-    try {
-      const response = await fetch(`/api/livekora/status?matchId=${encodeURIComponent(String(matchId))}`, {
-        cache: "no-store",
-      });
-      const payload = (await response.json().catch(() => null)) as { livekoraStatus?: LivekoraStatus | null } | null;
-      if (response.ok && payload?.livekoraStatus) {
-        setStatus(payload.livekoraStatus);
-      }
-    } catch {}
-  }, [matchId]);
+  const refreshProviderStatus = useCallback(
+    async (provider: StreamProviderId) => {
+      if (!Number.isFinite(matchId) || matchId <= 0) return;
+      try {
+        const response = await fetch(`/api/${provider}/status?matchId=${encodeURIComponent(String(matchId))}`, {
+          cache: "no-store",
+        });
+        const payload = (await response.json().catch(() => null)) as
+          | { livekoraStatus?: StreamSourceStatus | null; beinliveStatus?: StreamSourceStatus | null }
+          | null;
+        if (!response.ok || !payload) return;
+        if (provider === "livekora") applyProviderStatus(provider, payload.livekoraStatus);
+        if (provider === "beinlive") applyProviderStatus(provider, payload.beinliveStatus);
+      } catch {}
+    },
+    [applyProviderStatus, matchId]
+  );
 
-  const bootstrap = useCallback(async () => {
-    if (!Number.isFinite(matchId) || matchId <= 0) return;
-    setBootstrapPending(true);
-    try {
-      const response = await fetch("/api/livekora/bootstrap", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ matchId }),
-      });
-      const payload = (await response.json().catch(() => null)) as { livekoraStatus?: LivekoraStatus | null; reason?: string } | null;
-      if (payload?.livekoraStatus) {
-        setStatus(payload.livekoraStatus);
+  const refreshAllStatuses = useCallback(async () => {
+    await Promise.all(PROVIDER_META.map((item) => refreshProviderStatus(item.provider)));
+  }, [refreshProviderStatus]);
+
+  const bootstrapProvider = useCallback(
+    async (provider: StreamProviderId, opts?: { silent?: boolean }) => {
+      if (!Number.isFinite(matchId) || matchId <= 0) return;
+      setBootstrapPendingProvider(provider);
+      try {
+        const response = await fetch(`/api/${provider}/bootstrap`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ matchId }),
+        });
+        const payload = (await response.json().catch(() => null)) as
+          | {
+              livekoraStatus?: StreamSourceStatus | null;
+              beinliveStatus?: StreamSourceStatus | null;
+              reason?: string;
+              error?: string;
+            }
+          | null;
+        if (provider === "livekora") applyProviderStatus(provider, payload?.livekoraStatus);
+        if (provider === "beinlive") applyProviderStatus(provider, payload?.beinliveStatus);
+        if (!response.ok && !opts?.silent) {
+          setPageError(String(payload?.reason || payload?.error || "bootstrap-failed"));
+        }
+      } catch (error) {
+        if (!opts?.silent) {
+          setPageError(error instanceof Error ? error.message : "bootstrap-failed");
+        }
+      } finally {
+        setBootstrapPendingProvider((current) => (current === provider ? null : current));
       }
-      if (!response.ok && payload?.reason) {
-        setPageError(payload.reason);
-      }
-    } catch (error) {
-      setPageError(error instanceof Error ? error.message : "bootstrap-failed");
-    } finally {
-      setBootstrapPending(false);
-    }
-  }, [matchId]);
+    },
+    [applyProviderStatus, matchId]
+  );
 
   const requestPlaybackStart = useCallback(() => {
     setPageError(null);
     setPlaybackRequested(true);
     setPlaybackStarting(true);
     if (!String(streamUrl || "").trim()) {
-      void refreshStatus();
-      void bootstrap();
+      void refreshProviderStatus(activeProvider);
+      void bootstrapProvider(activeProvider);
     }
-  }, [bootstrap, refreshStatus, streamUrl]);
+  }, [activeProvider, bootstrapProvider, refreshProviderStatus, streamUrl]);
 
   const clearWaitingOverlayTimer = useCallback(() => {
     if (waitingOverlayTimerRef.current !== null) {
@@ -161,6 +244,8 @@ export default function WatchPage() {
     setPlaybackStarting(false);
     clearWaitingOverlayTimer();
     hasPlayedRef.current = false;
+    setStatusByProvider({ livekora: null, beinlive: null });
+    setSelectedProvider("livekora");
   }, [clearWaitingOverlayTimer, matchId]);
 
   useEffect(() => {
@@ -171,17 +256,17 @@ export default function WatchPage() {
 
   useEffect(() => {
     if (!match) return;
-    if (!String(match.stream_url_4 || "").trim()) return;
-    void bootstrap();
-  }, [bootstrap, match]);
+    if (!String(activeStatus?.sourceUrl || "").trim()) return;
+    void bootstrapProvider(activeProvider, { silent: true });
+  }, [activeProvider, activeStatus?.sourceUrl, bootstrapProvider, match]);
 
   useEffect(() => {
     if (!matchId || Number.isNaN(matchId)) return;
     const id = window.setInterval(() => {
-      void refreshStatus();
+      void refreshAllStatuses();
     }, STATUS_POLL_MS);
     return () => window.clearInterval(id);
-  }, [matchId, refreshStatus]);
+  }, [matchId, refreshAllStatuses]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -293,7 +378,7 @@ export default function WatchPage() {
       <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6">
         <div className="text-center">
           <div className="text-xl font-bold">جاري تحميل المباراة</div>
-          <div className="text-sm text-slate-300 mt-2">يتم تجهيز مسار livekora الآن.</div>
+          <div className="text-sm text-slate-300 mt-2">يتم تجهيز المصادر المتاحة الآن.</div>
         </div>
       </main>
     );
@@ -311,6 +396,7 @@ export default function WatchPage() {
   }
 
   const title = [match.home_team || "الفريق الأول", match.away_team || "الفريق الثاني"].join(" × ");
+  const isBootstrapPending = bootstrapPendingProvider === activeProvider;
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(15,118,110,0.28),_transparent_35%),linear-gradient(180deg,_#020617_0%,_#07111f_55%,_#020617_100%)] text-white">
@@ -354,8 +440,10 @@ export default function WatchPage() {
 
               {!streamUrl ? (
                 <div className="absolute inset-0 z-[55] flex flex-col items-center justify-center gap-3 bg-black/70 px-6 text-center">
-                  <div className="text-2xl font-bold">{stateLabel(status)}</div>
-                  <div className="text-sm text-slate-300">{status?.reason || pageError || "waiting-for-playlist"}</div>
+                  <div className="text-2xl font-bold">{stateLabel(activeStatus)}</div>
+                  <div className="text-sm text-slate-300">
+                    {activeStatus?.reason || pageError || "waiting-for-playlist"}
+                  </div>
                 </div>
               ) : null}
 
@@ -396,18 +484,47 @@ export default function WatchPage() {
             </div>
 
             <div className="rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur">
+              <div className="text-sm font-medium text-slate-300">المصادر</div>
+              <div className="mt-4 grid grid-cols-2 gap-3">
+                {PROVIDER_META.map((item) => {
+                  const status = statusByProvider[item.provider];
+                  const isActive = activeProvider === item.provider;
+                  return (
+                    <button
+                      key={item.provider}
+                      type="button"
+                      onClick={() => {
+                        setPageError(null);
+                        setSelectedProvider(item.provider);
+                      }}
+                      className={`rounded-2xl border px-4 py-3 text-right transition ${
+                        isActive
+                          ? "border-teal-400 bg-teal-500/15"
+                          : "border-white/10 bg-slate-950/30 hover:bg-white/10"
+                      }`}
+                    >
+                      <div className="text-xs text-slate-400">مصدر {item.order}</div>
+                      <div className="mt-1 font-semibold text-white">{status?.label || item.label}</div>
+                      <div className="mt-2 text-xs text-slate-300">{stateLabel(status)}</div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur">
               <div className="flex items-center justify-between gap-3">
                 <div className="text-sm font-medium text-slate-300">حالة البث</div>
-                <div className={`rounded-full px-3 py-1 text-xs font-bold ${stateTone(status)}`}>{stateLabel(status)}</div>
+                <div className={`rounded-full px-3 py-1 text-xs font-bold ${stateTone(activeStatus)}`}>{stateLabel(activeStatus)}</div>
               </div>
               <div className="mt-4 space-y-3 text-sm text-slate-200">
                 <div>
-                  <div className="text-slate-400">المزود</div>
-                  <div className="font-semibold">livekora</div>
+                  <div className="text-slate-400">المصدر المختار</div>
+                  <div className="font-semibold">{activeStatus?.label || PROVIDER_META.find((item) => item.provider === activeProvider)?.label || activeProvider}</div>
                 </div>
                 <div>
                   <div className="text-slate-400">سبب الحالة</div>
-                  <div className="break-all font-mono text-xs">{status?.reason || pageError || "n/a"}</div>
+                  <div className="break-all font-mono text-xs">{activeStatus?.reason || pageError || "n/a"}</div>
                 </div>
                 <div>
                   <div className="text-slate-400">رابط البث النهائي</div>
@@ -415,7 +532,7 @@ export default function WatchPage() {
                 </div>
                 <div>
                   <div className="text-slate-400">المصدر الحالي</div>
-                  <div className="break-all font-mono text-xs">{status?.currentSource || match.stream_url_4 || "غير متاح"}</div>
+                  <div className="break-all font-mono text-xs">{activeStatus?.currentSource || directSourceUrl || "غير متاح"}</div>
                 </div>
               </div>
               <div className="mt-5 flex gap-3">
@@ -423,19 +540,19 @@ export default function WatchPage() {
                   type="button"
                   onClick={() => {
                     setPageError(null);
-                    void bootstrap();
+                    void bootstrapProvider(activeProvider);
                   }}
                   className="rounded-2xl bg-teal-500 px-4 py-2 text-sm font-bold text-slate-950 transition hover:bg-teal-400 disabled:cursor-not-allowed disabled:opacity-60"
-                  disabled={bootstrapPending}
+                  disabled={isBootstrapPending}
                 >
-                  {bootstrapPending ? "جاري التجهيز..." : "إعادة التجهيز"}
+                  {isBootstrapPending ? "جاري التجهيز..." : "إعادة التجهيز"}
                 </button>
                 <button
                   type="button"
                   onClick={() => {
                     setPageError(null);
                     void loadMatch();
-                    void refreshStatus();
+                    void refreshAllStatuses();
                   }}
                   className="rounded-2xl border border-white/15 px-4 py-2 text-sm font-medium text-white transition hover:bg-white/10"
                 >

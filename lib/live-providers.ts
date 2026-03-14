@@ -1,9 +1,15 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
 import axios from "axios";
+import type { StreamProviderId } from "@/lib/stream-source-types";
 
-type MatchRowLike = {
+export type MatchRowLike = {
+  stream_url?: string | null;
   stream_url_4?: string | null;
+  home_team?: string | null;
+  away_team?: string | null;
+  match_start?: string | null;
+  match_day?: string | null;
 };
 
 type ManifestOptions = {
@@ -27,7 +33,7 @@ export type ProviderManifestResult =
       targetDurationSec: number;
       refreshed: boolean;
       rotated: boolean;
-      adapterKind: "livekora";
+      adapterKind: "livekora" | "bein";
       candidatesFound: number;
       candidatesTried: number;
       sessionOwned: true;
@@ -41,7 +47,7 @@ export type ProviderManifestResult =
       targetDurationSec: number;
       refreshed: boolean;
       rotated: boolean;
-      adapterKind: "livekora";
+      adapterKind: "livekora" | "bein";
       candidatesFound: number;
       candidatesTried: number;
     };
@@ -69,9 +75,11 @@ export type ProviderContext = {
 };
 
 export type LiveStreamProvider = {
-  id: "livekora";
+  id: StreamProviderId;
+  label: string;
+  order: number;
   publicPathPrefix: string;
-  sourceSelector: (row: MatchRowLike) => string | null;
+  sourceSelector: (row: MatchRowLike) => string | null | Promise<string | null>;
   isAllowedSource: (rawUrl: string) => boolean;
   extractCurrentManifest: (input: ProviderContext, options?: ManifestOptions) => Promise<ProviderManifestResult>;
   fetchAsset: (
@@ -452,6 +460,17 @@ export function buildLivekoraPublicPlaylistUrl(matchId: number, publicBaseUrl?: 
   return `${base}/livekora/m${matchId}/index.m3u8`;
 }
 
+export function buildProviderPublicPlaylistUrl(providerId: StreamProviderId, matchId: number, publicBaseUrl?: string) {
+  if (providerId === "livekora") return buildLivekoraPublicPlaylistUrl(matchId, publicBaseUrl);
+  if (!Number.isFinite(matchId) || matchId <= 0) return null;
+  const base =
+    String(publicBaseUrl || process.env.LIVEKORA_R2_PUBLIC_BASE_URL || "https://r2.tf-player.site/live")
+      .trim()
+      .replace(/\/+$/, "");
+  if (!base) return null;
+  return `${base}/beinlive/m${matchId}/index.m3u8`;
+}
+
 export function resolveInternalAppOrigin(req?: Request | null) {
   const configured = String(process.env.LIVEKORA_INTERNAL_APP_ORIGIN || process.env.INTERNAL_APP_ORIGIN || "").trim();
   if (configured) {
@@ -620,6 +639,8 @@ export function buildLivekoraSessionManifestUrl(matchId: number, internalOrigin:
 
 export const livekoraProvider: LiveStreamProvider = {
   id: "livekora",
+  label: "livekora vip",
+  order: 1,
   publicPathPrefix: "live/livekora",
   sourceSelector: pickLivekoraSourceUrl,
   isAllowedSource: isAllowedLivekoraSource,
@@ -744,5 +765,3 @@ export const livekoraProvider: LiveStreamProvider = {
     });
   },
 };
-
-export const liveProviders = [livekoraProvider] as const;

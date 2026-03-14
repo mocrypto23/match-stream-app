@@ -1,8 +1,11 @@
 import { NextResponse } from "next/server";
 
+import { buildBeinliveStatus } from "@/lib/beinlive-agent";
+import { beinliveProvider } from "@/lib/beinlive-provider";
 import { buildLivekoraStatus } from "@/lib/livekora-agent";
 import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
 import { pickLivekoraSourceUrl } from "@/lib/live-providers";
+import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,11 +28,18 @@ export async function GET(_req: Request, ctx: Ctx) {
   }
 
   const sourceUrl = pickLivekoraSourceUrl(data);
+  const beinliveSourceUrl = await resolveProviderSourceUrl(beinliveProvider, data);
   const livekoraStatus = await buildLivekoraStatus({
     matchId,
     row: data,
     sourceUrl,
   });
+  const beinliveStatus = await buildBeinliveStatus({
+    matchId,
+    row: data,
+    sourceUrl: beinliveSourceUrl,
+  });
+  const streamSources = [livekoraStatus, beinliveStatus].sort((left, right) => left.order - right.order);
 
   const response = NextResponse.json({
     id: data.id,
@@ -41,9 +51,13 @@ export async function GET(_req: Request, ctx: Ctx) {
     match_start: data.match_start || null,
     match_day: data.match_day || null,
     status_key: data.status_key || null,
+    stream_url: beinliveSourceUrl,
     stream_url_4: sourceUrl,
     livekoraStatus,
     livekoraPlaylistUrl: livekoraStatus.playlistUrl,
+    beinliveStatus,
+    beinlivePlaylistUrl: beinliveStatus.playlistUrl,
+    streamSources,
   });
   response.headers.set("Cache-Control", "public, s-maxage=6, stale-while-revalidate=20");
   return response;
