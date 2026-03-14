@@ -58,11 +58,17 @@ async function main() {
 
   const page = await context.newPage();
   let lastManifestUrl = "";
-  let resolveManifestResult = null;
-  const manifestResultPromise = new Promise((resolve) => {
-    resolveManifestResult = resolve;
-  });
   let manifestResolved = false;
+
+  const emitAndExit = async (payload) => {
+    if (manifestResolved) return;
+    manifestResolved = true;
+    console.log(JSON.stringify(payload));
+    await page.close().catch(() => {});
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+    process.exit(0);
+  };
 
   page.on("console", (message) => {
     const text = String(message.text() || "");
@@ -81,8 +87,7 @@ async function main() {
     try {
       const body = await response.text().catch(() => "");
       if (!body.trim() || !hasMediaSegments(body, url)) return;
-      manifestResolved = true;
-      resolveManifestResult?.({
+      await emitAndExit({
         ok: true,
         manifestUrl: url,
         manifestBody: body,
@@ -98,10 +103,7 @@ async function main() {
       waitUntil: "domcontentloaded",
       timeout: 20000,
     });
-    timeoutResult = await Promise.race([
-      manifestResultPromise,
-      page.waitForTimeout(12000).then(() => null),
-    ]);
+    await page.waitForTimeout(12000);
   } catch (error) {
     timeoutResult = {
       ok: false,
