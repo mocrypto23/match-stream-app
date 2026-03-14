@@ -8,7 +8,7 @@ import {
   type SlotServerId,
 } from "./server-source-policy";
 import type { MatchR2Status, R2ServerState, R2StatusServerEntry } from "./r2-status-types";
-import { extractLiveEmbedSessionSnapshot } from "./repack-embed-session";
+import { peekLiveEmbedSessionState } from "./repack-embed-session";
 import { resolveInternalPlayerOrigin } from "./repack-ingest-gateway";
 import { getRepackSeedRuntimeState } from "./repack-runtime-state";
 import type { StreamMode } from "./stream-mode";
@@ -413,15 +413,23 @@ async function probeSessionManifest(
   timeoutMs: number
 ): Promise<SessionManifestProbeResult> {
   try {
-    const snapshot = await extractLiveEmbedSessionSnapshot({
+    const snapshot = peekLiveEmbedSessionState({
       sourceUrl,
       requestOrigin: resolveInternalPlayerOrigin(),
       slotServerId: slotServer,
-      timeoutMs,
     });
-    const candidates = Array.isArray(snapshot?.candidates) ? snapshot.candidates : [];
-    const manifestCandidates = candidates.filter((candidate) => String(candidate?.manifestBody || "").includes("#EXTM3U"));
-    if (manifestCandidates.length) {
+    if (!snapshot) {
+      return {
+        state: "down",
+        reason: "session-manifest-idle",
+        resolverState: "unknown",
+        recoverable: false,
+        adapter: null,
+      };
+    }
+    const lastTouchedAgeMs = Math.max(0, Date.now() - Number(snapshot.lastTouchedAt || 0));
+    const activeSession = lastTouchedAgeMs <= Math.max(6_000, timeoutMs * 2);
+    if (snapshot.freshManifestCount > 0) {
       return {
         state: "ready",
         reason: "session-manifest-ready",
@@ -430,16 +438,16 @@ async function probeSessionManifest(
         adapter: null,
       };
     }
-    if (candidates.length) {
+    if (snapshot.freshCandidateCount > 0 || (snapshot.candidateCount > 0 && activeSession)) {
       return {
         state: "warming",
-        reason: snapshot?.ok ? "session-manifest-candidates" : String(snapshot?.error || "session-manifest-candidates"),
+        reason: "session-manifest-candidates",
         resolverState: "probe-failed",
         recoverable: true,
         adapter: null,
       };
     }
-    const error = String(snapshot?.error || "").trim() || "session-manifest-empty";
+    const error = String(snapshot.lastError || "").trim() || (activeSession ? "session-manifest-active" : "session-manifest-idle");
     if (error.includes("missing-source")) {
       return {
         state: "down",
@@ -467,11 +475,20 @@ async function probeSessionManifest(
         adapter: null,
       };
     }
+    if (activeSession || String(snapshot.state || "") === "starting" || String(snapshot.state || "") === "running") {
+      return {
+        state: "warming",
+        reason: error,
+        resolverState: "probe-failed",
+        recoverable: true,
+        adapter: null,
+      };
+    }
     return {
-      state: "warming",
+      state: "down",
       reason: error,
-      resolverState: "probe-failed",
-      recoverable: true,
+      resolverState: "unknown",
+      recoverable: false,
       adapter: null,
     };
   } catch {

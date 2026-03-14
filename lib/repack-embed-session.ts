@@ -2075,4 +2075,33 @@ export async function fetchLiveEmbedAsset(input: {
   );
 }
 
+export function peekLiveEmbedSessionState(input: {
+  sourceUrl: string;
+  requestOrigin: string;
+  slotServerId?: SlotServerId;
+}) {
+  cleanupIdleSessions();
+  const sourceUrl = normalizeHttpUrl(input.sourceUrl);
+  const requestOrigin = normalizeHttpUrl(input.requestOrigin);
+  const key = `${canonicalizeUrl(sourceUrl)}|${canonicalizeUrl(requestOrigin)}|${String(input.slotServerId || "")}`;
+  const session = sessions.get(key);
+  if (!session) return null;
+  const now = Date.now();
+  session.pruneStaleCandidates(now);
+  const candidates = session.snapshotCandidates();
+  const freshManifestCandidates = session.snapshotCandidatesWithManifestBody(SESSION_STALE_MS, now);
+  const freshCandidateCount = candidates.filter((candidate) => now - candidate.seenAt <= SESSION_STALE_MS).length;
+  return {
+    key: session.key,
+    state: session.state,
+    lastError: session.lastError,
+    playbackUrl: session.playbackUrl,
+    lastTouchedAt: session.lastTouchedAt,
+    lastActivityAt: session.lastActivityAt,
+    candidateCount: candidates.length,
+    freshCandidateCount,
+    freshManifestCount: freshManifestCandidates.length,
+  };
+}
+
 export type { SessionCandidate as LiveEmbedSessionCandidate };
