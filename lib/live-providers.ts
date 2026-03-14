@@ -514,7 +514,7 @@ async function discoverLivekoraState(input: ProviderContext) {
   }
 
   let manifestBody = String(extracted?.manifestBody || "").trim();
-  if (!manifestBody || !/^\s*#extm3u/m.test(manifestBody)) {
+  if (!manifestBody || !/^\s*#extm3u/im.test(manifestBody)) {
     manifestBody = String(
       (await fetchTextWithHeaders({
         url: manifestUrl,
@@ -523,7 +523,7 @@ async function discoverLivekoraState(input: ProviderContext) {
       })) || ""
     ).trim();
   }
-  if (!manifestBody || !/^\s*#extm3u/m.test(manifestBody)) {
+  if (!manifestBody || !/^\s*#extm3u/im.test(manifestBody)) {
     return {
       ok: false as const,
       error: String(extracted?.error || "direct-manifest-body-missing"),
@@ -581,7 +581,7 @@ async function resolveManifestFromState(input: ProviderContext, state: CachedSou
     requestHeaders: state.requestHeaders,
     referrerUrl: state.referrerUrl,
   });
-  if (!manifestBody || !/^\s*#extm3u/m.test(manifestBody)) {
+  if (!manifestBody || !/^\s*#extm3u/im.test(manifestBody)) {
     return null;
   }
 

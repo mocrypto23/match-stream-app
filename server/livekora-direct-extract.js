@@ -172,7 +172,7 @@ async function fetchManifestWithHeaders(manifestUrl, requestHeaders, referrerUrl
 
   const primary = await fetchText(normalizedManifestUrl);
   let body = primary.body;
-  if (!body || !/^\s*#extm3u/m.test(body)) {
+  if (!body || !/^\s*#extm3u/im.test(body)) {
     return {
       finalUrl: normalizedManifestUrl,
       manifestBody: "",
@@ -200,7 +200,7 @@ async function fetchManifestWithHeaders(manifestUrl, requestHeaders, referrerUrl
   }
   const variant = await fetchText(variantUrl);
   const variantBody = variant.body;
-  if (!variantBody || !/^\s*#extm3u/m.test(variantBody)) {
+  if (!variantBody || !/^\s*#extm3u/im.test(variantBody)) {
     return {
       finalUrl: variantUrl,
       manifestBody: "",
@@ -442,7 +442,7 @@ async function main() {
       });
       try {
         const body = await response.text().catch(() => "");
-        if (!body.trim() || !/^\s*#extm3u/m.test(body) || !hasMediaSegments(body, url)) return;
+        if (!body.trim() || !/^\s*#extm3u/im.test(body) || !hasMediaSegments(body, url)) return;
         lastManifestBody = body;
         await emitAndExit({
           ok: true,
