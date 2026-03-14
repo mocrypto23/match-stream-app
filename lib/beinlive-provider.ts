@@ -1,6 +1,5 @@
 import axios from "axios";
 
-import { beinRuntimeAdapter } from "@/lib/repack-runtime-adapters/bein";
 import { rewriteManifestForSessionMirror } from "@/lib/repack-runtime-adapters/shared";
 import type {
   LiveStreamProvider,
@@ -13,6 +12,8 @@ import type {
 const BEINLIVE_DAY_PAGE_URL = "https://www.bein-live.com/matches-today_3/";
 const BEINLIVE_HOST_SUFFIXES = ["bein-live.com"] as const;
 const DAY_PAGE_CACHE_TTL_MS = 90_000;
+const SOURCE_STATE_TTL_MS = 10 * 60_000;
+const WAIT_RETRY_INTERVAL_MS = 700;
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
@@ -25,7 +26,29 @@ type CachedDayPage = {
   }>;
 };
 
+type CachedSourceState = {
+  sourceUrl: string;
+  manifestUrl: string;
+  referrerUrl: string;
+  playbackUrl: string;
+  updatedAt: number;
+  lastMediaSequence: number | null;
+};
+
+type ResolvedManifestState = {
+  state: CachedSourceState;
+  manifestBody: string;
+  finalUrl: string;
+  mediaSequence: number | null;
+  targetDurationSec: number;
+};
+
 let cachedDayPage: CachedDayPage | null = null;
+const beinliveSourceState = new Map<string, CachedSourceState>();
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
 
 function decodeMaybeBase64(rawValue: string) {
   const value = String(rawValue || "").trim();
@@ -36,6 +59,44 @@ function decodeMaybeBase64(rawValue: string) {
   } catch {
     return value;
   }
+}
+
+function normalizeHttpUrl(rawUrl: string) {
+  try {
+    const parsed = new URL(String(rawUrl || "").trim());
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.toString() : "";
+  } catch {
+    return "";
+  }
+}
+
+function buildSourceStateKey(sourceUrl: string) {
+  return normalizeHttpUrl(sourceUrl).toLowerCase();
+}
+
+function readSourceState(sourceUrl: string) {
+  const key = buildSourceStateKey(sourceUrl);
+  if (!key) return null;
+  const cached = beinliveSourceState.get(key);
+  if (!cached) return null;
+  if (cached.updatedAt + SOURCE_STATE_TTL_MS <= Date.now()) {
+    beinliveSourceState.delete(key);
+    return null;
+  }
+  return cached;
+}
+
+function writeSourceState(state: CachedSourceState) {
+  const key = buildSourceStateKey(state.sourceUrl);
+  if (!key) return state;
+  beinliveSourceState.set(key, state);
+  return state;
+}
+
+function clearSourceState(sourceUrl: string) {
+  const key = buildSourceStateKey(sourceUrl);
+  if (!key) return;
+  beinliveSourceState.delete(key);
 }
 
 function resolveManifestUrl(raw: string, baseUrl: string) {
@@ -132,26 +193,114 @@ function computeAlbaSubdomain() {
   return out;
 }
 
+function buildRequestHeaders(referrerUrl: string, accept: string) {
+  const referer = normalizeHttpUrl(referrerUrl);
+  if (!referer) return null;
+  return {
+    "user-agent": DEFAULT_USER_AGENT,
+    accept,
+    referer,
+    origin: new URL(referer).origin,
+  };
+}
+
 async function fetchTextWithHeaders(url: string, referrerUrl: string) {
   const targetUrl = normalizeHttpUrl(url);
-  const referer = normalizeHttpUrl(referrerUrl);
-  if (!targetUrl || !referer) return null;
-  const origin = new URL(referer).origin;
+  const headers = buildRequestHeaders(referrerUrl, "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*");
+  if (!targetUrl || !headers) return null;
   const response = await axios.get<string>(targetUrl, {
     responseType: "text",
     timeout: 14_000,
     maxRedirects: 5,
     validateStatus: () => true,
-    headers: {
-      "user-agent": DEFAULT_USER_AGENT,
-      accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
-      referer,
-      origin,
-    },
+    headers,
   });
   if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) return null;
   const body = String(response.data || "").trim();
   return body || null;
+}
+
+async function fetchBinaryWithHeaders(input: {
+  url: string;
+  referrerUrl: string;
+  timeoutMs?: number;
+}): Promise<ProviderAssetResult> {
+  const targetUrl = normalizeHttpUrl(input.url);
+  const headers = buildRequestHeaders(input.referrerUrl, "*/*");
+  if (!targetUrl) {
+    return { ok: false, status: 0, contentType: "", bodyBase64: "", error: "invalid-asset-url" };
+  }
+  if (!headers) {
+    return { ok: false, status: 0, contentType: "", bodyBase64: "", error: "invalid-referrer-url" };
+  }
+
+  try {
+    const response = await axios.get<ArrayBuffer>(targetUrl, {
+      responseType: "arraybuffer",
+      timeout: Math.max(8_000, Number(input.timeoutMs || 22_000)),
+      maxRedirects: 5,
+      validateStatus: () => true,
+      headers,
+    });
+    if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) {
+      return {
+        ok: false,
+        status: Number(response.status || 0),
+        contentType: String(response.headers["content-type"] || ""),
+        bodyBase64: "",
+        error: `asset-http-${Number(response.status || 0)}`,
+      };
+    }
+    const bytes = Buffer.from(response.data);
+    return {
+      ok: true,
+      status: Number(response.status || 200),
+      contentType: String(response.headers["content-type"] || ""),
+      bodyBase64: bytes.toString("base64"),
+      error: "",
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      contentType: "",
+      bodyBase64: "",
+      error: error instanceof Error ? error.message : String(error || "asset-fetch-failed"),
+    };
+  }
+}
+
+async function resolveManifestFromState(state: CachedSourceState): Promise<ResolvedManifestState | null> {
+  let manifestBody = await fetchTextWithHeaders(state.manifestUrl, state.referrerUrl);
+  if (!manifestBody || !/^\s*#EXTM3U/im.test(manifestBody)) {
+    return null;
+  }
+
+  let finalUrl = state.manifestUrl;
+  if (!hasMediaSegments(manifestBody, finalUrl)) {
+    const variantUrl = pickVariantManifestUrl(manifestBody, finalUrl);
+    if (!variantUrl) return null;
+    const variantBody = await fetchTextWithHeaders(variantUrl, state.referrerUrl);
+    if (!variantBody || !hasMediaSegments(variantBody, variantUrl)) return null;
+    manifestBody = variantBody;
+    finalUrl = variantUrl;
+  }
+
+  const mediaSequence = parseMediaSequence(manifestBody);
+  const nextState = writeSourceState({
+    ...state,
+    manifestUrl: finalUrl,
+    updatedAt: Date.now(),
+    lastMediaSequence: mediaSequence,
+  });
+
+  return {
+    state: nextState,
+    manifestBody,
+    finalUrl,
+    mediaSequence,
+    targetDurationSec: parseTargetDurationSec(manifestBody),
+  };
 }
 
 async function fetchBeinliveAjaxHtml(sourceUrl: string) {
@@ -210,7 +359,6 @@ function extractBeinliveIframeUrl(serverHtml: string) {
 }
 
 function buildCandidateManifestUrls(input: {
-  iframeUrl: string;
   iframeHtml: string;
   currentSource?: string | null;
 }) {
@@ -252,8 +400,7 @@ function buildCandidateManifestUrls(input: {
 async function resolveBeinliveIframeManifest(input: {
   sourceUrl: string;
   currentSource?: string | null;
-  internalOrigin: string;
-}) {
+}): Promise<(ResolvedManifestState & { candidatesFound: number; candidatesTried: number }) | null> {
   const serverHtml = await fetchBeinliveAjaxHtml(input.sourceUrl);
   if (!serverHtml) return null;
 
@@ -276,11 +423,11 @@ async function resolveBeinliveIframeManifest(input: {
   const iframeHtml = String(iframeHtmlResponse.data || "");
 
   const candidates = buildCandidateManifestUrls({
-    iframeUrl,
     iframeHtml,
     currentSource: input.currentSource,
   });
-  for (const candidateUrl of candidates) {
+
+  for (const [index, candidateUrl] of candidates.entries()) {
     const candidateBody = await fetchTextWithHeaders(candidateUrl, iframeUrl).catch(() => null);
     if (!candidateBody || !/^\s*#EXTM3U/im.test(candidateBody)) continue;
 
@@ -295,30 +442,60 @@ async function resolveBeinliveIframeManifest(input: {
       manifestBody = variantBody;
     }
 
-    return {
-      manifestBody: rewriteManifestForSessionMirror(manifestBody, finalUrl, input.internalOrigin, input.sourceUrl, 1),
-      finalUrl,
-      targetUrl: finalUrl,
+    const mediaSequence = parseMediaSequence(manifestBody);
+    const state = writeSourceState({
+      sourceUrl: input.sourceUrl,
+      manifestUrl: finalUrl,
       referrerUrl: iframeUrl,
       playbackUrl: iframeUrl,
-      currentSource: finalUrl,
-      mediaSequence: parseMediaSequence(manifestBody),
+      updatedAt: Date.now(),
+      lastMediaSequence: mediaSequence,
+    });
+
+    return {
+      state,
+      manifestBody,
+      finalUrl,
+      mediaSequence,
       targetDurationSec: parseTargetDurationSec(manifestBody),
       candidatesFound: candidates.length,
-      candidatesTried: candidates.indexOf(candidateUrl) + 1,
+      candidatesTried: index + 1,
     };
   }
 
   return null;
 }
 
-function normalizeHttpUrl(rawUrl: string) {
-  try {
-    const parsed = new URL(String(rawUrl || "").trim());
-    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.toString() : "";
-  } catch {
-    return "";
-  }
+function buildManifestResult(input: {
+  sourceUrl: string;
+  internalOrigin: string;
+  state: CachedSourceState;
+  manifestBody: string;
+  finalUrl: string;
+  mediaSequence: number | null;
+  targetDurationSec: number;
+  refreshed: boolean;
+  candidatesFound: number;
+  candidatesTried: number;
+}): ProviderManifestResult {
+  return {
+    ok: true,
+    manifestBody: rewriteManifestForSessionMirror(input.manifestBody, input.finalUrl, input.internalOrigin, input.sourceUrl, 1),
+    finalUrl: input.finalUrl,
+    targetUrl: input.finalUrl,
+    fetchUrl: input.finalUrl,
+    referrerUrl: input.state.referrerUrl,
+    playbackUrl: input.state.playbackUrl || input.sourceUrl,
+    currentSource: input.finalUrl,
+    mediaSequence: input.mediaSequence,
+    targetDurationSec: input.targetDurationSec,
+    refreshed: input.refreshed,
+    rotated: false,
+    adapterKind: "bein",
+    candidatesFound: input.candidatesFound,
+    candidatesTried: input.candidatesTried,
+    sessionOwned: true,
+  };
 }
 
 function hostMatchesAnySuffix(host: string, suffixes: readonly string[]) {
@@ -434,53 +611,6 @@ export function buildBeinliveSessionManifestUrl(matchId: number, internalOrigin:
   return `${String(internalOrigin || "").replace(/\/+$/, "")}/api/beinlive/session-manifest?matchId=${encodeURIComponent(String(matchId))}`;
 }
 
-function mapManifestResult(result: Awaited<ReturnType<typeof beinRuntimeAdapter.currentManifest>>): ProviderManifestResult {
-  if (!result.ok) {
-    return {
-      ok: false,
-      error: result.error,
-      playbackUrl: result.playbackUrl,
-      currentSource: result.currentSource,
-      mediaSequence: result.mediaSequence,
-      targetDurationSec: result.targetDurationSec,
-      refreshed: result.refreshed,
-      rotated: result.rotated,
-      adapterKind: "bein",
-      candidatesFound: result.candidatesFound,
-      candidatesTried: result.candidatesTried,
-    };
-  }
-
-  return {
-    ok: true,
-    manifestBody: result.manifestBody,
-    finalUrl: result.finalUrl,
-    targetUrl: result.targetUrl,
-    fetchUrl: result.fetchUrl,
-    referrerUrl: result.referrerUrl,
-    playbackUrl: result.playbackUrl,
-    currentSource: result.currentSource,
-    mediaSequence: result.mediaSequence,
-    targetDurationSec: result.targetDurationSec,
-    refreshed: result.refreshed,
-    rotated: result.rotated,
-    adapterKind: "bein",
-    candidatesFound: result.candidatesFound,
-    candidatesTried: result.candidatesTried,
-    sessionOwned: true,
-  };
-}
-
-function mapAssetResult(result: Awaited<ReturnType<typeof beinRuntimeAdapter.fetchAsset>>): ProviderAssetResult {
-  return {
-    ok: !!result.ok,
-    status: Number(result.status || 0),
-    contentType: String(result.contentType || ""),
-    bodyBase64: String(result.bodyBase64 || ""),
-    error: String(result.error || ""),
-  };
-}
-
 export const beinliveProvider: LiveStreamProvider = {
   id: "beinlive",
   label: "bein-live",
@@ -489,58 +619,110 @@ export const beinliveProvider: LiveStreamProvider = {
   sourceSelector: pickBeinliveSourceUrl,
   isAllowedSource: isAllowedBeinliveSource,
   async extractCurrentManifest(input: ProviderContext, options) {
-    const primaryResult = await beinRuntimeAdapter.currentManifest(
-      {
-        sourceUrl: input.sourceUrl,
-        slotServer: 1,
-        internalOrigin: input.internalOrigin,
-      },
-      options
-    );
-    if (primaryResult.ok) {
-      return mapManifestResult(primaryResult);
-    }
+    const waitForMediaSequence =
+      Number.isFinite(Number(options?.waitForMediaSequence)) ? Number(options?.waitForMediaSequence) : null;
+    const waitDeadlineAt =
+      waitForMediaSequence !== null
+        ? Date.now() + Math.max(1_000, Math.min(12_000, Number(options?.waitTimeoutMs || 5_000)))
+        : 0;
 
-    if (/text-http-403|manifest-http-502|manifest-not-hls/i.test(String(primaryResult.error || ""))) {
-      const fallback = await resolveBeinliveIframeManifest({
-        sourceUrl: input.sourceUrl,
-        currentSource: primaryResult.currentSource,
-        internalOrigin: input.internalOrigin,
-      }).catch(() => null);
-      if (fallback) {
-        return {
-          ok: true,
-          manifestBody: fallback.manifestBody,
-          finalUrl: fallback.finalUrl,
-          targetUrl: fallback.targetUrl,
-          fetchUrl: fallback.finalUrl,
-          referrerUrl: fallback.referrerUrl,
-          playbackUrl: fallback.playbackUrl,
-          currentSource: fallback.currentSource,
-          mediaSequence: fallback.mediaSequence,
-          targetDurationSec: fallback.targetDurationSec,
-          refreshed: true,
-          rotated: primaryResult.rotated,
-          adapterKind: "bein",
-          candidatesFound: Math.max(primaryResult.candidatesFound, fallback.candidatesFound),
-          candidatesTried: primaryResult.candidatesTried + fallback.candidatesTried,
-          sessionOwned: true,
-        };
+    let state = options?.forceRefresh ? null : readSourceState(input.sourceUrl);
+    let attempts = 0;
+    let lastError = "beinlive-manifest-unavailable";
+
+    while (attempts < 4) {
+      attempts += 1;
+      const candidateCurrentSource = state?.manifestUrl || "";
+
+      if (state) {
+        const resolvedFromState = await resolveManifestFromState(state).catch(() => null);
+        if (!resolvedFromState) {
+          clearSourceState(input.sourceUrl);
+          state = null;
+          lastError = "beinlive-sticky-manifest-failed";
+        } else {
+          state = resolvedFromState.state;
+          if (
+            waitForMediaSequence !== null &&
+            resolvedFromState.mediaSequence !== null &&
+            resolvedFromState.mediaSequence <= waitForMediaSequence &&
+            Date.now() < waitDeadlineAt
+          ) {
+            await sleep(WAIT_RETRY_INTERVAL_MS);
+            continue;
+          }
+
+          return buildManifestResult({
+            sourceUrl: input.sourceUrl,
+            internalOrigin: input.internalOrigin,
+            state,
+            manifestBody: resolvedFromState.manifestBody,
+            finalUrl: resolvedFromState.finalUrl,
+            mediaSequence: resolvedFromState.mediaSequence,
+            targetDurationSec: resolvedFromState.targetDurationSec,
+            refreshed: attempts > 1,
+            candidatesFound: 1,
+            candidatesTried: attempts,
+          });
+        }
       }
+
+      const resolvedFromIframe = await resolveBeinliveIframeManifest({
+        sourceUrl: input.sourceUrl,
+        currentSource: candidateCurrentSource,
+      }).catch(() => null);
+      if (!resolvedFromIframe) {
+        lastError = "beinlive-iframe-manifest-missing";
+        break;
+      }
+
+      state = resolvedFromIframe.state;
+      if (
+        waitForMediaSequence !== null &&
+        resolvedFromIframe.mediaSequence !== null &&
+        resolvedFromIframe.mediaSequence <= waitForMediaSequence &&
+        Date.now() < waitDeadlineAt
+      ) {
+        await sleep(WAIT_RETRY_INTERVAL_MS);
+        continue;
+      }
+
+      return buildManifestResult({
+        sourceUrl: input.sourceUrl,
+        internalOrigin: input.internalOrigin,
+        state,
+        manifestBody: resolvedFromIframe.manifestBody,
+        finalUrl: resolvedFromIframe.finalUrl,
+        mediaSequence: resolvedFromIframe.mediaSequence,
+        targetDurationSec: resolvedFromIframe.targetDurationSec,
+        refreshed: attempts > 1,
+        candidatesFound: resolvedFromIframe.candidatesFound,
+        candidatesTried: resolvedFromIframe.candidatesTried,
+      });
     }
 
-    return mapManifestResult(primaryResult);
+    return {
+      ok: false,
+      error: lastError,
+      playbackUrl: state?.playbackUrl || input.sourceUrl,
+      currentSource: state?.manifestUrl || "",
+      mediaSequence: state?.lastMediaSequence ?? null,
+      targetDurationSec: 0,
+      refreshed: attempts > 1,
+      rotated: false,
+      adapterKind: "bein",
+      candidatesFound: state ? 1 : 0,
+      candidatesTried: attempts,
+    };
   },
   async fetchAsset(input) {
-    return mapAssetResult(
-      await beinRuntimeAdapter.fetchAsset({
-        sourceUrl: input.sourceUrl,
-        slotServer: 1,
-        internalOrigin: input.internalOrigin,
-        assetUrl: input.assetUrl,
-        referrerUrl: input.referrerUrl,
-        timeoutMs: input.timeoutMs,
-      })
-    );
+    const state = readSourceState(input.sourceUrl);
+    const referrerUrl =
+      normalizeHttpUrl(String(input.referrerUrl || "").trim()) || state?.manifestUrl || state?.referrerUrl || input.sourceUrl;
+    return await fetchBinaryWithHeaders({
+      url: input.assetUrl,
+      referrerUrl,
+      timeoutMs: input.timeoutMs,
+    });
   },
 };
