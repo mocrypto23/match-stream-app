@@ -646,11 +646,20 @@ export const livekoraProvider: LiveStreamProvider = {
     while (attempts < 3) {
       attempts += 1;
       if (!state || options?.forceRefresh) {
-        const discovered = await withTimeout(
-          discoverLivekoraState(input),
-          DIRECT_EXTRACT_TIMEOUT_MS + 5_000,
-          "livekora-direct-discovery-timeout"
-        );
+        let discovered:
+          | Awaited<ReturnType<typeof discoverLivekoraState>>
+          | null = null;
+        try {
+          discovered = await withTimeout(
+            discoverLivekoraState(input),
+            DIRECT_EXTRACT_TIMEOUT_MS + 5_000,
+            "livekora-direct-discovery-timeout"
+          );
+        } catch (error) {
+          lastError = error instanceof Error ? error.message : String(error || "livekora-direct-discovery-failed");
+          state = null;
+          continue;
+        }
         if (!discovered.ok) {
           lastError = discovered.error;
           state = null;
