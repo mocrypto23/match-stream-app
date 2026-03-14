@@ -657,6 +657,17 @@ class LivekoraJob {
 
       const variantUrl = pickVariantManifestUrl(fetched.body, fetched.finalUrl);
       if (!variantUrl) {
+        this.manager.log("warn", "livekora manifest missing media playlist", {
+          matchId: this.matchId,
+          requestUrl: currentUrl,
+          finalUrl: fetched.finalUrl,
+          contentType: fetched.contentType,
+          bodyLength: String(fetched.body || "").length,
+          bodySnippet: String(fetched.body || "")
+            .split(/\r?\n/)
+            .slice(0, 12)
+            .join("\n"),
+        });
         return {
           ok: false,
           reason: "manifest-no-media-playlist",
