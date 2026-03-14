@@ -161,6 +161,7 @@ type PageSeed = {
 
 type PlaywrightBrowser = {
   newContext: (input: unknown) => Promise<PlaywrightContext>;
+  close?: () => Promise<void>;
 };
 
 type PlaywrightContext = {
@@ -181,6 +182,9 @@ type PlaywrightPage = {
 };
 
 let browserPromise: Promise<unknown> | null = null;
+let browserInstance: PlaywrightBrowser | null = null;
+let browserClosingPromise: Promise<void> | null = null;
+let browserCleanupRegistered = false;
 const sessions = new Map<string, LiveEmbedSession>();
 
 function normalizeHttpUrl(raw: unknown) {
@@ -671,19 +675,50 @@ function getCandidateRetentionMs(slotServerId?: SlotServerId) {
 }
 
 async function loadBrowser() {
+  if (!browserCleanupRegistered) {
+    browserCleanupRegistered = true;
+    const closeSilently = () => {
+      void closeBrowser();
+    };
+    process.once("SIGTERM", closeSilently);
+    process.once("SIGINT", closeSilently);
+    process.once("beforeExit", closeSilently);
+  }
   if (!browserPromise) {
     browserPromise = (async () => {
       const { chromium } = (await import("playwright")) as { chromium: { launch: (input: unknown) => Promise<unknown> } };
-      return chromium.launch({
+      const browser = (await chromium.launch({
         headless: true,
         args: ["--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled", "--no-sandbox"],
-      });
+      })) as PlaywrightBrowser;
+      browserInstance = browser;
+      return browser;
     })().catch((error) => {
+      browserInstance = null;
       browserPromise = null;
       throw error;
     });
   }
   return browserPromise;
+}
+
+async function closeBrowser() {
+  if (browserClosingPromise) return browserClosingPromise;
+  const browser = browserInstance;
+  if (!browser) {
+    browserPromise = null;
+    return Promise.resolve();
+  }
+  browserClosingPromise = (async () => {
+    try {
+      await browser.close?.().catch(() => {});
+    } finally {
+      browserInstance = null;
+      browserPromise = null;
+      browserClosingPromise = null;
+    }
+  })();
+  return browserClosingPromise;
 }
 
 async function sleep(ms: number) {
@@ -2551,13 +2586,21 @@ function cleanupIdleSessions() {
     void session.close();
   }
 
-  if (sessions.size <= SESSION_MAX_COUNT) return;
+  if (sessions.size <= SESSION_MAX_COUNT) {
+    if (!sessions.size) {
+      void closeBrowser();
+    }
+    return;
+  }
   const overflow = [...sessions.values()]
     .sort((left, right) => left.lastTouchedAt - right.lastTouchedAt)
     .slice(0, sessions.size - SESSION_MAX_COUNT);
   for (const session of overflow) {
     sessions.delete(session.key);
     void session.close();
+  }
+  if (!sessions.size) {
+    void closeBrowser();
   }
 }
 
