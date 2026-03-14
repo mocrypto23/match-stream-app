@@ -441,7 +441,7 @@ function pickSessionFetchUrl(fetchUrl: string | undefined, targetUrl: string, in
   return normalizedTargetUrl;
 }
 
-function rewriteManifestForSessionMirror(
+export function rewriteManifestForSessionMirror(
   manifest: string,
   baseUrl: string,
   internalOrigin: string,
