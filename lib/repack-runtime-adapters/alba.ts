@@ -178,6 +178,7 @@ async function extractDirectLivekoraManifest(
     let manifestUrl = "";
     let manifestBody = "";
     let referrerUrl = channelUrl;
+    let iframeUrl = "";
     let resolveFound: (() => void) | null = null;
     const foundPromise = new Promise<void>((resolve) => {
       resolveFound = resolve;
@@ -227,6 +228,7 @@ async function extractDirectLivekoraManifest(
           (await page.locator("iframe#streamFrame, iframe[src]").first().getAttribute("src").catch(() => "")) || "",
           page.url() || channelUrl
         );
+        iframeUrl = iframeSrc;
         if (iframeSrc && iframeSrc !== normalizeHttpUrl(page.url())) {
           await page.goto(iframeSrc, {
             waitUntil: "domcontentloaded",
@@ -269,6 +271,16 @@ async function extractDirectLivekoraManifest(
     }
 
     if (!manifestUrl || !manifestBody) {
+      console.error(
+        `[livekora-direct-empty] ${JSON.stringify({
+          sourceUrl: input.sourceUrl,
+          channelUrl,
+          referrerUrl,
+          iframeUrl,
+          manifestUrl,
+          hasManifestBody: !!manifestBody,
+        })}`
+      );
       return null;
     }
 
