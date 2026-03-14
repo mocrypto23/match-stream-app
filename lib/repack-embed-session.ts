@@ -11,6 +11,7 @@ import {
 
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+const LIVEKORA_FAMILY_BASE_HOSTS = ["sportsurges.cc", "livekora.vip", "koooralive.click", "kooraxx.com"] as const;
 
 const ENABLE_LIVE_EMBED_SESSION =
   String(process.env.REPACK_LIVE_EMBED_SESSION_ENABLED || "1").trim() !== "0";
@@ -287,7 +288,7 @@ function expandLivekoraSportsurgesVariants(rawUrl: string) {
   try {
     const parsed = new URL(rawUrl);
     const host = parsed.hostname.toLowerCase();
-    if (!hostMatchesAnySuffix(host, ["sportsurges.cc", "livekora.vip", "koooralive.click", "kooraxx.com"])) {
+    if (!hostMatchesAnySuffix(host, [...LIVEKORA_FAMILY_BASE_HOSTS])) {
       return [] as string[];
     }
 
@@ -297,14 +298,25 @@ function expandLivekoraSportsurgesVariants(rawUrl: string) {
       .filter(Boolean);
     const pageSlug = pathParts[0] === "albaplayer" ? pathParts[1] || "" : pathParts[0] || "";
     const slugVariants = buildSlugVariants(pageSlug);
-    const origin = parsed.origin;
+    const scheme = parsed.protocol === "http:" ? "http" : "https";
+    const hostParts = host.split(".").filter(Boolean);
+    const firstLabel = hostParts.length > 2 ? hostParts[0] || "" : "";
+    const originVariants = new Set<string>([parsed.origin]);
+    for (const familyHost of LIVEKORA_FAMILY_BASE_HOSTS) {
+      originVariants.add(`${scheme}://${familyHost}`);
+      if (familyHost === "sportsurges.cc" && firstLabel && /^\d+$/.test(firstLabel)) {
+        originVariants.add(`${scheme}://${firstLabel}.${familyHost}`);
+      }
+    }
     const out = new Set<string>();
 
-    for (const slug of slugVariants) {
-      out.add(`${origin}/${slug}/`);
-      out.add(`${origin}/albaplayer/${slug}/`);
-      for (const serv of ["2", "5", "0", "1", "3", "4"]) {
-        out.add(`${origin}/albaplayer/${slug}/?serv=${serv}`);
+    for (const origin of originVariants) {
+      for (const slug of slugVariants) {
+        out.add(`${origin}/${slug}/`);
+        out.add(`${origin}/albaplayer/${slug}/`);
+        for (const serv of ["2", "5", "0", "1", "3", "4"]) {
+          out.add(`${origin}/albaplayer/${slug}/?serv=${serv}`);
+        }
       }
     }
 
@@ -2272,6 +2284,37 @@ class LiveEmbedSession {
             finalUrl = relayedFinalUrl;
             error = String(relayed.error || (relayed.ok ? "manifest-not-hls" : `text-http-${relayed.status || 0}`));
             status = Number(relayed.status || status || 0);
+          }
+        }
+      }
+
+      const shouldAttemptBrowserNavigation =
+        retryDepth < 1 &&
+        shouldNavigateSeedInBrowser(normalizedTargetUrl) &&
+        (!ok ||
+          !body.trim() ||
+          looksLikeChallengePageHtml(body) ||
+          (isDirectCrawlPreferred(normalizedTargetUrl) && !looksLikeManifestResponse(contentType, body, finalUrl)));
+      if (shouldAttemptBrowserNavigation) {
+        const navigated = await this.navigateSeedInBrowser(
+          {
+            pageUrl: normalizedTargetUrl,
+            referrerUrl: normalizedReferrerUrl,
+            depth: 0,
+          },
+          Math.max(6_000, Math.min(20_000, timeoutMs))
+        ).catch(() => false);
+        if (navigated) {
+          const snapshot = await this.readPageSnapshot().catch(() => ({ url: "", title: "", html: "" }));
+          const snapshotHtml = String(snapshot?.html || "");
+          const snapshotUrl = normalizeHttpUrl(String(snapshot?.url || "")) || normalizedTargetUrl;
+          if (snapshotHtml.trim()) {
+            ok = true;
+            status = status > 0 ? status : 200;
+            contentType = "text/html; charset=utf-8";
+            body = snapshotHtml;
+            finalUrl = snapshotUrl;
+            error = "";
           }
         }
       }

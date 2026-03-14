@@ -11,6 +11,8 @@ import {
   type RuntimeHintCandidate,
 } from "./shared";
 
+const LIVEKORA_FAMILY_BASE_HOSTS = ["sportsurges.cc", "livekora.vip", "koooralive.click", "kooraxx.com"] as const;
+
 function looksLikeAlbaSource(rawUrl: string) {
   try {
     const parsed = new URL(String(rawUrl || "").trim());
@@ -67,16 +69,29 @@ function buildAlbaVariants(sourceUrl: string) {
     ) {
       return [parsed.toString()];
     }
-    const origin = parsed.origin;
+    const scheme = parsed.protocol === "http:" ? "http" : "https";
+    const hostParts = host.split(".").filter(Boolean);
+    const firstLabel = hostParts.length > 2 ? hostParts[0] || "" : "";
+    const originVariants = new Set<string>([parsed.origin]);
+    for (const familyHost of LIVEKORA_FAMILY_BASE_HOSTS) {
+      originVariants.add(`${scheme}://${familyHost}`);
+      if (familyHost === "sportsurges.cc" && firstLabel && /^\d+$/.test(firstLabel)) {
+        originVariants.add(`${scheme}://${firstLabel}.${familyHost}`);
+      }
+    }
     const parts = String(parsed.pathname || "")
       .split("/")
       .map((item) => item.trim())
       .filter(Boolean);
     const slug = (parts[0] === "albaplayer" ? parts[1] : parts[0] || "").toLowerCase();
     if (!slug) return [parsed.toString()];
-    const variants = new Set<string>([parsed.toString(), `${origin}/${slug}/`, `${origin}/albaplayer/${slug}/`]);
-    for (const serv of ["2", "5", "1", "0", "3", "4"]) {
-      variants.add(`${origin}/albaplayer/${slug}/?serv=${serv}`);
+    const variants = new Set<string>([parsed.toString()]);
+    for (const origin of originVariants) {
+      variants.add(`${origin}/${slug}/`);
+      variants.add(`${origin}/albaplayer/${slug}/`);
+      for (const serv of ["2", "5", "1", "0", "3", "4"]) {
+        variants.add(`${origin}/albaplayer/${slug}/?serv=${serv}`);
+      }
     }
     return Array.from(variants);
   } catch {
@@ -99,6 +114,8 @@ function uniqHints(candidates: RuntimeHintCandidate[]) {
 }
 
 async function deriveAlbaHintCandidates(input: RuntimeAdapterInput) {
+  const startedAt = Date.now();
+  const deadlineAt = startedAt + 12_000;
   const queue = buildAlbaVariants(input.sourceUrl).map((url) => ({
     url,
     depth: 0,
@@ -107,12 +124,14 @@ async function deriveAlbaHintCandidates(input: RuntimeAdapterInput) {
   const visited = new Set<string>();
   const derived: RuntimeHintCandidate[] = [];
 
-  while (queue.length && visited.size < 6 && derived.length < 12) {
+  while (queue.length && visited.size < 6 && derived.length < 12 && Date.now() < deadlineAt) {
     const current = queue.shift();
     if (!current) continue;
     const pageUrl = normalizeHttpUrl(current.url);
     if (!pageUrl || visited.has(pageUrl)) continue;
     visited.add(pageUrl);
+    const remainingMs = Math.max(2_500, Math.min(7_000, deadlineAt - Date.now()));
+    if (remainingMs <= 0) break;
 
     const fetched = await fetchLiveEmbedText({
       sourceUrl: input.sourceUrl,
@@ -121,7 +140,7 @@ async function deriveAlbaHintCandidates(input: RuntimeAdapterInput) {
       targetUrl: pageUrl,
       fetchUrl: pageUrl,
       referrerUrl: current.referrerUrl,
-      timeoutMs: 8_000,
+      timeoutMs: remainingMs,
     }).catch(() => null);
     const body = String(fetched?.body || "").trim();
     const finalUrl = String(fetched?.finalUrl || pageUrl).trim() || pageUrl;
