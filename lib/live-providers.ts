@@ -5,6 +5,8 @@ import type { StreamProviderId } from "@/lib/stream-source-types";
 
 export type MatchRowLike = {
   stream_url?: string | null;
+  stream_url_2?: string | null;
+  stream_url_3?: string | null;
   stream_url_4?: string | null;
   home_team?: string | null;
   away_team?: string | null;
@@ -33,7 +35,7 @@ export type ProviderManifestResult =
       targetDurationSec: number;
       refreshed: boolean;
       rotated: boolean;
-      adapterKind: "livekora" | "bein";
+      adapterKind: "livekora" | "bein" | "playerv2";
       candidatesFound: number;
       candidatesTried: number;
       sessionOwned: true;
@@ -47,7 +49,7 @@ export type ProviderManifestResult =
       targetDurationSec: number;
       refreshed: boolean;
       rotated: boolean;
-      adapterKind: "livekora" | "bein";
+      adapterKind: "livekora" | "bein" | "playerv2";
       candidatesFound: number;
       candidatesTried: number;
     };
@@ -468,7 +470,7 @@ export function buildProviderPublicPlaylistUrl(providerId: StreamProviderId, mat
       .trim()
       .replace(/\/+$/, "");
   if (!base) return null;
-  return `${base}/beinlive/m${matchId}/index.m3u8`;
+  return providerId === "siiir" ? `${base}/siiir/m${matchId}/index.m3u8` : `${base}/beinlive/m${matchId}/index.m3u8`;
 }
 
 export function resolveInternalAppOrigin(req?: Request | null) {

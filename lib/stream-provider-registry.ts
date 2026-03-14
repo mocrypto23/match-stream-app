@@ -1,8 +1,9 @@
 import { beinliveProvider } from "@/lib/beinlive-provider";
 import { livekoraProvider, type LiveStreamProvider, type MatchRowLike } from "@/lib/live-providers";
+import { siiirProvider } from "@/lib/siiir-provider";
 import type { StreamProviderId } from "@/lib/stream-source-types";
 
-export const streamProviders = [livekoraProvider, beinliveProvider] as const;
+export const streamProviders = [livekoraProvider, beinliveProvider, siiirProvider] as const;
 
 export function getStreamProvider(providerId: StreamProviderId) {
   return streamProviders.find((provider) => provider.id === providerId) || null;

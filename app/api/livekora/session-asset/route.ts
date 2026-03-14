@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { beinliveProvider } from "@/lib/beinlive-provider";
 import { livekoraProvider, resolveInternalAppOrigin } from "@/lib/live-providers";
+import { siiirProvider } from "@/lib/siiir-provider";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -28,7 +29,9 @@ export async function GET(req: Request) {
   const assetUrl = String(url.searchParams.get("assetUrl") || "").trim();
   const referrerUrl = String(url.searchParams.get("referrerUrl") || "").trim();
   const provider =
-    providerId === "beinlive" || slotServer === 1 || beinliveProvider.isAllowedSource(sourceUrl)
+    providerId === "siiir" || slotServer === 2 || siiirProvider.isAllowedSource(sourceUrl)
+      ? siiirProvider
+      : providerId === "beinlive" || slotServer === 1 || beinliveProvider.isAllowedSource(sourceUrl)
       ? beinliveProvider
       : livekoraProvider;
 

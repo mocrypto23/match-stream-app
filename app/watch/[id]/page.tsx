@@ -17,11 +17,14 @@ type MatchPayload = {
   match_day?: string | null;
   status_key?: string | null;
   stream_url?: string | null;
+  stream_url_2?: string | null;
   stream_url_4?: string | null;
   livekoraStatus?: StreamSourceStatus | null;
   livekoraPlaylistUrl?: string | null;
   beinliveStatus?: StreamSourceStatus | null;
   beinlivePlaylistUrl?: string | null;
+  siiirStatus?: StreamSourceStatus | null;
+  siiirPlaylistUrl?: string | null;
   streamSources?: StreamSourceStatus[] | null;
 };
 
@@ -31,6 +34,7 @@ const STATUS_POLL_MS = 4_000;
 const PROVIDER_META: Array<{ provider: StreamProviderId; order: number; label: string }> = [
   { provider: "livekora", order: 1, label: "livekora vip" },
   { provider: "beinlive", order: 2, label: "bein-live" },
+  { provider: "siiir", order: 3, label: "siiir.tv" },
 ];
 
 function formatKickoff(value: string | null | undefined) {
@@ -65,6 +69,7 @@ function buildStatusMap(payload: MatchPayload | null): StatusMap {
   return {
     livekora: payload?.livekoraStatus || null,
     beinlive: payload?.beinliveStatus || null,
+    siiir: payload?.siiirStatus || null,
   };
 }
 
@@ -81,7 +86,7 @@ export default function WatchPage() {
   const params = useParams<{ id?: string }>();
   const matchId = Number.parseInt(String(params?.id || "").trim(), 10);
   const [match, setMatch] = useState<MatchPayload | null>(null);
-  const [statusByProvider, setStatusByProvider] = useState<StatusMap>({ livekora: null, beinlive: null });
+  const [statusByProvider, setStatusByProvider] = useState<StatusMap>({ livekora: null, beinlive: null, siiir: null });
   const [selectedProvider, setSelectedProvider] = useState<StreamProviderId>("livekora");
   const [pageError, setPageError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -114,14 +119,19 @@ export default function WatchPage() {
       const fallback = String(match?.livekoraPlaylistUrl || "").trim();
       return fallback || null;
     }
-    const fallback = String(match?.beinlivePlaylistUrl || "").trim();
+    if (activeProvider === "beinlive") {
+      const fallback = String(match?.beinlivePlaylistUrl || "").trim();
+      return fallback || null;
+    }
+    const fallback = String(match?.siiirPlaylistUrl || "").trim();
     return fallback || null;
-  }, [activeProvider, activeStatus?.playlistUrl, match?.beinlivePlaylistUrl, match?.livekoraPlaylistUrl]);
+  }, [activeProvider, activeStatus?.playlistUrl, match?.beinlivePlaylistUrl, match?.livekoraPlaylistUrl, match?.siiirPlaylistUrl]);
 
   const directSourceUrl = useMemo(() => {
     if (activeProvider === "livekora") return String(match?.stream_url_4 || "").trim() || null;
-    return String(match?.stream_url || "").trim() || null;
-  }, [activeProvider, match?.stream_url, match?.stream_url_4]);
+    if (activeProvider === "beinlive") return String(match?.stream_url || "").trim() || null;
+    return String(match?.stream_url_2 || "").trim() || null;
+  }, [activeProvider, match?.stream_url, match?.stream_url_2, match?.stream_url_4]);
 
   const applyProviderStatus = useCallback((provider: StreamProviderId, status: StreamSourceStatus | null | undefined) => {
     if (!status) return;
@@ -168,11 +178,12 @@ export default function WatchPage() {
           cache: "no-store",
         });
         const payload = (await response.json().catch(() => null)) as
-          | { livekoraStatus?: StreamSourceStatus | null; beinliveStatus?: StreamSourceStatus | null }
+          | { livekoraStatus?: StreamSourceStatus | null; beinliveStatus?: StreamSourceStatus | null; siiirStatus?: StreamSourceStatus | null }
           | null;
         if (!response.ok || !payload) return;
         if (provider === "livekora") applyProviderStatus(provider, payload.livekoraStatus);
         if (provider === "beinlive") applyProviderStatus(provider, payload.beinliveStatus);
+        if (provider === "siiir") applyProviderStatus(provider, payload.siiirStatus);
       } catch {}
     },
     [applyProviderStatus, matchId]
@@ -198,12 +209,14 @@ export default function WatchPage() {
           | {
               livekoraStatus?: StreamSourceStatus | null;
               beinliveStatus?: StreamSourceStatus | null;
+              siiirStatus?: StreamSourceStatus | null;
               reason?: string;
               error?: string;
             }
           | null;
         if (provider === "livekora") applyProviderStatus(provider, payload?.livekoraStatus);
         if (provider === "beinlive") applyProviderStatus(provider, payload?.beinliveStatus);
+        if (provider === "siiir") applyProviderStatus(provider, payload?.siiirStatus);
         if (!response.ok && !opts?.silent) {
           setPageError(String(payload?.reason || payload?.error || "bootstrap-failed"));
         }
@@ -244,7 +257,7 @@ export default function WatchPage() {
     setPlaybackStarting(false);
     clearWaitingOverlayTimer();
     hasPlayedRef.current = false;
-    setStatusByProvider({ livekora: null, beinlive: null });
+    setStatusByProvider({ livekora: null, beinlive: null, siiir: null });
     setSelectedProvider("livekora");
   }, [clearWaitingOverlayTimer, matchId]);
 

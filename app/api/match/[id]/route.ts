@@ -5,6 +5,8 @@ import { beinliveProvider } from "@/lib/beinlive-provider";
 import { buildLivekoraStatus } from "@/lib/livekora-agent";
 import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
 import { pickLivekoraSourceUrl } from "@/lib/live-providers";
+import { buildSiiirStatus } from "@/lib/siiir-agent";
+import { siiirProvider } from "@/lib/siiir-provider";
 import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
 
 export const runtime = "nodejs";
@@ -29,6 +31,7 @@ export async function GET(_req: Request, ctx: Ctx) {
 
   const sourceUrl = pickLivekoraSourceUrl(data);
   const beinliveSourceUrl = await resolveProviderSourceUrl(beinliveProvider, data);
+  const siiirSourceUrl = await resolveProviderSourceUrl(siiirProvider, data);
   const livekoraStatus = await buildLivekoraStatus({
     matchId,
     row: data,
@@ -39,7 +42,12 @@ export async function GET(_req: Request, ctx: Ctx) {
     row: data,
     sourceUrl: beinliveSourceUrl,
   });
-  const streamSources = [livekoraStatus, beinliveStatus].sort((left, right) => left.order - right.order);
+  const siiirStatus = await buildSiiirStatus({
+    matchId,
+    row: data,
+    sourceUrl: siiirSourceUrl,
+  });
+  const streamSources = [livekoraStatus, beinliveStatus, siiirStatus].sort((left, right) => left.order - right.order);
 
   const response = NextResponse.json({
     id: data.id,
@@ -52,11 +60,14 @@ export async function GET(_req: Request, ctx: Ctx) {
     match_day: data.match_day || null,
     status_key: data.status_key || null,
     stream_url: beinliveSourceUrl,
+    stream_url_2: siiirSourceUrl,
     stream_url_4: sourceUrl,
     livekoraStatus,
     livekoraPlaylistUrl: livekoraStatus.playlistUrl,
     beinliveStatus,
     beinlivePlaylistUrl: beinliveStatus.playlistUrl,
+    siiirStatus,
+    siiirPlaylistUrl: siiirStatus.playlistUrl,
     streamSources,
   });
   response.headers.set("Cache-Control", "public, s-maxage=6, stale-while-revalidate=20");

@@ -1,4 +1,4 @@
-export type StreamProviderId = "livekora" | "beinlive";
+export type StreamProviderId = "livekora" | "beinlive" | "siiir";
 
 export type StreamSourceState = "ready" | "warming" | "down";
 
