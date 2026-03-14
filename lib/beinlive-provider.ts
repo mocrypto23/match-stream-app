@@ -127,6 +127,11 @@ function parseTargetDurationSec(manifestText: string) {
   return 0;
 }
 
+function isSequenceRollback(nextMediaSequence: number | null, previousMediaSequence: number | null) {
+  if (!Number.isFinite(nextMediaSequence) || !Number.isFinite(previousMediaSequence)) return false;
+  return Number(nextMediaSequence) + 2 < Number(previousMediaSequence);
+}
+
 function hasMediaSegments(manifestText: string, baseUrl: string) {
   let previousExtInf = false;
   for (const line of String(manifestText || "").split(/\r?\n/)) {
@@ -646,6 +651,7 @@ export const beinliveProvider: LiveStreamProvider = {
             waitForMediaSequence !== null &&
             resolvedFromState.mediaSequence !== null &&
             resolvedFromState.mediaSequence <= waitForMediaSequence &&
+            !isSequenceRollback(resolvedFromState.mediaSequence, waitForMediaSequence) &&
             Date.now() < waitDeadlineAt
           ) {
             await sleep(WAIT_RETRY_INTERVAL_MS);
@@ -681,6 +687,7 @@ export const beinliveProvider: LiveStreamProvider = {
         waitForMediaSequence !== null &&
         resolvedFromIframe.mediaSequence !== null &&
         resolvedFromIframe.mediaSequence <= waitForMediaSequence &&
+        !isSequenceRollback(resolvedFromIframe.mediaSequence, waitForMediaSequence) &&
         Date.now() < waitDeadlineAt
       ) {
         await sleep(WAIT_RETRY_INTERVAL_MS);
