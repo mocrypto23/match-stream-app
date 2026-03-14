@@ -11,7 +11,6 @@ import type { MatchR2Status, R2ServerState, R2StatusServerEntry } from "./r2-sta
 import { peekLiveEmbedSessionState } from "./repack-embed-session";
 import { resolveInternalPlayerOrigin } from "./repack-ingest-gateway";
 import { getRepackSeedRuntimeState } from "./repack-runtime-state";
-import type { StreamMode } from "./stream-mode";
 import { computeMatchWindowState, getMatchWindowConfig, parseMatchStartMs } from "./match-window";
 
 const DEFAULT_R2_PROBE_TIMEOUT_MS = 2400;
@@ -553,13 +552,11 @@ function resolveStateFromRecentSeed(
 }
 
 export async function buildMatchR2Status(input: {
-  mode: StreamMode;
   matchId: number;
   row: StreamRowFields;
   repackBaseUrl: string;
   probeTimeoutMs?: number;
 }) {
-  const mode = input.mode;
   const matchId = Number.parseInt(String(input.matchId || 0), 10);
   const nowMs = Date.now();
   const statusKey = String(input.row.status_key || "").trim().toLowerCase();
@@ -589,8 +586,7 @@ export async function buildMatchR2Status(input: {
     3000,
     Number.parseInt(String(process.env.R2_STATUS_STALE_SEQUENCE_GUARD_MS || DEFAULT_STALE_SEQUENCE_GUARD_MS), 10)
   );
-  const shouldProbeR2 = mode === "r2_strict";
-  const agentJobsByKey = shouldProbeR2 ? await fetchAgentDiagJobs() : new Map<string, AgentDiagJob>();
+  const agentJobsByKey = await fetchAgentDiagJobs();
   trimEarlyStopState(nowMs);
 
   const servers = await Promise.all(
@@ -615,23 +611,6 @@ export async function buildMatchR2Status(input: {
           resolverState: !hasSource ? "missing-source" : "unknown",
           resolveReason: !hasSource ? "missing-source" : !sourceAllowed ? "source-not-allowed" : "invalid-match-id",
           reason: !hasSource ? "missing-source" : !sourceAllowed ? "source-not-allowed" : "invalid-match-id",
-          updatedAt: nowIso(nowMs),
-        };
-      }
-
-      if (!shouldProbeR2) {
-        clearEarlyStopState(matchSlotKey);
-        clearRecentReadyState(matchSlotKey);
-        return {
-          uiServer,
-          slotServer,
-          state: "ready",
-          playlistUrl,
-          segmentProbe: "unknown",
-          lastSequenceAgeMs: null,
-          resolverState: "ok",
-          resolveReason: "legacy-mode",
-          reason: "legacy-mode",
           updatedAt: nowIso(nowMs),
         };
       }
@@ -885,7 +864,7 @@ export async function buildMatchR2Status(input: {
   );
 
   const status: MatchR2Status = {
-    mode,
+    mode: "r2_strict",
     servers,
     updatedAt: nowIso(nowMs),
   };

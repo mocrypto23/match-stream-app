@@ -1,8 +1,8 @@
-export type StreamMode = "r2_strict" | "legacy_strict";
+export type StreamMode = "r2_strict";
 
 export const DEFAULT_STREAM_MODE: StreamMode = "r2_strict";
 
-function normalizeStreamMode(raw: unknown): StreamMode {
+function normalizeStreamMode(_raw: unknown): StreamMode {
   return "r2_strict";
 }
 

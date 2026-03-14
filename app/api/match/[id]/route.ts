@@ -715,7 +715,6 @@ async function waitForBootstrapSettle(input: {
   row: MatchApiRow;
   repackBaseUrl: string;
   initialStatus: Awaited<ReturnType<typeof buildMatchR2Status>> | null;
-  mode: ReturnType<typeof getServerStreamMode>;
 }) {
   let status = input.initialStatus;
   const deadlineAt = Date.now() + MATCH_BOOTSTRAP_SETTLE_TIMEOUT_MS;
@@ -724,7 +723,6 @@ async function waitForBootstrapSettle(input: {
     if (settledState.hasReady || settledState.settled) return status;
     await new Promise((resolve) => setTimeout(resolve, MATCH_BOOTSTRAP_SETTLE_POLL_MS));
     status = await buildMatchR2Status({
-      mode: input.mode,
       matchId: input.matchId,
       row: input.row,
       repackBaseUrl: input.repackBaseUrl,
@@ -1179,7 +1177,6 @@ export async function GET(req: Request, ctx: Ctx) {
   const repackFlags = getRuntimeRepackFlags();
   const streamMode = getServerStreamMode();
   let r2Status = await buildMatchR2Status({
-    mode: streamMode,
     matchId: Number(payload.id),
     row: payload,
     repackBaseUrl: repackFlags.publicBaseUrl,
@@ -1212,7 +1209,6 @@ export async function GET(req: Request, ctx: Ctx) {
           row: payload,
           repackBaseUrl: repackFlags.publicBaseUrl,
           initialStatus: r2Status,
-          mode: streamMode,
         });
         if (settledStatus?.servers?.length) {
           r2Status = settledStatus;

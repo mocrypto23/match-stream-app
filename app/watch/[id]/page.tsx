@@ -119,8 +119,6 @@ const STRICT_BOOTSTRAP_RECENT_WINDOW_MS = 20_000;
 const NETWORK_FATAL_WINDOW_MS = 12_000;
 const RESOLVE_COOLDOWN_MS = 1500;
 const REPACK_SEED_DEDUPE_WINDOW_MS = 12_000;
-const REPACK_TOKEN_REFRESH_KICK_MS = 16_000;
-const EMBED_FALLBACK_ENABLED = false;
 const LIVE_ONLY_PLAYBACK = String(process.env.NEXT_PUBLIC_LIVE_ONLY_PLAYBACK || "1").trim() !== "0";
 const CANDIDATE_PROBE_TIMEOUT_MS = 6500;
 const FAST_PHASE_PROBE_TIMEOUT_MS = 2200;
@@ -5350,7 +5348,6 @@ export default function WatchPage() {
   const [serverHealth, setServerHealth] = useState<Record<number, ServerHealthState>>({});
   const [diagLogs, setDiagLogs] = useState<string[]>([]);
   const [isTfPlayerHost, setIsTfPlayerHost] = useState(false);
-  const [repackBypassVersion, setRepackBypassVersion] = useState(0);
   const candidatesRef = useRef<string[]>([]);
   const selectedCandidateRef = useRef(0);
   const selectedServerRef = useRef(4);
@@ -5391,7 +5388,6 @@ export default function WatchPage() {
     4: new Set<string>(),
   });
   const lastRepackSeedCandidateKeyByServerRef = useRef<Record<number, string>>({});
-  const repackBypassServersRef = useRef<Set<number>>(new Set());
   const repackFallbackReasonByServerRef = useRef<Record<number, string>>({});
   const repackCacheStatusByServerRef = useRef<Record<number, string>>({});
   const repackStallCountByServerRef = useRef<Record<number, number>>({});
@@ -5546,7 +5542,6 @@ export default function WatchPage() {
       4: new Set<string>(),
     };
     lastRepackSeedCandidateKeyByServerRef.current = {};
-    repackBypassServersRef.current = new Set();
     repackFallbackReasonByServerRef.current = {};
     repackCacheStatusByServerRef.current = {};
     repackStallCountByServerRef.current = {};
@@ -5564,7 +5559,6 @@ export default function WatchPage() {
     strictRecoveryStateRef.current = "healthy";
     setStrictRecoveryState("healthy");
     setStrictBreakerUntilMs(null);
-    setRepackBypassVersion((prev) => prev + 1);
     if (R2_STRICT_MODE) setR2Status(null);
   }, [idNum]);
 
@@ -5682,24 +5676,8 @@ export default function WatchPage() {
     const strictR2Server = R2_STRICT_MODE && server >= 1 && server <= 4;
     const normalizedCandidates = (() => {
       const base = dedupeUrls(nextCandidates || []);
-      if (strictR2Server) return base.filter((candidate) => isValidHttpUrl(candidate));
-      const repackBypassActive =
-        server >= 1 && server <= 4 && repackBypassServersRef.current.has(server);
-      if (!repackBypassActive) return base;
-      const out: string[] = [];
-      for (const candidate of base) {
-        const raw = String(candidate || "").trim();
-        if (!raw) continue;
-        if (raw.startsWith("/api/embed-proxy?")) {
-          out.push(raw);
-          continue;
-        }
-        const underlying = String(toUnderlyingUrl(raw) || raw).trim();
-        if (!isValidHttpUrl(underlying)) continue;
-        const proxied = toEmbedProxyUrl(underlying, underlying);
-        if (proxied) out.push(proxied);
-      }
-      return dedupeUrls(out);
+      if (!strictR2Server) return base;
+      return base.filter((candidate) => isValidHttpUrl(candidate));
     })();
     const prioritized = prioritizeCandidatesByServer(server, normalizedCandidates);
     const next = filterCandidatesByHealth(server, prioritized);
@@ -6693,34 +6671,6 @@ export default function WatchPage() {
   }, [candidates.length, selectedCandidate]);
 
   useEffect(() => {
-    if (R2_STRICT_MODE) return;
-    if (!idNum || shouldBlockStream) return;
-    if (selectedServer < 1 || selectedServer > 4) return;
-    if (!isRepackPlaylistUrl(selectedUrl)) return;
-    if (repackBypassServersRef.current.has(selectedServer)) return;
-    const fallbackProbe = String(selectedFallbackUrl || "").trim();
-    const needsTokenRefresh =
-      isPlayerv2LikeUrl(fallbackProbe) || /[?&](?:token|sid|nonce|ts)=/i.test(fallbackProbe);
-    if (!needsTokenRefresh) return;
-
-    const timerId = window.setInterval(() => {
-      const now = Date.now();
-      if (resolveLockRef.current) {
-        pendingResolveKickReasonRef.current = "repack-token-refresh";
-        return;
-      }
-      if (now - lastResolveKickRef.current < RESOLVE_COOLDOWN_MS) return;
-      lastResolveKickRef.current = now;
-      setResolveRevision((prev) => prev + 1);
-      pushDiag("resolve bump (repack-token-refresh)");
-    }, REPACK_TOKEN_REFRESH_KICK_MS);
-
-    return () => {
-      window.clearInterval(timerId);
-    };
-  }, [idNum, selectedServer, selectedUrl, selectedFallbackUrl, shouldBlockStream, pushDiag]);
-
-  useEffect(() => {
     let cancel = false;
     const controller = new AbortController();
     const resolveId = activeResolveIdRef.current + 1;
@@ -6751,8 +6701,7 @@ export default function WatchPage() {
         resolveLockRef.current = false;
         return;
       }
-      const repackPrimaryOnlyMode =
-        isRepackPlaylistUrl(selectedResolveUrl) && !repackBypassServersRef.current.has(selectedServer);
+      const repackPrimaryOnlyMode = isRepackPlaylistUrl(selectedResolveUrl);
       const resolveSourceUrl =
         repackPrimaryOnlyMode &&
         selectedFallbackUrl &&
@@ -7234,7 +7183,7 @@ export default function WatchPage() {
           const mergedPreferred =
             repackPrimaryOnlyMode
               ? [selectedUrl]
-              : isRepackPlaylistUrl(selectedUrl) && !repackBypassServersRef.current.has(selectedServer)
+              : isRepackPlaylistUrl(selectedUrl)
                 ? dedupeUrls([selectedUrl, ...merged])
               : merged;
           if (isRepackPlaylistUrl(selectedUrl)) {
@@ -8375,52 +8324,35 @@ export default function WatchPage() {
           if (idleMs < REPACK_STALE_PLAYLIST_MAX_IDLE_MS) return;
           const sinceProgressMs = now - lastProgressAtRef.current;
           if (sinceProgressMs < REPACK_STALE_PROGRESS_GUARD_MS) return;
-          if (repackBypassServersRef.current.has(selectedServer)) return;
-          if (!EMBED_FALLBACK_ENABLED) {
-            pushDiag(`repack stale-manifest s${selectedServer} no-fallback`);
-            const staleErrCount = (repackRecoveryErrorCountByServerRef.current[selectedServer] || 0) + 1;
-            repackRecoveryErrorCountByServerRef.current[selectedServer] = staleErrCount;
-            const failedSeedKey = String(lastRepackSeedCandidateKeyByServerRef.current[selectedServer] || "").trim();
-            if (failedSeedKey) {
-              const badSet = badRepackSeedCandidatesByServerRef.current[selectedServer] || new Set<string>();
-              badSet.add(failedSeedKey);
-              badRepackSeedCandidatesByServerRef.current[selectedServer] = badSet;
-            }
-            if (idNum) {
-              const seedPrefix = `${idNum}:${selectedServer}:`;
-              for (const key of Array.from(repackSeedSentRef.current.keys())) {
-                if (key.startsWith(seedPrefix)) repackSeedSentRef.current.delete(key);
-              }
-            }
-            if (staleErrCount >= 3) {
-              setPlayerError("تحديث R2 متوقف مؤقتًا... جاري إعادة المحاولة تلقائيًا.");
-            } else if (staleErrCount >= 2) {
-              setPlayerError("تذبذب مؤقت في تحديث R2... جاري التثبيت.");
-            } else {
-              setPlayerError(null);
-            }
-            requestSoftRecovery("repack-stale-no-fallback");
-            if (staleErrCount >= 2) {
-              scheduleResolveRecovery("repack-stale-no-fallback", true);
-            }
-            return;
-          }
-
           pushDiag(`repack stale-manifest s${selectedServer} idle=${idleMs}ms`);
-          repackBypassServersRef.current.add(selectedServer);
-          setRepackBypassVersion((prev) => prev + 1);
-          pushDiag(`repack runtime-bypass s${selectedServer}`);
+          const staleErrCount = (repackRecoveryErrorCountByServerRef.current[selectedServer] || 0) + 1;
+          repackRecoveryErrorCountByServerRef.current[selectedServer] = staleErrCount;
+          const failedSeedKey = String(lastRepackSeedCandidateKeyByServerRef.current[selectedServer] || "").trim();
+          if (failedSeedKey) {
+            const badSet = badRepackSeedCandidatesByServerRef.current[selectedServer] || new Set<string>();
+            badSet.add(failedSeedKey);
+            badRepackSeedCandidatesByServerRef.current[selectedServer] = badSet;
+          }
+          if (idNum) {
+            const seedPrefix = `${idNum}:${selectedServer}:`;
+            for (const key of Array.from(repackSeedSentRef.current.keys())) {
+              if (key.startsWith(seedPrefix)) repackSeedSentRef.current.delete(key);
+            }
+          }
+          if (staleErrCount >= 3) {
+            setPlayerError("تحديث R2 متوقف مؤقتًا... جاري إعادة المحاولة تلقائيًا.");
+          } else if (staleErrCount >= 2) {
+            setPlayerError("تذبذب مؤقت في تحديث R2... جاري التثبيت.");
+          } else {
+            setPlayerError(null);
+          }
           if (useFastFailover) {
             markCandidateAsBad(selectedServer, selectedHlsUrl, "repack-stale-manifest");
           }
-          applyCandidatesPreservingSelection([]);
-          selectedCandidateRef.current = 0;
-          setSelectedCandidate(0);
-          setResolverLoading(true);
-          setPlayerError("تحديث R2 متوقف... جاري التحويل تلقائيًا للمصدر الاحتياطي.");
-          scheduleResolveRecovery("repack-stale-manifest", true);
-          hidePlayerLoading();
-          try { instance.stopLoad(); } catch { }
+          requestSoftRecovery("repack-stale-manifest");
+          if (staleErrCount >= 2) {
+            scheduleResolveRecovery("repack-stale-manifest", true);
+          }
         });
         instance.on(Hls.Events.ERROR, (_event, data) => {
           if (cancel || !data.fatal) return;
@@ -8438,53 +8370,37 @@ export default function WatchPage() {
               errorDetails.includes("manifestparsingerror") ||
               errorDetails.includes("levelparsingerror"));
           if (repackManifestUnavailable) {
-            if (!EMBED_FALLBACK_ENABLED) {
-              pushDiag(`repack unavailable no-fallback code=${responseCode || 0} details=${errorDetails || "n/a"}`);
-              const unavailableErrCount = (repackRecoveryErrorCountByServerRef.current[selectedServer] || 0) + 1;
-              repackRecoveryErrorCountByServerRef.current[selectedServer] = unavailableErrCount;
-              const failedSeedKey = String(lastRepackSeedCandidateKeyByServerRef.current[selectedServer] || "").trim();
-              if (failedSeedKey) {
-                const badSet = badRepackSeedCandidatesByServerRef.current[selectedServer] || new Set<string>();
-                badSet.add(failedSeedKey);
-                badRepackSeedCandidatesByServerRef.current[selectedServer] = badSet;
-              }
-              if (idNum) {
-                const seedPrefix = `${idNum}:${selectedServer}:`;
-                for (const key of Array.from(repackSeedSentRef.current.keys())) {
-                  if (key.startsWith(seedPrefix)) repackSeedSentRef.current.delete(key);
-                }
-              }
-              if (unavailableErrCount >= 3) {
-                setPlayerError("تعذر تحميل R2 الآن... جاري إعادة المحاولة تلقائيًا.");
-              } else if (unavailableErrCount >= 2) {
-                setPlayerError("انقطاع مؤقت في R2... جاري التثبيت.");
-              } else {
-                setPlayerError(null);
-              }
-              queueTimeout(() => {
-                requestSoftRecovery("repack-unavailable-no-fallback");
-              }, 250);
-              if (unavailableErrCount >= 2) {
-                scheduleResolveRecovery("repack-unavailable-no-fallback", true);
-              }
-              hidePlayerLoading();
-              return;
-            }
             pushDiag(`repack unavailable code=${responseCode || 0} details=${errorDetails || "n/a"}`);
-            if (!repackBypassServersRef.current.has(selectedServer)) {
-              repackBypassServersRef.current.add(selectedServer);
-              setRepackBypassVersion((prev) => prev + 1);
-              pushDiag(`repack runtime-bypass s${selectedServer}`);
+            const unavailableErrCount = (repackRecoveryErrorCountByServerRef.current[selectedServer] || 0) + 1;
+            repackRecoveryErrorCountByServerRef.current[selectedServer] = unavailableErrCount;
+            const failedSeedKey = String(lastRepackSeedCandidateKeyByServerRef.current[selectedServer] || "").trim();
+            if (failedSeedKey) {
+              const badSet = badRepackSeedCandidatesByServerRef.current[selectedServer] || new Set<string>();
+              badSet.add(failedSeedKey);
+              badRepackSeedCandidatesByServerRef.current[selectedServer] = badSet;
+            }
+            if (idNum) {
+              const seedPrefix = `${idNum}:${selectedServer}:`;
+              for (const key of Array.from(repackSeedSentRef.current.keys())) {
+                if (key.startsWith(seedPrefix)) repackSeedSentRef.current.delete(key);
+              }
+            }
+            if (unavailableErrCount >= 3) {
+              setPlayerError("تعذر تحميل R2 الآن... جاري إعادة المحاولة تلقائيًا.");
+            } else if (unavailableErrCount >= 2) {
+              setPlayerError("انقطاع مؤقت في R2... جاري التثبيت.");
+            } else {
+              setPlayerError(null);
             }
             if (useFastFailover) {
               markCandidateAsBad(selectedServer, selectedHlsUrl, `repack-unavailable-${responseCode || 0}`);
             }
-            applyCandidatesPreservingSelection([]);
-            selectedCandidateRef.current = 0;
-            setSelectedCandidate(0);
-            setResolverLoading(true);
-            setPlayerError("تعذر تشغيل R2... جاري التحويل تلقائيًا للمصدر الاحتياطي.");
-            scheduleResolveRecovery("repack-runtime-bypass", true);
+            queueTimeout(() => {
+              requestSoftRecovery("repack-unavailable");
+            }, 250);
+            if (unavailableErrCount >= 2) {
+              scheduleResolveRecovery("repack-unavailable", true);
+            }
             hidePlayerLoading();
             return;
           }
@@ -8688,37 +8604,6 @@ export default function WatchPage() {
       pushDiag(`stall-freeze ${stalledFor}ms source=${current + 1}/${Math.max(1, total)}`);
       requestSoftRecovery("stall-watchdog");
       if (total <= 1) {
-        const fallbackCandidate = String(selectedFallbackUrl || "").trim();
-        const fallbackUnderlying = String(toUnderlyingUrl(fallbackCandidate) || fallbackCandidate).trim();
-        const canSwitchToLegacyFallback =
-          EMBED_FALLBACK_ENABLED &&
-          stallFreezeCount >= 2 &&
-          isRepackPlaylistUrl(selectedHlsUrl) &&
-          !!fallbackCandidate &&
-          !isRepackPlaylistUrl(fallbackUnderlying) &&
-          isValidHttpUrl(fallbackUnderlying);
-        if (canSwitchToLegacyFallback) {
-          pushDiag("repack single-source stall -> runtime bypass");
-          trackRepackFallback("stall-single-source", selectedHlsUrl, fallbackCandidate);
-          if (!repackBypassServersRef.current.has(selectedServer)) {
-            repackBypassServersRef.current.add(selectedServer);
-            setRepackBypassVersion((prev) => prev + 1);
-            pushDiag(`repack runtime-bypass s${selectedServer}`);
-          }
-          if (useFastFailover) {
-            markCandidateAsBad(selectedServer, selectedHlsUrl, "repack-single-source-stall");
-          }
-          applyCandidatesPreservingSelection([]);
-          selectedCandidateRef.current = 0;
-          setSelectedCandidate(0);
-          setResolverLoading(true);
-          setPlayerError("تم التحويل تلقائيًا للمصدر الاحتياطي لضمان استمرارية البث.");
-          scheduleResolveRecovery("repack-stall-runtime-bypass", true);
-          hidePlayerLoading();
-          freezeTriggered = false;
-          stallFreezeCount = 0;
-          return;
-        }
         // Single-source playback: avoid hard source switch loops; keep trying in-place.
         setPlayerError("انقطاع مؤقت... جاري إعادة المزامنة");
         queueTimeout(() => {

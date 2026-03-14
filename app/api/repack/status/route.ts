@@ -187,7 +187,6 @@ export async function GET(req: Request) {
   const mode = getServerStreamMode();
   const repackFlags = getRuntimeRepackFlags();
   const r2Status = await buildMatchR2Status({
-    mode,
     matchId,
     row,
     repackBaseUrl: repackFlags.publicBaseUrl,

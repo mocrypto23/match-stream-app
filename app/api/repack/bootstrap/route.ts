@@ -661,7 +661,6 @@ export async function POST(req: Request) {
   }
 
   const r2Status = await buildMatchR2Status({
-    mode,
     matchId,
     row,
     repackBaseUrl: repackFlags.publicBaseUrl,
