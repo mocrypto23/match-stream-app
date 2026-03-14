@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
+import axios from "axios";
 
 type MatchRowLike = {
   stream_url_4?: string | null;
@@ -357,27 +358,23 @@ async function fetchTextWithHeaders(input: {
 }) {
   const targetUrl = normalizeHttpUrl(input.url);
   if (!targetUrl) return null;
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), Math.max(8_000, Number(input.timeoutMs || DIRECT_FETCH_TIMEOUT_MS)));
   try {
-    const response = await fetch(targetUrl, {
-      method: "GET",
-      cache: "no-store",
-      redirect: "follow",
-      signal: controller.signal,
+    const response = await axios.get<string>(targetUrl, {
+      responseType: "text",
+      timeout: Math.max(8_000, Number(input.timeoutMs || DIRECT_FETCH_TIMEOUT_MS)),
+      maxRedirects: 5,
+      validateStatus: () => true,
       headers: buildFetchHeaders({
         requestHeaders: input.requestHeaders,
         referrerUrl: input.referrerUrl,
         accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
       }),
     });
-    if (!response.ok) return null;
-    const body = await response.text().catch(() => "");
+    if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) return null;
+    const body = String(response.data || "");
     return body.trim() ? body : null;
   } catch {
     return null;
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 
@@ -391,34 +388,32 @@ async function fetchBinaryWithHeaders(input: {
   if (!targetUrl) {
     return { ok: false as const, status: 0, contentType: "", bodyBase64: "", error: "invalid-asset-url" };
   }
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), Math.max(8_000, Number(input.timeoutMs || DIRECT_FETCH_TIMEOUT_MS)));
   try {
-    const response = await fetch(targetUrl, {
-      method: "GET",
-      cache: "no-store",
-      redirect: "follow",
-      signal: controller.signal,
+    const response = await axios.get<ArrayBuffer>(targetUrl, {
+      responseType: "arraybuffer",
+      timeout: Math.max(8_000, Number(input.timeoutMs || DIRECT_FETCH_TIMEOUT_MS)),
+      maxRedirects: 5,
+      validateStatus: () => true,
       headers: buildFetchHeaders({
         requestHeaders: input.requestHeaders,
         referrerUrl: input.referrerUrl,
         accept: "*/*",
       }),
     });
-    if (!response.ok) {
+    if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) {
       return {
         ok: false as const,
         status: Number(response.status || 0),
-        contentType: String(response.headers.get("content-type") || ""),
+        contentType: String(response.headers["content-type"] || ""),
         bodyBase64: "",
         error: `asset-http-${Number(response.status || 0)}`,
       };
     }
-    const bytes = Buffer.from(await response.arrayBuffer());
+    const bytes = Buffer.from(response.data);
     return {
       ok: true as const,
       status: Number(response.status || 200),
-      contentType: String(response.headers.get("content-type") || "application/octet-stream"),
+      contentType: String(response.headers["content-type"] || "application/octet-stream"),
       bodyBase64: bytes.toString("base64"),
       error: "",
     };
@@ -430,8 +425,6 @@ async function fetchBinaryWithHeaders(input: {
       bodyBase64: "",
       error: error instanceof Error ? error.message : String(error || "asset-fetch-failed"),
     };
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 
