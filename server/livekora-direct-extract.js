@@ -470,6 +470,10 @@ async function main() {
     }
   } finally {
     if (!manifestResolved) {
+      await page.close().catch(() => {});
+      await context.close().catch(() => {});
+      await browser.close().catch(() => {});
+
       let finalManifestUrl = lastManifestUrl;
       let finalManifestBody = lastManifestBody;
       if (finalManifestUrl && !finalManifestBody) {
@@ -496,9 +500,6 @@ async function main() {
           playbackUrl: lastPlaybackUrl || sourceUrl,
         })
       );
-      await page.close().catch(() => {});
-      await context.close().catch(() => {});
-      await browser.close().catch(() => {});
     }
   }
 }
