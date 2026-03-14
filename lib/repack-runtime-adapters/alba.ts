@@ -23,6 +23,7 @@ type DirectLivekoraManifestCacheEntry = {
 };
 
 const directLivekoraManifestCache = new Map<string, DirectLivekoraManifestCacheEntry>();
+const directLivekoraManifestInflight = new Map<string, Promise<RuntimeManifestResult | null>>();
 
 function looksLikeAlbaSource(rawUrl: string) {
   try {
@@ -114,7 +115,7 @@ function hasMediaSegments(manifestText: string, baseUrl: string) {
 }
 
 function readDirectLivekoraManifestCache(input: RuntimeAdapterInput, waitForMediaSequence?: number | null) {
-  const key = `${input.slotServer}|${normalizeLivekoraChannelUrl(input.sourceUrl)}`;
+  const key = buildDirectLivekoraCacheKey(input);
   const cached = directLivekoraManifestCache.get(key);
   if (!cached || cached.expiresAt <= Date.now()) {
     if (cached) directLivekoraManifestCache.delete(key);
@@ -132,11 +133,15 @@ function readDirectLivekoraManifestCache(input: RuntimeAdapterInput, waitForMedi
 }
 
 function writeDirectLivekoraManifestCache(input: RuntimeAdapterInput, result: RuntimeManifestResult) {
-  const key = `${input.slotServer}|${normalizeLivekoraChannelUrl(input.sourceUrl)}`;
+  const key = buildDirectLivekoraCacheKey(input);
   directLivekoraManifestCache.set(key, {
     expiresAt: Date.now() + DIRECT_LIVEKORA_MANIFEST_CACHE_TTL_MS,
     result,
   });
+}
+
+function buildDirectLivekoraCacheKey(input: RuntimeAdapterInput) {
+  return `${input.slotServer}|${normalizeLivekoraChannelUrl(input.sourceUrl)}`;
 }
 
 async function extractDirectLivekoraManifest(
@@ -146,124 +151,136 @@ async function extractDirectLivekoraManifest(
   if (!isLivekoraFamilyUrl(input.sourceUrl)) return null;
   const cached = readDirectLivekoraManifestCache(input, queryOptions?.waitForMediaSequence);
   if (cached) return cached;
+  const cacheKey = buildDirectLivekoraCacheKey(input);
+  const inflight = directLivekoraManifestInflight.get(cacheKey);
+  if (inflight) {
+    return inflight;
+  }
+  const pending = (async () => {
+    const channelUrl = normalizeLivekoraChannelUrl(input.sourceUrl);
+    if (!isValidHttpUrl(channelUrl)) return null;
 
-  const channelUrl = normalizeLivekoraChannelUrl(input.sourceUrl);
-  if (!isValidHttpUrl(channelUrl)) return null;
-
-  const { chromium } = (await import("playwright")) as typeof import("playwright");
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled", "--no-sandbox"],
-  });
-
-  let manifestUrl = "";
-  let manifestBody = "";
-  let referrerUrl = channelUrl;
-  let resolveFound: (() => void) | null = null;
-  const foundPromise = new Promise<void>((resolve) => {
-    resolveFound = resolve;
-  });
-
-  try {
-    const context = await browser.newContext({
-      ignoreHTTPSErrors: true,
-      locale: "ar-EG",
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-      viewport: { width: 1440, height: 900 },
-      extraHTTPHeaders: {
-        "accept-language": "ar,en-US;q=0.9,en;q=0.8",
-      },
-    });
-    const page = await context.newPage();
-    page.on("console", (message) => {
-      const text = String(message.text() || "");
-      const match = text.match(/loadSource:(https?:\/\/\S+)/i);
-      const candidate = normalizeHttpUrl(match?.[1] || "");
-      if (candidate) {
-        manifestUrl = candidate;
-      }
-    });
-    page.on("response", async (response) => {
-      try {
-        const url = normalizeHttpUrl(response.url());
-        if (!url || !/\.m3u8(?:$|[?#])|\/hls\/|\/stream\/|\/live\/|amazonaws/i.test(url)) return;
-        const body = await response.text().catch(() => "");
-        if (!body.trim() || !hasMediaSegments(body, url)) return;
-        manifestUrl = url;
-        manifestBody = body;
-        resolveFound?.();
-      } catch {}
+    const { chromium } = (await import("playwright")) as typeof import("playwright");
+    const browser = await chromium.launch({
+      headless: true,
+      args: ["--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled", "--no-sandbox"],
     });
 
-    await page.goto(channelUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: DIRECT_LIVEKORA_BROWSER_TIMEOUT_MS,
+    let manifestUrl = "";
+    let manifestBody = "";
+    let referrerUrl = channelUrl;
+    let resolveFound: (() => void) | null = null;
+    const foundPromise = new Promise<void>((resolve) => {
+      resolveFound = resolve;
     });
-    referrerUrl = normalizeHttpUrl(page.url()) || channelUrl;
-    await Promise.race([foundPromise, page.waitForTimeout(Math.max(4_000, DIRECT_LIVEKORA_BROWSER_TIMEOUT_MS - 2_000))]);
 
-    if (!manifestBody && manifestUrl) {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 8_000);
-      try {
-        const response = await fetch(manifestUrl, {
-          method: "GET",
-          cache: "no-store",
-          redirect: "follow",
-          signal: controller.signal,
-          headers: {
-            accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
-            referer: referrerUrl,
-            origin: new URL(referrerUrl).origin,
-          },
-        });
-        const body = await response.text().catch(() => "");
-        if (response.ok && hasMediaSegments(body, response.url || manifestUrl)) {
-          manifestUrl = normalizeHttpUrl(response.url || manifestUrl) || manifestUrl;
-          manifestBody = body;
+    try {
+      const context = await browser.newContext({
+        ignoreHTTPSErrors: true,
+        locale: "ar-EG",
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+        viewport: { width: 1440, height: 900 },
+        extraHTTPHeaders: {
+          "accept-language": "ar,en-US;q=0.9,en;q=0.8",
+        },
+      });
+      const page = await context.newPage();
+      page.on("console", (message) => {
+        const text = String(message.text() || "");
+        const match = text.match(/loadSource:(https?:\/\/\S+)/i);
+        const candidate = normalizeHttpUrl(match?.[1] || "");
+        if (candidate) {
+          manifestUrl = candidate;
         }
-      } finally {
-        clearTimeout(timeoutId);
+      });
+      page.on("response", async (response) => {
+        try {
+          const url = normalizeHttpUrl(response.url());
+          if (!url || !/\.m3u8(?:$|[?#])|\/hls\/|\/stream\/|\/live\/|amazonaws/i.test(url)) return;
+          const body = await response.text().catch(() => "");
+          if (!body.trim() || !hasMediaSegments(body, url)) return;
+          manifestUrl = url;
+          manifestBody = body;
+          resolveFound?.();
+        } catch {}
+      });
+
+      await page.goto(channelUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: DIRECT_LIVEKORA_BROWSER_TIMEOUT_MS,
+      });
+      referrerUrl = normalizeHttpUrl(page.url()) || channelUrl;
+      await Promise.race([foundPromise, page.waitForTimeout(Math.max(4_000, DIRECT_LIVEKORA_BROWSER_TIMEOUT_MS - 2_000))]);
+
+      if (!manifestBody && manifestUrl) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8_000);
+        try {
+          const response = await fetch(manifestUrl, {
+            method: "GET",
+            cache: "no-store",
+            redirect: "follow",
+            signal: controller.signal,
+            headers: {
+              accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
+              referer: referrerUrl,
+              origin: new URL(referrerUrl).origin,
+            },
+          });
+          const body = await response.text().catch(() => "");
+          if (response.ok && hasMediaSegments(body, response.url || manifestUrl)) {
+            manifestUrl = normalizeHttpUrl(response.url || manifestUrl) || manifestUrl;
+            manifestBody = body;
+          }
+        } finally {
+          clearTimeout(timeoutId);
+        }
       }
+
+      await page.close().catch(() => {});
+      await context.close().catch(() => {});
+    } finally {
+      await browser.close().catch(() => {});
     }
 
-    await page.close().catch(() => {});
-    await context.close().catch(() => {});
+    if (!manifestUrl || !manifestBody) {
+      return null;
+    }
+
+    const result: RuntimeManifestResult = {
+      ok: true,
+      manifestBody: rewriteManifestForSessionMirror(
+        manifestBody,
+        manifestUrl,
+        input.internalOrigin,
+        input.sourceUrl,
+        input.slotServer
+      ),
+      finalUrl: manifestUrl,
+      targetUrl: manifestUrl,
+      fetchUrl: manifestUrl,
+      referrerUrl,
+      playbackUrl: channelUrl,
+      currentSource: manifestUrl,
+      mediaSequence: parseMediaSequence(manifestBody),
+      targetDurationSec: parseTargetDurationSec(manifestBody),
+      refreshed: false,
+      rotated: false,
+      adapterKind: "alba",
+      candidatesFound: 1,
+      candidatesTried: 1,
+      sessionOwned: true,
+    };
+    writeDirectLivekoraManifestCache(input, result);
+    return result;
+  })();
+  directLivekoraManifestInflight.set(cacheKey, pending);
+  try {
+    return await pending;
   } finally {
-    await browser.close().catch(() => {});
+    directLivekoraManifestInflight.delete(cacheKey);
   }
-
-  if (!manifestUrl || !manifestBody) {
-    return null;
-  }
-
-  const result: RuntimeManifestResult = {
-    ok: true,
-    manifestBody: rewriteManifestForSessionMirror(
-      manifestBody,
-      manifestUrl,
-      input.internalOrigin,
-      input.sourceUrl,
-      input.slotServer
-    ),
-    finalUrl: manifestUrl,
-    targetUrl: manifestUrl,
-    fetchUrl: manifestUrl,
-    referrerUrl,
-    playbackUrl: channelUrl,
-    currentSource: manifestUrl,
-    mediaSequence: parseMediaSequence(manifestBody),
-    targetDurationSec: parseTargetDurationSec(manifestBody),
-    refreshed: false,
-    rotated: false,
-    adapterKind: "alba",
-    candidatesFound: 1,
-    candidatesTried: 1,
-    sessionOwned: true,
-  };
-  writeDirectLivekoraManifestCache(input, result);
-  return result;
 }
 
 async function fetchDirectLivekoraAsset(input: {
@@ -494,6 +511,21 @@ export const albaRuntimeAdapter: RuntimeAdapter = {
   currentManifest: async (input, queryOptions) => {
     const directResolved = await extractDirectLivekoraManifest(input, queryOptions);
     if (directResolved?.ok) return directResolved;
+    if (isLivekoraFamilyUrl(input.sourceUrl)) {
+      return {
+        ok: false,
+        error: "direct-livekora-manifest-empty",
+        playbackUrl: normalizeLivekoraChannelUrl(input.sourceUrl),
+        currentSource: "",
+        mediaSequence: null,
+        targetDurationSec: 0,
+        refreshed: false,
+        rotated: false,
+        adapterKind: "alba",
+        candidatesFound: 0,
+        candidatesTried: 0,
+      };
+    }
     const peek = albaBaseAdapter.peekStatus(input);
     if (peek.state !== "ready" && (!peek.currentSource || peek.sourceCount === 0)) {
       for (const candidate of await deriveAlbaHintCandidates(input)) {
