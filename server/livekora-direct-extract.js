@@ -108,6 +108,28 @@ async function main() {
     referrerUrl = normalizeHttpUrl(page.url()) || channelUrl;
     await Promise.race([foundPromise, page.waitForTimeout(8000)]);
 
+    if (!manifestBody && manifestUrl) {
+      const browserFetched = await page
+        .evaluate(async (url) => {
+          const response = await fetch(url, {
+            method: "GET",
+            credentials: "include",
+            cache: "no-store",
+            redirect: "follow",
+          });
+          return {
+            ok: response.ok,
+            url: response.url || url,
+            body: await response.text().catch(() => ""),
+          };
+        }, manifestUrl)
+        .catch(() => null);
+      if (browserFetched && browserFetched.ok && hasMediaSegments(browserFetched.body, browserFetched.url || manifestUrl)) {
+        manifestUrl = normalizeHttpUrl(browserFetched.url || manifestUrl) || manifestUrl;
+        manifestBody = browserFetched.body;
+      }
+    }
+
     if (!manifestBody) {
       const iframeSrc = await page
         .evaluate(() => {
@@ -134,6 +156,27 @@ async function main() {
         });
         referrerUrl = normalizeHttpUrl(page.url()) || iframeUrl;
         await Promise.race([foundPromise, page.waitForTimeout(8000)]);
+        if (!manifestBody && manifestUrl) {
+          const browserFetched = await page
+            .evaluate(async (url) => {
+              const response = await fetch(url, {
+                method: "GET",
+                credentials: "include",
+                cache: "no-store",
+                redirect: "follow",
+              });
+              return {
+                ok: response.ok,
+                url: response.url || url,
+                body: await response.text().catch(() => ""),
+              };
+            }, manifestUrl)
+            .catch(() => null);
+          if (browserFetched && browserFetched.ok && hasMediaSegments(browserFetched.body, browserFetched.url || manifestUrl)) {
+            manifestUrl = normalizeHttpUrl(browserFetched.url || manifestUrl) || manifestUrl;
+            manifestBody = browserFetched.body;
+          }
+        }
       }
     }
 
