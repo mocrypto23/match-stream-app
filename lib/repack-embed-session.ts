@@ -1419,7 +1419,10 @@ class LiveEmbedSession {
   async crawlQueuedPages(timeoutMs: number) {
     let crawledPages = 0;
     const visited = new Set<string>();
+    const deadlineAt = Date.now() + Math.max(8_000, Math.min(28_000, timeoutMs));
     while (this.pageQueue.length && crawledPages < SESSION_MAX_CRAWL_PAGES) {
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) break;
       const next = this.pageQueue.shift();
       if (!next) continue;
       if (next.depth > SESSION_MAX_CRAWL_DEPTH) continue;
@@ -1429,7 +1432,7 @@ class LiveEmbedSession {
       crawledPages += 1;
 
       if (shouldNavigateSeedInBrowser(next.pageUrl) && this.page && !this.page.isClosed?.()) {
-        const navigated = await this.navigateSeedInBrowser(next, timeoutMs);
+        const navigated = await this.navigateSeedInBrowser(next, Math.max(4_000, remainingMs));
         if (navigated) continue;
       }
 
@@ -1445,7 +1448,7 @@ class LiveEmbedSession {
       const fetched = await fetchTextDocument({
         url: pageFetchUrl,
         referrerUrl: next.referrerUrl,
-        timeoutMs: Math.min(SESSION_PAGE_FETCH_TIMEOUT_MS, timeoutMs),
+        timeoutMs: Math.max(2_500, Math.min(SESSION_PAGE_FETCH_TIMEOUT_MS, remainingMs)),
       });
       if (!fetched.ok || !fetched.body) continue;
 
@@ -1499,6 +1502,7 @@ class LiveEmbedSession {
     if (!playbackUrl) return false;
 
     try {
+      const challengeWaitBudgetMs = Math.min(this.slotServerId === 4 ? 10_000 : 18_000, timeoutMs);
       await page.goto(playbackUrl, {
         waitUntil: "domcontentloaded",
         timeout: Math.max(7_000, Math.min(35_000, timeoutMs)),
@@ -1509,7 +1513,7 @@ class LiveEmbedSession {
         }).catch(() => {});
       }
       await page.waitForTimeout(Math.max(2_000, Math.min(8_000, SESSION_WAIT_MS)));
-      await this.waitOutChallengeIfNeeded(Math.min(18_000, timeoutMs)).catch(() => false);
+      await this.waitOutChallengeIfNeeded(challengeWaitBudgetMs).catch(() => false);
       await this.drainDomCandidates();
       if (this.pendingTasks.size) {
         await Promise.allSettled(Array.from(this.pendingTasks));
@@ -1952,6 +1956,7 @@ class LiveEmbedSession {
     const page = this.page;
     if (!page || page.isClosed?.()) throw new Error("browser-page-closed");
 
+    const challengeWaitBudgetMs = Math.min(this.slotServerId === 4 ? 10_000 : 18_000, timeoutMs);
     this.seedSourceVariants();
     await page.goto(this.playbackUrl, {
       waitUntil: "domcontentloaded",
@@ -1963,7 +1968,7 @@ class LiveEmbedSession {
       }).catch(() => {});
     }
     await page.waitForTimeout(Math.max(2_000, Math.min(12_000, SESSION_WAIT_MS)));
-    await this.waitOutChallengeIfNeeded(Math.min(18_000, timeoutMs)).catch(() => false);
+    await this.waitOutChallengeIfNeeded(challengeWaitBudgetMs).catch(() => false);
     await this.drainDomCandidates();
     if (!this.candidates.size) {
       await page.waitForTimeout(Math.min(6_000, SESSION_RETRY_WAIT_MS));
