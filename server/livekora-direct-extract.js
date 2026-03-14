@@ -1,6 +1,7 @@
 const { chromium } = require("playwright");
 
-const channelUrl = String(process.argv[2] || "").trim();
+const sourceUrl = String(process.argv[2] || "").trim();
+const playbackUrlArg = String(process.argv[3] || "").trim();
 const BROWSER_TIMEOUT_MS = 20000;
 
 function normalizeHttpUrl(rawUrl) {
@@ -56,11 +57,36 @@ function looksLikeManifestUrl(rawUrl) {
   }
 }
 
+function extractProxyReferrer(rawUrl) {
+  const value = normalizeHttpUrl(rawUrl);
+  if (!value) return "";
+  try {
+    const parsed = new URL(value);
+    if (!String(parsed.pathname || "").toLowerCase().includes("/api/embed-proxy")) return "";
+    const ref = String(parsed.searchParams.get("ref") || "").trim();
+    return normalizeHttpUrl(decodeURIComponent(ref));
+  } catch {
+    return "";
+  }
+}
+
+function resolveResponseTargetUrl(response) {
+  try {
+    const headers = response.headers();
+    const target = normalizeHttpUrl(String(headers["x-embed-proxy-target"] || "").trim());
+    return target || normalizeHttpUrl(response.url());
+  } catch {
+    return "";
+  }
+}
+
 async function main() {
-  if (!channelUrl) {
+  if (!sourceUrl) {
     console.log(JSON.stringify({ ok: false, error: "missing-channel-url" }));
     return;
   }
+
+  const playbackUrl = normalizeHttpUrl(playbackUrlArg) || normalizeHttpUrl(sourceUrl) || sourceUrl;
 
   const browser = await chromium.launch({
     headless: true,
@@ -115,17 +141,18 @@ async function main() {
       const url = normalizeHttpUrl(response.url());
       const contentType = String(response.headers()["content-type"] || "").toLowerCase();
       if (!url || (!looksLikeManifestUrl(url) && !contentType.includes("mpegurl"))) return;
-      lastManifestUrl = url;
+      const targetUrl = resolveResponseTargetUrl(response) || url;
+      lastManifestUrl = targetUrl;
       try {
         const body = await response.text().catch(() => "");
-        if (!body.trim() || !/^\s*#extm3u/m.test(body) || !hasMediaSegments(body, url)) return;
+        if (!body.trim() || !/^\s*#extm3u/m.test(body) || !hasMediaSegments(body, targetUrl)) return;
         await emitAndExit({
           ok: true,
-          manifestUrl: url,
+          manifestUrl: targetUrl,
           manifestBody: body,
-          referrerUrl: normalizeHttpUrl(page.url()) || channelUrl,
+          referrerUrl: extractProxyReferrer(response.url()) || normalizeHttpUrl(page.url()) || sourceUrl,
           manifestRequestHeaders: lastManifestRequestHeaders,
-          playbackUrl: channelUrl,
+          playbackUrl: sourceUrl,
         });
       } catch {}
     })();
@@ -137,7 +164,7 @@ async function main() {
 
   let timeoutResult = null;
   try {
-    await page.goto(channelUrl, {
+    await page.goto(playbackUrl, {
       waitUntil: "domcontentloaded",
       timeout: 20000,
     });
@@ -151,9 +178,9 @@ async function main() {
       error: error instanceof Error ? error.message : String(error || "goto-failed"),
       manifestUrl: lastManifestUrl,
       manifestBody: "",
-      referrerUrl: normalizeHttpUrl(page.url()) || channelUrl,
+      referrerUrl: extractProxyReferrer(page.url()) || normalizeHttpUrl(page.url()) || sourceUrl,
       manifestRequestHeaders: lastManifestRequestHeaders,
-      playbackUrl: channelUrl,
+      playbackUrl: sourceUrl,
     };
   }
 
@@ -162,9 +189,9 @@ async function main() {
       ok: false,
       manifestUrl: lastManifestUrl,
       manifestBody: "",
-      referrerUrl: normalizeHttpUrl(page.url()) || channelUrl,
+      referrerUrl: extractProxyReferrer(page.url()) || normalizeHttpUrl(page.url()) || sourceUrl,
       manifestRequestHeaders: lastManifestRequestHeaders,
-      playbackUrl: channelUrl,
+      playbackUrl: sourceUrl,
     };
   }
 
@@ -183,7 +210,7 @@ main().catch(async (error) => {
       manifestBody: "",
       referrerUrl: "",
       manifestRequestHeaders: {},
-      playbackUrl: channelUrl,
+      playbackUrl: sourceUrl,
     })
   );
 });
