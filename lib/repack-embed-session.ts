@@ -343,6 +343,18 @@ function looksLikeExtractableTextBody(contentType: string, body: string) {
   return /^\s*(?:<!doctype\s+html|<html|<head|<body|<script|<iframe|<div|\{|\[)/i.test(text);
 }
 
+function looksLikeChallengePageHtml(body: string) {
+  const text = String(body || "").toLowerCase();
+  if (!text.trim()) return false;
+  return (
+    text.includes("cf-mitigated") ||
+    text.includes("just a moment") ||
+    text.includes("_cf_chl_opt") ||
+    text.includes("challenge-platform") ||
+    text.includes("enable javascript and cookies to continue")
+  );
+}
+
 function looksLikeNavigableStreamPage(rawUrl: string) {
   if (!isValidHttpUrl(rawUrl)) return false;
   if (looksLikeManifestUrl(rawUrl) || looksLikeStaticAssetUrl(rawUrl)) return false;
@@ -780,6 +792,65 @@ async function fetchBinaryDocument(input: { url: string; referrerUrl?: string; t
 
 function createExtractorInitScript() {
   return () => {
+    try {
+      const nav = navigator as Navigator & {
+        webdriver?: boolean;
+        userAgentData?: unknown;
+      };
+      try {
+        Object.defineProperty(nav, "webdriver", {
+          configurable: true,
+          get: () => false,
+        });
+      } catch {}
+      try {
+        Object.defineProperty(nav, "languages", {
+          configurable: true,
+          get: () => ["ar-EG", "ar", "en-US", "en"],
+        });
+      } catch {}
+      try {
+        Object.defineProperty(nav, "platform", {
+          configurable: true,
+          get: () => "Win32",
+        });
+      } catch {}
+      try {
+        Object.defineProperty(nav, "plugins", {
+          configurable: true,
+          get: () => [
+            { name: "Chrome PDF Plugin" },
+            { name: "Chrome PDF Viewer" },
+            { name: "Native Client" },
+          ],
+        });
+      } catch {}
+    } catch {}
+
+    try {
+      const runtime = {};
+      (
+        window as Window & {
+          chrome?: { runtime?: Record<string, never> };
+        }
+      ).chrome = { runtime };
+    } catch {}
+
+    try {
+      const originalQuery = window.navigator.permissions?.query?.bind(window.navigator.permissions);
+      if (typeof originalQuery === "function") {
+        window.navigator.permissions.query = ((parameters: PermissionDescriptor) => {
+          if (parameters?.name === "notifications") {
+            return Promise.resolve({
+              state: Notification.permission,
+              onchange: null,
+            } as PermissionStatus);
+          }
+          return originalQuery(parameters);
+        }) as typeof window.navigator.permissions.query;
+      }
+    } catch {}
+
     const store = new Set<string>();
     const push = (value: unknown) => {
       const raw = String(value || "").trim();
@@ -1426,6 +1497,7 @@ class LiveEmbedSession {
         }).catch(() => {});
       }
       await page.waitForTimeout(Math.max(2_000, Math.min(8_000, SESSION_WAIT_MS)));
+      await this.waitOutChallengeIfNeeded(Math.min(18_000, timeoutMs)).catch(() => false);
       await this.drainDomCandidates();
       if (this.pendingTasks.size) {
         await Promise.allSettled(Array.from(this.pendingTasks));
@@ -1559,6 +1631,63 @@ class LiveEmbedSession {
         depth: 1,
       });
     }
+  }
+
+  async readPageSnapshot() {
+    const page = this.page;
+    if (!page || page.isClosed?.()) {
+      return {
+        url: "",
+        title: "",
+        html: "",
+      };
+    }
+    return page
+      .evaluate(() => {
+        try {
+          return {
+            url: String(location.href || ""),
+            title: String(document.title || ""),
+            html: String(document.documentElement?.outerHTML || document.body?.outerHTML || ""),
+          };
+        } catch {
+          return {
+            url: "",
+            title: "",
+            html: "",
+          };
+        }
+      })
+      .catch(() => ({
+        url: "",
+        title: "",
+        html: "",
+      }));
+  }
+
+  async waitOutChallengeIfNeeded(timeoutMs: number) {
+    const page = this.page;
+    if (!page || page.isClosed?.()) return false;
+    const snapshot = await this.readPageSnapshot();
+    if (
+      !looksLikeChallengePageHtml(snapshot.html) &&
+      !/just a moment/i.test(String(snapshot.title || ""))
+    ) {
+      return false;
+    }
+    const extraWaitMs = Math.max(6_000, Math.min(18_000, timeoutMs));
+    await page.waitForTimeout(extraWaitMs).catch(() => {});
+    if (typeof page.waitForLoadState === "function") {
+      await page.waitForLoadState("networkidle", {
+        timeout: Math.min(extraWaitMs, 10_000),
+      }).catch(() => {});
+    }
+    await this.drainDomCandidates();
+    if (this.pendingTasks.size) {
+      await Promise.allSettled(Array.from(this.pendingTasks));
+    }
+    const after = await this.readPageSnapshot();
+    return !looksLikeChallengePageHtml(after.html) && !/just a moment/i.test(String(after.title || ""));
   }
 
   async refreshEmbedRuntime(reason: string) {
@@ -1822,6 +1951,7 @@ class LiveEmbedSession {
       }).catch(() => {});
     }
     await page.waitForTimeout(Math.max(2_000, Math.min(12_000, SESSION_WAIT_MS)));
+    await this.waitOutChallengeIfNeeded(Math.min(18_000, timeoutMs)).catch(() => false);
     await this.drainDomCandidates();
     if (!this.candidates.size) {
       await page.waitForTimeout(Math.min(6_000, SESSION_RETRY_WAIT_MS));
