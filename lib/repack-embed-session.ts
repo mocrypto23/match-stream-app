@@ -782,6 +782,7 @@ function ensureSessionCleanupTimer() {
 function enforceSessionCapacity(targetSize = SESSION_MAX_COUNT) {
   if (sessions.size <= targetSize) return;
   const overflow = [...sessions.values()]
+    .filter((session) => session.state === "closed" || session.isIdle())
     .sort((left, right) => left.lastTouchedAt - right.lastTouchedAt)
     .slice(0, Math.max(0, sessions.size - targetSize));
   for (const session of overflow) {
@@ -1149,6 +1150,10 @@ class LiveEmbedSession {
 
   isIdle(now = Date.now()) {
     return now - this.lastTouchedAt > SESSION_IDLE_TTL_MS;
+  }
+
+  isEvictable(now = Date.now()) {
+    return this.state === "closed" || this.isIdle(now);
   }
 
   newestCandidateAgeMs(now = Date.now()) {
@@ -2684,6 +2689,7 @@ function cleanupIdleSessions() {
     return;
   }
   const overflow = [...sessions.values()]
+    .filter((session) => session.isEvictable(now))
     .sort((left, right) => left.lastTouchedAt - right.lastTouchedAt)
     .slice(0, sessions.size - SESSION_MAX_COUNT);
   for (const session of overflow) {
