@@ -1181,40 +1181,12 @@ export async function GET(req: Request, ctx: Ctx) {
     row: payload,
     repackBaseUrl: repackFlags.publicBaseUrl,
   });
-  const matchWindow = computeMatchWindowState({
-    nowMs: Date.now(),
-    matchStartMs: parseMatchStartMs(payload.match_start),
-    config: getMatchWindowConfig(),
-  });
   if (streamMode === "r2_strict") {
     const bootstrapUiServers = getBootstrapPrimeUiServers(payload).filter((uiServer) => {
       const entry = r2Status?.servers?.find((item) => item.uiServer === uiServer);
       return shouldBootstrapStrictUiServer(entry);
     });
-    const hasReadyServer = !!r2Status?.servers?.some((entry) => entry.state === "ready");
-    const hasRuntimeDrivenBootstrap = bootstrapUiServers.some((uiServer) => {
-      const entry = r2Status?.servers?.find((item) => item.uiServer === uiServer);
-      return isSessionDrivenStrictStatusEntry(entry);
-    });
-    const shouldRunSyncBootstrap = bootstrapUiServers.length && (!hasReadyServer || matchWindow.inWindow || hasRuntimeDrivenBootstrap);
-    if (shouldRunSyncBootstrap) {
-      const syncStatus = await runBootstrapPrimeSync(req, Number(payload.id), bootstrapUiServers);
-      if (syncStatus?.servers?.length) {
-        r2Status = syncStatus;
-      }
-      if (matchWindow.inWindow || hasRuntimeDrivenBootstrap) {
-        const settledStatus = await waitForBootstrapSettle({
-          matchId: Number(payload.id),
-          uiServers: bootstrapUiServers,
-          row: payload,
-          repackBaseUrl: repackFlags.publicBaseUrl,
-          initialStatus: r2Status,
-        });
-        if (settledStatus?.servers?.length) {
-          r2Status = settledStatus;
-        }
-      }
-    } else if (bootstrapUiServers.length && queueBootstrapPrime(req, Number(payload.id), bootstrapUiServers)) {
+    if (bootstrapUiServers.length && queueBootstrapPrime(req, Number(payload.id), bootstrapUiServers)) {
       r2Status = withQueuedBootstrapStatus(r2Status, payload, bootstrapUiServers);
     }
   }
