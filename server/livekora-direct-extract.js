@@ -35,7 +35,6 @@ function hasMediaSegments(manifestText, baseUrl) {
       continue;
     }
     if (trimmed.startsWith("#")) {
-      if (!trimmed.startsWith("#EXT-X-STREAM-INF")) previousExtInf = false;
       continue;
     }
     try {

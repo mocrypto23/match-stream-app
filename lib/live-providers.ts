@@ -181,7 +181,6 @@ function hasMediaSegments(manifestText: string, baseUrl: string) {
       continue;
     }
     if (trimmed.startsWith("#")) {
-      if (!trimmed.startsWith("#EXT-X-STREAM-INF")) previousExtInf = false;
       continue;
     }
     const absolute = resolveManifestUrl(trimmed, baseUrl);
