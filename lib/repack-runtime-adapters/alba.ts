@@ -224,27 +224,24 @@ async function extractDirectLivekoraManifest(
       await Promise.race([foundPromise, page.waitForTimeout(Math.max(4_000, DIRECT_LIVEKORA_BROWSER_TIMEOUT_MS - 2_000))]);
 
       if (!manifestBody && manifestUrl) {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 8_000);
-        try {
-          const response = await fetch(manifestUrl, {
-            method: "GET",
-            cache: "no-store",
-            redirect: "follow",
-            signal: controller.signal,
-            headers: {
-              accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
-              referer: referrerUrl,
-              origin: new URL(referrerUrl).origin,
-            },
-          });
-          const body = await response.text().catch(() => "");
-          if (response.ok && hasMediaSegments(body, response.url || manifestUrl)) {
-            manifestUrl = normalizeHttpUrl(response.url || manifestUrl) || manifestUrl;
-            manifestBody = body;
-          }
-        } finally {
-          clearTimeout(timeoutId);
+        const browserFetched = await page
+          .evaluate(async (url) => {
+            const response = await fetch(url, {
+              method: "GET",
+              credentials: "include",
+              cache: "no-store",
+              redirect: "follow",
+            });
+            return {
+              ok: response.ok,
+              url: response.url || url,
+              body: await response.text().catch(() => ""),
+            };
+          }, manifestUrl)
+          .catch(() => null);
+        if (browserFetched?.ok && hasMediaSegments(browserFetched.body, browserFetched.url || manifestUrl)) {
+          manifestUrl = normalizeHttpUrl(browserFetched.url || manifestUrl) || manifestUrl;
+          manifestBody = browserFetched.body;
         }
       }
 
@@ -269,27 +266,24 @@ async function extractDirectLivekoraManifest(
       }
 
       if (!manifestBody && manifestUrl) {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 8_000);
-        try {
-          const response = await fetch(manifestUrl, {
-            method: "GET",
-            cache: "no-store",
-            redirect: "follow",
-            signal: controller.signal,
-            headers: {
-              accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
-              referer: referrerUrl,
-              origin: new URL(referrerUrl).origin,
-            },
-          });
-          const body = await response.text().catch(() => "");
-          if (response.ok && hasMediaSegments(body, response.url || manifestUrl)) {
-            manifestUrl = normalizeHttpUrl(response.url || manifestUrl) || manifestUrl;
-            manifestBody = body;
-          }
-        } finally {
-          clearTimeout(timeoutId);
+        const browserFetched = await page
+          .evaluate(async (url) => {
+            const response = await fetch(url, {
+              method: "GET",
+              credentials: "include",
+              cache: "no-store",
+              redirect: "follow",
+            });
+            return {
+              ok: response.ok,
+              url: response.url || url,
+              body: await response.text().catch(() => ""),
+            };
+          }, manifestUrl)
+          .catch(() => null);
+        if (browserFetched?.ok && hasMediaSegments(browserFetched.body, browserFetched.url || manifestUrl)) {
+          manifestUrl = normalizeHttpUrl(browserFetched.url || manifestUrl) || manifestUrl;
+          manifestBody = browserFetched.body;
         }
       }
 
