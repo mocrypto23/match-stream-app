@@ -85,15 +85,23 @@ function buildAlbaVariants(sourceUrl: string) {
       .filter(Boolean);
     const slug = (parts[0] === "albaplayer" ? parts[1] : parts[0] || "").toLowerCase();
     if (!slug) return [parsed.toString()];
-    const variants = new Set<string>([parsed.toString()]);
+    const variants: string[] = [];
+    const pushVariant = (value: string) => {
+      const normalized = normalizeHttpUrl(value);
+      if (!normalized || variants.includes(normalized)) return;
+      variants.push(normalized);
+    };
     for (const origin of originVariants) {
-      variants.add(`${origin}/${slug}/`);
-      variants.add(`${origin}/albaplayer/${slug}/`);
+      pushVariant(`${origin}/${slug}/`);
+    }
+    pushVariant(parsed.toString());
+    for (const origin of originVariants) {
+      pushVariant(`${origin}/albaplayer/${slug}/`);
       for (const serv of ["2", "5", "1", "0", "3", "4"]) {
-        variants.add(`${origin}/albaplayer/${slug}/?serv=${serv}`);
+        pushVariant(`${origin}/albaplayer/${slug}/?serv=${serv}`);
       }
     }
-    return Array.from(variants);
+    return variants;
   } catch {
     return [String(sourceUrl || "").trim()].filter(Boolean);
   }

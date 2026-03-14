@@ -274,8 +274,21 @@ function pickPreferredDirectPlaybackUrl(rawUrl: string) {
   if (!isValidHttpUrl(rawUrl)) return rawUrl;
   try {
     const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
     const path = String(parsed.pathname || "").toLowerCase();
     if (!path.includes("/albaplayer/") && !path.includes("/alba.php")) return parsed.toString();
+    if (hostMatchesAnySuffix(host, [...LIVEKORA_FAMILY_BASE_HOSTS])) {
+      const pathParts = String(parsed.pathname || "")
+        .split("/")
+        .map((item) => item.trim())
+        .filter(Boolean);
+      const slug = String(pathParts[0] === "albaplayer" ? pathParts[1] || "" : pathParts[0] || "").trim();
+      if (slug) {
+        parsed.pathname = `/${slug}/`;
+        parsed.search = "";
+        return parsed.toString();
+      }
+    }
     const fallbackServ = path.includes("/ad-sport-2/") ? "5" : "2";
     if (String(parsed.searchParams.get("serv") || "").trim() === fallbackServ) return parsed.toString();
     parsed.searchParams.set("serv", fallbackServ);
