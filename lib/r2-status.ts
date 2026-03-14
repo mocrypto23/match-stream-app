@@ -8,7 +8,8 @@ import {
   type SlotServerId,
 } from "./server-source-policy";
 import type { MatchR2Status, R2ServerState, R2StatusServerEntry } from "./r2-status-types";
-import { buildRepackGatewayManifestUrl } from "./repack-ingest-gateway";
+import { extractLiveEmbedSessionSnapshot } from "./repack-embed-session";
+import { resolveInternalPlayerOrigin } from "./repack-ingest-gateway";
 import { getRepackSeedRuntimeState } from "./repack-runtime-state";
 import type { StreamMode } from "./stream-mode";
 import { computeMatchWindowState, getMatchWindowConfig, parseMatchStartMs } from "./match-window";
@@ -406,63 +407,46 @@ async function probeR2Playlist(playlistUrl: string, timeoutMs: number): Promise<
   }
 }
 
-async function probeSessionManifest(matchId: number, slotServer: SlotServerId, timeoutMs: number): Promise<SessionManifestProbeResult> {
-  const targetUrl = buildRepackGatewayManifestUrl({
-    matchId,
-    slotServer,
-  });
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+async function probeSessionManifest(
+  sourceUrl: string,
+  slotServer: SlotServerId,
+  timeoutMs: number
+): Promise<SessionManifestProbeResult> {
   try {
-    const response = await fetch(targetUrl, {
-      method: "GET",
-      cache: "no-store",
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        accept: "application/vnd.apple.mpegurl,application/x-mpegurl,application/json,text/plain,*/*",
-      },
+    const snapshot = await extractLiveEmbedSessionSnapshot({
+      sourceUrl,
+      requestOrigin: resolveInternalPlayerOrigin(),
+      slotServerId: slotServer,
+      timeoutMs,
     });
-    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
-    const runtimeAdapter = String(response.headers.get("x-repack-runtime-adapter") || "").trim() || null;
-    const body = await response.text().catch(() => "");
-    if (response.ok) {
-      const looksLikeManifest =
-        body.includes("#EXTM3U") ||
-        contentType.includes("application/vnd.apple.mpegurl") ||
-        contentType.includes("application/x-mpegurl");
-      if (looksLikeManifest) {
-        return {
-          state: "ready",
-          reason: "session-manifest-ready",
-          resolverState: "ok",
-          recoverable: true,
-          adapter: runtimeAdapter,
-        };
-      }
+    const candidates = Array.isArray(snapshot?.candidates) ? snapshot.candidates : [];
+    const manifestCandidates = candidates.filter((candidate) => String(candidate?.manifestBody || "").includes("#EXTM3U"));
+    if (manifestCandidates.length) {
       return {
-        state: "warming",
-        reason: "session-manifest-non-hls",
-        resolverState: "probe-failed",
+        state: "ready",
+        reason: "session-manifest-ready",
+        resolverState: "ok",
         recoverable: true,
-        adapter: runtimeAdapter,
+        adapter: null,
       };
     }
-
-    let payload: Record<string, unknown> | null = null;
-    if (contentType.includes("application/json")) {
-      payload = JSON.parse(body || "null") as Record<string, unknown> | null;
+    if (candidates.length) {
+      return {
+        state: "warming",
+        reason: snapshot?.ok ? "session-manifest-candidates" : String(snapshot?.error || "session-manifest-candidates"),
+        resolverState: "probe-failed",
+        recoverable: true,
+        adapter: null,
+      };
     }
-    const extractor = payload && typeof payload.extractor === "object" && payload.extractor ? (payload.extractor as Record<string, unknown>) : null;
-    const error = String((payload && "error" in payload ? payload.error : "") || "").trim() || `session-manifest-http-${response.status || 0}`;
-    const adapter = String((extractor && "adapter" in extractor ? extractor.adapter : runtimeAdapter) || "").trim() || null;
+    const error = String(snapshot?.error || "").trim() || "session-manifest-empty";
     if (error.includes("missing-source")) {
       return {
         state: "down",
         reason: "missing-source",
         resolverState: "missing-source",
         recoverable: false,
-        adapter,
+        adapter: null,
       };
     }
     if (error.includes("source-not-allowed")) {
@@ -471,7 +455,7 @@ async function probeSessionManifest(matchId: number, slotServer: SlotServerId, t
         reason: "source-not-allowed",
         resolverState: "unknown",
         recoverable: false,
-        adapter,
+        adapter: null,
       };
     }
     if (error.includes("no-candidate")) {
@@ -480,7 +464,7 @@ async function probeSessionManifest(matchId: number, slotServer: SlotServerId, t
         reason: error,
         resolverState: "no-candidate",
         recoverable: true,
-        adapter,
+        adapter: null,
       };
     }
     return {
@@ -488,7 +472,7 @@ async function probeSessionManifest(matchId: number, slotServer: SlotServerId, t
       reason: error,
       resolverState: "probe-failed",
       recoverable: true,
-      adapter,
+      adapter: null,
     };
   } catch {
     return {
@@ -498,8 +482,6 @@ async function probeSessionManifest(matchId: number, slotServer: SlotServerId, t
       recoverable: true,
       adapter: null,
     };
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 
@@ -651,7 +633,7 @@ export async function buildMatchR2Status(input: {
         !recentSeedState.accepted &&
         nowMs - recentSeedState.updatedAt <= DEFAULT_SEED_WARMING_WINDOW_MS;
       const agentSignal = deriveAgentSignal(agentJob, nowMs);
-      const sessionProbe = await probeSessionManifest(matchId, slotServer, Math.max(900, Math.min(2600, probeTimeoutMs)));
+      const sessionProbe = await probeSessionManifest(sourceUrl, slotServer, Math.max(1500, Math.min(5000, probeTimeoutMs * 2)));
       const allowRuntimeDrivenStatus =
         sessionProbe.state !== "down" ||
         !!agentSignal ||
