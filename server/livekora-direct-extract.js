@@ -140,7 +140,7 @@ function buildUpstreamFetchHeaders(requestHeaders, referrerUrl, accept) {
 
 async function fetchManifestWithHeaders(manifestUrl, requestHeaders, referrerUrl) {
   const normalizedManifestUrl = normalizeHttpUrl(manifestUrl);
-  if (!normalizedManifestUrl) return null;
+  if (!normalizedManifestUrl) return { finalUrl: "", manifestBody: "", error: "invalid-manifest-url" };
   const headers = buildUpstreamFetchHeaders(
     requestHeaders,
     referrerUrl,
@@ -148,24 +148,34 @@ async function fetchManifestWithHeaders(manifestUrl, requestHeaders, referrerUrl
   );
 
   const fetchText = async (targetUrl) => {
-    const response = await axios.get(targetUrl, {
-      responseType: "text",
-      timeout: 15000,
-      maxRedirects: 5,
-      validateStatus: () => true,
-      headers,
-    });
-    if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) return null;
-    const body = String(response.data || "");
-    return body.trim() ? body : null;
+    try {
+      const response = await axios.get(targetUrl, {
+        responseType: "text",
+        timeout: 15000,
+        maxRedirects: 5,
+        validateStatus: () => true,
+        headers,
+      });
+      if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) {
+        return { body: "", error: `http-${Number(response.status || 0)}` };
+      }
+      const body = String(response.data || "");
+      return { body: body.trim() ? body : "", error: body.trim() ? "" : "empty-body" };
+    } catch (error) {
+      return { body: "", error: error instanceof Error ? error.message : String(error || "axios-fetch-failed") };
+    }
   };
 
-  let body = await fetchText(normalizedManifestUrl);
-  if (!body || !/^\s*#extm3u/m.test(body)) return null;
+  const primary = await fetchText(normalizedManifestUrl);
+  let body = primary.body;
+  if (!body || !/^\s*#extm3u/m.test(body)) {
+    return { finalUrl: normalizedManifestUrl, manifestBody: "", error: primary.error || "not-manifest" };
+  }
   if (hasMediaSegments(body, normalizedManifestUrl)) {
     return {
       finalUrl: normalizedManifestUrl,
       manifestBody: body,
+      error: "",
     };
   }
 
@@ -174,13 +184,18 @@ async function fetchManifestWithHeaders(manifestUrl, requestHeaders, referrerUrl
     return {
       finalUrl: normalizedManifestUrl,
       manifestBody: body,
+      error: "",
     };
   }
-  const variantBody = await fetchText(variantUrl);
-  if (!variantBody || !/^\s*#extm3u/m.test(variantBody)) return null;
+  const variant = await fetchText(variantUrl);
+  const variantBody = variant.body;
+  if (!variantBody || !/^\s*#extm3u/m.test(variantBody)) {
+    return { finalUrl: variantUrl, manifestBody: "", error: variant.error || "variant-not-manifest" };
+  }
   return {
     finalUrl: variantUrl,
     manifestBody: variantBody,
+    error: "",
   };
 }
 
@@ -476,6 +491,7 @@ async function main() {
 
       let finalManifestUrl = lastManifestUrl;
       let finalManifestBody = lastManifestBody;
+      let helperFetchError = "";
       if (finalManifestUrl && !finalManifestBody) {
         try {
           const fetchedManifest = await fetchManifestWithHeaders(
@@ -483,11 +499,14 @@ async function main() {
             lastManifestRequestHeaders,
             lastReferrerUrl || lastPlaybackUrl || sourceUrl
           );
+          helperFetchError = String((fetchedManifest && fetchedManifest.error) || "").trim();
           if (fetchedManifest && fetchedManifest.finalUrl && fetchedManifest.manifestBody) {
             finalManifestUrl = fetchedManifest.finalUrl;
             finalManifestBody = fetchedManifest.manifestBody;
           }
-        } catch {}
+        } catch (error) {
+          helperFetchError = error instanceof Error ? error.message : String(error || "helper-fetch-failed");
+        }
       }
       console.log(
         JSON.stringify({
@@ -498,6 +517,7 @@ async function main() {
           referrerUrl: lastReferrerUrl || normalizeHttpUrl(page.url()) || sourceUrl,
           manifestRequestHeaders: lastManifestRequestHeaders,
           playbackUrl: lastPlaybackUrl || sourceUrl,
+          helperFetchError,
         })
       );
     }
