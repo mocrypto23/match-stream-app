@@ -58,7 +58,6 @@ async function main() {
   let manifestBody = "";
   let referrerUrl = channelUrl;
   let resolveFound = null;
-  const pendingResponseReads = new Set();
   const foundPromise = new Promise((resolve) => {
     resolveFound = resolve;
   });
@@ -74,6 +73,26 @@ async function main() {
         "accept-language": "ar,en-US;q=0.9,en;q=0.8",
       },
     });
+    await context.route("**/*", async (route) => {
+      const requestUrl = normalizeHttpUrl(route.request().url());
+      if (!requestUrl || !/\.m3u8(?:$|[?#])|\/hls\/|\/stream\/|\/live\/|amazonaws/i.test(requestUrl)) {
+        await route.continue().catch(() => {});
+        return;
+      }
+      try {
+        const response = await route.fetch();
+        const finalUrl = normalizeHttpUrl(response.url() || requestUrl) || requestUrl;
+        const body = await response.text().catch(() => "");
+        if (!manifestBody && body.trim() && hasMediaSegments(body, finalUrl)) {
+          manifestUrl = finalUrl;
+          manifestBody = body;
+          if (resolveFound) resolveFound();
+        }
+        await route.fulfill({ response }).catch(() => {});
+      } catch {
+        await route.continue().catch(() => {});
+      }
+    });
     const page = await context.newPage();
 
     page.on("console", (message) => {
@@ -83,22 +102,6 @@ async function main() {
       if (candidate) {
         manifestUrl = candidate;
       }
-    });
-
-    page.on("response", (response) => {
-      const task = (async () => {
-        try {
-          const url = normalizeHttpUrl(response.url());
-          if (!url || !/\.m3u8(?:$|[?#])|\/hls\/|\/stream\/|\/live\/|amazonaws/i.test(url)) return;
-          const body = await response.text().catch(() => "");
-          if (!body.trim() || !hasMediaSegments(body, url)) return;
-          manifestUrl = url;
-          manifestBody = body;
-          if (resolveFound) resolveFound();
-        } catch {}
-      })();
-      pendingResponseReads.add(task);
-      task.finally(() => pendingResponseReads.delete(task));
     });
 
     await page.goto(channelUrl, {
@@ -178,10 +181,6 @@ async function main() {
           }
         }
       }
-    }
-
-    if (pendingResponseReads.size) {
-      await Promise.allSettled(Array.from(pendingResponseReads));
     }
 
     await page.close().catch(() => {});
