@@ -1,9 +1,14 @@
+import { fetchLiveEmbedText } from "@/lib/repack-embed-session";
+import { extractCandidatesFromText, isLikelyAlbaLandingUrl } from "@/lib/repack-ingest-resolver";
 import { getSourceFamilyForSlotServer } from "@/lib/server-source-policy";
 
 import {
   DEFAULT_RUNTIME_MANIFEST_MAX_AGE_MS,
   buildSessionOwnedRuntimeAdapter,
+  primeRuntimeHint,
   type RuntimeAdapter,
+  type RuntimeAdapterInput,
+  type RuntimeHintCandidate,
 } from "./shared";
 
 function looksLikeAlbaSource(rawUrl: string) {
@@ -14,6 +19,136 @@ function looksLikeAlbaSource(rawUrl: string) {
   } catch {
     return false;
   }
+}
+
+function normalizeHttpUrl(rawUrl: string) {
+  try {
+    const parsed = new URL(String(rawUrl || "").trim());
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.toString() : "";
+  } catch {
+    return "";
+  }
+}
+
+function looksLikeStreamishUrl(rawUrl: string) {
+  try {
+    const parsed = new URL(String(rawUrl || "").trim());
+    const pathname = String(parsed.pathname || "").toLowerCase();
+    const search = String(parsed.search || "").toLowerCase();
+    return (
+      pathname.includes(".m3u8") ||
+      pathname.includes("/hls/") ||
+      pathname.includes("/stream/") ||
+      pathname.includes("/live/") ||
+      pathname.includes("/manifest/") ||
+      pathname.includes("/kooora/") ||
+      search.includes("token=") ||
+      search.includes("sid=") ||
+      search.includes("session")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function buildAlbaVariants(sourceUrl: string) {
+  try {
+    const parsed = new URL(String(sourceUrl || "").trim());
+    const host = String(parsed.hostname || "").toLowerCase();
+    if (
+      !host.endsWith("sportsurges.cc") &&
+      host !== "sportsurges.cc" &&
+      !host.endsWith("livekora.vip") &&
+      host !== "livekora.vip" &&
+      !host.endsWith("koooralive.click") &&
+      host !== "koooralive.click" &&
+      !host.endsWith("kooraxx.com") &&
+      host !== "kooraxx.com"
+    ) {
+      return [parsed.toString()];
+    }
+    const origin = parsed.origin;
+    const parts = String(parsed.pathname || "")
+      .split("/")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const slug = (parts[0] === "albaplayer" ? parts[1] : parts[0] || "").toLowerCase();
+    if (!slug) return [parsed.toString()];
+    const variants = new Set<string>([parsed.toString(), `${origin}/${slug}/`, `${origin}/albaplayer/${slug}/`]);
+    for (const serv of ["2", "5", "1", "0", "3", "4"]) {
+      variants.add(`${origin}/albaplayer/${slug}/?serv=${serv}`);
+    }
+    return Array.from(variants);
+  } catch {
+    return [String(sourceUrl || "").trim()].filter(Boolean);
+  }
+}
+
+function uniqHints(candidates: RuntimeHintCandidate[]) {
+  const out: RuntimeHintCandidate[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const targetUrl = String(candidate.targetUrl || "").trim();
+    const fetchUrl = String(candidate.fetchUrl || "").trim();
+    const key = `${targetUrl}|${fetchUrl}`;
+    if (!targetUrl || seen.has(key)) continue;
+    seen.add(key);
+    out.push(candidate);
+  }
+  return out;
+}
+
+async function deriveAlbaHintCandidates(input: RuntimeAdapterInput) {
+  const queue = buildAlbaVariants(input.sourceUrl).map((url) => ({
+    url,
+    depth: 0,
+    referrerUrl: input.sourceUrl,
+  }));
+  const visited = new Set<string>();
+  const derived: RuntimeHintCandidate[] = [];
+
+  while (queue.length && visited.size < 6 && derived.length < 12) {
+    const current = queue.shift();
+    if (!current) continue;
+    const pageUrl = normalizeHttpUrl(current.url);
+    if (!pageUrl || visited.has(pageUrl)) continue;
+    visited.add(pageUrl);
+
+    const fetched = await fetchLiveEmbedText({
+      sourceUrl: input.sourceUrl,
+      requestOrigin: input.internalOrigin,
+      slotServerId: input.slotServer,
+      targetUrl: pageUrl,
+      fetchUrl: pageUrl,
+      referrerUrl: current.referrerUrl,
+      timeoutMs: 8_000,
+    }).catch(() => null);
+    const body = String(fetched?.body || "").trim();
+    const finalUrl = String(fetched?.finalUrl || pageUrl).trim() || pageUrl;
+    if (!body) continue;
+
+    for (const rawCandidate of extractCandidatesFromText(body, finalUrl)) {
+      const candidate = normalizeHttpUrl(rawCandidate);
+      if (!candidate || candidate.includes("/api/embed-proxy")) continue;
+      if (isLikelyAlbaLandingUrl(candidate) && current.depth < 2) {
+        queue.push({
+          url: candidate,
+          depth: current.depth + 1,
+          referrerUrl: finalUrl,
+        });
+        continue;
+      }
+      if (!looksLikeStreamishUrl(candidate)) continue;
+      derived.push({
+        targetUrl: candidate,
+        fetchUrl: candidate,
+        referrerUrl: finalUrl,
+      });
+      if (derived.length >= 12) break;
+    }
+  }
+
+  return uniqHints(derived);
 }
 
 const albaBaseAdapter = buildSessionOwnedRuntimeAdapter(
@@ -41,6 +176,11 @@ export const albaRuntimeAdapter: RuntimeAdapter = {
   ...albaBaseAdapter,
   currentManifest: async (input, queryOptions) => {
     const peek = albaBaseAdapter.peekStatus(input);
+    if (peek.state !== "ready" && (!peek.currentSource || peek.sourceCount === 0)) {
+      for (const candidate of await deriveAlbaHintCandidates(input)) {
+        primeRuntimeHint(input, candidate);
+      }
+    }
     if (
       peek.state !== "ready" &&
       (peek.sourceCount > 1 || !peek.currentSource || peek.watchdogState === "stalled")
@@ -60,6 +200,17 @@ export const albaRuntimeAdapter: RuntimeAdapter = {
         forceRefresh: true,
         allowRotate: false,
       });
+    }
+    if (!resolved.ok) {
+      for (const candidate of await deriveAlbaHintCandidates(input)) {
+        if (!primeRuntimeHint(input, candidate)) continue;
+        resolved = await albaBaseAdapter.currentManifest(input, {
+          ...queryOptions,
+          forceRefresh: true,
+          allowRotate: false,
+        });
+        if (resolved.ok) break;
+      }
     }
     return resolved;
   },

@@ -1,9 +1,18 @@
+import { fetchLiveEmbedText } from "@/lib/repack-embed-session";
+import {
+  buildPlayerv2Candidates,
+  looksLikePlayerv2Html,
+  looksLikePlayerv2PageUrl,
+} from "@/lib/repack-ingest-resolver";
 import { getSourceFamilyForSlotServer } from "@/lib/server-source-policy";
 
 import {
   PLAYERV2_RUNTIME_MANIFEST_MAX_AGE_MS,
   buildSessionOwnedRuntimeAdapter,
+  primeRuntimeHint,
   type RuntimeAdapter,
+  type RuntimeAdapterInput,
+  type RuntimeHintCandidate,
 } from "./shared";
 
 function looksLikePlayerv2Source(rawUrl: string) {
@@ -13,6 +22,49 @@ function looksLikePlayerv2Source(rawUrl: string) {
   } catch {
     return false;
   }
+}
+
+function uniqHints(candidates: RuntimeHintCandidate[]) {
+  const out: RuntimeHintCandidate[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const targetUrl = String(candidate.targetUrl || "").trim();
+    const fetchUrl = String(candidate.fetchUrl || "").trim();
+    const key = `${targetUrl}|${fetchUrl}`;
+    if (!targetUrl || seen.has(key)) continue;
+    seen.add(key);
+    out.push(candidate);
+  }
+  return out;
+}
+
+async function derivePlayerv2HintCandidates(input: RuntimeAdapterInput) {
+  const referrerUrl = input.sourceUrl;
+  const fetched = await fetchLiveEmbedText({
+    sourceUrl: input.sourceUrl,
+    requestOrigin: input.internalOrigin,
+    slotServerId: input.slotServer,
+    targetUrl: input.sourceUrl,
+    fetchUrl: input.sourceUrl,
+    referrerUrl,
+    timeoutMs: 9_000,
+  }).catch(() => null);
+  const body = String(fetched?.body || "").trim();
+  const finalUrl = String(fetched?.finalUrl || input.sourceUrl).trim() || input.sourceUrl;
+  const contextUrl = looksLikePlayerv2PageUrl(finalUrl) ? finalUrl : input.sourceUrl;
+  if (!body || !looksLikePlayerv2Html(body)) return [] as RuntimeHintCandidate[];
+
+  const candidates = await buildPlayerv2Candidates(contextUrl, body, 5_500, input.internalOrigin).catch(() => []);
+  return uniqHints(
+    candidates
+      .filter((candidate) => candidate && !candidate.includes("/api/embed-proxy"))
+      .slice(0, 8)
+      .map((candidate) => ({
+        targetUrl: candidate,
+        fetchUrl: candidate,
+        referrerUrl: contextUrl,
+      }))
+  );
 }
 
 const playerv2BaseAdapter = buildSessionOwnedRuntimeAdapter(
@@ -39,6 +91,11 @@ export const playerv2RuntimeAdapter: RuntimeAdapter = {
   ...playerv2BaseAdapter,
   currentManifest: async (input, queryOptions) => {
     const peek = playerv2BaseAdapter.peekStatus(input);
+    if (peek.state !== "ready" && !peek.currentSource) {
+      for (const candidate of await derivePlayerv2HintCandidates(input)) {
+        primeRuntimeHint(input, candidate);
+      }
+    }
     if (
       peek.state !== "ready" &&
       (!peek.currentSource || peek.watchdogState === "stalled" || peek.watchdogState === "recovering")
@@ -61,6 +118,17 @@ export const playerv2RuntimeAdapter: RuntimeAdapter = {
         forceRefresh: true,
         allowRotate: false,
       });
+    }
+    if (!resolved.ok) {
+      for (const candidate of await derivePlayerv2HintCandidates(input)) {
+        if (!primeRuntimeHint(input, candidate)) continue;
+        resolved = await playerv2BaseAdapter.currentManifest(input, {
+          ...queryOptions,
+          forceRefresh: true,
+          allowRotate: false,
+        });
+        if (resolved.ok) break;
+      }
     }
     return resolved;
   },

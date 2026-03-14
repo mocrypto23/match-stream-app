@@ -66,6 +66,12 @@ type ActiveRuntimeHint = {
   updatedAt: number;
 };
 
+export type RuntimeHintCandidate = {
+  targetUrl: string;
+  fetchUrl?: string;
+  referrerUrl: string;
+};
+
 export type RuntimeAdapterKind = "playerv2" | "bein" | "livehd" | "alba" | "default";
 
 export type RuntimeAdapterInput = {
@@ -200,6 +206,19 @@ function writeActiveHint(input: RuntimeAdapterInput, resolved: { targetUrl: stri
     referrerUrl: resolved.referrerUrl,
     updatedAt: Date.now(),
   });
+}
+
+export function primeRuntimeHint(input: RuntimeAdapterInput, resolved: RuntimeHintCandidate) {
+  const targetUrl = String(resolved.targetUrl || "").trim();
+  const referrerUrl = String(resolved.referrerUrl || input.sourceUrl).trim() || input.sourceUrl;
+  const fetchUrl = String(resolved.fetchUrl || targetUrl).trim() || undefined;
+  if (!isValidHttpUrl(targetUrl) || !isValidHttpUrl(referrerUrl)) return false;
+  writeActiveHint(input, {
+    targetUrl,
+    fetchUrl: fetchUrl && isValidHttpUrl(fetchUrl) ? fetchUrl : undefined,
+    referrerUrl,
+  });
+  return true;
 }
 
 function resolveManifestUrl(raw: string, baseUrl: string) {
