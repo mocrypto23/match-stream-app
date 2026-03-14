@@ -1,6 +1,7 @@
 import axios from "axios";
 
 import { beinRuntimeAdapter } from "@/lib/repack-runtime-adapters/bein";
+import { rewriteManifestForSessionMirror } from "@/lib/repack-runtime-adapters/shared";
 import type {
   LiveStreamProvider,
   MatchRowLike,
@@ -25,6 +26,291 @@ type CachedDayPage = {
 };
 
 let cachedDayPage: CachedDayPage | null = null;
+
+function decodeMaybeBase64(rawValue: string) {
+  const value = String(rawValue || "").trim();
+  if (!value) return "";
+  try {
+    const decoded = Buffer.from(value, "base64").toString("utf8").trim();
+    return /^https?:\/\//i.test(decoded) ? decoded : value;
+  } catch {
+    return value;
+  }
+}
+
+function resolveManifestUrl(raw: string, baseUrl: string) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  try {
+    const absolute = new URL(value, baseUrl).toString();
+    return normalizeHttpUrl(absolute);
+  } catch {
+    return "";
+  }
+}
+
+function parseMediaSequence(manifestText: string) {
+  const match = String(manifestText || "").match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/i);
+  if (!match?.[1]) return null;
+  const value = Number.parseInt(match[1], 10);
+  return Number.isFinite(value) ? value : null;
+}
+
+function parseTargetDurationSec(manifestText: string) {
+  for (const line of String(manifestText || "").split(/\r?\n/)) {
+    const match = String(line || "").trim().match(/^#EXT-X-TARGETDURATION:(\d+(?:\.\d+)?)/i);
+    if (!match?.[1]) continue;
+    const value = Number.parseFloat(match[1]);
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+  return 0;
+}
+
+function hasMediaSegments(manifestText: string, baseUrl: string) {
+  let previousExtInf = false;
+  for (const line of String(manifestText || "").split(/\r?\n/)) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith("#EXTINF")) {
+      previousExtInf = true;
+      continue;
+    }
+    if (trimmed.startsWith("#")) continue;
+    const absolute = resolveManifestUrl(trimmed, baseUrl);
+    if (!absolute) continue;
+    if (previousExtInf) return true;
+    previousExtInf = false;
+  }
+  return false;
+}
+
+function pickVariantManifestUrl(manifestText: string, baseUrl: string) {
+  let pendingBandwidth = -1;
+  const variants: Array<{ url: string; bandwidth: number; order: number }> = [];
+  let order = 0;
+
+  for (const line of String(manifestText || "").split(/\r?\n/)) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith("#EXT-X-STREAM-INF")) {
+      const match = trimmed.match(/BANDWIDTH=(\d+)/i);
+      pendingBandwidth = match?.[1] ? Number.parseInt(match[1], 10) : -1;
+      continue;
+    }
+    if (trimmed.startsWith("#")) continue;
+    const absolute = resolveManifestUrl(trimmed, baseUrl);
+    if (!absolute || !absolute.toLowerCase().includes(".m3u8")) {
+      pendingBandwidth = -1;
+      continue;
+    }
+    variants.push({
+      url: absolute,
+      bandwidth: Number.isFinite(pendingBandwidth) ? pendingBandwidth : -1,
+      order,
+    });
+    order += 1;
+    pendingBandwidth = -1;
+  }
+
+  variants.sort((left, right) => {
+    if (right.bandwidth !== left.bandwidth) return right.bandwidth - left.bandwidth;
+    return left.order - right.order;
+  });
+  return variants[0]?.url || "";
+}
+
+function computeAlbaSubdomain() {
+  let value = Math.floor(Date.now() / 14_400_000) + Math.floor((Date.now() / 86_400_000) * 1.5);
+  let length = (value % 7) + 6;
+  const alphabet = "abcdefghijklmnopqrstuvwxyz";
+  let out = "";
+  while (length > 0) {
+    out += alphabet[value % 26] || "";
+    value = Math.floor(value / 26);
+    length -= 1;
+  }
+  return out;
+}
+
+async function fetchTextWithHeaders(url: string, referrerUrl: string) {
+  const targetUrl = normalizeHttpUrl(url);
+  const referer = normalizeHttpUrl(referrerUrl);
+  if (!targetUrl || !referer) return null;
+  const origin = new URL(referer).origin;
+  const response = await axios.get<string>(targetUrl, {
+    responseType: "text",
+    timeout: 14_000,
+    maxRedirects: 5,
+    validateStatus: () => true,
+    headers: {
+      "user-agent": DEFAULT_USER_AGENT,
+      accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
+      referer,
+      origin,
+    },
+  });
+  if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) return null;
+  const body = String(response.data || "").trim();
+  return body || null;
+}
+
+async function fetchBeinliveAjaxHtml(sourceUrl: string) {
+  const pageResponse = await axios.get<string>(sourceUrl, {
+    responseType: "text",
+    timeout: 14_000,
+    maxRedirects: 5,
+    validateStatus: () => true,
+    headers: {
+      "user-agent": DEFAULT_USER_AGENT,
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "accept-language": "ar,en;q=0.9",
+      referer: sourceUrl,
+    },
+  });
+  if (Number(pageResponse.status || 0) < 200 || Number(pageResponse.status || 0) >= 300) return null;
+
+  const pageHtml = String(pageResponse.data || "");
+  const ajaxUrl =
+    normalizeHttpUrl(String(pageHtml.match(/AlbaAjax\s*=\s*\{[^}]*"ajax_url":"([^"]+)"/i)?.[1] || "").trim()) ||
+    "https://www.bein-live.com/wp-admin/admin-ajax.php";
+  const matchId = String(pageHtml.match(/alba-ajax-servers-container[^>]*data-match-id=['"](\d+)['"]/i)?.[1] || "").trim();
+  if (!matchId) return null;
+
+  const serverResponse = await axios.post<string>(
+    ajaxUrl,
+    new URLSearchParams({
+      action: "load_match_servers",
+      match_id: matchId,
+    }).toString(),
+    {
+      responseType: "text",
+      timeout: 14_000,
+      maxRedirects: 5,
+      validateStatus: () => true,
+      headers: {
+        "user-agent": DEFAULT_USER_AGENT,
+        "content-type": "application/x-www-form-urlencoded",
+        referer: sourceUrl,
+        origin: new URL(sourceUrl).origin,
+      },
+    }
+  );
+
+  if (Number(serverResponse.status || 0) < 200 || Number(serverResponse.status || 0) >= 300) return null;
+  return String(serverResponse.data || "");
+}
+
+function extractBeinliveIframeUrl(serverHtml: string) {
+  const raw =
+    String(serverHtml.match(/data-vload=['"]([^'"]+)['"]/i)?.[1] || "").trim() ||
+    String(serverHtml.match(/data-initial=['"]([^'"]+)['"]/i)?.[1] || "").trim() ||
+    String(serverHtml.match(/data-id=['"]([^'"]+)['"]/i)?.[1] || "").trim() ||
+    String(serverHtml.match(/data-url=['"]([^'"]+)['"]/i)?.[1] || "").trim();
+  return normalizeHttpUrl(decodeMaybeBase64(raw));
+}
+
+function buildCandidateManifestUrls(input: {
+  iframeUrl: string;
+  iframeHtml: string;
+  currentSource?: string | null;
+}) {
+  const out: string[] = [];
+  const pushUnique = (rawUrl: string) => {
+    const normalized = normalizeHttpUrl(rawUrl);
+    if (!normalized || out.includes(normalized)) return;
+    out.push(normalized);
+  };
+
+  const currentSource = normalizeHttpUrl(String(input.currentSource || "").trim());
+  if (currentSource) {
+    pushUnique(currentSource);
+    if (/\/master\.m3u8(?:$|\?)/i.test(currentSource)) {
+      pushUnique(currentSource.replace(/\/master\.m3u8(?:$|\?)/i, "/live/index.m3u8"));
+    }
+  }
+
+  const domainsMatch = input.iframeHtml.match(/const\s+D\s*=\s*\[([^\]]+)\]/i);
+  const domains = (domainsMatch?.[1] || "")
+    .split(",")
+    .map((value) => value.replace(/['"`]/g, "").trim())
+    .filter(Boolean);
+  const channelKey =
+    String(input.iframeHtml.match(/\/hls\/([^/]+)\/master\.m3u8/i)?.[1] || "").trim() ||
+    String(currentSource.match(/\/hls\/([^/]+)\//i)?.[1] || "").trim();
+  const subdomain = computeAlbaSubdomain();
+
+  if (channelKey && domains.length) {
+    for (const domain of domains) {
+      pushUnique(`https://${subdomain}.${domain}/hls/${channelKey}/master.m3u8`);
+      pushUnique(`https://${subdomain}.${domain}/hls/${channelKey}/live/index.m3u8`);
+    }
+  }
+
+  return out;
+}
+
+async function resolveBeinliveIframeManifest(input: {
+  sourceUrl: string;
+  currentSource?: string | null;
+  internalOrigin: string;
+}) {
+  const serverHtml = await fetchBeinliveAjaxHtml(input.sourceUrl);
+  if (!serverHtml) return null;
+
+  const iframeUrl = extractBeinliveIframeUrl(serverHtml);
+  if (!iframeUrl) return null;
+
+  const iframeHtmlResponse = await axios.get<string>(iframeUrl, {
+    responseType: "text",
+    timeout: 14_000,
+    maxRedirects: 5,
+    validateStatus: () => true,
+    headers: {
+      "user-agent": DEFAULT_USER_AGENT,
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      referer: input.sourceUrl,
+      origin: new URL(input.sourceUrl).origin,
+    },
+  });
+  if (Number(iframeHtmlResponse.status || 0) < 200 || Number(iframeHtmlResponse.status || 0) >= 300) return null;
+  const iframeHtml = String(iframeHtmlResponse.data || "");
+
+  const candidates = buildCandidateManifestUrls({
+    iframeUrl,
+    iframeHtml,
+    currentSource: input.currentSource,
+  });
+  for (const candidateUrl of candidates) {
+    const candidateBody = await fetchTextWithHeaders(candidateUrl, iframeUrl).catch(() => null);
+    if (!candidateBody || !/^\s*#EXTM3U/im.test(candidateBody)) continue;
+
+    let finalUrl = candidateUrl;
+    let manifestBody = candidateBody;
+    if (!hasMediaSegments(manifestBody, finalUrl)) {
+      const variantUrl = pickVariantManifestUrl(manifestBody, finalUrl);
+      if (!variantUrl) continue;
+      const variantBody = await fetchTextWithHeaders(variantUrl, iframeUrl).catch(() => null);
+      if (!variantBody || !hasMediaSegments(variantBody, variantUrl)) continue;
+      finalUrl = variantUrl;
+      manifestBody = variantBody;
+    }
+
+    return {
+      manifestBody: rewriteManifestForSessionMirror(manifestBody, finalUrl, input.internalOrigin, input.sourceUrl, 1),
+      finalUrl,
+      targetUrl: finalUrl,
+      referrerUrl: iframeUrl,
+      playbackUrl: iframeUrl,
+      currentSource: finalUrl,
+      mediaSequence: parseMediaSequence(manifestBody),
+      targetDurationSec: parseTargetDurationSec(manifestBody),
+      candidatesFound: candidates.length,
+      candidatesTried: candidates.indexOf(candidateUrl) + 1,
+    };
+  }
+
+  return null;
+}
 
 function normalizeHttpUrl(rawUrl: string) {
   try {
@@ -203,16 +489,47 @@ export const beinliveProvider: LiveStreamProvider = {
   sourceSelector: pickBeinliveSourceUrl,
   isAllowedSource: isAllowedBeinliveSource,
   async extractCurrentManifest(input: ProviderContext, options) {
-    return mapManifestResult(
-      await beinRuntimeAdapter.currentManifest(
-        {
-          sourceUrl: input.sourceUrl,
-          slotServer: 1,
-          internalOrigin: input.internalOrigin,
-        },
-        options
-      )
+    const primaryResult = await beinRuntimeAdapter.currentManifest(
+      {
+        sourceUrl: input.sourceUrl,
+        slotServer: 1,
+        internalOrigin: input.internalOrigin,
+      },
+      options
     );
+    if (primaryResult.ok) {
+      return mapManifestResult(primaryResult);
+    }
+
+    if (/text-http-403|manifest-http-502|manifest-not-hls/i.test(String(primaryResult.error || ""))) {
+      const fallback = await resolveBeinliveIframeManifest({
+        sourceUrl: input.sourceUrl,
+        currentSource: primaryResult.currentSource,
+        internalOrigin: input.internalOrigin,
+      }).catch(() => null);
+      if (fallback) {
+        return {
+          ok: true,
+          manifestBody: fallback.manifestBody,
+          finalUrl: fallback.finalUrl,
+          targetUrl: fallback.targetUrl,
+          fetchUrl: fallback.finalUrl,
+          referrerUrl: fallback.referrerUrl,
+          playbackUrl: fallback.playbackUrl,
+          currentSource: fallback.currentSource,
+          mediaSequence: fallback.mediaSequence,
+          targetDurationSec: fallback.targetDurationSec,
+          refreshed: true,
+          rotated: primaryResult.rotated,
+          adapterKind: "bein",
+          candidatesFound: Math.max(primaryResult.candidatesFound, fallback.candidatesFound),
+          candidatesTried: primaryResult.candidatesTried + fallback.candidatesTried,
+          sessionOwned: true,
+        };
+      }
+    }
+
+    return mapManifestResult(primaryResult);
   },
   async fetchAsset(input) {
     return mapAssetResult(
