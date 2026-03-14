@@ -36,7 +36,7 @@ export async function bootstrapR2MirrorAgent(input: {
   ingestUrl: string;
 }) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 12_000);
+  const timeoutId = setTimeout(() => controller.abort(), 25_000);
   try {
     const response = await fetch(localAgentUrl("/bootstrap"), {
       method: "POST",
@@ -67,6 +67,15 @@ export async function bootstrapR2MirrorAgent(input: {
       reason: String(payload?.reason || (!response.ok ? `agent-http-${response.status}` : "")).trim() || null,
     };
   } catch (error) {
+    const fallbackStatus = await readR2MirrorAgentStatus(input.provider, input.matchId);
+    if (fallbackStatus?.exists) {
+      return {
+        ok: true,
+        accepted: true,
+        status: fallbackStatus,
+        reason: fallbackStatus.reason || "accepted",
+      };
+    }
     return {
       ok: false,
       accepted: false,
