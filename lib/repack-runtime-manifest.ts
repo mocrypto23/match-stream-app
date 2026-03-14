@@ -211,6 +211,11 @@ async function resolveRuntimeManifestForRequest(req: Request) {
       allowRotate,
     }
   );
+  const runtimePeek = adapter.peekStatus({
+    sourceUrl,
+    slotServer,
+    internalOrigin,
+  });
 
   if (resolved.ok) {
     return new Response(resolved.manifestBody, {
@@ -232,6 +237,13 @@ async function resolveRuntimeManifestForRequest(req: Request) {
         "x-repack-runtime-target-duration": String(resolved.targetDurationSec || 0),
         "x-repack-runtime-refreshed": resolved.refreshed ? "1" : "0",
         "x-repack-runtime-rotated": resolved.rotated ? "1" : "0",
+        "x-repack-runtime-path": runtimePeek.runtimePath || "",
+        "x-repack-runtime-source-count": String(runtimePeek.sourceCount || 0),
+        "x-repack-runtime-source-index": String(runtimePeek.sourceIndex ?? ""),
+        "x-repack-runtime-tab-index": String(runtimePeek.tabIndex ?? ""),
+        "x-repack-runtime-watchdog-state": runtimePeek.watchdogState || "",
+        "x-repack-runtime-last-refresh-reason": runtimePeek.lastRefreshReason || "",
+        "x-repack-runtime-last-rotate-reason": runtimePeek.lastRotateReason || "",
         "x-repack-extractor-candidates-found": String(resolved.candidatesFound),
         "x-repack-extractor-candidates-tried": String(resolved.candidatesTried),
       },
@@ -253,6 +265,13 @@ async function resolveRuntimeManifestForRequest(req: Request) {
         rotated: resolved.rotated,
         candidatesFound: resolved.candidatesFound,
         candidatesTried: resolved.candidatesTried,
+        runtimePath: runtimePeek.runtimePath || null,
+        sourceCount: runtimePeek.sourceCount || 0,
+        sourceIndex: runtimePeek.sourceIndex,
+        tabIndex: runtimePeek.tabIndex,
+        watchdogState: runtimePeek.watchdogState || "",
+        lastRefreshReason: runtimePeek.lastRefreshReason || "",
+        lastRotateReason: runtimePeek.lastRotateReason || "",
       },
     },
     { status: 502 }

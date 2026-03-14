@@ -15,7 +15,7 @@ function looksLikePlayerv2Source(rawUrl: string) {
   }
 }
 
-export const playerv2RuntimeAdapter: RuntimeAdapter = buildSessionOwnedRuntimeAdapter(
+const playerv2BaseAdapter = buildSessionOwnedRuntimeAdapter(
   "playerv2",
   (input) =>
     input.slotServer === 2 || looksLikePlayerv2Source(input.sourceUrl) || getSourceFamilyForSlotServer(input.slotServer) === "siiir",
@@ -24,8 +24,44 @@ export const playerv2RuntimeAdapter: RuntimeAdapter = buildSessionOwnedRuntimeAd
     candidateMaxAgeMs: PLAYERV2_RUNTIME_MANIFEST_MAX_AGE_MS,
     maxCandidatesToTry: 8,
     forceFreshManifest: true,
+    readyManifestMaxAgeMs: 10_000,
+    warmingRuntimeMaxAgeMs: 18_000,
+    warmingProgressMaxAgeMs: 12_000,
+    runtimeWatchdogReadyStates: ["healthy", "refreshing"],
+    runtimeWatchdogWarmingStates: ["recovering", "stalled", "refreshing"],
     preferUrlIncludes: ["/kooora/", "token=", "sid=", "nonce=", ".m3u8"],
     preferReferrerIncludes: ["/playerv2.php", "siiir", "yallashot"],
     preferManifestIncludes: ["/kooora/", "#extm3u"],
   }
 );
+
+export const playerv2RuntimeAdapter: RuntimeAdapter = {
+  ...playerv2BaseAdapter,
+  currentManifest: async (input, queryOptions) => {
+    const peek = playerv2BaseAdapter.peekStatus(input);
+    if (
+      peek.state !== "ready" &&
+      (!peek.currentSource || peek.watchdogState === "stalled" || peek.watchdogState === "recovering")
+    ) {
+      await playerv2BaseAdapter.refresh(input, "playerv2_preflight_refresh").catch(() => null);
+    }
+
+    let resolved = await playerv2BaseAdapter.currentManifest(input, {
+      ...queryOptions,
+      forceRefresh: queryOptions?.forceRefresh || peek.watchdogState === "stalled",
+    });
+    if (
+      !resolved.ok &&
+      queryOptions?.allowRotate !== false &&
+      /(?:403|404|empty|no-verified-manifest|media-sequence-unchanged)/i.test(String(resolved.error || ""))
+    ) {
+      await playerv2BaseAdapter.rotate(input, "playerv2_retry_rotate").catch(() => null);
+      resolved = await playerv2BaseAdapter.currentManifest(input, {
+        ...queryOptions,
+        forceRefresh: true,
+        allowRotate: false,
+      });
+    }
+    return resolved;
+  },
+};

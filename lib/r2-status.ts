@@ -8,8 +8,8 @@ import {
   type SlotServerId,
 } from "./server-source-policy";
 import type { MatchR2Status, R2ServerState, R2StatusServerEntry } from "./r2-status-types";
-import { peekLiveEmbedSessionState } from "./repack-embed-session";
 import { resolveInternalPlayerOrigin } from "./repack-ingest-gateway";
+import { pickRuntimeAdapter } from "./repack-runtime-adapters";
 import { getRepackSeedRuntimeState } from "./repack-runtime-state";
 import { computeMatchWindowState, getMatchWindowConfig, parseMatchStartMs } from "./match-window";
 
@@ -412,10 +412,15 @@ async function probeSessionManifest(
   timeoutMs: number
 ): Promise<SessionManifestProbeResult> {
   try {
-    const snapshot = peekLiveEmbedSessionState({
+    const adapter = pickRuntimeAdapter({
       sourceUrl,
-      requestOrigin: resolveInternalPlayerOrigin(),
-      slotServerId: slotServer,
+      slotServer,
+      internalOrigin: resolveInternalPlayerOrigin(),
+    });
+    const snapshot = adapter.peekStatus({
+      sourceUrl,
+      slotServer,
+      internalOrigin: resolveInternalPlayerOrigin(),
     });
     if (!snapshot) {
       return {
@@ -426,43 +431,32 @@ async function probeSessionManifest(
         adapter: null,
       };
     }
-    const lastTouchedAgeMs = Math.max(0, Date.now() - Number(snapshot.lastTouchedAt || 0));
-    const activeSession = lastTouchedAgeMs <= Math.max(6_000, timeoutMs * 2);
-    const activeManifestAgeMs =
-      Number.isFinite(snapshot.activeManifestUpdatedAt) && snapshot.activeManifestUpdatedAt > 0
-        ? Math.max(0, Date.now() - Number(snapshot.activeManifestUpdatedAt))
-        : null;
-    const hasRecentActiveManifest =
-      activeManifestAgeMs !== null && activeManifestAgeMs <= Math.max(6_000, timeoutMs * 2);
-    const hasRuntimeSource =
-      !!String(snapshot.runtimeActiveSource || snapshot.activeManifestUrl || "").trim() ||
-      (Array.isArray(snapshot.runtimeSources) && snapshot.runtimeSources.length > 0);
-    if (snapshot.freshManifestCount > 0 || hasRecentActiveManifest) {
+    if (snapshot.state === "ready") {
       return {
         state: "ready",
-        reason: hasRecentActiveManifest ? "session-runtime-active-manifest" : "session-manifest-ready",
+        reason: snapshot.reason,
         resolverState: "ok",
-        recoverable: true,
-        adapter: null,
+        recoverable: snapshot.recoverable,
+        adapter: snapshot.adapterKind,
       };
     }
-    if (snapshot.freshCandidateCount > 0 || (snapshot.candidateCount > 0 && activeSession) || hasRuntimeSource) {
+    if (snapshot.state === "warming") {
       return {
         state: "warming",
-        reason: hasRuntimeSource ? "session-runtime-source" : "session-manifest-candidates",
-        resolverState: "probe-failed",
-        recoverable: true,
-        adapter: null,
+        reason: snapshot.reason,
+        resolverState: snapshot.currentSource ? "ok" : "probe-failed",
+        recoverable: snapshot.recoverable,
+        adapter: snapshot.adapterKind,
       };
     }
-    const error = String(snapshot.lastError || "").trim() || (activeSession ? "session-manifest-active" : "session-manifest-idle");
+    const error = String(snapshot.lastError || snapshot.reason || "").trim() || "session-manifest-idle";
     if (error.includes("missing-source")) {
       return {
         state: "down",
         reason: "missing-source",
         resolverState: "missing-source",
         recoverable: false,
-        adapter: null,
+        adapter: snapshot.adapterKind,
       };
     }
     if (error.includes("source-not-allowed")) {
@@ -471,7 +465,7 @@ async function probeSessionManifest(
         reason: "source-not-allowed",
         resolverState: "unknown",
         recoverable: false,
-        adapter: null,
+        adapter: snapshot.adapterKind,
       };
     }
     if (error.includes("no-candidate")) {
@@ -480,16 +474,16 @@ async function probeSessionManifest(
         reason: error,
         resolverState: "no-candidate",
         recoverable: true,
-        adapter: null,
+        adapter: snapshot.adapterKind,
       };
     }
-    if (activeSession || String(snapshot.state || "") === "starting" || String(snapshot.state || "") === "running") {
+    if (snapshot.recoverable) {
       return {
         state: "warming",
         reason: error,
         resolverState: "probe-failed",
         recoverable: true,
-        adapter: null,
+        adapter: snapshot.adapterKind,
       };
     }
     return {
@@ -497,7 +491,7 @@ async function probeSessionManifest(
       reason: error,
       resolverState: "unknown",
       recoverable: false,
-      adapter: null,
+      adapter: snapshot.adapterKind,
     };
   } catch {
     return {

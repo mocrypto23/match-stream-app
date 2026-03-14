@@ -43,6 +43,11 @@ type RuntimeResolutionOptions = {
   preferUrlIncludes?: string[];
   preferReferrerIncludes?: string[];
   preferManifestIncludes?: string[];
+  readyManifestMaxAgeMs?: number;
+  warmingRuntimeMaxAgeMs?: number;
+  warmingProgressMaxAgeMs?: number;
+  runtimeWatchdogReadyStates?: string[];
+  runtimeWatchdogWarmingStates?: string[];
 };
 
 type RuntimeManifestQueryOptions = {
@@ -61,7 +66,7 @@ type ActiveRuntimeHint = {
   updatedAt: number;
 };
 
-export type RuntimeAdapterKind = "playerv2" | "bein" | "alba" | "default";
+export type RuntimeAdapterKind = "playerv2" | "bein" | "livehd" | "alba" | "default";
 
 export type RuntimeAdapterInput = {
   sourceUrl: string;
@@ -122,6 +127,35 @@ export type RuntimeControlResult = {
   runtimeState: LiveEmbedSessionRuntimeState | RuntimePeekState;
 };
 
+export type RuntimeAdapterPeekResult = {
+  state: "ready" | "warming" | "down";
+  reason: string;
+  recoverable: boolean;
+  adapterKind: RuntimeAdapterKind;
+  playbackUrl: string;
+  currentSource: string;
+  runtimePath: string;
+  sourceCount: number;
+  sourceIndex: number | null;
+  tabIndex: number | null;
+  mediaSequence: number | null;
+  targetDurationSec: number;
+  activeManifestAgeMs: number | null;
+  lastRefreshReason: string;
+  lastRefreshAt: number;
+  lastRotateReason: string;
+  lastRotateAt: number;
+  watchdogState: string;
+  lastRuntimeEvent: string;
+  lastRuntimeEventReason: string;
+  lastRuntimeEventAt: number;
+  freshManifestCount: number;
+  freshCandidateCount: number;
+  candidateCount: number;
+  lastError: string;
+  runtimeState: RuntimePeekState;
+};
+
 export type RuntimeAdapter = {
   kind: RuntimeAdapterKind;
   matches: (input: RuntimeAdapterInput) => boolean;
@@ -131,6 +165,7 @@ export type RuntimeAdapter = {
   rotate: (input: RuntimeAdapterInput, reason?: string) => Promise<RuntimeControlResult>;
   fetchAsset: (input: RuntimeAdapterInput & { assetUrl: string; referrerUrl?: string | null; timeoutMs?: number }) => ReturnType<typeof fetchLiveEmbedAsset>;
   peek: (input: RuntimeAdapterInput) => RuntimePeekState;
+  peekStatus: (input: RuntimeAdapterInput) => RuntimeAdapterPeekResult;
 };
 
 const activeRuntimeHints = new Map<string, ActiveRuntimeHint>();
@@ -672,6 +707,143 @@ async function currentSourceFromRuntimeState(
   };
 }
 
+function buildPeekStatus(
+  runtimeState: RuntimePeekState,
+  options: RuntimeResolutionOptions
+): RuntimeAdapterPeekResult {
+  const now = Date.now();
+  const readyManifestMaxAgeMs = Math.max(2_000, Number(options.readyManifestMaxAgeMs || options.candidateMaxAgeMs || 8_000));
+  const warmingRuntimeMaxAgeMs = Math.max(4_000, Number(options.warmingRuntimeMaxAgeMs || readyManifestMaxAgeMs * 2 || 16_000));
+  const warmingProgressMaxAgeMs = Math.max(
+    4_000,
+    Number(options.warmingProgressMaxAgeMs || Math.max(readyManifestMaxAgeMs, 8_000))
+  );
+  const activeManifestAgeMs =
+    Number.isFinite(Number(runtimeState?.activeManifestUpdatedAt || 0)) && Number(runtimeState?.activeManifestUpdatedAt || 0) > 0
+      ? Math.max(0, now - Number(runtimeState?.activeManifestUpdatedAt || 0))
+      : null;
+  const runtimeAgeMs =
+    Number.isFinite(Number(runtimeState?.runtimeUpdatedAt || 0)) && Number(runtimeState?.runtimeUpdatedAt || 0) > 0
+      ? Math.max(0, now - Number(runtimeState?.runtimeUpdatedAt || 0))
+      : null;
+  const progressAgeMs =
+    Number.isFinite(Number(runtimeState?.runtimeLastProgressAt || 0)) && Number(runtimeState?.runtimeLastProgressAt || 0) > 0
+      ? Math.max(0, now - Number(runtimeState?.runtimeLastProgressAt || 0))
+      : null;
+  const sourceCount = Math.max(
+    Number.parseInt(String(runtimeState?.runtimeSourceCount || 0), 10) || 0,
+    Array.isArray(runtimeState?.runtimeSources) ? runtimeState.runtimeSources.length : 0
+  );
+  const currentSource = String(runtimeState?.runtimeActiveSource || runtimeState?.activeManifestUrl || "").trim();
+  const watchdogState = String(runtimeState?.runtimeWatchdogState || "").trim().toLowerCase();
+  const readyWatchdogStates = new Set((options.runtimeWatchdogReadyStates || ["healthy"]).map((value) => String(value || "").toLowerCase()));
+  const warmingWatchdogStates = new Set(
+    (options.runtimeWatchdogWarmingStates || ["refreshing", "recovering", "stalled"]).map((value) => String(value || "").toLowerCase())
+  );
+  const lastError = String(runtimeState?.lastError || "").trim();
+  const base: Omit<RuntimeAdapterPeekResult, "state" | "reason" | "recoverable"> = {
+    adapterKind: options.adapterKind,
+    playbackUrl: String(runtimeState?.playbackUrl || "").trim(),
+    currentSource,
+    runtimePath: String(runtimeState?.runtimePath || "").trim(),
+    sourceCount,
+    sourceIndex:
+      Number.isFinite(Number(runtimeState?.runtimeSourceIndex)) ? Number(runtimeState?.runtimeSourceIndex) : null,
+    tabIndex: Number.isFinite(Number(runtimeState?.runtimeTabIndex)) ? Number(runtimeState?.runtimeTabIndex) : null,
+    mediaSequence:
+      Number.isFinite(Number(runtimeState?.activeMediaSequence)) && runtimeState?.activeMediaSequence !== null
+        ? Number(runtimeState?.activeMediaSequence)
+        : null,
+    targetDurationSec: Number.isFinite(Number(runtimeState?.activeTargetDurationSec))
+      ? Number(runtimeState?.activeTargetDurationSec)
+      : 0,
+    activeManifestAgeMs,
+    lastRefreshReason: String(runtimeState?.lastRefreshReason || "").trim(),
+    lastRefreshAt: Number.isFinite(Number(runtimeState?.lastRefreshAt)) ? Number(runtimeState?.lastRefreshAt) : 0,
+    lastRotateReason: String(runtimeState?.lastRotateReason || "").trim(),
+    lastRotateAt: Number.isFinite(Number(runtimeState?.lastRotateAt)) ? Number(runtimeState?.lastRotateAt) : 0,
+    watchdogState,
+    lastRuntimeEvent: String(runtimeState?.lastRuntimeEvent || "").trim(),
+    lastRuntimeEventReason: String(runtimeState?.lastRuntimeEventReason || "").trim(),
+    lastRuntimeEventAt: Number.isFinite(Number(runtimeState?.lastRuntimeEventAt)) ? Number(runtimeState?.lastRuntimeEventAt) : 0,
+    freshManifestCount: Math.max(0, Number.parseInt(String(runtimeState?.freshManifestCount || 0), 10) || 0),
+    freshCandidateCount: Math.max(0, Number.parseInt(String(runtimeState?.freshCandidateCount || 0), 10) || 0),
+    candidateCount: Math.max(0, Number.parseInt(String(runtimeState?.candidateCount || 0), 10) || 0),
+    lastError,
+    runtimeState,
+  };
+
+  if (!runtimeState) {
+    return {
+      ...base,
+      state: "down",
+      reason: "runtime-missing",
+      recoverable: false,
+    };
+  }
+
+  if (lastError.includes("missing-source")) {
+    return {
+      ...base,
+      state: "down",
+      reason: "missing-source",
+      recoverable: false,
+    };
+  }
+
+  if (
+    activeManifestAgeMs !== null &&
+    activeManifestAgeMs <= readyManifestMaxAgeMs &&
+    (base.mediaSequence !== null || readyWatchdogStates.has(watchdogState) || base.freshManifestCount > 0)
+  ) {
+    return {
+      ...base,
+      state: "ready",
+      reason: "runtime-active-manifest",
+      recoverable: true,
+    };
+  }
+
+  if (
+    base.freshManifestCount > 0 ||
+    (currentSource &&
+      runtimeAgeMs !== null &&
+      runtimeAgeMs <= warmingRuntimeMaxAgeMs &&
+      (warmingWatchdogStates.has(watchdogState) ||
+        readyWatchdogStates.has(watchdogState) ||
+        (progressAgeMs !== null && progressAgeMs <= warmingProgressMaxAgeMs)))
+  ) {
+    return {
+      ...base,
+      state: "warming",
+      reason: currentSource ? "runtime-source-active" : "runtime-manifest-fresh",
+      recoverable: true,
+    };
+  }
+
+  if (
+    base.freshCandidateCount > 0 ||
+    base.candidateCount > 0 ||
+    sourceCount > 0 ||
+    String(runtimeState?.state || "").trim().toLowerCase() === "starting" ||
+    String(runtimeState?.state || "").trim().toLowerCase() === "running"
+  ) {
+    return {
+      ...base,
+      state: "warming",
+      reason: lastError || "runtime-candidates-present",
+      recoverable: true,
+    };
+  }
+
+  return {
+    ...base,
+    state: "down",
+    reason: lastError || "runtime-idle",
+    recoverable: false,
+  };
+}
+
 export async function resolveRuntimeOwnedManifest(
   input: RuntimeAdapterInput,
   options: RuntimeResolutionOptions,
@@ -900,5 +1072,13 @@ export function buildSessionOwnedRuntimeAdapter(
         requestOrigin: input.internalOrigin,
         slotServerId: input.slotServer,
       }),
+    peekStatus: (input) => {
+      const runtimeState = peekLiveEmbedSessionState({
+        sourceUrl: input.sourceUrl,
+        requestOrigin: input.internalOrigin,
+        slotServerId: input.slotServer,
+      });
+      return buildPeekStatus(runtimeState, options);
+    },
   };
 }

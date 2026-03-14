@@ -1433,6 +1433,19 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number, s
   let lastProgressAt = Date.now();
   let lastRecoverAt = 0;
   let refreshingToken = false;
+  let lastRefreshReason = "";
+  let lastRefreshAt = 0;
+  let lastRotateReason = "";
+  let lastRotateAt = 0;
+  let lastRuntimeEvent = "boot";
+  let lastRuntimeEventReason = "";
+  let lastRuntimeEventAt = Date.now();
+
+  const noteRuntimeEvent = (event, reason = "") => {
+    lastRuntimeEvent = String(event || "").trim() || "unknown";
+    lastRuntimeEventReason = String(reason || "").trim();
+    lastRuntimeEventAt = Date.now();
+  };
 
   const emitDiag = (event, data) => {
     try {
@@ -1722,6 +1735,7 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number, s
     const now = Date.now();
     if (now - lastRecoverAt < 2500) return;
     lastRecoverAt = now;
+    noteRuntimeEvent("recover", reason);
     emitDiag("yalla_recover", { reason, idx: currentTabIndex, sourceIdx: currentSourceIndex });
     if (hls && typeof hls.startLoad === "function") {
       try { hls.startLoad(); } catch {}
@@ -1732,6 +1746,9 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number, s
   const refreshTabStream = (reason) => {
     if (refreshingToken || !currentPath) return false;
     refreshingToken = true;
+    lastRefreshReason = String(reason || "refresh");
+    lastRefreshAt = Date.now();
+    noteRuntimeEvent("refresh", reason);
     emitDiag("yalla_refresh_tab", { reason, path: currentPath, idx: currentTabIndex });
     playTab({ path: currentPath, label: "auto" }, currentTabIndex, true)
       .catch(() => {})
@@ -1746,6 +1763,9 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number, s
     currentSourceIndex = (currentSourceIndex + 1) % currentSources.length;
     networkRetryCount = 0;
     stallRecoverCount = 0;
+    lastRotateReason = String(reason || "rotate");
+    lastRotateAt = Date.now();
+    noteRuntimeEvent("rotate", reason);
     emitDiag("yalla_switch_source", { reason, idx: currentTabIndex, sourceIdx: currentSourceIndex });
     playCurrentSource().catch(() => {});
     return true;
@@ -1758,6 +1778,7 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number, s
     stallRecoverCount = 0;
     lastPlaybackTime = 0;
     lastProgressAt = Date.now();
+    noteRuntimeEvent("play_source", "source_" + String(sourceIndex));
     emitDiag("yalla_play_source", { source, sourceIdx: sourceIndex });
 
     if (video.canPlayType("application/vnd.apple.mpegurl")) {
@@ -1796,6 +1817,7 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number, s
         sourceIdx: currentSourceIndex,
       });
       if (!data?.fatal) return;
+      noteRuntimeEvent("hls_error", String(data?.details || data?.type || "unknown"));
       if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
         networkRetryCount += 1;
         if (networkRetryCount <= 2) {
@@ -1834,6 +1856,27 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number, s
       sourceIdx: currentSourceIndex,
       activeSource: currentSources[currentSourceIndex] || "",
       sources: Array.isArray(currentSources) ? currentSources.slice() : [],
+      sourceCount: Array.isArray(currentSources) ? currentSources.length : 0,
+      refreshingToken: !!refreshingToken,
+      networkRetryCount,
+      stallRecoverCount,
+      lastProgressAt,
+      lastRecoverAt,
+      lastRefreshReason,
+      lastRefreshAt,
+      lastRotateReason,
+      lastRotateAt,
+      lastRuntimeEvent,
+      lastRuntimeEventReason,
+      lastRuntimeEventAt,
+      watchdogState:
+        refreshingToken
+          ? "refreshing"
+          : stallRecoverCount > 0
+            ? "stalled"
+            : Date.now() - lastProgressAt > 7000
+              ? "recovering"
+              : "healthy",
     }),
     refreshCurrent: (reason = "external_refresh") => refreshTabStream(reason),
     rotateCurrent: (reason = "external_rotate") => rotateSource(reason),
@@ -1857,6 +1900,7 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number, s
     const candidates = buildCandidates(tab.path, tokenData, domains);
     currentPath = tab.path;
     currentTabIndex = idx;
+    noteRuntimeEvent("play_tab", tab.path);
     markActiveTab(idx);
     const sources = candidates.map((candidate) => toProxyWrap(candidate)).filter(Boolean);
     emitDiag("yalla_candidates", { path: tab.path, count: sources.length });

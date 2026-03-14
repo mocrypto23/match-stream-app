@@ -124,9 +124,25 @@ type SessionRuntimeState = {
   freshCandidateCount: number;
   freshManifestCount: number;
   runtimePath: string;
+  runtimeTabIndex: number | null;
+  runtimeSourceIndex: number | null;
+  runtimeSourceCount: number;
   runtimeActiveSource: string;
   runtimeSources: string[];
   runtimeUpdatedAt: number;
+  runtimeRefreshing: boolean;
+  runtimeNetworkRetryCount: number;
+  runtimeStallRecoverCount: number;
+  runtimeLastProgressAt: number;
+  runtimeLastRecoverAt: number;
+  runtimeWatchdogState: string;
+  lastRefreshReason: string;
+  lastRefreshAt: number;
+  lastRotateReason: string;
+  lastRotateAt: number;
+  lastRuntimeEvent: string;
+  lastRuntimeEventReason: string;
+  lastRuntimeEventAt: number;
   activeManifestUrl: string;
   activeManifestFetchUrl: string;
   activeManifestReferrerUrl: string;
@@ -903,9 +919,25 @@ class LiveEmbedSession {
   pageQueue: PageSeed[] = [];
   pendingTasks = new Set<Promise<void>>();
   runtimePath = "";
+  runtimeTabIndex: number | null = null;
+  runtimeSourceIndex: number | null = null;
+  runtimeSourceCount = 0;
   runtimeActiveSource = "";
   runtimeSources: string[] = [];
   runtimeUpdatedAt = 0;
+  runtimeRefreshing = false;
+  runtimeNetworkRetryCount = 0;
+  runtimeStallRecoverCount = 0;
+  runtimeLastProgressAt = 0;
+  runtimeLastRecoverAt = 0;
+  runtimeWatchdogState = "";
+  lastRefreshReason = "";
+  lastRefreshAt = 0;
+  lastRotateReason = "";
+  lastRotateAt = 0;
+  lastRuntimeEvent = "";
+  lastRuntimeEventReason = "";
+  lastRuntimeEventAt = 0;
   activeManifestUrl = "";
   activeManifestFetchUrl = "";
   activeManifestReferrerUrl = "";
@@ -982,17 +1014,91 @@ class LiveEmbedSession {
     });
   }
 
-  rememberRuntimeSources(input: { path?: string; activeSource?: string; sources?: string[] }) {
+  rememberRuntimeSources(input: {
+    path?: string;
+    tabIndex?: number | null;
+    sourceIndex?: number | null;
+    sourceCount?: number | null;
+    activeSource?: string;
+    sources?: string[];
+    refreshingToken?: boolean;
+    networkRetryCount?: number | null;
+    stallRecoverCount?: number | null;
+    lastProgressAt?: number | null;
+    lastRecoverAt?: number | null;
+    watchdogState?: string;
+    lastRefreshReason?: string;
+    lastRefreshAt?: number | null;
+    lastRotateReason?: string;
+    lastRotateAt?: number | null;
+    lastRuntimeEvent?: string;
+    lastRuntimeEventReason?: string;
+    lastRuntimeEventAt?: number | null;
+  }) {
     const runtimePath = String(input.path || "").trim();
+    const runtimeTabIndex = Number.isFinite(Number(input.tabIndex)) ? Number(input.tabIndex) : null;
+    const runtimeSourceIndex = Number.isFinite(Number(input.sourceIndex)) ? Number(input.sourceIndex) : null;
+    const runtimeSourceCount = Math.max(0, Number.parseInt(String(input.sourceCount ?? 0), 10) || 0);
     const runtimeActiveSource = normalizeHttpUrl(input.activeSource || "");
     const runtimeSources = dedupeUrls([
       ...(Array.isArray(input.sources) ? input.sources : []),
       runtimeActiveSource,
     ]);
-    if (!runtimePath && !runtimeActiveSource && !runtimeSources.length) return;
+    const runtimeRefreshing = !!input.refreshingToken;
+    const runtimeNetworkRetryCount = Math.max(0, Number.parseInt(String(input.networkRetryCount ?? 0), 10) || 0);
+    const runtimeStallRecoverCount = Math.max(0, Number.parseInt(String(input.stallRecoverCount ?? 0), 10) || 0);
+    const runtimeLastProgressAt = Number.isFinite(Number(input.lastProgressAt)) ? Number(input.lastProgressAt) : 0;
+    const runtimeLastRecoverAt = Number.isFinite(Number(input.lastRecoverAt)) ? Number(input.lastRecoverAt) : 0;
+    const runtimeWatchdogState = String(input.watchdogState || "").trim();
+    const lastRefreshReason = String(input.lastRefreshReason || "").trim();
+    const lastRefreshAt = Number.isFinite(Number(input.lastRefreshAt)) ? Number(input.lastRefreshAt) : 0;
+    const lastRotateReason = String(input.lastRotateReason || "").trim();
+    const lastRotateAt = Number.isFinite(Number(input.lastRotateAt)) ? Number(input.lastRotateAt) : 0;
+    const lastRuntimeEvent = String(input.lastRuntimeEvent || "").trim();
+    const lastRuntimeEventReason = String(input.lastRuntimeEventReason || "").trim();
+    const lastRuntimeEventAt = Number.isFinite(Number(input.lastRuntimeEventAt)) ? Number(input.lastRuntimeEventAt) : 0;
+    if (
+      !runtimePath &&
+      runtimeTabIndex === null &&
+      runtimeSourceIndex === null &&
+      runtimeSourceCount <= 0 &&
+      !runtimeActiveSource &&
+      !runtimeSources.length &&
+      !runtimeRefreshing &&
+      runtimeNetworkRetryCount <= 0 &&
+      runtimeStallRecoverCount <= 0 &&
+      !runtimeLastProgressAt &&
+      !runtimeLastRecoverAt &&
+      !runtimeWatchdogState &&
+      !lastRefreshReason &&
+      !lastRefreshAt &&
+      !lastRotateReason &&
+      !lastRotateAt &&
+      !lastRuntimeEvent &&
+      !lastRuntimeEventReason &&
+      !lastRuntimeEventAt
+    ) {
+      return;
+    }
     if (runtimePath) this.runtimePath = runtimePath;
+    if (runtimeTabIndex !== null) this.runtimeTabIndex = runtimeTabIndex;
+    if (runtimeSourceIndex !== null) this.runtimeSourceIndex = runtimeSourceIndex;
+    if (runtimeSourceCount > 0 || runtimeSources.length) this.runtimeSourceCount = Math.max(runtimeSourceCount, runtimeSources.length);
     if (runtimeActiveSource) this.runtimeActiveSource = runtimeActiveSource;
     if (runtimeSources.length) this.runtimeSources = runtimeSources;
+    this.runtimeRefreshing = runtimeRefreshing;
+    this.runtimeNetworkRetryCount = runtimeNetworkRetryCount;
+    this.runtimeStallRecoverCount = runtimeStallRecoverCount;
+    if (runtimeLastProgressAt > 0) this.runtimeLastProgressAt = runtimeLastProgressAt;
+    if (runtimeLastRecoverAt > 0) this.runtimeLastRecoverAt = runtimeLastRecoverAt;
+    if (runtimeWatchdogState) this.runtimeWatchdogState = runtimeWatchdogState;
+    if (lastRefreshReason) this.lastRefreshReason = lastRefreshReason;
+    if (lastRefreshAt > 0) this.lastRefreshAt = lastRefreshAt;
+    if (lastRotateReason) this.lastRotateReason = lastRotateReason;
+    if (lastRotateAt > 0) this.lastRotateAt = lastRotateAt;
+    if (lastRuntimeEvent) this.lastRuntimeEvent = lastRuntimeEvent;
+    if (lastRuntimeEventReason) this.lastRuntimeEventReason = lastRuntimeEventReason;
+    if (lastRuntimeEventAt > 0) this.lastRuntimeEventAt = lastRuntimeEventAt;
     this.runtimeUpdatedAt = Date.now();
   }
 
@@ -1032,9 +1138,25 @@ class LiveEmbedSession {
       freshCandidateCount,
       freshManifestCount: freshManifestCandidates.length,
       runtimePath: this.runtimePath,
+      runtimeTabIndex: this.runtimeTabIndex,
+      runtimeSourceIndex: this.runtimeSourceIndex,
+      runtimeSourceCount: this.runtimeSourceCount,
       runtimeActiveSource: this.runtimeActiveSource,
       runtimeSources: this.runtimeSources.slice(),
       runtimeUpdatedAt: this.runtimeUpdatedAt,
+      runtimeRefreshing: this.runtimeRefreshing,
+      runtimeNetworkRetryCount: this.runtimeNetworkRetryCount,
+      runtimeStallRecoverCount: this.runtimeStallRecoverCount,
+      runtimeLastProgressAt: this.runtimeLastProgressAt,
+      runtimeLastRecoverAt: this.runtimeLastRecoverAt,
+      runtimeWatchdogState: this.runtimeWatchdogState,
+      lastRefreshReason: this.lastRefreshReason,
+      lastRefreshAt: this.lastRefreshAt,
+      lastRotateReason: this.lastRotateReason,
+      lastRotateAt: this.lastRotateAt,
+      lastRuntimeEvent: this.lastRuntimeEvent,
+      lastRuntimeEventReason: this.lastRuntimeEventReason,
+      lastRuntimeEventAt: this.lastRuntimeEventAt,
       activeManifestUrl: this.activeManifestUrl,
       activeManifestFetchUrl: this.activeManifestFetchUrl,
       activeManifestReferrerUrl: this.activeManifestReferrerUrl,
@@ -1347,8 +1469,24 @@ class LiveEmbedSession {
           __tfRepackYalla?: {
             getState?: () => {
               path?: string;
+              tabIndex?: number;
+              sourceIdx?: number;
+              sourceCount?: number;
               activeSource?: string;
               sources?: string[];
+              refreshingToken?: boolean;
+              networkRetryCount?: number;
+              stallRecoverCount?: number;
+              lastProgressAt?: number;
+              lastRecoverAt?: number;
+              watchdogState?: string;
+              lastRefreshReason?: string;
+              lastRefreshAt?: number;
+              lastRotateReason?: string;
+              lastRotateAt?: number;
+              lastRuntimeEvent?: string;
+              lastRuntimeEventReason?: string;
+              lastRuntimeEventAt?: number;
             };
           };
         }
@@ -1357,15 +1495,53 @@ class LiveEmbedSession {
       return {
         ...(typeof drain === "function" ? drain() : { urls: [], dom: [] }),
         runtimeSources: Array.isArray(runtimeState?.sources) ? runtimeState.sources : [],
+        tabIndex: Number.isFinite(Number(runtimeState?.tabIndex)) ? Number(runtimeState?.tabIndex) : null,
+        sourceIndex: Number.isFinite(Number(runtimeState?.sourceIdx)) ? Number(runtimeState?.sourceIdx) : null,
+        sourceCount: Number.isFinite(Number(runtimeState?.sourceCount)) ? Number(runtimeState?.sourceCount) : 0,
         activeSource: String(runtimeState?.activeSource || ""),
         runtimePath: String(runtimeState?.path || ""),
+        refreshingToken: !!runtimeState?.refreshingToken,
+        networkRetryCount: Number.isFinite(Number(runtimeState?.networkRetryCount))
+          ? Number(runtimeState?.networkRetryCount)
+          : 0,
+        stallRecoverCount: Number.isFinite(Number(runtimeState?.stallRecoverCount))
+          ? Number(runtimeState?.stallRecoverCount)
+          : 0,
+        lastProgressAt: Number.isFinite(Number(runtimeState?.lastProgressAt)) ? Number(runtimeState?.lastProgressAt) : 0,
+        lastRecoverAt: Number.isFinite(Number(runtimeState?.lastRecoverAt)) ? Number(runtimeState?.lastRecoverAt) : 0,
+        watchdogState: String(runtimeState?.watchdogState || ""),
+        lastRefreshReason: String(runtimeState?.lastRefreshReason || ""),
+        lastRefreshAt: Number.isFinite(Number(runtimeState?.lastRefreshAt)) ? Number(runtimeState?.lastRefreshAt) : 0,
+        lastRotateReason: String(runtimeState?.lastRotateReason || ""),
+        lastRotateAt: Number.isFinite(Number(runtimeState?.lastRotateAt)) ? Number(runtimeState?.lastRotateAt) : 0,
+        lastRuntimeEvent: String(runtimeState?.lastRuntimeEvent || ""),
+        lastRuntimeEventReason: String(runtimeState?.lastRuntimeEventReason || ""),
+        lastRuntimeEventAt: Number.isFinite(Number(runtimeState?.lastRuntimeEventAt))
+          ? Number(runtimeState?.lastRuntimeEventAt)
+          : 0,
       };
     });
 
     this.rememberRuntimeSources({
       path: String(drained?.runtimePath || ""),
+      tabIndex: Number.isFinite(Number(drained?.tabIndex)) ? Number(drained?.tabIndex) : null,
+      sourceIndex: Number.isFinite(Number(drained?.sourceIndex)) ? Number(drained?.sourceIndex) : null,
+      sourceCount: Number.isFinite(Number(drained?.sourceCount)) ? Number(drained?.sourceCount) : 0,
       activeSource: String(drained?.activeSource || ""),
       sources: Array.isArray(drained?.runtimeSources) ? drained.runtimeSources : [],
+      refreshingToken: !!drained?.refreshingToken,
+      networkRetryCount: Number.isFinite(Number(drained?.networkRetryCount)) ? Number(drained?.networkRetryCount) : 0,
+      stallRecoverCount: Number.isFinite(Number(drained?.stallRecoverCount)) ? Number(drained?.stallRecoverCount) : 0,
+      lastProgressAt: Number.isFinite(Number(drained?.lastProgressAt)) ? Number(drained?.lastProgressAt) : 0,
+      lastRecoverAt: Number.isFinite(Number(drained?.lastRecoverAt)) ? Number(drained?.lastRecoverAt) : 0,
+      watchdogState: String(drained?.watchdogState || ""),
+      lastRefreshReason: String(drained?.lastRefreshReason || ""),
+      lastRefreshAt: Number.isFinite(Number(drained?.lastRefreshAt)) ? Number(drained?.lastRefreshAt) : 0,
+      lastRotateReason: String(drained?.lastRotateReason || ""),
+      lastRotateAt: Number.isFinite(Number(drained?.lastRotateAt)) ? Number(drained?.lastRotateAt) : 0,
+      lastRuntimeEvent: String(drained?.lastRuntimeEvent || ""),
+      lastRuntimeEventReason: String(drained?.lastRuntimeEventReason || ""),
+      lastRuntimeEventAt: Number.isFinite(Number(drained?.lastRuntimeEventAt)) ? Number(drained?.lastRuntimeEventAt) : 0,
     });
 
     for (const rawValue of [
@@ -1401,6 +1577,8 @@ class LiveEmbedSession {
       }, reason)
       .catch(() => false);
     if (!refreshed) return false;
+    this.lastRefreshReason = String(reason || "runtime_refresh");
+    this.lastRefreshAt = Date.now();
     await page.waitForTimeout(Math.max(1_250, Math.min(4_000, SESSION_RETRY_WAIT_MS)));
     await this.drainDomCandidates();
     if (this.pendingTasks.size) {
@@ -1426,6 +1604,8 @@ class LiveEmbedSession {
       }, reason)
       .catch(() => false);
     if (!rotated) return false;
+    this.lastRotateReason = String(reason || "runtime_rotate");
+    this.lastRotateAt = Date.now();
     await page.waitForTimeout(Math.max(1_250, Math.min(4_000, SESSION_RETRY_WAIT_MS)));
     await this.drainDomCandidates();
     if (this.pendingTasks.size) {
@@ -2320,9 +2500,25 @@ export function peekLiveEmbedSessionState(input: {
     freshCandidateCount,
     freshManifestCount: freshManifestCandidates.length,
     runtimePath: session.runtimePath,
+    runtimeTabIndex: session.runtimeTabIndex,
+    runtimeSourceIndex: session.runtimeSourceIndex,
+    runtimeSourceCount: session.runtimeSourceCount,
     runtimeActiveSource: session.runtimeActiveSource,
     runtimeSources: session.runtimeSources.slice(),
     runtimeUpdatedAt: session.runtimeUpdatedAt,
+    runtimeRefreshing: session.runtimeRefreshing,
+    runtimeNetworkRetryCount: session.runtimeNetworkRetryCount,
+    runtimeStallRecoverCount: session.runtimeStallRecoverCount,
+    runtimeLastProgressAt: session.runtimeLastProgressAt,
+    runtimeLastRecoverAt: session.runtimeLastRecoverAt,
+    runtimeWatchdogState: session.runtimeWatchdogState,
+    lastRefreshReason: session.lastRefreshReason,
+    lastRefreshAt: session.lastRefreshAt,
+    lastRotateReason: session.lastRotateReason,
+    lastRotateAt: session.lastRotateAt,
+    lastRuntimeEvent: session.lastRuntimeEvent,
+    lastRuntimeEventReason: session.lastRuntimeEventReason,
+    lastRuntimeEventAt: session.lastRuntimeEventAt,
     activeManifestUrl: session.activeManifestUrl,
     activeManifestFetchUrl: session.activeManifestFetchUrl,
     activeManifestReferrerUrl: session.activeManifestReferrerUrl,
