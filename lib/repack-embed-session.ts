@@ -1492,6 +1492,7 @@ class LiveEmbedSession {
   async navigateSeedInBrowser(seed: PageSeed, timeoutMs: number) {
     const page = this.page;
     if (!page || page.isClosed?.()) return false;
+    const deadlineAt = Date.now() + Math.max(6_000, Math.min(18_000, timeoutMs));
     const playbackUrl = isDirectCrawlPreferred(seed.pageUrl)
       ? pickPreferredDirectPlaybackUrl(seed.pageUrl)
       : buildPlaybackProxyUrl({
@@ -1502,21 +1503,32 @@ class LiveEmbedSession {
     if (!playbackUrl) return false;
 
     try {
-      const challengeWaitBudgetMs = Math.min(this.slotServerId === 4 ? 10_000 : 18_000, timeoutMs);
+      const initialBudgetMs = Math.max(4_000, deadlineAt - Date.now());
       await page.goto(playbackUrl, {
         waitUntil: "domcontentloaded",
-        timeout: Math.max(7_000, Math.min(35_000, timeoutMs)),
+        timeout: Math.max(4_000, Math.min(20_000, initialBudgetMs)),
       });
       if (typeof page.waitForLoadState === "function") {
+        const networkIdleBudgetMs = Math.max(1_000, deadlineAt - Date.now());
         await page.waitForLoadState("networkidle", {
-          timeout: Math.min(5_000, SESSION_NETWORK_IDLE_WAIT_MS),
+          timeout: Math.min(networkIdleBudgetMs, 5_000, SESSION_NETWORK_IDLE_WAIT_MS),
         }).catch(() => {});
       }
-      await page.waitForTimeout(Math.max(2_000, Math.min(8_000, SESSION_WAIT_MS)));
+      const settleBudgetMs = Math.max(0, deadlineAt - Date.now());
+      if (settleBudgetMs > 0) {
+        await page.waitForTimeout(Math.max(750, Math.min(3_500, SESSION_WAIT_MS, settleBudgetMs)));
+      }
+      const challengeWaitBudgetMs = Math.max(
+        0,
+        Math.min(this.slotServerId === 4 ? 8_000 : 12_000, timeoutMs, deadlineAt - Date.now())
+      );
       await this.waitOutChallengeIfNeeded(challengeWaitBudgetMs).catch(() => false);
       await this.drainDomCandidates();
-      if (this.pendingTasks.size) {
-        await Promise.allSettled(Array.from(this.pendingTasks));
+      if (this.pendingTasks.size && deadlineAt - Date.now() > 0) {
+        await Promise.race([
+          Promise.allSettled(Array.from(this.pendingTasks)),
+          sleep(Math.max(250, Math.min(2_500, deadlineAt - Date.now()))),
+        ]).catch(() => {});
       }
       const html = await page
         .evaluate(() => {
@@ -1955,32 +1967,45 @@ class LiveEmbedSession {
   async primePage(timeoutMs: number) {
     const page = this.page;
     if (!page || page.isClosed?.()) throw new Error("browser-page-closed");
+    const deadlineAt = Date.now() + Math.max(8_000, Math.min(24_000, timeoutMs));
 
-    const challengeWaitBudgetMs = Math.min(this.slotServerId === 4 ? 10_000 : 18_000, timeoutMs);
     this.seedSourceVariants();
     await page.goto(this.playbackUrl, {
       waitUntil: "domcontentloaded",
-      timeout: Math.max(7_000, Math.min(35_000, timeoutMs)),
+      timeout: Math.max(4_000, Math.min(20_000, deadlineAt - Date.now())),
     });
     if (typeof page.waitForLoadState === "function") {
+      const networkIdleBudgetMs = Math.max(1_000, deadlineAt - Date.now());
       await page.waitForLoadState("networkidle", {
-        timeout: Math.min(5_000, SESSION_NETWORK_IDLE_WAIT_MS),
+        timeout: Math.min(networkIdleBudgetMs, 5_000, SESSION_NETWORK_IDLE_WAIT_MS),
       }).catch(() => {});
     }
-    await page.waitForTimeout(Math.max(2_000, Math.min(12_000, SESSION_WAIT_MS)));
+    const settleBudgetMs = Math.max(0, deadlineAt - Date.now());
+    if (settleBudgetMs > 0) {
+      await page.waitForTimeout(Math.max(750, Math.min(4_000, SESSION_WAIT_MS, settleBudgetMs)));
+    }
+    const challengeWaitBudgetMs = Math.max(
+      0,
+      Math.min(this.slotServerId === 4 ? 8_000 : 12_000, timeoutMs, deadlineAt - Date.now())
+    );
     await this.waitOutChallengeIfNeeded(challengeWaitBudgetMs).catch(() => false);
     await this.drainDomCandidates();
-    if (!this.candidates.size) {
-      await page.waitForTimeout(Math.min(6_000, SESSION_RETRY_WAIT_MS));
+    if (!this.candidates.size && deadlineAt - Date.now() > 0) {
+      await page.waitForTimeout(Math.max(500, Math.min(2_500, SESSION_RETRY_WAIT_MS, deadlineAt - Date.now())));
       await this.drainDomCandidates();
     }
-    if (this.pendingTasks.size) {
-      await Promise.allSettled(Array.from(this.pendingTasks));
+    if (this.pendingTasks.size && deadlineAt - Date.now() > 0) {
+      await Promise.race([
+        Promise.allSettled(Array.from(this.pendingTasks)),
+        sleep(Math.max(250, Math.min(3_000, deadlineAt - Date.now()))),
+      ]).catch(() => {});
     }
-    if (!this.candidates.size || this.pageQueue.length) {
-      await this.crawlQueuedPages(timeoutMs);
+    if ((!this.candidates.size || this.pageQueue.length) && deadlineAt - Date.now() > 0) {
+      await this.crawlQueuedPages(Math.max(3_000, deadlineAt - Date.now()));
     }
-    await this.hydrateCandidateBodiesInPage();
+    if (deadlineAt - Date.now() > 0) {
+      await this.hydrateCandidateBodiesInPage();
+    }
     this.lastReloadAt = Date.now();
   }
 
