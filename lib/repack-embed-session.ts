@@ -431,6 +431,15 @@ function looksLikeManifestResponse(contentType: string, body: string, finalUrl: 
   return looksLikeManifestUrl(finalUrl);
 }
 
+function hasHlsManifestBody(contentType: string, body: string) {
+  const ct = String(contentType || "").toLowerCase();
+  const text = String(body || "");
+  if (/^\s*#extm3u/m.test(text)) return true;
+  return (
+    !!text.trim() && (ct.includes("application/vnd.apple.mpegurl") || ct.includes("application/x-mpegurl"))
+  );
+}
+
 function buildPlaybackProxyUrl(input: {
   sourceUrl: string;
   requestOrigin: string;
@@ -1183,7 +1192,7 @@ class LiveEmbedSession {
         const status = Number(item?.status || 0);
         const contentType = String(item?.contentType || "").trim();
         if (!targetUrl || status < 200 || status >= 300) continue;
-        if (!looksLikeManifestResponse(contentType, body, finalUrl)) continue;
+        if (!hasHlsManifestBody(contentType, body)) continue;
         this.rememberCandidate({
           fetchUrl: String(item?.fetchUrl || finalUrl).trim(),
           targetUrl,
@@ -1252,7 +1261,7 @@ class LiveEmbedSession {
             normalizeHttpUrl(String(requestHeaders?.referer || requestHeaders?.referrer || "").trim()) ||
             this.sourceUrl;
 
-          if (looksLikeManifestResponse(contentType, body, targetUrl)) {
+          if (hasHlsManifestBody(contentType, body)) {
             if (hasMediaSegments(body, targetUrl)) {
               this.rememberCandidate({
                 fetchUrl: responseUrl,
@@ -1599,8 +1608,7 @@ class LiveEmbedSession {
       let ok = !!fetched?.ok;
       let error = String(fetched?.error || "");
 
-      const shouldRelay =
-        !ok || !body.trim() || !looksLikeManifestResponse(contentType, body, unwrapProxyTarget(finalUrl) || finalUrl);
+      const shouldRelay = !ok || !body.trim() || !hasHlsManifestBody(contentType, body);
       if (shouldRelay) {
         const relayUrl = buildSessionRelayFetchUrl({
           requestOrigin: this.requestOrigin,
@@ -1617,11 +1625,7 @@ class LiveEmbedSession {
             normalizeHttpUrl(relayed.targetUrl || "") ||
             unwrapProxyTarget(relayed.finalUrl || "") ||
             normalizedTargetUrl;
-          const relayedLooksLikeManifest = looksLikeManifestResponse(
-            relayed.contentType,
-            relayed.body,
-            relayedFinalUrl
-          );
+          const relayedLooksLikeManifest = hasHlsManifestBody(relayed.contentType, relayed.body);
           if (relayed.ok && relayed.body.trim() && relayedLooksLikeManifest) {
             ok = true;
             body = relayed.body;
@@ -1638,7 +1642,7 @@ class LiveEmbedSession {
         }
       }
 
-      if (ok && looksLikeManifestResponse(contentType, body, finalUrl)) {
+      if (ok && hasHlsManifestBody(contentType, body)) {
         this.rememberCandidate({
           fetchUrl: normalizedFetchUrl,
           targetUrl: unwrapProxyTarget(finalUrl) || finalUrl,
