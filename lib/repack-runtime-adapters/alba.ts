@@ -1,3 +1,6 @@
+import { execFile } from "node:child_process";
+import path from "node:path";
+
 import { fetchLiveEmbedText } from "@/lib/repack-embed-session";
 import { extractCandidatesFromText, isLikelyAlbaLandingUrl } from "@/lib/repack-ingest-resolver";
 import { getSourceFamilyForSlotServer, isValidHttpUrl } from "@/lib/server-source-policy";
@@ -24,6 +27,15 @@ type DirectLivekoraManifestCacheEntry = {
 
 const directLivekoraManifestCache = new Map<string, DirectLivekoraManifestCacheEntry>();
 const directLivekoraManifestInflight = new Map<string, Promise<RuntimeManifestResult | null>>();
+
+type DirectLivekoraExtractorOutput = {
+  ok: boolean;
+  manifestUrl?: string;
+  manifestBody?: string;
+  referrerUrl?: string;
+  playbackUrl?: string;
+  error?: string;
+};
 
 function looksLikeAlbaSource(rawUrl: string) {
   try {
@@ -153,6 +165,42 @@ function buildDirectLivekoraCacheKey(input: RuntimeAdapterInput) {
   return `${input.slotServer}|${normalizeLivekoraChannelUrl(input.sourceUrl)}`;
 }
 
+async function runDirectLivekoraExtractor(channelUrl: string): Promise<DirectLivekoraExtractorOutput | null> {
+  const scriptPath = path.join(process.cwd(), "server", "livekora-direct-extract.js");
+  return await new Promise((resolve) => {
+    execFile(
+      process.execPath,
+      [scriptPath, channelUrl],
+      {
+        cwd: process.cwd(),
+        timeout: DIRECT_LIVEKORA_BROWSER_TIMEOUT_MS + 8_000,
+        maxBuffer: 4 * 1024 * 1024,
+      },
+      (error, stdout) => {
+        if (error) {
+          resolve(null);
+          return;
+        }
+        const raw = String(stdout || "")
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .at(-1);
+        if (!raw) {
+          resolve(null);
+          return;
+        }
+        try {
+          const parsed = JSON.parse(raw) as DirectLivekoraExtractorOutput;
+          resolve(parsed);
+        } catch {
+          resolve(null);
+        }
+      }
+    );
+  });
+}
+
 async function extractDirectLivekoraManifest(
   input: RuntimeAdapterInput,
   queryOptions?: { waitForMediaSequence?: number | null }
@@ -169,141 +217,13 @@ async function extractDirectLivekoraManifest(
     const channelUrl = normalizeLivekoraChannelUrl(input.sourceUrl);
     if (!isValidHttpUrl(channelUrl)) return null;
 
-    const { chromium } = (await import("playwright")) as typeof import("playwright");
-    const browser = await chromium.launch({
-      headless: true,
-      args: ["--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled", "--no-sandbox"],
-    });
+    const extracted = await runDirectLivekoraExtractor(channelUrl);
+    const manifestUrl = normalizeHttpUrl(String(extracted?.manifestUrl || "").trim());
+    const manifestBody = String(extracted?.manifestBody || "");
+    const referrerUrl = normalizeHttpUrl(String(extracted?.referrerUrl || "").trim()) || channelUrl;
 
-    let manifestUrl = "";
-    let manifestBody = "";
-    let referrerUrl = channelUrl;
-    let iframeUrl = "";
-    let resolveFound: (() => void) | null = null;
-    const foundPromise = new Promise<void>((resolve) => {
-      resolveFound = resolve;
-    });
-
-    try {
-      const context = await browser.newContext({
-        ignoreHTTPSErrors: true,
-        locale: "ar-EG",
-        userAgent:
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-        viewport: { width: 1440, height: 900 },
-        extraHTTPHeaders: {
-          "accept-language": "ar,en-US;q=0.9,en;q=0.8",
-        },
-      });
-      const page = await context.newPage();
-      page.on("console", (message) => {
-        const text = String(message.text() || "");
-        const match = text.match(/loadSource:(https?:\/\/\S+)/i);
-        const candidate = normalizeHttpUrl(match?.[1] || "");
-        if (candidate) {
-          manifestUrl = candidate;
-        }
-      });
-      page.on("response", async (response) => {
-        try {
-          const url = normalizeHttpUrl(response.url());
-          if (!url || !/\.m3u8(?:$|[?#])|\/hls\/|\/stream\/|\/live\/|amazonaws/i.test(url)) return;
-          const body = await response.text().catch(() => "");
-          if (!body.trim() || !hasMediaSegments(body, url)) return;
-          manifestUrl = url;
-          manifestBody = body;
-          resolveFound?.();
-        } catch {}
-      });
-
-      await page.goto(channelUrl, {
-        waitUntil: "domcontentloaded",
-        timeout: DIRECT_LIVEKORA_BROWSER_TIMEOUT_MS,
-      });
-      referrerUrl = normalizeHttpUrl(page.url()) || channelUrl;
-      await Promise.race([foundPromise, page.waitForTimeout(Math.max(4_000, DIRECT_LIVEKORA_BROWSER_TIMEOUT_MS - 2_000))]);
-
-      if (!manifestBody && manifestUrl) {
-        const browserFetched = await page
-          .evaluate(async (url) => {
-            const response = await fetch(url, {
-              method: "GET",
-              credentials: "include",
-              cache: "no-store",
-              redirect: "follow",
-            });
-            return {
-              ok: response.ok,
-              url: response.url || url,
-              body: await response.text().catch(() => ""),
-            };
-          }, manifestUrl)
-          .catch(() => null);
-        if (browserFetched?.ok && hasMediaSegments(browserFetched.body, browserFetched.url || manifestUrl)) {
-          manifestUrl = normalizeHttpUrl(browserFetched.url || manifestUrl) || manifestUrl;
-          manifestBody = browserFetched.body;
-        }
-      }
-
-      if (!manifestBody) {
-        const iframeSrc = resolveLivekoraIframeUrl(
-          (await page
-            .locator("iframe#streamFrame, iframe[src*='albaplayer'], iframe[src*='sportsurges'], iframe[src*='livekora']")
-            .first()
-            .getAttribute("src")
-            .catch(() => "")) || "",
-          page.url() || channelUrl
-        );
-        iframeUrl = iframeSrc;
-        if (iframeSrc && iframeSrc !== normalizeHttpUrl(page.url())) {
-          await page.goto(iframeSrc, {
-            waitUntil: "domcontentloaded",
-            timeout: DIRECT_LIVEKORA_BROWSER_TIMEOUT_MS,
-          });
-          referrerUrl = normalizeHttpUrl(page.url()) || iframeSrc;
-          await Promise.race([foundPromise, page.waitForTimeout(6_000)]);
-        }
-      }
-
-      if (!manifestBody && manifestUrl) {
-        const browserFetched = await page
-          .evaluate(async (url) => {
-            const response = await fetch(url, {
-              method: "GET",
-              credentials: "include",
-              cache: "no-store",
-              redirect: "follow",
-            });
-            return {
-              ok: response.ok,
-              url: response.url || url,
-              body: await response.text().catch(() => ""),
-            };
-          }, manifestUrl)
-          .catch(() => null);
-        if (browserFetched?.ok && hasMediaSegments(browserFetched.body, browserFetched.url || manifestUrl)) {
-          manifestUrl = normalizeHttpUrl(browserFetched.url || manifestUrl) || manifestUrl;
-          manifestBody = browserFetched.body;
-        }
-      }
-
-      await page.close().catch(() => {});
-      await context.close().catch(() => {});
-    } finally {
-      await browser.close().catch(() => {});
-    }
-
-    if (!manifestUrl || !manifestBody) {
-      console.error(
-        `[livekora-direct-empty] ${JSON.stringify({
-          sourceUrl: input.sourceUrl,
-          channelUrl,
-          referrerUrl,
-          iframeUrl,
-          manifestUrl,
-          hasManifestBody: !!manifestBody,
-        })}`
-      );
+    if (!extracted?.ok || !manifestUrl || !manifestBody || !hasMediaSegments(manifestBody, manifestUrl)) {
+      console.error(`[livekora-direct-empty] ${JSON.stringify({ sourceUrl: input.sourceUrl, channelUrl, extracted })}`);
       return null;
     }
 
