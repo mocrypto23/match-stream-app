@@ -262,12 +262,9 @@ function hostMatchesAnySuffix(hostname: string, suffixes: string[]) {
 
 function isDirectCrawlPreferred(rawUrl: string) {
   if (!isValidHttpUrl(rawUrl)) return false;
-  try {
-    const host = new URL(rawUrl).hostname.toLowerCase();
-    return hostMatchesAnySuffix(host, ["sportsurges.cc", "livekora.vip", "koooralive.click", "kooraxx.com"]);
-  } catch {
-    return false;
-  }
+  // Livekora must stay behind embed-proxy so the browser session follows
+  // the same in-page chain that worked before the R2 rewrite.
+  return false;
 }
 
 function pickPreferredDirectPlaybackUrl(rawUrl: string) {
