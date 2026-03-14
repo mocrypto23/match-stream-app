@@ -82,20 +82,35 @@ export type LiveStreamProvider = {
   ) => Promise<ProviderAssetResult>;
 };
 
-type EmbedProxyExtractorOutput = {
+type DirectExtractorOutput = {
   ok?: boolean;
   manifestUrl?: string;
   manifestBody?: string;
   referrerUrl?: string;
+  manifestRequestHeaders?: Record<string, string>;
   playbackUrl?: string;
   error?: string;
 };
 
+type CachedSourceState = {
+  sourceUrl: string;
+  manifestUrl: string;
+  referrerUrl: string;
+  requestHeaders: Record<string, string>;
+  playbackUrl: string;
+  updatedAt: number;
+  lastMediaSequence: number | null;
+};
+
 const LIVEKORA_HOST_SUFFIXES = ["sportsurges.cc", "livekora.vip", "koooralive.click", "kooraxx.com"] as const;
-const EMBED_PROXY_EXTRACT_TIMEOUT_MS = 30_000;
-const EMBED_PROXY_FETCH_TIMEOUT_MS = 25_000;
+const DIRECT_EXTRACT_TIMEOUT_MS = 22_000;
+const DIRECT_FETCH_TIMEOUT_MS = 15_000;
+const WAIT_RETRY_INTERVAL_MS = 700;
+const SOURCE_STATE_TTL_MS = 10 * 60_000;
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+
+const livekoraSourceState = new Map<string, CachedSourceState>();
 
 function normalizeHttpUrl(rawUrl: string) {
   try {
@@ -114,6 +129,17 @@ function hostMatchesAnySuffix(host: string, suffixes: readonly string[]) {
   const normalized = String(host || "").trim().toLowerCase().replace(/\.$/, "");
   if (!normalized) return false;
   return suffixes.some((suffix) => normalized === suffix || normalized.endsWith(`.${suffix}`));
+}
+
+function normalizeHeaderMap(headers?: Record<string, string> | null) {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers || {})) {
+    const normalizedKey = String(key || "").trim().toLowerCase();
+    const normalizedValue = String(value || "").trim();
+    if (!normalizedKey || !normalizedValue) continue;
+    out[normalizedKey] = normalizedValue;
+  }
+  return out;
 }
 
 function resolveManifestUrl(raw: string, baseUrl: string) {
@@ -198,24 +224,7 @@ function pickVariantManifestUrl(manifestText: string, baseUrl: string) {
   return variants[0]?.url || "";
 }
 
-function buildEmbedProxyUrl(input: {
-  targetUrl: string;
-  requestOrigin: string;
-  referrerUrl?: string | null;
-}) {
-  const targetUrl = normalizeHttpUrl(input.targetUrl);
-  const requestOrigin = normalizeHttpUrl(input.requestOrigin);
-  if (!targetUrl || !requestOrigin) return "";
-  const params = new URLSearchParams();
-  params.set("url", targetUrl);
-  params.set("depth", "0");
-  params.set("stable", "1");
-  const referrerUrl = normalizeHttpUrl(input.referrerUrl || input.targetUrl);
-  if (referrerUrl) params.set("ref", referrerUrl);
-  return `${requestOrigin.replace(/\/+$/, "")}/api/embed-proxy?${params.toString()}`;
-}
-
-function buildLivekoraSessionAssetUrl(input: {
+function buildSessionAssetUrl(input: {
   internalOrigin: string;
   sourceUrl: string;
   assetUrl: string;
@@ -233,7 +242,7 @@ function buildLivekoraSessionAssetUrl(input: {
   return `${internalOrigin.replace(/\/+$/, "")}/api/livekora/session-asset?${params.toString()}`;
 }
 
-function rewriteManifestForLivekoraSession(input: {
+function rewriteManifestForSession(input: {
   manifest: string;
   baseUrl: string;
   internalOrigin: string;
@@ -246,7 +255,7 @@ function rewriteManifestForLivekoraSession(input: {
     const absolute = resolveManifestUrl(raw, input.baseUrl);
     if (!absolute) return raw;
     return (
-      buildLivekoraSessionAssetUrl({
+      buildSessionAssetUrl({
         internalOrigin: input.internalOrigin,
         sourceUrl: input.sourceUrl,
         assetUrl: absolute,
@@ -268,6 +277,162 @@ function rewriteManifestForLivekoraSession(input: {
     out.push(rewriteAssetUrl(trimmed));
   }
   return out.join("\n");
+}
+
+function buildSourceStateKey(sourceUrl: string) {
+  return normalizeHttpUrl(sourceUrl).toLowerCase();
+}
+
+function readSourceState(sourceUrl: string) {
+  const key = buildSourceStateKey(sourceUrl);
+  const cached = livekoraSourceState.get(key);
+  if (!cached) return null;
+  if (cached.updatedAt + SOURCE_STATE_TTL_MS <= Date.now()) {
+    livekoraSourceState.delete(key);
+    return null;
+  }
+  return cached;
+}
+
+function writeSourceState(state: CachedSourceState) {
+  livekoraSourceState.set(buildSourceStateKey(state.sourceUrl), state);
+  return state;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorText: string) {
+  return new Promise<T>((resolve, reject) => {
+    const timeoutId = setTimeout(() => reject(new Error(errorText)), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timeoutId);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timeoutId);
+        reject(error);
+      }
+    );
+  });
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function buildFetchHeaders(input: {
+  requestHeaders?: Record<string, string> | null;
+  referrerUrl: string;
+  accept: string;
+}) {
+  const requestHeaders = normalizeHeaderMap(input.requestHeaders);
+  const referrerUrl = normalizeHttpUrl(input.referrerUrl);
+  const out: Record<string, string> = {
+    accept: input.accept,
+    "user-agent": requestHeaders["user-agent"] || DEFAULT_USER_AGENT,
+  };
+  const referer = requestHeaders["referer"] || requestHeaders["referrer"] || referrerUrl;
+  if (referer) out.referer = referer;
+  const origin = requestHeaders["origin"] || (referer ? new URL(referer).origin : "");
+  if (origin) out.origin = origin;
+  for (const key of [
+    "accept-language",
+    "cookie",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "sec-fetch-site",
+    "sec-fetch-mode",
+    "sec-fetch-dest",
+  ]) {
+    if (requestHeaders[key]) out[key] = requestHeaders[key];
+  }
+  return out;
+}
+
+async function fetchTextWithHeaders(input: {
+  url: string;
+  requestHeaders?: Record<string, string> | null;
+  referrerUrl: string;
+  timeoutMs?: number;
+}) {
+  const targetUrl = normalizeHttpUrl(input.url);
+  if (!targetUrl) return null;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), Math.max(8_000, Number(input.timeoutMs || DIRECT_FETCH_TIMEOUT_MS)));
+  try {
+    const response = await fetch(targetUrl, {
+      method: "GET",
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: buildFetchHeaders({
+        requestHeaders: input.requestHeaders,
+        referrerUrl: input.referrerUrl,
+        accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
+      }),
+    });
+    if (!response.ok) return null;
+    const body = await response.text().catch(() => "");
+    return body.trim() ? body : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function fetchBinaryWithHeaders(input: {
+  url: string;
+  requestHeaders?: Record<string, string> | null;
+  referrerUrl: string;
+  timeoutMs?: number;
+}) {
+  const targetUrl = normalizeHttpUrl(input.url);
+  if (!targetUrl) {
+    return { ok: false as const, status: 0, contentType: "", bodyBase64: "", error: "invalid-asset-url" };
+  }
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), Math.max(8_000, Number(input.timeoutMs || DIRECT_FETCH_TIMEOUT_MS)));
+  try {
+    const response = await fetch(targetUrl, {
+      method: "GET",
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: buildFetchHeaders({
+        requestHeaders: input.requestHeaders,
+        referrerUrl: input.referrerUrl,
+        accept: "*/*",
+      }),
+    });
+    if (!response.ok) {
+      return {
+        ok: false as const,
+        status: Number(response.status || 0),
+        contentType: String(response.headers.get("content-type") || ""),
+        bodyBase64: "",
+        error: `asset-http-${Number(response.status || 0)}`,
+      };
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    return {
+      ok: true as const,
+      status: Number(response.status || 200),
+      contentType: String(response.headers.get("content-type") || "application/octet-stream"),
+      bodyBase64: bytes.toString("base64"),
+      error: "",
+    };
+  } catch (error) {
+    return {
+      ok: false as const,
+      status: 0,
+      contentType: "",
+      bodyBase64: "",
+      error: error instanceof Error ? error.message : String(error || "asset-fetch-failed"),
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 export function isAllowedLivekoraSource(rawUrl: string) {
@@ -311,36 +476,15 @@ export function resolveInternalAppOrigin(req?: Request | null) {
   return `http://127.0.0.1:${port}`;
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorText: string) {
-  return new Promise<T>((resolve, reject) => {
-    const timeoutId = setTimeout(() => reject(new Error(errorText)), timeoutMs);
-    promise.then(
-      (value) => {
-        clearTimeout(timeoutId);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timeoutId);
-        reject(error);
-      }
-    );
-  });
-}
-
-function runEmbedProxyLivekoraExtractor(input: ProviderContext) {
+function runDirectLivekoraExtractor(sourceUrl: string) {
   const scriptPath = path.join(process.cwd(), "server", "livekora-direct-extract.js");
-  const playbackUrl = buildEmbedProxyUrl({
-    targetUrl: input.sourceUrl,
-    requestOrigin: input.internalOrigin,
-    referrerUrl: input.sourceUrl,
-  });
-  return new Promise<EmbedProxyExtractorOutput | null>((resolve) => {
+  return new Promise<DirectExtractorOutput | null>((resolve) => {
     execFile(
       process.execPath,
-      [scriptPath, input.sourceUrl, playbackUrl],
+      [scriptPath, sourceUrl],
       {
         cwd: process.cwd(),
-        timeout: EMBED_PROXY_EXTRACT_TIMEOUT_MS + 10_000,
+        timeout: DIRECT_EXTRACT_TIMEOUT_MS + 8_000,
         maxBuffer: 4 * 1024 * 1024,
       },
       (_error, stdout) => {
@@ -354,7 +498,7 @@ function runEmbedProxyLivekoraExtractor(input: ProviderContext) {
           return;
         }
         try {
-          resolve(JSON.parse(raw) as EmbedProxyExtractorOutput);
+          resolve(JSON.parse(raw) as DirectExtractorOutput);
         } catch {
           resolve(null);
         }
@@ -363,96 +507,119 @@ function runEmbedProxyLivekoraExtractor(input: ProviderContext) {
   });
 }
 
-async function fetchTextViaEmbedProxy(input: {
-  targetUrl: string;
-  internalOrigin: string;
-  referrerUrl: string;
-  timeoutMs?: number;
-}) {
-  const proxyUrl = buildEmbedProxyUrl({
-    targetUrl: input.targetUrl,
-    requestOrigin: input.internalOrigin,
-    referrerUrl: input.referrerUrl,
-  });
-  if (!proxyUrl) return null;
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), Math.max(8_000, Number(input.timeoutMs || EMBED_PROXY_FETCH_TIMEOUT_MS)));
-  try {
-    const response = await fetch(proxyUrl, {
-      method: "GET",
-      cache: "no-store",
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
-        "user-agent": DEFAULT_USER_AGENT,
-      },
-    });
-    if (!response.ok) return null;
-    const body = await response.text().catch(() => "");
-    return body.trim() ? body : null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
-async function fetchBinaryViaEmbedProxy(input: {
-  targetUrl: string;
-  internalOrigin: string;
-  referrerUrl: string;
-  timeoutMs?: number;
-}) {
-  const proxyUrl = buildEmbedProxyUrl({
-    targetUrl: input.targetUrl,
-    requestOrigin: input.internalOrigin,
-    referrerUrl: input.referrerUrl,
-  });
-  if (!proxyUrl) {
-    return { ok: false as const, status: 0, contentType: "", bodyBase64: "", error: "invalid-proxy-url" };
-  }
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), Math.max(8_000, Number(input.timeoutMs || EMBED_PROXY_FETCH_TIMEOUT_MS)));
-  try {
-    const response = await fetch(proxyUrl, {
-      method: "GET",
-      cache: "no-store",
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        accept: "*/*",
-        "user-agent": DEFAULT_USER_AGENT,
-      },
-    });
-    if (!response.ok) {
-      return {
-        ok: false as const,
-        status: Number(response.status || 0),
-        contentType: String(response.headers.get("content-type") || ""),
-        bodyBase64: "",
-        error: `embed-proxy-http-${Number(response.status || 0)}`,
-      };
-    }
-    const bytes = Buffer.from(await response.arrayBuffer());
-    return {
-      ok: true as const,
-      status: Number(response.status || 200),
-      contentType: String(response.headers.get("content-type") || "application/octet-stream"),
-      bodyBase64: bytes.toString("base64"),
-      error: "",
-    };
-  } catch (error) {
+async function discoverLivekoraState(input: ProviderContext) {
+  const extracted = await runDirectLivekoraExtractor(input.sourceUrl);
+  const manifestUrl = normalizeHttpUrl(String(extracted?.manifestUrl || "").trim());
+  const requestHeaders = normalizeHeaderMap(extracted?.manifestRequestHeaders);
+  const referrerUrl = normalizeHttpUrl(String(extracted?.referrerUrl || "").trim()) || input.sourceUrl;
+  if (!manifestUrl) {
     return {
       ok: false as const,
-      status: 0,
-      contentType: "",
-      bodyBase64: "",
-      error: error instanceof Error ? error.message : String(error || "embed-proxy-fetch-failed"),
+      error: String(extracted?.error || "direct-manifest-url-missing"),
+      extracted,
     };
-  } finally {
-    clearTimeout(timeoutId);
   }
+
+  let manifestBody = String(extracted?.manifestBody || "").trim();
+  if (!manifestBody || !/^\s*#extm3u/m.test(manifestBody)) {
+    manifestBody = String(
+      (await fetchTextWithHeaders({
+        url: manifestUrl,
+        requestHeaders,
+        referrerUrl,
+      })) || ""
+    ).trim();
+  }
+  if (!manifestBody || !/^\s*#extm3u/m.test(manifestBody)) {
+    return {
+      ok: false as const,
+      error: String(extracted?.error || "direct-manifest-body-missing"),
+      extracted,
+    };
+  }
+
+  let finalUrl = manifestUrl;
+  if (!hasMediaSegments(manifestBody, finalUrl)) {
+    const variantUrl = pickVariantManifestUrl(manifestBody, finalUrl);
+    if (!variantUrl) {
+      return {
+        ok: false as const,
+        error: "direct-variant-missing",
+        extracted,
+      };
+    }
+    const variantBody = await fetchTextWithHeaders({
+      url: variantUrl,
+      requestHeaders,
+      referrerUrl,
+    });
+    if (!variantBody || !hasMediaSegments(variantBody, variantUrl)) {
+      return {
+        ok: false as const,
+        error: "direct-variant-fetch-failed",
+        extracted,
+      };
+    }
+    manifestBody = variantBody;
+    finalUrl = variantUrl;
+  }
+
+  const cached = writeSourceState({
+    sourceUrl: input.sourceUrl,
+    manifestUrl: finalUrl,
+    referrerUrl,
+    requestHeaders,
+    playbackUrl: normalizeHttpUrl(String(extracted?.playbackUrl || "").trim()) || input.sourceUrl,
+    updatedAt: Date.now(),
+    lastMediaSequence: parseMediaSequence(manifestBody),
+  });
+
+  return {
+    ok: true as const,
+    state: cached,
+    manifestBody,
+    finalUrl,
+  };
+}
+
+async function resolveManifestFromState(input: ProviderContext, state: CachedSourceState) {
+  let manifestBody = await fetchTextWithHeaders({
+    url: state.manifestUrl,
+    requestHeaders: state.requestHeaders,
+    referrerUrl: state.referrerUrl,
+  });
+  if (!manifestBody || !/^\s*#extm3u/m.test(manifestBody)) {
+    return null;
+  }
+
+  let finalUrl = state.manifestUrl;
+  if (!hasMediaSegments(manifestBody, finalUrl)) {
+    const variantUrl = pickVariantManifestUrl(manifestBody, finalUrl);
+    if (!variantUrl) return null;
+    const variantBody = await fetchTextWithHeaders({
+      url: variantUrl,
+      requestHeaders: state.requestHeaders,
+      referrerUrl: state.referrerUrl,
+    });
+    if (!variantBody || !hasMediaSegments(variantBody, variantUrl)) return null;
+    manifestBody = variantBody;
+    finalUrl = variantUrl;
+  }
+
+  const mediaSequence = parseMediaSequence(manifestBody);
+  writeSourceState({
+    ...state,
+    manifestUrl: finalUrl,
+    updatedAt: Date.now(),
+    lastMediaSequence: mediaSequence,
+  });
+
+  return {
+    manifestBody,
+    finalUrl,
+    mediaSequence,
+    targetDurationSec: parseTargetDurationSec(manifestBody),
+  };
 }
 
 export function buildLivekoraSessionManifestUrl(matchId: number, internalOrigin: string) {
@@ -464,124 +631,99 @@ export const livekoraProvider: LiveStreamProvider = {
   publicPathPrefix: "live/livekora",
   sourceSelector: pickLivekoraSourceUrl,
   isAllowedSource: isAllowedLivekoraSource,
-  async extractCurrentManifest(input) {
-    try {
-      const extracted = await withTimeout(
-        runEmbedProxyLivekoraExtractor(input),
-        EMBED_PROXY_EXTRACT_TIMEOUT_MS + 5_000,
-        "livekora-embed-proxy-timeout"
-      );
-      const manifestUrl = normalizeHttpUrl(String(extracted?.manifestUrl || "").trim());
-      const upstreamReferrerUrl = normalizeHttpUrl(String(extracted?.referrerUrl || "").trim()) || input.sourceUrl;
-      let manifestBody = String(extracted?.manifestBody || "").trim();
+  async extractCurrentManifest(input, options) {
+    const waitForMediaSequence =
+      Number.isFinite(Number(options?.waitForMediaSequence)) ? Number(options?.waitForMediaSequence) : null;
+    const waitDeadlineAt =
+      waitForMediaSequence !== null
+        ? Date.now() + Math.max(1_000, Math.min(12_000, Number(options?.waitTimeoutMs || 5_000)))
+        : 0;
 
-      if (!manifestUrl || !manifestBody || !/^\s*#extm3u/m.test(manifestBody)) {
-        return {
-          ok: false,
-          error: String(extracted?.error || "embed-proxy-manifest-missing"),
-          playbackUrl: input.sourceUrl,
-          currentSource: "",
-          mediaSequence: null,
-          targetDurationSec: 0,
-          refreshed: false,
-          rotated: false,
-          adapterKind: "livekora",
-          candidatesFound: 0,
-          candidatesTried: 1,
-        };
+    let state = readSourceState(input.sourceUrl);
+    let attempts = 0;
+    let lastError = "livekora-manifest-unavailable";
+
+    while (attempts < 3) {
+      attempts += 1;
+      if (!state || options?.forceRefresh) {
+        const discovered = await withTimeout(
+          discoverLivekoraState(input),
+          DIRECT_EXTRACT_TIMEOUT_MS + 5_000,
+          "livekora-direct-discovery-timeout"
+        );
+        if (!discovered.ok) {
+          lastError = discovered.error;
+          state = null;
+          continue;
+        }
+        state = discovered.state;
       }
 
-      let finalUrl = manifestUrl;
-      if (!hasMediaSegments(manifestBody, finalUrl)) {
-        const variantUrl = pickVariantManifestUrl(manifestBody, finalUrl);
-        if (!variantUrl) {
-          return {
-            ok: false,
-            error: "embed-proxy-variant-missing",
-            playbackUrl: input.sourceUrl,
-            currentSource: manifestUrl,
-            mediaSequence: null,
-            targetDurationSec: 0,
-            refreshed: false,
-            rotated: false,
-            adapterKind: "livekora",
-            candidatesFound: 1,
-            candidatesTried: 1,
-          };
-        }
-        const variantBody = await fetchTextViaEmbedProxy({
-          targetUrl: variantUrl,
-          internalOrigin: input.internalOrigin,
-          referrerUrl: upstreamReferrerUrl,
-        });
-        if (!variantBody || !hasMediaSegments(variantBody, variantUrl)) {
-          return {
-            ok: false,
-            error: "embed-proxy-variant-fetch-failed",
-            playbackUrl: input.sourceUrl,
-            currentSource: variantUrl,
-            mediaSequence: null,
-            targetDurationSec: 0,
-            refreshed: false,
-            rotated: false,
-            adapterKind: "livekora",
-            candidatesFound: 1,
-            candidatesTried: 2,
-          };
-        }
-        manifestBody = variantBody;
-        finalUrl = variantUrl;
+      const resolved = await resolveManifestFromState(input, state);
+      if (!resolved) {
+        lastError = "livekora-manifest-fetch-failed";
+        livekoraSourceState.delete(buildSourceStateKey(input.sourceUrl));
+        state = null;
+        continue;
+      }
+
+      if (
+        waitForMediaSequence !== null &&
+        resolved.mediaSequence !== null &&
+        resolved.mediaSequence <= waitForMediaSequence &&
+        Date.now() < waitDeadlineAt
+      ) {
+        await sleep(WAIT_RETRY_INTERVAL_MS);
+        continue;
       }
 
       return {
         ok: true,
-        manifestBody: rewriteManifestForLivekoraSession({
-          manifest: manifestBody,
-          baseUrl: finalUrl,
+        manifestBody: rewriteManifestForSession({
+          manifest: resolved.manifestBody,
+          baseUrl: resolved.finalUrl,
           internalOrigin: input.internalOrigin,
           sourceUrl: input.sourceUrl,
-          referrerUrl: upstreamReferrerUrl,
+          referrerUrl: state.referrerUrl,
         }),
-        finalUrl,
-        targetUrl: finalUrl,
-        fetchUrl: buildEmbedProxyUrl({
-          targetUrl: finalUrl,
-          requestOrigin: input.internalOrigin,
-          referrerUrl: upstreamReferrerUrl,
-        }),
-        referrerUrl: upstreamReferrerUrl,
-        playbackUrl: String(extracted?.playbackUrl || input.sourceUrl).trim() || input.sourceUrl,
-        currentSource: finalUrl,
-        mediaSequence: parseMediaSequence(manifestBody),
-        targetDurationSec: parseTargetDurationSec(manifestBody),
-        refreshed: false,
+        finalUrl: resolved.finalUrl,
+        targetUrl: resolved.finalUrl,
+        fetchUrl: resolved.finalUrl,
+        referrerUrl: state.referrerUrl,
+        playbackUrl: state.playbackUrl || input.sourceUrl,
+        currentSource: resolved.finalUrl,
+        mediaSequence: resolved.mediaSequence,
+        targetDurationSec: resolved.targetDurationSec,
+        refreshed: attempts > 1,
         rotated: false,
         adapterKind: "livekora",
         candidatesFound: 1,
-        candidatesTried: 1,
+        candidatesTried: attempts,
         sessionOwned: true,
       };
-    } catch (error) {
-      return {
-        ok: false,
-        error: error instanceof Error ? error.message : String(error || "livekora-embed-proxy-failed"),
-        playbackUrl: input.sourceUrl,
-        currentSource: "",
-        mediaSequence: null,
-        targetDurationSec: 0,
-        refreshed: false,
-        rotated: false,
-        adapterKind: "livekora",
-        candidatesFound: 0,
-        candidatesTried: 0,
-      };
     }
+
+    return {
+      ok: false,
+      error: lastError,
+      playbackUrl: input.sourceUrl,
+      currentSource: state?.manifestUrl || "",
+      mediaSequence: state?.lastMediaSequence ?? null,
+      targetDurationSec: 0,
+      refreshed: attempts > 1,
+      rotated: false,
+      adapterKind: "livekora",
+      candidatesFound: state ? 1 : 0,
+      candidatesTried: attempts,
+    };
   },
   async fetchAsset(input) {
-    const referrerUrl = normalizeHttpUrl(String(input.referrerUrl || "").trim()) || input.sourceUrl;
-    return await fetchBinaryViaEmbedProxy({
-      targetUrl: input.assetUrl,
-      internalOrigin: input.internalOrigin,
+    const state = readSourceState(input.sourceUrl);
+    const referrerUrl =
+      normalizeHttpUrl(String(input.referrerUrl || "").trim()) || state?.referrerUrl || input.sourceUrl;
+    return await fetchBinaryWithHeaders({
+      url: input.assetUrl,
+      requestHeaders: state?.requestHeaders,
       referrerUrl,
       timeoutMs: input.timeoutMs,
     });
