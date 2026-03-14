@@ -68,6 +68,119 @@ function looksLikeManifestUrl(rawUrl) {
   }
 }
 
+function pickVariantManifestUrl(manifestText, baseUrl) {
+  let pendingBandwidth = -1;
+  const variants = [];
+  let order = 0;
+  for (const line of String(manifestText || "").split(/\r?\n/)) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith("#EXT-X-STREAM-INF")) {
+      const match = trimmed.match(/BANDWIDTH=(\d+)/i);
+      pendingBandwidth = match && match[1] ? Number.parseInt(match[1], 10) : -1;
+      continue;
+    }
+    if (trimmed.startsWith("#")) continue;
+    try {
+      const absolute = new URL(trimmed, baseUrl).toString();
+      if (!absolute || !absolute.toLowerCase().includes(".m3u8")) {
+        pendingBandwidth = -1;
+        continue;
+      }
+      variants.push({
+        url: absolute,
+        bandwidth: Number.isFinite(pendingBandwidth) ? pendingBandwidth : -1,
+        order,
+      });
+      order += 1;
+      pendingBandwidth = -1;
+    } catch {
+      pendingBandwidth = -1;
+    }
+  }
+  variants.sort((left, right) => {
+    if (right.bandwidth !== left.bandwidth) return right.bandwidth - left.bandwidth;
+    return left.order - right.order;
+  });
+  return variants[0] ? variants[0].url : "";
+}
+
+function buildUpstreamFetchHeaders(requestHeaders, referrerUrl, accept) {
+  const headers = {
+    accept,
+    "user-agent":
+      String(requestHeaders && requestHeaders["user-agent"] ? requestHeaders["user-agent"] : "").trim() ||
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+  };
+  const referer =
+    String(
+      (requestHeaders && (requestHeaders.referer || requestHeaders.referrer)) || referrerUrl || playbackUrlArg || sourceUrl
+    ).trim() || "";
+  if (referer) headers.referer = referer;
+  try {
+    const origin = String((requestHeaders && requestHeaders.origin) || (referer ? new URL(referer).origin : "")).trim();
+    if (origin) headers.origin = origin;
+  } catch {}
+  for (const key of [
+    "accept-language",
+    "cookie",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "sec-fetch-site",
+    "sec-fetch-mode",
+    "sec-fetch-dest",
+  ]) {
+    const value = String(requestHeaders && requestHeaders[key] ? requestHeaders[key] : "").trim();
+    if (value) headers[key] = value;
+  }
+  return headers;
+}
+
+async function fetchManifestWithHeaders(manifestUrl, requestHeaders, referrerUrl) {
+  const normalizedManifestUrl = normalizeHttpUrl(manifestUrl);
+  if (!normalizedManifestUrl) return null;
+  const headers = buildUpstreamFetchHeaders(
+    requestHeaders,
+    referrerUrl,
+    "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*"
+  );
+
+  const fetchText = async (targetUrl) => {
+    const response = await fetch(targetUrl, {
+      method: "GET",
+      redirect: "follow",
+      headers,
+    });
+    if (!response.ok) return null;
+    const body = await response.text().catch(() => "");
+    return body.trim() ? body : null;
+  };
+
+  let body = await fetchText(normalizedManifestUrl);
+  if (!body || !/^\s*#extm3u/m.test(body)) return null;
+  if (hasMediaSegments(body, normalizedManifestUrl)) {
+    return {
+      finalUrl: normalizedManifestUrl,
+      manifestBody: body,
+    };
+  }
+
+  const variantUrl = pickVariantManifestUrl(body, normalizedManifestUrl);
+  if (!variantUrl) {
+    return {
+      finalUrl: normalizedManifestUrl,
+      manifestBody: body,
+    };
+  }
+  const variantBody = await fetchText(variantUrl);
+  if (!variantBody || !/^\s*#extm3u/m.test(variantBody)) return null;
+  return {
+    finalUrl: variantUrl,
+    manifestBody: variantBody,
+  };
+}
+
 function buildPlaybackCandidates(rawSourceUrl, rawPlaybackUrl) {
   const ordered = [];
   const seen = new Set();
@@ -354,12 +467,27 @@ async function main() {
     }
   } finally {
     if (!manifestResolved) {
+      let finalManifestUrl = lastManifestUrl;
+      let finalManifestBody = lastManifestBody;
+      if (finalManifestUrl && !finalManifestBody) {
+        try {
+          const fetchedManifest = await fetchManifestWithHeaders(
+            finalManifestUrl,
+            lastManifestRequestHeaders,
+            lastReferrerUrl || lastPlaybackUrl || sourceUrl
+          );
+          if (fetchedManifest && fetchedManifest.finalUrl && fetchedManifest.manifestBody) {
+            finalManifestUrl = fetchedManifest.finalUrl;
+            finalManifestBody = fetchedManifest.manifestBody;
+          }
+        } catch {}
+      }
       console.log(
         JSON.stringify({
-          ok: !!lastManifestUrl,
+          ok: !!finalManifestUrl,
           error: lastError,
-          manifestUrl: lastManifestUrl,
-          manifestBody: lastManifestBody,
+          manifestUrl: finalManifestUrl,
+          manifestBody: finalManifestBody,
           referrerUrl: lastReferrerUrl || normalizeHttpUrl(page.url()) || sourceUrl,
           manifestRequestHeaders: lastManifestRequestHeaders,
           playbackUrl: lastPlaybackUrl || sourceUrl,
