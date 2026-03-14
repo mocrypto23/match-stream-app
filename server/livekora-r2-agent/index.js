@@ -113,7 +113,7 @@ function isLikelyChildPlaylistUrl(rawUrl) {
 function looksLikeManifestResponse(contentType, body, finalUrl) {
   const ct = String(contentType || "").toLowerCase();
   const text = String(body || "");
-  if (/^\s*#extm3u/m.test(text)) return true;
+  if (/^\s*#extm3u/im.test(text)) return true;
   if (ct.includes("application/vnd.apple.mpegurl") || ct.includes("application/x-mpegurl")) return true;
   return isLikelyChildPlaylistUrl(finalUrl);
 }
@@ -146,7 +146,6 @@ function hasMediaSegments(manifestText, baseUrl) {
       continue;
     }
     if (trimmed.startsWith("#")) {
-      if (!trimmed.startsWith("#EXT-X-STREAM-INF")) previousExtInf = false;
       continue;
     }
     const absolute = resolveManifestUrl(trimmed, baseUrl);
