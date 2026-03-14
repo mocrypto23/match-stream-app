@@ -20,6 +20,10 @@ const VERIFIED_MANIFEST_CACHE_TTL_MS = Math.max(
   5_000,
   Number.parseInt(String(process.env.REPACK_VERIFIED_MANIFEST_CACHE_TTL_MS || "15000"), 10) || 15_000
 );
+const INLINE_SESSION_MANIFEST_MAX_AGE_MS = Math.max(
+  500,
+  Number.parseInt(String(process.env.REPACK_INLINE_SESSION_MANIFEST_MAX_AGE_MS || "1500"), 10) || 1_500
+);
 
 type MatchRow = {
   id: number;
@@ -476,11 +480,17 @@ async function resolveSessionCandidateMediaManifest(input: {
   fetchUrl?: string;
   referrerUrl: string;
   manifestBody?: string;
+  manifestSeenAt?: number;
 }) {
   let currentUrl = String(input.targetUrl || "").trim();
   let currentFetchUrl = pickSessionFetchUrl(input.fetchUrl, currentUrl, input.internalOrigin);
   let currentReferrerUrl = String(input.referrerUrl || input.sourceUrl).trim() || input.sourceUrl;
-  let currentBody = String(input.manifestBody || "").trim();
+  const manifestSeenAt = Number.isFinite(input.manifestSeenAt) ? Number(input.manifestSeenAt) : 0;
+  const canReuseInlineManifest =
+    !!String(input.manifestBody || "").trim() &&
+    manifestSeenAt > 0 &&
+    Date.now() - manifestSeenAt <= INLINE_SESSION_MANIFEST_MAX_AGE_MS;
+  let currentBody = canReuseInlineManifest ? String(input.manifestBody || "").trim() : "";
 
   for (let depth = 0; depth < 3; depth += 1) {
     if (!currentBody) {
@@ -583,6 +593,7 @@ async function resolveSessionBackedManifest(input: {
       fetchUrl: candidate.fetchUrl,
       referrerUrl,
       manifestBody: candidate.manifestBody,
+      manifestSeenAt: Number(candidate.seenAt || 0),
     });
     if (!resolved.ok) {
       lastError = resolved.error || lastError;
