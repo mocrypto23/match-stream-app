@@ -63,6 +63,8 @@ export default function WatchPage() {
   const [playbackStarting, setPlaybackStarting] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const waitingOverlayTimerRef = useRef<number | null>(null);
+  const hasPlayedRef = useRef(false);
 
   const streamUrl = useMemo(() => {
     const direct = String(status?.playlistUrl || "").trim();
@@ -143,6 +145,13 @@ export default function WatchPage() {
     }
   }, [bootstrap, refreshStatus, streamUrl]);
 
+  const clearWaitingOverlayTimer = useCallback(() => {
+    if (waitingOverlayTimerRef.current !== null) {
+      window.clearTimeout(waitingOverlayTimerRef.current);
+      waitingOverlayTimerRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     void loadMatch();
   }, [loadMatch]);
@@ -150,7 +159,15 @@ export default function WatchPage() {
   useEffect(() => {
     setPlaybackRequested(false);
     setPlaybackStarting(false);
-  }, [matchId]);
+    clearWaitingOverlayTimer();
+    hasPlayedRef.current = false;
+  }, [clearWaitingOverlayTimer, matchId]);
+
+  useEffect(() => {
+    return () => {
+      clearWaitingOverlayTimer();
+    };
+  }, [clearWaitingOverlayTimer]);
 
   useEffect(() => {
     if (!match) return;
@@ -170,6 +187,7 @@ export default function WatchPage() {
     const video = videoRef.current;
     const src = String(streamUrl || "").trim();
 
+    clearWaitingOverlayTimer();
     if (hlsRef.current) {
       hlsRef.current.destroy();
       hlsRef.current = null;
@@ -182,6 +200,7 @@ export default function WatchPage() {
 
     if (!src || !playbackRequested) {
       setPlaybackStarting(false);
+      hasPlayedRef.current = false;
       return;
     }
 
@@ -192,12 +211,22 @@ export default function WatchPage() {
     };
 
     const onPlaying = () => {
+      clearWaitingOverlayTimer();
+      hasPlayedRef.current = true;
       setPlaybackStarting(false);
       setPageError(null);
     };
 
     const onWaiting = () => {
-      setPlaybackStarting(true);
+      clearWaitingOverlayTimer();
+      if (!hasPlayedRef.current) {
+        setPlaybackStarting(true);
+        return;
+      }
+      waitingOverlayTimerRef.current = window.setTimeout(() => {
+        setPlaybackStarting(true);
+        waitingOverlayTimerRef.current = null;
+      }, 1200);
     };
 
     if (video.canPlayType("application/vnd.apple.mpegurl")) {
@@ -251,12 +280,13 @@ export default function WatchPage() {
     hls.attachMedia(video);
 
     return () => {
+      clearWaitingOverlayTimer();
       video.removeEventListener("playing", onPlaying);
       video.removeEventListener("waiting", onWaiting);
       hls.destroy();
       if (hlsRef.current === hls) hlsRef.current = null;
     };
-  }, [playbackRequested, streamUrl]);
+  }, [clearWaitingOverlayTimer, playbackRequested, streamUrl]);
 
   if (loading) {
     return (
@@ -312,15 +342,12 @@ export default function WatchPage() {
               {streamUrl && !playbackRequested ? (
                 <div className="absolute inset-0 z-[60] flex flex-col items-center justify-center gap-4 bg-black/80 px-6 text-center">
                   <div className="text-3xl font-bold text-white">اضغط لبدء البث</div>
-                  <div className="max-w-md text-sm text-slate-300">
-                    يبدأ التشغيل بعد تفاعل واحد منك لضمان استقرار البث بدون الاعتماد على التشغيل التلقائي الصامت.
-                  </div>
                   <button
                     type="button"
                     onClick={requestPlaybackStart}
                     className="rounded-2xl bg-teal-500 px-6 py-3 text-base font-bold text-slate-950 transition hover:bg-teal-400"
                   >
-                    بدء البث الآن
+                    اضغط لبدء البث
                   </button>
                 </div>
               ) : null}
@@ -334,8 +361,12 @@ export default function WatchPage() {
 
               {playbackRequested && playbackStarting ? (
                 <div className="pointer-events-none absolute inset-0 z-[56] flex flex-col items-center justify-center gap-3 bg-black/35 px-6 text-center">
-                  <div className="text-2xl font-bold text-white">جاري بدء البث</div>
-                  <div className="text-sm text-slate-200">يتم تثبيت الاتصال قبل التشغيل.</div>
+                  <div className="text-2xl font-bold text-white">
+                    {hasPlayedRef.current ? "جاري استعادة البث" : "جاري بدء البث"}
+                  </div>
+                  <div className="text-sm text-slate-200">
+                    {hasPlayedRef.current ? "قد يتأخر لثوانٍ بسيطة ثم يكمل." : "انتظر لحظة حتى يبدأ البث."}
+                  </div>
                 </div>
               ) : null}
 
