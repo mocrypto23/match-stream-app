@@ -350,6 +350,39 @@ function isStrictGatewayIngestUrl(rawUrl, matchId, serverId) {
   }
 }
 
+function isSessionManifestPathname(pathname) {
+  return String(pathname || "").toLowerCase().includes("/api/repack/session-manifest");
+}
+
+function isSessionAssetUrl(rawUrl) {
+  if (!isHttpUrl(rawUrl)) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    return String(parsed.pathname || "").toLowerCase().includes("/api/repack/session-asset");
+  } catch {
+    return false;
+  }
+}
+
+function manifestUsesOnlySessionAssets(manifestText, baseUrl) {
+  for (const line of String(manifestText || "").split(/\r?\n/)) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith("#")) {
+      const matches = [...trimmed.matchAll(/URI="([^"]+)"/gi)];
+      for (const match of matches) {
+        const rawUri = match && match[1] ? String(match[1]).trim() : "";
+        const absolute = resolveManifestUrl(rawUri, baseUrl);
+        if (!absolute || !isSessionAssetUrl(absolute)) return false;
+      }
+      continue;
+    }
+    const absolute = resolveManifestUrl(trimmed, baseUrl);
+    if (!absolute || !isSessionAssetUrl(absolute)) return false;
+  }
+  return true;
+}
+
 function shouldDeleteRemoteName(name) {
   const lower = String(name || "").toLowerCase();
   return (
@@ -448,6 +481,10 @@ class MirrorJob {
 
   get key() {
     return buildStrictGatewayIngestUrlKey(this.matchId, this.serverId);
+  }
+
+  get isStrictGatewayJob() {
+    return isStrictGatewayIngestUrl(this.ingestUrl, this.matchId, this.serverId);
   }
 
   get playlistKey() {
@@ -619,8 +656,9 @@ class MirrorJob {
 
   async fetchManifestDocument() {
     const fetchManifestOnce = async (fetchUrl) => {
+      const strictGatewayFetch = isStrictGatewayIngestUrl(fetchUrl, this.matchId, this.serverId);
       const controller = new AbortController();
-      const timeoutMs = isStrictGatewayIngestUrl(fetchUrl, this.matchId, this.serverId)
+      const timeoutMs = strictGatewayFetch
         ? this.manager.config.strictGatewayManifestFetchTimeoutMs
         : this.manager.config.manifestFetchTimeoutMs;
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -639,10 +677,20 @@ class MirrorJob {
         const body = await response.text();
         const contentType = String(response.headers.get("content-type") || "").toLowerCase();
         const finalUrl = response.url || fetchUrl;
+        const sessionManifest = String(response.headers.get("x-repack-session-manifest") || "").trim() === "1";
         if (!response.ok) {
           return {
             ok: false,
             reason: `manifest-http-${response.status || 0}`,
+            body,
+            contentType,
+            finalUrl,
+          };
+        }
+        if (strictGatewayFetch && !sessionManifest) {
+          return {
+            ok: false,
+            reason: "strict-session-manifest-missing-header",
             body,
             contentType,
             finalUrl,
@@ -657,11 +705,21 @@ class MirrorJob {
             finalUrl,
           };
         }
+        if (strictGatewayFetch && !manifestUsesOnlySessionAssets(body, finalUrl)) {
+          return {
+            ok: false,
+            reason: "strict-session-manifest-non-session-assets",
+            body,
+            contentType,
+            finalUrl,
+          };
+        }
         return {
           ok: true,
           body,
           contentType,
           finalUrl,
+          sessionManifest,
         };
       } catch (error) {
         return {
@@ -703,6 +761,15 @@ class MirrorJob {
     for (let depth = 0; depth < 3; depth += 1) {
       const fetched = await fetchManifestWithRetry(currentUrl);
       if (!fetched.ok) return fetched;
+      if (this.isStrictGatewayJob && fetched.sessionManifest && !hasMediaSegments(fetched.body, fetched.finalUrl)) {
+        return {
+          ok: false,
+          reason: "strict-session-manifest-no-media-playlist",
+          body: fetched.body,
+          contentType: fetched.contentType,
+          finalUrl: fetched.finalUrl,
+        };
+      }
       if (hasMediaSegments(fetched.body, fetched.finalUrl)) return fetched;
 
       const variantUrl = pickVariantManifestUrl(fetched.body, fetched.finalUrl);
@@ -740,9 +807,13 @@ class MirrorJob {
   async uploadAsset(record) {
     const startedAt = Date.now();
     const fetchAssetBytes = async (fetchUrl) => {
+      const strictSessionAssetFetch = this.isStrictGatewayJob;
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), this.manager.config.assetFetchTimeoutMs);
       try {
+        if (strictSessionAssetFetch && !isSessionAssetUrl(fetchUrl)) {
+          throw new Error("strict-session-asset-url-required");
+        }
         const response = await fetch(fetchUrl, {
           method: "GET",
           cache: "no-store",
@@ -750,10 +821,14 @@ class MirrorJob {
           signal: controller.signal,
           headers: {
             "user-agent": DEFAULT_USER_AGENT,
+            "x-repack-worker-fetch": "1",
           },
         });
         if (!response.ok) {
           throw new Error(`asset-http-${response.status || 0}`);
+        }
+        if (strictSessionAssetFetch && String(response.headers.get("x-repack-session-asset") || "").trim() !== "1") {
+          throw new Error("strict-session-asset-missing-header");
         }
         return {
           bytes: Buffer.from(await response.arrayBuffer()),
@@ -768,6 +843,9 @@ class MirrorJob {
     let bytes = null;
     let contentType = inferContentTypeFromName(record.remoteName);
     try {
+      if (this.isStrictGatewayJob && !isSessionAssetUrl(record.sourceUrl)) {
+        throw new Error("strict-session-asset-url-required");
+      }
       const fetched = await fetchAssetBytes(record.sourceUrl);
       bytes = fetched.bytes;
       contentType = fetched.contentType;
