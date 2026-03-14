@@ -638,6 +638,14 @@ export const livekoraProvider: LiveStreamProvider = {
 
     while (attempts < 3) {
       attempts += 1;
+      let discoveredResolved:
+        | {
+            manifestBody: string;
+            finalUrl: string;
+            mediaSequence: number | null;
+            targetDurationSec: number;
+          }
+        | null = null;
       if (!state || options?.forceRefresh) {
         let discovered:
           | Awaited<ReturnType<typeof discoverLivekoraState>>
@@ -659,9 +667,15 @@ export const livekoraProvider: LiveStreamProvider = {
           continue;
         }
         state = discovered.state;
+        discoveredResolved = {
+          manifestBody: discovered.manifestBody,
+          finalUrl: discovered.finalUrl,
+          mediaSequence: parseMediaSequence(discovered.manifestBody),
+          targetDurationSec: parseTargetDurationSec(discovered.manifestBody),
+        };
       }
 
-      const resolved = await resolveManifestFromState(input, state);
+      const resolved = discoveredResolved || (await resolveManifestFromState(input, state));
       if (!resolved) {
         lastError = "livekora-manifest-fetch-failed";
         livekoraSourceState.delete(buildSourceStateKey(input.sourceUrl));
