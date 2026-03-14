@@ -1,10 +1,11 @@
 "use client";
 
 import Hls from "hls.js";
-import VideoPlayerControls from "@/components/VideoPlayerControls";
-import type { LivekoraStatus } from "@/lib/livekora-types";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import VideoPlayerControls from "@/components/VideoPlayerControls";
+import type { LivekoraStatus } from "@/lib/livekora-types";
 
 type MatchPayload = {
   id: number;
@@ -58,6 +59,8 @@ export default function WatchPage() {
   const [pageError, setPageError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [bootstrapPending, setBootstrapPending] = useState(false);
+  const [playbackRequested, setPlaybackRequested] = useState(false);
+  const [playbackStarting, setPlaybackStarting] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
 
@@ -74,6 +77,7 @@ export default function WatchPage() {
       setLoading(false);
       return;
     }
+
     setLoading(true);
     setPageError(null);
     try {
@@ -129,9 +133,24 @@ export default function WatchPage() {
     }
   }, [matchId]);
 
+  const requestPlaybackStart = useCallback(() => {
+    setPageError(null);
+    setPlaybackRequested(true);
+    setPlaybackStarting(true);
+    if (!String(streamUrl || "").trim()) {
+      void refreshStatus();
+      void bootstrap();
+    }
+  }, [bootstrap, refreshStatus, streamUrl]);
+
   useEffect(() => {
     void loadMatch();
   }, [loadMatch]);
+
+  useEffect(() => {
+    setPlaybackRequested(false);
+    setPlaybackStarting(false);
+  }, [matchId]);
 
   useEffect(() => {
     if (!match) return;
@@ -157,43 +176,87 @@ export default function WatchPage() {
     }
     if (!video) return;
 
+    video.pause();
     video.removeAttribute("src");
     video.load();
-    if (!src) return;
 
-    if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = src;
-      void video.play().catch(() => {});
+    if (!src || !playbackRequested) {
+      setPlaybackStarting(false);
       return;
     }
 
+    setPlaybackStarting(true);
+
+    const startPlayback = () => {
+      void video.play().catch(() => {});
+    };
+
+    const onPlaying = () => {
+      setPlaybackStarting(false);
+      setPageError(null);
+    };
+
+    const onWaiting = () => {
+      setPlaybackStarting(true);
+    };
+
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = src;
+      video.addEventListener("playing", onPlaying);
+      video.addEventListener("waiting", onWaiting);
+      startPlayback();
+      return () => {
+        video.removeEventListener("playing", onPlaying);
+        video.removeEventListener("waiting", onWaiting);
+      };
+    }
+
     if (!Hls.isSupported()) {
+      setPlaybackStarting(false);
       setPageError("المتصفح لا يدعم HLS.");
       return;
     }
 
     const hls = new Hls({
       enableWorker: true,
-      lowLatencyMode: true,
-      backBufferLength: 30,
+      lowLatencyMode: false,
+      backBufferLength: 90,
+      maxBufferLength: 30,
+      liveSyncDurationCount: 4,
+      liveMaxLatencyDurationCount: 10,
     });
     hlsRef.current = hls;
-    hls.loadSource(src);
-    hls.attachMedia(video);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => {
-      void video.play().catch(() => {});
-    });
+
+    hls.on(Hls.Events.MANIFEST_PARSED, startPlayback);
     hls.on(Hls.Events.ERROR, (_event, data) => {
-      if (data?.fatal) {
-        setPageError(`hls-fatal:${String(data.type || "unknown")}`);
+      if (!data?.fatal) return;
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        hls.startLoad();
+        startPlayback();
+        return;
       }
+      if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        hls.recoverMediaError();
+        startPlayback();
+        return;
+      }
+      setPlaybackStarting(false);
+      setPageError(`hls-fatal:${String(data.type || "unknown")}`);
     });
 
+    video.addEventListener("playing", onPlaying);
+    video.addEventListener("waiting", onWaiting);
+
+    hls.loadSource(src);
+    hls.attachMedia(video);
+
     return () => {
+      video.removeEventListener("playing", onPlaying);
+      video.removeEventListener("waiting", onWaiting);
       hls.destroy();
       if (hlsRef.current === hls) hlsRef.current = null;
     };
-  }, [streamUrl]);
+  }, [playbackRequested, streamUrl]);
 
   if (loading) {
     return (
@@ -230,11 +293,14 @@ export default function WatchPage() {
                 className="h-full w-full"
                 controls={false}
                 playsInline
-                autoPlay
-                muted
+                preload="none"
                 onClick={() => {
                   const video = videoRef.current;
                   if (!video) return;
+                  if (!playbackRequested) {
+                    requestPlaybackStart();
+                    return;
+                  }
                   if (video.paused) {
                     void video.play().catch(() => {});
                     return;
@@ -242,12 +308,37 @@ export default function WatchPage() {
                   video.pause();
                 }}
               />
+
+              {streamUrl && !playbackRequested ? (
+                <div className="absolute inset-0 z-[60] flex flex-col items-center justify-center gap-4 bg-black/80 px-6 text-center">
+                  <div className="text-3xl font-bold text-white">اضغط لبدء البث</div>
+                  <div className="max-w-md text-sm text-slate-300">
+                    يبدأ التشغيل بعد تفاعل واحد منك لضمان استقرار البث بدون الاعتماد على التشغيل التلقائي الصامت.
+                  </div>
+                  <button
+                    type="button"
+                    onClick={requestPlaybackStart}
+                    className="rounded-2xl bg-teal-500 px-6 py-3 text-base font-bold text-slate-950 transition hover:bg-teal-400"
+                  >
+                    بدء البث الآن
+                  </button>
+                </div>
+              ) : null}
+
               {!streamUrl ? (
-                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/70 px-6 text-center">
+                <div className="absolute inset-0 z-[55] flex flex-col items-center justify-center gap-3 bg-black/70 px-6 text-center">
                   <div className="text-2xl font-bold">{stateLabel(status)}</div>
                   <div className="text-sm text-slate-300">{status?.reason || pageError || "waiting-for-playlist"}</div>
                 </div>
               ) : null}
+
+              {playbackRequested && playbackStarting ? (
+                <div className="pointer-events-none absolute inset-0 z-[56] flex flex-col items-center justify-center gap-3 bg-black/35 px-6 text-center">
+                  <div className="text-2xl font-bold text-white">جاري بدء البث</div>
+                  <div className="text-sm text-slate-200">يتم تثبيت الاتصال قبل التشغيل.</div>
+                </div>
+              ) : null}
+
               <VideoPlayerControls videoRef={videoRef} hls={hlsRef.current} title={title} isLive />
             </div>
           </div>
