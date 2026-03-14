@@ -58,6 +58,7 @@ async function main() {
   let manifestBody = "";
   let referrerUrl = channelUrl;
   let resolveFound = null;
+  const pendingResponseReads = new Set();
   const foundPromise = new Promise((resolve) => {
     resolveFound = resolve;
   });
@@ -84,16 +85,20 @@ async function main() {
       }
     });
 
-    page.on("response", async (response) => {
-      try {
-        const url = normalizeHttpUrl(response.url());
-        if (!url || !/\.m3u8(?:$|[?#])|\/hls\/|\/stream\/|\/live\/|amazonaws/i.test(url)) return;
-        const body = await response.text().catch(() => "");
-        if (!body.trim() || !hasMediaSegments(body, url)) return;
-        manifestUrl = url;
-        manifestBody = body;
-        if (resolveFound) resolveFound();
-      } catch {}
+    page.on("response", (response) => {
+      const task = (async () => {
+        try {
+          const url = normalizeHttpUrl(response.url());
+          if (!url || !/\.m3u8(?:$|[?#])|\/hls\/|\/stream\/|\/live\/|amazonaws/i.test(url)) return;
+          const body = await response.text().catch(() => "");
+          if (!body.trim() || !hasMediaSegments(body, url)) return;
+          manifestUrl = url;
+          manifestBody = body;
+          if (resolveFound) resolveFound();
+        } catch {}
+      })();
+      pendingResponseReads.add(task);
+      task.finally(() => pendingResponseReads.delete(task));
     });
 
     await page.goto(channelUrl, {
@@ -130,6 +135,10 @@ async function main() {
         referrerUrl = normalizeHttpUrl(page.url()) || iframeUrl;
         await Promise.race([foundPromise, page.waitForTimeout(8000)]);
       }
+    }
+
+    if (pendingResponseReads.size) {
+      await Promise.allSettled(Array.from(pendingResponseReads));
     }
 
     await page.close().catch(() => {});
