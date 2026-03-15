@@ -58,12 +58,24 @@ async function main() {
 
   const browser = await chromium.launch({
     headless: true,
-    args: ["--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+    args: ["--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled", "--no-sandbox"],
   });
   const context = await browser.newContext({
+    ignoreHTTPSErrors: true,
     userAgent: DEFAULT_USER_AGENT,
     locale: "ar-EG",
     viewport: { width: 1366, height: 900 },
+    extraHTTPHeaders: {
+      "accept-language": "ar,en-US;q=0.9,en;q=0.8",
+    },
+  });
+  await context.addInitScript(() => {
+    try {
+      Object.defineProperty(navigator, "webdriver", {
+        configurable: true,
+        get: () => undefined,
+      });
+    } catch {}
   });
   const page = await context.newPage();
   const deadlineAt = Date.now() + OVERALL_TIMEOUT_MS;
