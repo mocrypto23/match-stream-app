@@ -446,7 +446,7 @@ export default function WatchPage() {
             href="https://twofooty.com"
             className="inline-flex items-center rounded-full border border-white/12 bg-white/6 px-4 py-2 text-sm font-medium text-slate-100 transition hover:bg-white/12"
           >
-            Ø§Ù„Ø±Ø¬ÙˆØ¹ Ø¥Ù„Ù‰ TwoFooty
+            {"\u0627\u0644\u0631\u062c\u0648\u0639 \u0625\u0644\u0649 TwoFooty"}
           </a>
         </div>
         <div className="grid gap-6 lg:grid-cols-[1.6fr_0.8fr]">
