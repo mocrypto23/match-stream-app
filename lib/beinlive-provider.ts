@@ -433,21 +433,9 @@ async function resolveManifestFromCandidate(
 }
 
 async function fetchBeinliveAjaxHtml(sourceUrl: string) {
-  const pageResponse = await axios.get<string>(sourceUrl, {
-    responseType: "text",
-    timeout: 14_000,
-    maxRedirects: 5,
-    validateStatus: () => true,
-    headers: {
-      "user-agent": DEFAULT_USER_AGENT,
-      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "accept-language": "ar,en;q=0.9",
-      referer: sourceUrl,
-    },
-  });
-  if (Number(pageResponse.status || 0) < 200 || Number(pageResponse.status || 0) >= 300) return null;
+  const pageHtml = await fetchBeinlivePageHtml(sourceUrl);
+  if (!pageHtml) return null;
 
-  const pageHtml = String(pageResponse.data || "");
   const ajaxUrl =
     normalizeHttpUrl(String(pageHtml.match(/AlbaAjax\s*=\s*\{[^}]*"ajax_url":"([^"]+)"/i)?.[1] || "").trim()) ||
     "https://www.bein-live.com/wp-admin/admin-ajax.php";
@@ -478,6 +466,24 @@ async function fetchBeinliveAjaxHtml(sourceUrl: string) {
   if (Number(serverResponse.status || 0) < 200 || Number(serverResponse.status || 0) >= 300) return null;
   const html = String(serverResponse.data || "");
   return html.trim() ? html : null;
+}
+
+async function fetchBeinlivePageHtml(sourceUrl: string) {
+  const pageResponse = await axios.get<string>(sourceUrl, {
+    responseType: "text",
+    timeout: 14_000,
+    maxRedirects: 5,
+    validateStatus: () => true,
+    headers: {
+      "user-agent": DEFAULT_USER_AGENT,
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "accept-language": "ar,en;q=0.9",
+      referer: sourceUrl,
+    },
+  });
+  if (Number(pageResponse.status || 0) < 200 || Number(pageResponse.status || 0) >= 300) return null;
+  const pageHtml = String(pageResponse.data || "");
+  return pageHtml.trim() ? pageHtml : null;
 }
 
 function runDirectBeinliveExtractor(sourceUrl: string) {
@@ -526,6 +532,32 @@ function extractBeinliveIframeUrls(serverHtml: string) {
     pushUnique(String(match[1] || ""));
   }
   return out;
+}
+
+function inferBeinliveChannelSlug(pageHtml: string) {
+  const channelText = String(
+    pageHtml.match(/<th>\s*اسم القناة\s*<\/th>\s*<td>\s*([^<]+?)\s*<\/td>/i)?.[1] ||
+      pageHtml.match(/<th>\s*اسم القناه\s*<\/th>\s*<td>\s*([^<]+?)\s*<\/td>/i)?.[1] ||
+      ""
+  )
+    .replace(/&nbsp;/gi, " ")
+    .trim()
+    .toLowerCase();
+  if (!channelText) return "";
+
+  const sportsMatch = channelText.match(/bein\s*sports?\s*(\d+)/i);
+  if (sportsMatch?.[1]) return `sports-${sportsMatch[1]}`;
+
+  const premiumMatch = channelText.match(/bein\s*premium\s*(\d+)/i);
+  if (premiumMatch?.[1]) return `ad-premium-${premiumMatch[1]}`;
+
+  return "";
+}
+
+function buildDirectBeinliveIframeUrls(pageHtml: string) {
+  const slug = inferBeinliveChannelSlug(pageHtml);
+  if (!slug) return [] as string[];
+  return expandBeinliveIframeVariants(`https://aaa.yallashoot2026.com/albaplayer/${slug}/`);
 }
 
 function expandBeinliveIframeVariants(rawIframeUrl: string) {
@@ -647,8 +679,12 @@ async function discoverBeinliveSourceState(input: {
   sourceUrl: string;
   currentSource?: string | null;
 }) {
+  const pageHtml = await fetchBeinlivePageHtml(input.sourceUrl).catch(() => null);
   let serverHtml = await fetchBeinliveAjaxHtml(input.sourceUrl);
   let iframeUrls = serverHtml ? extractBeinliveIframeUrls(serverHtml) : [];
+  if (!iframeUrls.length && pageHtml) {
+    iframeUrls = buildDirectBeinliveIframeUrls(pageHtml);
+  }
   if (!iframeUrls.length) {
     const extracted = await runDirectBeinliveExtractor(input.sourceUrl).catch(() => null);
     const extractedHtml = String(extracted?.serverHtml || "").trim();
