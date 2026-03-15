@@ -1,3 +1,5 @@
+import { execFile } from "node:child_process";
+import path from "node:path";
 import axios from "axios";
 
 import { rewriteManifestForSessionMirror } from "@/lib/repack-runtime-adapters/shared";
@@ -14,6 +16,7 @@ const BEINLIVE_HOST_SUFFIXES = ["bein-live.com"] as const;
 const DAY_PAGE_CACHE_TTL_MS = 90_000;
 const SOURCE_STATE_TTL_MS = 10 * 60_000;
 const WAIT_RETRY_INTERVAL_MS = 700;
+const DIRECT_EXTRACT_TIMEOUT_MS = 24_000;
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 const ALBA_SERV_ORDER = ["2", "3", "1", "0", "5", "4"] as const;
@@ -50,6 +53,13 @@ type DiscoveredCandidate = {
   referrerUrl: string;
   playbackUrl: string;
   priority: number;
+};
+
+type DirectExtractorOutput = {
+  ok?: boolean;
+  serverHtml?: string;
+  iframeUrls?: string[];
+  error?: string;
 };
 
 type ResolvedManifestState = {
@@ -466,7 +476,39 @@ async function fetchBeinliveAjaxHtml(sourceUrl: string) {
   );
 
   if (Number(serverResponse.status || 0) < 200 || Number(serverResponse.status || 0) >= 300) return null;
-  return String(serverResponse.data || "");
+  const html = String(serverResponse.data || "");
+  return html.trim() ? html : null;
+}
+
+function runDirectBeinliveExtractor(sourceUrl: string) {
+  const scriptPath = path.join(process.cwd(), "server", "beinlive-direct-extract.js");
+  return new Promise<DirectExtractorOutput | null>((resolve) => {
+    execFile(
+      process.execPath,
+      [scriptPath, sourceUrl],
+      {
+        cwd: process.cwd(),
+        timeout: DIRECT_EXTRACT_TIMEOUT_MS + 8_000,
+        maxBuffer: 4 * 1024 * 1024,
+      },
+      (_error, stdout) => {
+        const raw = String(stdout || "")
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .at(-1);
+        if (!raw) {
+          resolve(null);
+          return;
+        }
+        try {
+          resolve(JSON.parse(raw) as DirectExtractorOutput);
+        } catch {
+          resolve(null);
+        }
+      }
+    );
+  });
 }
 
 function extractBeinliveIframeUrls(serverHtml: string) {
@@ -605,10 +647,20 @@ async function discoverBeinliveSourceState(input: {
   sourceUrl: string;
   currentSource?: string | null;
 }) {
-  const serverHtml = await fetchBeinliveAjaxHtml(input.sourceUrl);
-  if (!serverHtml) return null;
-
-  const iframeUrls = extractBeinliveIframeUrls(serverHtml);
+  let serverHtml = await fetchBeinliveAjaxHtml(input.sourceUrl);
+  let iframeUrls = serverHtml ? extractBeinliveIframeUrls(serverHtml) : [];
+  if (!iframeUrls.length) {
+    const extracted = await runDirectBeinliveExtractor(input.sourceUrl).catch(() => null);
+    const extractedHtml = String(extracted?.serverHtml || "").trim();
+    if (extractedHtml) serverHtml = extractedHtml;
+    for (const rawUrl of Array.isArray(extracted?.iframeUrls) ? extracted?.iframeUrls : []) {
+      const normalized = normalizeHttpUrl(String(rawUrl || "").trim());
+      if (normalized && !iframeUrls.includes(normalized)) iframeUrls.push(normalized);
+    }
+    if (!iframeUrls.length && serverHtml) {
+      iframeUrls = extractBeinliveIframeUrls(serverHtml);
+    }
+  }
   if (!iframeUrls.length) return null;
 
   const iframeVariants: string[] = [];
