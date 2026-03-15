@@ -91,6 +91,9 @@ export const playerv2RuntimeAdapter: RuntimeAdapter = {
   ...playerv2BaseAdapter,
   currentManifest: async (input, queryOptions) => {
     const peek = playerv2BaseAdapter.peekStatus(input);
+    if (queryOptions?.forceRefresh) {
+      await playerv2BaseAdapter.refresh(input, "playerv2_forced_manifest_refresh").catch(() => null);
+    }
     if (peek.state !== "ready" && !peek.currentSource) {
       for (const candidate of await derivePlayerv2HintCandidates(input)) {
         primeRuntimeHint(input, candidate);

@@ -553,7 +553,7 @@ class LivekoraJob {
     };
   }
 
-  async fetchManifestDocument() {
+  async fetchManifestDocument(options = {}) {
     const buildFetchUrl = (rawUrl) => {
       if (!isSessionManifestUrl(rawUrl)) return rawUrl;
       try {
@@ -574,6 +574,9 @@ class LivekoraJob {
           );
         }
         parsed.searchParams.set("allowRotate", "1");
+        if (options.forceRefresh) {
+          parsed.searchParams.set("forceRefresh", "1");
+        }
         return parsed.toString();
       } catch {
         return rawUrl;
@@ -798,83 +801,100 @@ class LivekoraJob {
   }
 
   async performSync() {
-    const manifest = await this.fetchManifestDocument();
-    if (!manifest.ok) {
-      this.lastError = manifest.reason;
-      this.lastErrorAt = Date.now();
-      this.consecutiveFailures += 1;
-      if (this.consecutiveFailures >= this.manager.config.maxConsecutiveFailures) {
-        this.state = "degraded";
-      }
-      return {
-        ok: false,
-        reason: manifest.reason,
-        nextDelayMs: Math.max(1000, this.manager.config.uploadPollMs),
-      };
-    }
-
-    const rewritten = this.rewriteManifestForPublic(manifest.body, manifest.finalUrl);
-    const nowMs = Date.now();
-    this.touch();
-    if (Number.isFinite(rewritten.targetDurationSec) && rewritten.targetDurationSec > 0) {
-      this.lastObservedTargetDurationSec = rewritten.targetDurationSec;
-    }
-    if (Number.isFinite(rewritten.mediaSequence)) {
-      this.lastRuntimeMediaSequence = rewritten.mediaSequence;
-    }
-
-    const uploads = [];
-    for (const sourceUrl of rewritten.currentAssetUrls) {
-      const record = this.assetsBySourceUrl.get(sourceUrl);
-      if (!record) continue;
-      record.lastSeenAt = nowMs;
-      if (record.uploadedAt > 0) continue;
-      uploads.push(record);
-    }
-
     try {
-      const failedUploads = [];
-      await mapLimit(uploads, this.manager.config.mirrorAssetConcurrency, async (record) => {
-        try {
-          await this.uploadAsset(record);
-        } catch (error) {
-          failedUploads.push({ record, error: error instanceof Error ? error.message : String(error) });
+      for (let syncAttempt = 0; syncAttempt < 2; syncAttempt += 1) {
+        const manifest = await this.fetchManifestDocument({ forceRefresh: syncAttempt > 0 });
+        if (!manifest.ok) {
+          this.lastError = manifest.reason;
+          this.lastErrorAt = Date.now();
+          this.consecutiveFailures += 1;
+          if (this.consecutiveFailures >= this.manager.config.maxConsecutiveFailures) {
+            this.state = "degraded";
+          }
+          return {
+            ok: false,
+            reason: manifest.reason,
+            nextDelayMs: Math.max(1000, this.manager.config.uploadPollMs),
+          };
         }
-      });
 
-      const fatalUpload = failedUploads.find(({ record }) => record.kind !== "segment");
-      if (fatalUpload) {
-        throw new Error(fatalUpload.error);
-      }
-
-      let publishManifestBody = rewritten.manifestBody;
-      if (failedUploads.length) {
-        const missingRemoteNames = new Set(failedUploads.map(({ record }) => record.remoteName));
-        publishManifestBody = filterUnavailableSegmentsFromManifest(rewritten.manifestBody, missingRemoteNames);
-        if (!hasMediaSegments(publishManifestBody, this.publicPlaylistUrl)) {
-          throw new Error(failedUploads[0].error);
+        const rewritten = this.rewriteManifestForPublic(manifest.body, manifest.finalUrl);
+        const nowMs = Date.now();
+        this.touch();
+        if (Number.isFinite(rewritten.targetDurationSec) && rewritten.targetDurationSec > 0) {
+          this.lastObservedTargetDurationSec = rewritten.targetDurationSec;
         }
+        if (Number.isFinite(rewritten.mediaSequence)) {
+          this.lastRuntimeMediaSequence = rewritten.mediaSequence;
+        }
+
+        const uploads = [];
+        for (const sourceUrl of rewritten.currentAssetUrls) {
+          const record = this.assetsBySourceUrl.get(sourceUrl);
+          if (!record) continue;
+          record.lastSeenAt = nowMs;
+          if (record.uploadedAt > 0) continue;
+          uploads.push(record);
+        }
+
+        const failedUploads = [];
+        await mapLimit(uploads, this.manager.config.mirrorAssetConcurrency, async (record) => {
+          try {
+            await this.uploadAsset(record);
+          } catch (error) {
+            failedUploads.push({ record, error: error instanceof Error ? error.message : String(error) });
+          }
+        });
+
+        const fatalUpload = failedUploads.find(({ record }) => record.kind !== "segment");
+        if (fatalUpload) {
+          throw new Error(fatalUpload.error);
+        }
+
+        let publishManifestBody = rewritten.manifestBody;
+        if (failedUploads.length) {
+          const missingRemoteNames = new Set(failedUploads.map(({ record }) => record.remoteName));
+          publishManifestBody = filterUnavailableSegmentsFromManifest(rewritten.manifestBody, missingRemoteNames);
+          const allSegment403 =
+            failedUploads.length > 0 &&
+            failedUploads.every(
+              ({ record, error }) => record.kind === "segment" && /asset-http-403/i.test(String(error || ""))
+            );
+          if (!hasMediaSegments(publishManifestBody, this.publicPlaylistUrl)) {
+            if (allSegment403 && syncAttempt === 0) {
+              this.manager.log("warn", "retrying manifest sync after segment 403", {
+                matchId: this.matchId,
+                provider: this.providerId,
+                currentSource: this.lastCurrentSource,
+              });
+              continue;
+            }
+            throw new Error(failedUploads[0].error);
+          }
+        }
+
+        await this.cleanupStaleAssets(nowMs, rewritten.currentAssetUrls);
+        const fingerprint = hashHex(publishManifestBody);
+        if (
+          fingerprint !== this.lastPlaylistFingerprint ||
+          !this.lastPublishAt ||
+          nowMs - this.lastPublishAt >= this.manager.config.playlistPublishMinIntervalMs
+        ) {
+          await this.uploadManifest(publishManifestBody);
+          this.lastPlaylistFingerprint = fingerprint;
+        }
+
+        this.state = "running";
+        this.consecutiveFailures = 0;
+        this.lastError = "";
+        const nextDelayMs = Math.max(
+          600,
+          Math.min(8000, Math.round(Math.max(2, this.lastObservedTargetDurationSec || 2) * 1000 * 0.45))
+        );
+        return { ok: true, reason: syncAttempt > 0 ? "ok_after_forced_refresh" : "ok", nextDelayMs };
       }
 
-      await this.cleanupStaleAssets(nowMs, rewritten.currentAssetUrls);
-      const fingerprint = hashHex(publishManifestBody);
-      if (
-        fingerprint !== this.lastPlaylistFingerprint ||
-        !this.lastPublishAt ||
-        nowMs - this.lastPublishAt >= this.manager.config.playlistPublishMinIntervalMs
-      ) {
-        await this.uploadManifest(publishManifestBody);
-        this.lastPlaylistFingerprint = fingerprint;
-      }
-
-      this.state = "running";
-      this.consecutiveFailures = 0;
-      this.lastError = "";
-      const nextDelayMs = Math.max(
-        600,
-        Math.min(8000, Math.round(Math.max(2, this.lastObservedTargetDurationSec || 2) * 1000 * 0.45))
-      );
-      return { ok: true, reason: "ok", nextDelayMs };
+      throw new Error("segment-refresh-retry-exhausted");
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : String(error);
       this.lastErrorAt = Date.now();
