@@ -16,6 +16,7 @@ const SOURCE_STATE_TTL_MS = 10 * 60_000;
 const WAIT_RETRY_INTERVAL_MS = 700;
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+const ALBA_SERV_ORDER = ["2", "3", "1", "0", "5", "4"] as const;
 
 type CachedDayPage = {
   fetchedAt: number;
@@ -26,17 +27,35 @@ type CachedDayPage = {
   }>;
 };
 
-type CachedSourceState = {
-  sourceUrl: string;
+type BeinliveCandidateState = {
   manifestUrl: string;
   referrerUrl: string;
   playbackUrl: string;
   updatedAt: number;
   lastMediaSequence: number | null;
+  lastError: string;
+  failureCount: number;
+};
+
+type CachedSourceState = {
+  sourceUrl: string;
+  updatedAt: number;
+  activeIndex: number;
+  lastMediaSequence: number | null;
+  candidates: BeinliveCandidateState[];
+};
+
+type DiscoveredCandidate = {
+  manifestUrl: string;
+  referrerUrl: string;
+  playbackUrl: string;
+  priority: number;
 };
 
 type ResolvedManifestState = {
   state: CachedSourceState;
+  activeIndex: number;
+  candidate: BeinliveCandidateState;
   manifestBody: string;
   finalUrl: string;
   mediaSequence: number | null;
@@ -50,6 +69,15 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 }
 
+function normalizeHttpUrl(rawUrl: string) {
+  try {
+    const parsed = new URL(String(rawUrl || "").trim());
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.toString() : "";
+  } catch {
+    return "";
+  }
+}
+
 function decodeMaybeBase64(rawValue: string) {
   const value = String(rawValue || "").trim();
   if (!value) return "";
@@ -61,24 +89,42 @@ function decodeMaybeBase64(rawValue: string) {
   }
 }
 
-function normalizeHttpUrl(rawUrl: string) {
-  try {
-    const parsed = new URL(String(rawUrl || "").trim());
-    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.toString() : "";
-  } catch {
-    return "";
-  }
-}
-
 function buildSourceStateKey(sourceUrl: string) {
   return normalizeHttpUrl(sourceUrl).toLowerCase();
+}
+
+function sanitizeState(state: CachedSourceState | null) {
+  if (!state) return null;
+  const candidates = state.candidates
+    .map((candidate) => ({
+      manifestUrl: normalizeHttpUrl(candidate.manifestUrl),
+      referrerUrl: normalizeHttpUrl(candidate.referrerUrl),
+      playbackUrl: normalizeHttpUrl(candidate.playbackUrl),
+      updatedAt: Number(candidate.updatedAt || 0),
+      lastMediaSequence: Number.isFinite(candidate.lastMediaSequence) ? Number(candidate.lastMediaSequence) : null,
+      lastError: String(candidate.lastError || ""),
+      failureCount: Math.max(0, Number(candidate.failureCount || 0)),
+    }))
+    .filter((candidate) => candidate.manifestUrl && candidate.referrerUrl && candidate.playbackUrl);
+  if (!candidates.length) return null;
+
+  return {
+    sourceUrl: normalizeHttpUrl(state.sourceUrl),
+    updatedAt: Number(state.updatedAt || Date.now()),
+    activeIndex: Math.max(0, Math.min(candidates.length - 1, Number(state.activeIndex || 0))),
+    lastMediaSequence: Number.isFinite(state.lastMediaSequence) ? Number(state.lastMediaSequence) : null,
+    candidates,
+  } satisfies CachedSourceState;
 }
 
 function readSourceState(sourceUrl: string) {
   const key = buildSourceStateKey(sourceUrl);
   if (!key) return null;
-  const cached = beinliveSourceState.get(key);
-  if (!cached) return null;
+  const cached = sanitizeState(beinliveSourceState.get(key) || null);
+  if (!cached) {
+    beinliveSourceState.delete(key);
+    return null;
+  }
   if (cached.updatedAt + SOURCE_STATE_TTL_MS <= Date.now()) {
     beinliveSourceState.delete(key);
     return null;
@@ -87,10 +133,12 @@ function readSourceState(sourceUrl: string) {
 }
 
 function writeSourceState(state: CachedSourceState) {
-  const key = buildSourceStateKey(state.sourceUrl);
-  if (!key) return state;
-  beinliveSourceState.set(key, state);
-  return state;
+  const normalized = sanitizeState(state);
+  if (!normalized) return null;
+  const key = buildSourceStateKey(normalized.sourceUrl);
+  if (!key) return null;
+  beinliveSourceState.set(key, normalized);
+  return normalized;
 }
 
 function clearSourceState(sourceUrl: string) {
@@ -103,8 +151,7 @@ function resolveManifestUrl(raw: string, baseUrl: string) {
   const value = String(raw || "").trim();
   if (!value) return "";
   try {
-    const absolute = new URL(value, baseUrl).toString();
-    return normalizeHttpUrl(absolute);
+    return normalizeHttpUrl(new URL(value, baseUrl).toString());
   } catch {
     return "";
   }
@@ -141,7 +188,10 @@ function hasMediaSegments(manifestText: string, baseUrl: string) {
       previousExtInf = true;
       continue;
     }
-    if (trimmed.startsWith("#")) continue;
+    if (trimmed.startsWith("#")) {
+      if (!trimmed.startsWith("#EXT-X-STREAM-INF")) previousExtInf = false;
+      continue;
+    }
     const absolute = resolveManifestUrl(trimmed, baseUrl);
     if (!absolute) continue;
     if (previousExtInf) return true;
@@ -164,6 +214,7 @@ function pickVariantManifestUrl(manifestText: string, baseUrl: string) {
       continue;
     }
     if (trimmed.startsWith("#")) continue;
+
     const absolute = resolveManifestUrl(trimmed, baseUrl);
     if (!absolute || !absolute.toLowerCase().includes(".m3u8")) {
       pendingBandwidth = -1;
@@ -209,9 +260,9 @@ function buildRequestHeaders(referrerUrl: string, accept: string) {
   };
 }
 
-async function fetchTextWithHeaders(url: string, referrerUrl: string) {
+async function fetchTextWithHeaders(url: string, referrerUrl: string, accept: string) {
   const targetUrl = normalizeHttpUrl(url);
-  const headers = buildRequestHeaders(referrerUrl, "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*");
+  const headers = buildRequestHeaders(referrerUrl, accept);
   if (!targetUrl || !headers) return null;
   const response = await axios.get<string>(targetUrl, {
     responseType: "text",
@@ -223,6 +274,18 @@ async function fetchTextWithHeaders(url: string, referrerUrl: string) {
   if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) return null;
   const body = String(response.data || "").trim();
   return body || null;
+}
+
+async function fetchManifestText(url: string, referrerUrl: string) {
+  return await fetchTextWithHeaders(
+    url,
+    referrerUrl,
+    "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*"
+  );
+}
+
+async function fetchHtmlText(url: string, referrerUrl: string) {
+  return await fetchTextWithHeaders(url, referrerUrl, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
 }
 
 async function fetchBinaryWithHeaders(input: {
@@ -256,12 +319,12 @@ async function fetchBinaryWithHeaders(input: {
         error: `asset-http-${Number(response.status || 0)}`,
       };
     }
-    const bytes = Buffer.from(response.data);
+
     return {
       ok: true,
       status: Number(response.status || 200),
       contentType: String(response.headers["content-type"] || ""),
-      bodyBase64: bytes.toString("base64"),
+      bodyBase64: Buffer.from(response.data).toString("base64"),
       error: "",
     };
   } catch (error) {
@@ -275,35 +338,86 @@ async function fetchBinaryWithHeaders(input: {
   }
 }
 
-async function resolveManifestFromState(state: CachedSourceState): Promise<ResolvedManifestState | null> {
-  let manifestBody = await fetchTextWithHeaders(state.manifestUrl, state.referrerUrl);
-  if (!manifestBody || !/^\s*#EXTM3U/im.test(manifestBody)) {
-    return null;
-  }
+function cloneState(state: CachedSourceState) {
+  return {
+    ...state,
+    candidates: state.candidates.map((candidate) => ({ ...candidate })),
+  } satisfies CachedSourceState;
+}
 
-  let finalUrl = state.manifestUrl;
+function candidateAttemptOrder(activeIndex: number, count: number, allowRotate: boolean) {
+  if (count <= 0) return [] as number[];
+  if (!allowRotate) return [Math.max(0, Math.min(count - 1, activeIndex))];
+  const start = Math.max(0, Math.min(count - 1, activeIndex));
+  const order: number[] = [];
+  for (let offset = 0; offset < count; offset += 1) {
+    order.push((start + offset) % count);
+  }
+  return order;
+}
+
+function recordCandidateFailure(state: CachedSourceState, index: number, error: string) {
+  const next = cloneState(state);
+  const candidate = next.candidates[index];
+  if (!candidate) return next;
+  candidate.lastError = String(error || "");
+  candidate.failureCount += 1;
+  candidate.updatedAt = Date.now();
+  next.updatedAt = Date.now();
+  return writeSourceState(next) || next;
+}
+
+function recordCandidateSuccess(
+  state: CachedSourceState,
+  index: number,
+  resolved: { finalUrl: string; mediaSequence: number | null }
+) {
+  const next = cloneState(state);
+  const candidate = next.candidates[index];
+  if (!candidate) return next;
+  candidate.manifestUrl = normalizeHttpUrl(resolved.finalUrl) || candidate.manifestUrl;
+  candidate.lastMediaSequence = resolved.mediaSequence;
+  candidate.lastError = "";
+  candidate.failureCount = 0;
+  candidate.updatedAt = Date.now();
+  next.activeIndex = index;
+  next.lastMediaSequence = resolved.mediaSequence;
+  next.updatedAt = Date.now();
+  return writeSourceState(next) || next;
+}
+
+async function resolveManifestFromCandidate(
+  state: CachedSourceState,
+  candidateIndex: number
+): Promise<Omit<ResolvedManifestState, "state" | "activeIndex"> | null> {
+  const candidate = state.candidates[candidateIndex];
+  if (!candidate) return null;
+
+  let manifestBody = await fetchManifestText(candidate.manifestUrl, candidate.referrerUrl);
+  if (!manifestBody || !/^\s*#EXTM3U/im.test(manifestBody)) return null;
+
+  let finalUrl = candidate.manifestUrl;
   if (!hasMediaSegments(manifestBody, finalUrl)) {
     const variantUrl = pickVariantManifestUrl(manifestBody, finalUrl);
     if (!variantUrl) return null;
-    const variantBody = await fetchTextWithHeaders(variantUrl, state.referrerUrl);
+    const variantBody = await fetchManifestText(variantUrl, candidate.referrerUrl);
     if (!variantBody || !hasMediaSegments(variantBody, variantUrl)) return null;
     manifestBody = variantBody;
     finalUrl = variantUrl;
   }
 
-  const mediaSequence = parseMediaSequence(manifestBody);
-  const nextState = writeSourceState({
-    ...state,
-    manifestUrl: finalUrl,
-    updatedAt: Date.now(),
-    lastMediaSequence: mediaSequence,
-  });
-
   return {
-    state: nextState,
+    candidate: {
+      ...candidate,
+      manifestUrl: finalUrl,
+      lastMediaSequence: parseMediaSequence(manifestBody),
+      updatedAt: Date.now(),
+      lastError: "",
+      failureCount: 0,
+    },
     manifestBody,
     finalUrl,
-    mediaSequence,
+    mediaSequence: parseMediaSequence(manifestBody),
     targetDurationSec: parseTargetDurationSec(manifestBody),
   };
 }
@@ -346,6 +460,7 @@ async function fetchBeinliveAjaxHtml(sourceUrl: string) {
         "content-type": "application/x-www-form-urlencoded",
         referer: sourceUrl,
         origin: new URL(sourceUrl).origin,
+        "x-requested-with": "XMLHttpRequest",
       },
     }
   );
@@ -354,150 +469,243 @@ async function fetchBeinliveAjaxHtml(sourceUrl: string) {
   return String(serverResponse.data || "");
 }
 
-function extractBeinliveIframeUrl(serverHtml: string) {
-  const raw =
-    String(serverHtml.match(/data-vload=['"]([^'"]+)['"]/i)?.[1] || "").trim() ||
-    String(serverHtml.match(/data-initial=['"]([^'"]+)['"]/i)?.[1] || "").trim() ||
-    String(serverHtml.match(/data-id=['"]([^'"]+)['"]/i)?.[1] || "").trim() ||
-    String(serverHtml.match(/data-url=['"]([^'"]+)['"]/i)?.[1] || "").trim();
-  return normalizeHttpUrl(decodeMaybeBase64(raw));
+function extractBeinliveIframeUrls(serverHtml: string) {
+  const out: string[] = [];
+  const pushUnique = (raw: string) => {
+    const normalized = normalizeHttpUrl(decodeMaybeBase64(raw));
+    if (!normalized || out.includes(normalized)) return;
+    out.push(normalized);
+  };
+
+  for (const match of serverHtml.matchAll(/\b(?:data-vload|data-initial|data-id|data-url)=['"]([^'"]+)['"]/gi)) {
+    pushUnique(String(match[1] || ""));
+  }
+  for (const match of serverHtml.matchAll(/\bhref=['"]([^'"]*\/albaplayer\/[^'"]+)['"]/gi)) {
+    pushUnique(String(match[1] || ""));
+  }
+  return out;
+}
+
+function expandBeinliveIframeVariants(rawIframeUrl: string) {
+  const iframeUrl = normalizeHttpUrl(rawIframeUrl);
+  if (!iframeUrl) return [] as string[];
+
+  const out: string[] = [];
+  const pushUnique = (raw: string) => {
+    const normalized = normalizeHttpUrl(raw);
+    if (!normalized || out.includes(normalized)) return;
+    out.push(normalized);
+  };
+
+  pushUnique(iframeUrl);
+  try {
+    const parsed = new URL(iframeUrl);
+    const parts = String(parsed.pathname || "")
+      .split("/")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const slug = String(parts[0] === "albaplayer" ? parts[1] || "" : parts[0] || "").trim();
+    if (!slug) return out;
+
+    for (const serv of ALBA_SERV_ORDER) {
+      pushUnique(`${parsed.origin}/albaplayer/${slug}/?serv=${serv}`);
+    }
+    pushUnique(`${parsed.origin}/albaplayer/${slug}/`);
+  } catch {}
+
+  return out;
+}
+
+function parseIframeDomains(iframeHtml: string) {
+  const domainsMatch = iframeHtml.match(/const\s+D\s*=\s*\[([^\]]+)\]/i);
+  return (domainsMatch?.[1] || "")
+    .split(",")
+    .map((value) => value.replace(/['"`]/g, "").trim())
+    .filter(Boolean);
+}
+
+function parseIframeChannelKey(iframeHtml: string, currentSource?: string | null) {
+  const fromHtml =
+    String(iframeHtml.match(/\/hls\/([^/]+)\/(?:master\.m3u8|live\/index\.m3u8)/i)?.[1] || "").trim() ||
+    String(iframeHtml.match(/return['"`]\s*ch(\d+)/i)?.[1] || "").trim();
+  const fromCurrent = String(String(currentSource || "").match(/\/hls\/([^/]+)\//i)?.[1] || "").trim();
+  const resolved = fromHtml || fromCurrent;
+  return resolved ? resolved.replace(/^ch/i, "ch") : "";
 }
 
 function buildCandidateManifestUrls(input: {
   iframeHtml: string;
   currentSource?: string | null;
 }) {
-  const out: string[] = [];
-  const pushUnique = (rawUrl: string) => {
+  const out: Array<{ manifestUrl: string; priority: number }> = [];
+  const seen = new Set<string>();
+  const pushUnique = (rawUrl: string, priority: number) => {
     const normalized = normalizeHttpUrl(rawUrl);
-    if (!normalized || out.includes(normalized)) return;
-    out.push(normalized);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    out.push({ manifestUrl: normalized, priority });
   };
 
   const currentSource = normalizeHttpUrl(String(input.currentSource || "").trim());
   if (currentSource) {
-    pushUnique(currentSource);
+    pushUnique(currentSource, 2_400);
     if (/\/master\.m3u8(?:$|\?)/i.test(currentSource)) {
-      pushUnique(currentSource.replace(/\/master\.m3u8(?:$|\?)/i, "/live/index.m3u8"));
+      pushUnique(currentSource.replace(/\/master\.m3u8(?:$|\?)/i, "/live/index.m3u8"), 2_600);
     }
   }
 
-  const domainsMatch = input.iframeHtml.match(/const\s+D\s*=\s*\[([^\]]+)\]/i);
-  const domains = (domainsMatch?.[1] || "")
-    .split(",")
-    .map((value) => value.replace(/['"`]/g, "").trim())
-    .filter(Boolean);
-  const channelKey =
-    String(input.iframeHtml.match(/\/hls\/([^/]+)\/master\.m3u8/i)?.[1] || "").trim() ||
-    String(currentSource.match(/\/hls\/([^/]+)\//i)?.[1] || "").trim();
+  for (const match of input.iframeHtml.matchAll(/https?:\/\/[^"'`\s]+\/hls\/[^"'`\s]+(?:master\.m3u8|live\/index\.m3u8)/gi)) {
+    const raw = String(match[0] || "").trim();
+    pushUnique(raw, /\/live\/index\.m3u8/i.test(raw) ? 2_300 : 2_050);
+  }
+
+  const channelKey = parseIframeChannelKey(input.iframeHtml, currentSource);
+  const domains = parseIframeDomains(input.iframeHtml);
   const subdomain = computeAlbaSubdomain();
 
   if (channelKey && domains.length) {
     for (const domain of domains) {
-      pushUnique(`https://${subdomain}.${domain}/hls/${channelKey}/master.m3u8`);
-      pushUnique(`https://${subdomain}.${domain}/hls/${channelKey}/live/index.m3u8`);
+      pushUnique(`https://${subdomain}.${domain}/hls/${channelKey}/live/index.m3u8`, 2_200);
+      pushUnique(`https://${subdomain}.${domain}/hls/${channelKey}/master.m3u8`, 1_950);
     }
   }
 
   return out;
 }
 
-async function resolveBeinliveIframeManifest(input: {
+function computeCandidatePriority(input: {
+  manifestUrl: string;
+  referrerUrl: string;
+  currentSource?: string | null;
+  basePriority: number;
+  order: number;
+}) {
+  let score = Number(input.basePriority || 0);
+  const manifestUrl = String(input.manifestUrl || "").toLowerCase();
+  const referrerUrl = String(input.referrerUrl || "").toLowerCase();
+  const currentSource = String(input.currentSource || "").toLowerCase();
+
+  if (manifestUrl.includes("/live/index.m3u8")) score += 320;
+  if (manifestUrl.includes(".yallashoot.cv/")) score += 180;
+  if (manifestUrl.includes(".kora-live-live.info/")) score += 160;
+  if (referrerUrl.includes("serv=2")) score += 260;
+  if (referrerUrl.includes("serv=3")) score += 180;
+  if (!referrerUrl.includes("serv=")) score += 120;
+  if (currentSource && manifestUrl === currentSource) score += 1_200;
+  try {
+    if (currentSource && new URL(input.manifestUrl).hostname === new URL(input.currentSource || input.manifestUrl).hostname) {
+      score += 140;
+    }
+  } catch {}
+  score -= input.order * 8;
+  return score;
+}
+
+async function discoverBeinliveSourceState(input: {
   sourceUrl: string;
   currentSource?: string | null;
-}): Promise<(ResolvedManifestState & { candidatesFound: number; candidatesTried: number }) | null> {
+}) {
   const serverHtml = await fetchBeinliveAjaxHtml(input.sourceUrl);
   if (!serverHtml) return null;
 
-  const iframeUrl = extractBeinliveIframeUrl(serverHtml);
-  if (!iframeUrl) return null;
+  const iframeUrls = extractBeinliveIframeUrls(serverHtml);
+  if (!iframeUrls.length) return null;
 
-  const iframeHtmlResponse = await axios.get<string>(iframeUrl, {
-    responseType: "text",
-    timeout: 14_000,
-    maxRedirects: 5,
-    validateStatus: () => true,
-    headers: {
-      "user-agent": DEFAULT_USER_AGENT,
-      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      referer: input.sourceUrl,
-      origin: new URL(input.sourceUrl).origin,
-    },
-  });
-  if (Number(iframeHtmlResponse.status || 0) < 200 || Number(iframeHtmlResponse.status || 0) >= 300) return null;
-  const iframeHtml = String(iframeHtmlResponse.data || "");
-
-  const candidates = buildCandidateManifestUrls({
-    iframeHtml,
-    currentSource: input.currentSource,
-  });
-
-  for (const [index, candidateUrl] of candidates.entries()) {
-    const candidateBody = await fetchTextWithHeaders(candidateUrl, iframeUrl).catch(() => null);
-    if (!candidateBody || !/^\s*#EXTM3U/im.test(candidateBody)) continue;
-
-    let finalUrl = candidateUrl;
-    let manifestBody = candidateBody;
-    if (!hasMediaSegments(manifestBody, finalUrl)) {
-      const variantUrl = pickVariantManifestUrl(manifestBody, finalUrl);
-      if (!variantUrl) continue;
-      const variantBody = await fetchTextWithHeaders(variantUrl, iframeUrl).catch(() => null);
-      if (!variantBody || !hasMediaSegments(variantBody, variantUrl)) continue;
-      finalUrl = variantUrl;
-      manifestBody = variantBody;
+  const iframeVariants: string[] = [];
+  for (const iframeUrl of iframeUrls) {
+    for (const variant of expandBeinliveIframeVariants(iframeUrl)) {
+      if (!iframeVariants.includes(variant)) iframeVariants.push(variant);
     }
-
-    const mediaSequence = parseMediaSequence(manifestBody);
-    const state = writeSourceState({
-      sourceUrl: input.sourceUrl,
-      manifestUrl: finalUrl,
-      referrerUrl: iframeUrl,
-      playbackUrl: iframeUrl,
-      updatedAt: Date.now(),
-      lastMediaSequence: mediaSequence,
-    });
-
-    return {
-      state,
-      manifestBody,
-      finalUrl,
-      mediaSequence,
-      targetDurationSec: parseTargetDurationSec(manifestBody),
-      candidatesFound: candidates.length,
-      candidatesTried: index + 1,
-    };
   }
 
-  return null;
+  const discovered: DiscoveredCandidate[] = [];
+  const now = Date.now();
+  for (const iframeUrl of iframeVariants.slice(0, 12)) {
+    const iframeHtml = await fetchHtmlText(iframeUrl, input.sourceUrl).catch(() => null);
+    if (!iframeHtml) continue;
+
+    for (const candidate of buildCandidateManifestUrls({
+      iframeHtml,
+      currentSource: input.currentSource,
+    })) {
+      discovered.push({
+        manifestUrl: candidate.manifestUrl,
+        referrerUrl: iframeUrl,
+        playbackUrl: iframeUrl,
+        priority: computeCandidatePriority({
+          manifestUrl: candidate.manifestUrl,
+          referrerUrl: iframeUrl,
+          currentSource: input.currentSource,
+          basePriority: candidate.priority,
+          order: discovered.length,
+        }),
+      });
+    }
+  }
+
+  const deduped = new Map<string, DiscoveredCandidate>();
+  for (const candidate of discovered) {
+    const key = `${candidate.manifestUrl}|${candidate.referrerUrl}`;
+    const previous = deduped.get(key);
+    if (!previous || candidate.priority > previous.priority) {
+      deduped.set(key, candidate);
+    }
+  }
+
+  const candidates = Array.from(deduped.values())
+    .sort((left, right) => right.priority - left.priority)
+    .map(
+      (candidate) =>
+        ({
+          manifestUrl: candidate.manifestUrl,
+          referrerUrl: candidate.referrerUrl,
+          playbackUrl: candidate.playbackUrl,
+          updatedAt: now,
+          lastMediaSequence: null,
+          lastError: "",
+          failureCount: 0,
+        }) satisfies BeinliveCandidateState
+    );
+  if (!candidates.length) return null;
+
+  return writeSourceState({
+    sourceUrl: input.sourceUrl,
+    updatedAt: now,
+    activeIndex: 0,
+    lastMediaSequence: null,
+    candidates,
+  });
 }
 
 function buildManifestResult(input: {
   sourceUrl: string;
   internalOrigin: string;
   state: CachedSourceState;
+  activeIndex: number;
   manifestBody: string;
   finalUrl: string;
   mediaSequence: number | null;
   targetDurationSec: number;
   refreshed: boolean;
-  candidatesFound: number;
+  rotated: boolean;
   candidatesTried: number;
 }): ProviderManifestResult {
+  const candidate = input.state.candidates[input.activeIndex];
   return {
     ok: true,
     manifestBody: rewriteManifestForSessionMirror(input.manifestBody, input.finalUrl, input.internalOrigin, input.sourceUrl, 1),
     finalUrl: input.finalUrl,
     targetUrl: input.finalUrl,
     fetchUrl: input.finalUrl,
-    referrerUrl: input.state.referrerUrl,
-    playbackUrl: input.state.playbackUrl || input.sourceUrl,
+    referrerUrl: candidate?.referrerUrl || input.sourceUrl,
+    playbackUrl: candidate?.playbackUrl || input.sourceUrl,
     currentSource: input.finalUrl,
     mediaSequence: input.mediaSequence,
     targetDurationSec: input.targetDurationSec,
     refreshed: input.refreshed,
-    rotated: false,
+    rotated: input.rotated,
     adapterKind: "bein",
-    candidatesFound: input.candidatesFound,
+    candidatesFound: input.state.candidates.length,
     candidatesTried: input.candidatesTried,
     sessionOwned: true,
   };
@@ -630,102 +838,116 @@ export const beinliveProvider: LiveStreamProvider = {
       waitForMediaSequence !== null
         ? Date.now() + Math.max(1_000, Math.min(12_000, Number(options?.waitTimeoutMs || 5_000)))
         : 0;
+    const allowRotate = options?.allowRotate !== false;
 
     let state = options?.forceRefresh ? null : readSourceState(input.sourceUrl);
     let attempts = 0;
+    let candidatesTried = 0;
     let lastError = "beinlive-manifest-unavailable";
+    let rotated = false;
+    let refreshed = !!options?.forceRefresh;
 
     while (attempts < 4) {
       attempts += 1;
-      const candidateCurrentSource = state?.manifestUrl || "";
-
-      if (state) {
-        const resolvedFromState = await resolveManifestFromState(state).catch(() => null);
-        if (!resolvedFromState) {
+      if (!state || !state.candidates.length) {
+        state = await discoverBeinliveSourceState({
+          sourceUrl: input.sourceUrl,
+          currentSource: state?.candidates[state.activeIndex]?.manifestUrl || "",
+        }).catch(() => null);
+        if (!state) {
           clearSourceState(input.sourceUrl);
-          state = null;
-          lastError = "beinlive-sticky-manifest-failed";
-        } else {
-          state = resolvedFromState.state;
-          if (
-            waitForMediaSequence !== null &&
-            resolvedFromState.mediaSequence !== null &&
-            resolvedFromState.mediaSequence <= waitForMediaSequence &&
-            !isSequenceRollback(resolvedFromState.mediaSequence, waitForMediaSequence) &&
-            Date.now() < waitDeadlineAt
-          ) {
-            await sleep(WAIT_RETRY_INTERVAL_MS);
+          lastError = "beinlive-iframe-manifest-missing";
+          break;
+        }
+        refreshed = true;
+      }
+
+      const order = candidateAttemptOrder(state.activeIndex, state.candidates.length, allowRotate);
+      let shouldRetry = false;
+      for (const candidateIndex of order) {
+        candidatesTried += 1;
+        const resolved = await resolveManifestFromCandidate(state, candidateIndex).catch(() => null);
+        if (!resolved) {
+          state = recordCandidateFailure(state, candidateIndex, "beinlive-candidate-failed");
+          lastError = "beinlive-candidate-failed";
+          if (candidateIndex !== state.activeIndex) rotated = true;
+          continue;
+        }
+
+        state = recordCandidateSuccess(state, candidateIndex, {
+          finalUrl: resolved.finalUrl,
+          mediaSequence: resolved.mediaSequence,
+        });
+        const updatedState = readSourceState(input.sourceUrl) || state;
+        const unchangedSequence =
+          waitForMediaSequence !== null &&
+          resolved.mediaSequence !== null &&
+          resolved.mediaSequence <= waitForMediaSequence &&
+          !isSequenceRollback(resolved.mediaSequence, waitForMediaSequence);
+
+        if (unchangedSequence && Date.now() < waitDeadlineAt) {
+          lastError = "media-sequence-unchanged";
+          if (allowRotate && updatedState.candidates.length > 1) {
+            state = recordCandidateFailure(updatedState, candidateIndex, "media-sequence-unchanged");
+            rotated = true;
             continue;
           }
-
-          return buildManifestResult({
-            sourceUrl: input.sourceUrl,
-            internalOrigin: input.internalOrigin,
-            state,
-            manifestBody: resolvedFromState.manifestBody,
-            finalUrl: resolvedFromState.finalUrl,
-            mediaSequence: resolvedFromState.mediaSequence,
-            targetDurationSec: resolvedFromState.targetDurationSec,
-            refreshed: attempts > 1,
-            candidatesFound: 1,
-            candidatesTried: attempts,
-          });
+          shouldRetry = true;
+          await sleep(WAIT_RETRY_INTERVAL_MS);
+          break;
         }
+
+        return buildManifestResult({
+          sourceUrl: input.sourceUrl,
+          internalOrigin: input.internalOrigin,
+          state: updatedState,
+          activeIndex: updatedState.activeIndex,
+          manifestBody: resolved.manifestBody,
+          finalUrl: resolved.finalUrl,
+          mediaSequence: resolved.mediaSequence,
+          targetDurationSec: resolved.targetDurationSec,
+          refreshed,
+          rotated,
+          candidatesTried,
+        });
       }
 
-      const resolvedFromIframe = await resolveBeinliveIframeManifest({
+      if (shouldRetry && Date.now() < waitDeadlineAt) continue;
+
+      state = await discoverBeinliveSourceState({
         sourceUrl: input.sourceUrl,
-        currentSource: candidateCurrentSource,
+        currentSource: state?.candidates[state.activeIndex]?.manifestUrl || "",
       }).catch(() => null);
-      if (!resolvedFromIframe) {
-        lastError = "beinlive-iframe-manifest-missing";
+      refreshed = true;
+      if (!state) {
+        clearSourceState(input.sourceUrl);
         break;
       }
-
-      state = resolvedFromIframe.state;
-      if (
-        waitForMediaSequence !== null &&
-        resolvedFromIframe.mediaSequence !== null &&
-        resolvedFromIframe.mediaSequence <= waitForMediaSequence &&
-        !isSequenceRollback(resolvedFromIframe.mediaSequence, waitForMediaSequence) &&
-        Date.now() < waitDeadlineAt
-      ) {
-        await sleep(WAIT_RETRY_INTERVAL_MS);
-        continue;
-      }
-
-      return buildManifestResult({
-        sourceUrl: input.sourceUrl,
-        internalOrigin: input.internalOrigin,
-        state,
-        manifestBody: resolvedFromIframe.manifestBody,
-        finalUrl: resolvedFromIframe.finalUrl,
-        mediaSequence: resolvedFromIframe.mediaSequence,
-        targetDurationSec: resolvedFromIframe.targetDurationSec,
-        refreshed: attempts > 1,
-        candidatesFound: resolvedFromIframe.candidatesFound,
-        candidatesTried: resolvedFromIframe.candidatesTried,
-      });
     }
 
+    const fallbackState = readSourceState(input.sourceUrl) || state;
     return {
       ok: false,
       error: lastError,
-      playbackUrl: state?.playbackUrl || input.sourceUrl,
-      currentSource: state?.manifestUrl || "",
-      mediaSequence: state?.lastMediaSequence ?? null,
+      playbackUrl: fallbackState?.candidates[fallbackState.activeIndex]?.playbackUrl || input.sourceUrl,
+      currentSource: fallbackState?.candidates[fallbackState.activeIndex]?.manifestUrl || "",
+      mediaSequence: fallbackState?.lastMediaSequence ?? null,
       targetDurationSec: 0,
-      refreshed: attempts > 1,
-      rotated: false,
+      refreshed,
+      rotated,
       adapterKind: "bein",
-      candidatesFound: state ? 1 : 0,
-      candidatesTried: attempts,
+      candidatesFound: fallbackState?.candidates.length || 0,
+      candidatesTried,
     };
   },
   async fetchAsset(input) {
     const state = readSourceState(input.sourceUrl);
+    const activeCandidate = state?.candidates[state.activeIndex];
     const referrerUrl =
-      normalizeHttpUrl(String(input.referrerUrl || "").trim()) || state?.manifestUrl || state?.referrerUrl || input.sourceUrl;
+      normalizeHttpUrl(String(input.referrerUrl || "").trim()) ||
+      activeCandidate?.manifestUrl ||
+      activeCandidate?.referrerUrl ||
+      input.sourceUrl;
     return await fetchBinaryWithHeaders({
       url: input.assetUrl,
       referrerUrl,
