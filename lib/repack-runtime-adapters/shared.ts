@@ -72,6 +72,11 @@ export type RuntimeHintCandidate = {
   referrerUrl: string;
 };
 
+function isSequenceRollback(nextMediaSequence: number | null, previousMediaSequence: number | null) {
+  if (!Number.isFinite(nextMediaSequence) || !Number.isFinite(previousMediaSequence)) return false;
+  return Number(nextMediaSequence) + 2 < Number(previousMediaSequence);
+}
+
 export type RuntimeAdapterKind = "playerv2" | "bein" | "livehd" | "alba" | "default";
 
 export type RuntimeAdapterInput = {
@@ -948,6 +953,7 @@ export async function resolveRuntimeOwnedManifest(
           waitForMediaSequence !== null &&
           mediaSequence !== null &&
           mediaSequence <= waitForMediaSequence &&
+          !isSequenceRollback(mediaSequence, waitForMediaSequence) &&
           Date.now() < deadlineAt
         ) {
           lastError = "media-sequence-unchanged";
@@ -990,6 +996,7 @@ export async function resolveRuntimeOwnedManifest(
       waitForMediaSequence !== null &&
       lastMediaSequence !== null &&
       lastMediaSequence <= waitForMediaSequence &&
+      !isSequenceRollback(lastMediaSequence, waitForMediaSequence) &&
       Date.now() < deadlineAt;
     if (shouldWaitForSequence) {
       if (!refreshed) {
