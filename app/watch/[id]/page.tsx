@@ -31,6 +31,7 @@ type MatchPayload = {
 type StatusMap = Record<StreamProviderId, StreamSourceStatus | null>;
 
 const STATUS_POLL_MS = 4_000;
+const AUTO_BOOTSTRAP_RETRY_MS = 12_000;
 const PROVIDER_META: Array<{ provider: StreamProviderId; order: number; label: string }> = [
   { provider: "livekora", order: 1, label: "livekora vip" },
   { provider: "beinlive", order: 2, label: "bein-live" },
@@ -97,6 +98,11 @@ export default function WatchPage() {
   const hlsRef = useRef<Hls | null>(null);
   const waitingOverlayTimerRef = useRef<number | null>(null);
   const hasPlayedRef = useRef(false);
+  const lastAutoBootstrapAtRef = useRef<Record<StreamProviderId, number>>({
+    livekora: 0,
+    beinlive: 0,
+    siiir: 0,
+  });
 
   const sources = useMemo(
     () =>
@@ -272,6 +278,27 @@ export default function WatchPage() {
     if (!String(activeStatus?.sourceUrl || "").trim()) return;
     void bootstrapProvider(activeProvider, { silent: true });
   }, [activeProvider, activeStatus?.sourceUrl, bootstrapProvider, match]);
+
+  useEffect(() => {
+    if (!match) return;
+    if (!String(activeStatus?.sourceUrl || "").trim()) return;
+    if (activeStatus?.reason !== "not-bootstrapped") return;
+    if (bootstrapPendingProvider === activeProvider) return;
+
+    const now = Date.now();
+    const lastAttemptAt = lastAutoBootstrapAtRef.current[activeProvider] || 0;
+    if (now - lastAttemptAt < AUTO_BOOTSTRAP_RETRY_MS) return;
+
+    lastAutoBootstrapAtRef.current[activeProvider] = now;
+    void bootstrapProvider(activeProvider, { silent: true });
+  }, [
+    activeProvider,
+    activeStatus?.reason,
+    activeStatus?.sourceUrl,
+    bootstrapPendingProvider,
+    bootstrapProvider,
+    match,
+  ]);
 
   useEffect(() => {
     if (!matchId || Number.isNaN(matchId)) return;
