@@ -441,6 +441,14 @@ export default function WatchPage() {
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(15,118,110,0.28),_transparent_35%),linear-gradient(180deg,_#020617_0%,_#07111f_55%,_#020617_100%)] text-white">
       <section className="mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:px-8">
+        <div className="mb-4 flex justify-start">
+          <a
+            href="https://twofooty.com"
+            className="inline-flex items-center rounded-full border border-white/12 bg-white/6 px-4 py-2 text-sm font-medium text-slate-100 transition hover:bg-white/12"
+          >
+            Ø§Ù„Ø±Ø¬ÙˆØ¹ Ø¥Ù„Ù‰ TwoFooty
+          </a>
+        </div>
         <div className="grid gap-6 lg:grid-cols-[1.6fr_0.8fr]">
           <div className="overflow-hidden rounded-3xl border border-white/10 bg-black/40 shadow-2xl shadow-black/40">
             <div className="relative aspect-video bg-black">
