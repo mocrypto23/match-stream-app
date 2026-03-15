@@ -6908,7 +6908,7 @@ async function startScraping() {
     if (rpcRes.error) {
       console.error("❌ RPC Error:", rpcRes.error.message);
       if (DIAG) diagWrite("rpc_error.txt", rpcRes.error.message);
-      return;
+      throw new Error(`RPC Error: ${rpcRes.error.message}`);
     }
 
     // Remove merged-away duplicates from DB so they don't keep showing in the UI.
@@ -6983,6 +6983,7 @@ async function startScraping() {
 
     const postRpc = await backfillDynamicMatchFields(mergedRows);
     if (postRpc.fail > 0) {
+      process.exitCode = 1;
       console.error(`⚠️ post-RPC backfill partial: ok=${postRpc.ok}, fail=${postRpc.fail}`);
     } else {
       console.log(`🩹 post-RPC backfill: ${postRpc.ok} row(s) updated.`);
@@ -6995,6 +6996,7 @@ async function startScraping() {
 
     console.log("✅ تم التحديث بنجاح (Server2..Server6 مفعلة، Server7 محجوز لحين تحديد المصدر).");
   } catch (err) {
+    process.exitCode = 1;
     console.error("❌ فشل السكرابر:", err.message);
     if (DIAG) diagWrite("fatal_error.txt", String(err?.stack || err?.message || err));
     try {
@@ -7010,5 +7012,8 @@ async function startScraping() {
   }
 }
 
-startScraping();
+startScraping().catch((err) => {
+  console.error("Unhandled scraper error:", err?.message || err);
+  process.exitCode = 1;
+});
 
