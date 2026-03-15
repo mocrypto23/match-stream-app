@@ -181,6 +181,11 @@ function parseTargetDurationSec(manifestText: string) {
   return 0;
 }
 
+function isSequenceRollback(nextMediaSequence: number | null, previousMediaSequence: number | null) {
+  if (!Number.isFinite(nextMediaSequence) || !Number.isFinite(previousMediaSequence)) return false;
+  return Number(nextMediaSequence) + 2 < Number(previousMediaSequence);
+}
+
 function hasMediaSegments(manifestText: string, baseUrl: string) {
   let previousExtInf = false;
   for (const line of String(manifestText || "").split(/\r?\n/)) {
@@ -653,12 +658,16 @@ export const livekoraProvider: LiveStreamProvider = {
       waitForMediaSequence !== null
         ? Date.now() + Math.max(1_000, Math.min(12_000, Number(options?.waitTimeoutMs || 5_000)))
         : 0;
+    const maxAttempts =
+      waitForMediaSequence !== null
+        ? Math.max(3, Math.ceil(Math.max(0, waitDeadlineAt - Date.now()) / WAIT_RETRY_INTERVAL_MS) + 2)
+        : 3;
 
     let state = readSourceState(input.sourceUrl);
     let attempts = 0;
     let lastError = "livekora-manifest-unavailable";
 
-    while (attempts < 3) {
+    while (attempts < maxAttempts) {
       attempts += 1;
       let discoveredResolved:
         | {
@@ -705,12 +714,17 @@ export const livekoraProvider: LiveStreamProvider = {
         continue;
       }
 
-      if (
+      const unchangedSequence =
         waitForMediaSequence !== null &&
         resolved.mediaSequence !== null &&
         resolved.mediaSequence <= waitForMediaSequence &&
+        !isSequenceRollback(resolved.mediaSequence, waitForMediaSequence);
+
+      if (
+        unchangedSequence &&
         Date.now() < waitDeadlineAt
       ) {
+        lastError = "media-sequence-unchanged";
         await sleep(WAIT_RETRY_INTERVAL_MS);
         continue;
       }
