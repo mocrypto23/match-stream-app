@@ -656,15 +656,9 @@ function computeCandidatePriority(input: {
 }) {
   let score = Number(input.basePriority || 0);
   const manifestUrl = String(input.manifestUrl || "").toLowerCase();
-  const referrerUrl = String(input.referrerUrl || "").toLowerCase();
   const currentSource = String(input.currentSource || "").toLowerCase();
 
-  if (manifestUrl.includes("/live/index.m3u8")) score += 320;
-  if (manifestUrl.includes(".yallashoot.cv/")) score += 180;
-  if (manifestUrl.includes(".kora-live-live.info/")) score += 160;
-  if (referrerUrl.includes("serv=2")) score += 260;
-  if (referrerUrl.includes("serv=3")) score += 180;
-  if (!referrerUrl.includes("serv=")) score += 120;
+  if (manifestUrl.includes("/live/index.m3u8")) score += 120;
   if (currentSource && manifestUrl === currentSource) score += 1_200;
   try {
     if (currentSource && new URL(input.manifestUrl).hostname === new URL(input.currentSource || input.manifestUrl).hostname) {
@@ -973,16 +967,19 @@ export const beinliveProvider: LiveStreamProvider = {
           resolved.mediaSequence <= waitForMediaSequence &&
           !isSequenceRollback(resolved.mediaSequence, waitForMediaSequence);
 
-        if (unchangedSequence && Date.now() < waitDeadlineAt) {
+        if (unchangedSequence) {
           lastError = "media-sequence-unchanged";
+          const isActiveCandidate = candidateIndex === updatedState.activeIndex;
+          if (Date.now() < waitDeadlineAt && (isActiveCandidate || !allowRotate || updatedState.candidates.length <= 1)) {
+            shouldRetry = true;
+            await sleep(WAIT_RETRY_INTERVAL_MS);
+            break;
+          }
           if (allowRotate && updatedState.candidates.length > 1) {
             state = recordCandidateFailure(updatedState, candidateIndex, "media-sequence-unchanged");
             rotated = true;
             continue;
           }
-          shouldRetry = true;
-          await sleep(WAIT_RETRY_INTERVAL_MS);
-          break;
         }
 
         return buildManifestResult({
