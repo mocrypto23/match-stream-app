@@ -103,6 +103,11 @@ export default function WatchPage() {
     beinlive: 0,
     siiir: 0,
   });
+  const backgroundBootstrapAtRef = useRef<Record<StreamProviderId, number>>({
+    livekora: 0,
+    beinlive: 0,
+    siiir: 0,
+  });
 
   const sources = useMemo(
     () =>
@@ -263,6 +268,8 @@ export default function WatchPage() {
     setPlaybackStarting(false);
     clearWaitingOverlayTimer();
     hasPlayedRef.current = false;
+    backgroundBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
+    lastAutoBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     setStatusByProvider({ livekora: null, beinlive: null, siiir: null });
     setSelectedProvider("livekora");
   }, [clearWaitingOverlayTimer, matchId]);
@@ -278,6 +285,30 @@ export default function WatchPage() {
     if (!String(activeStatus?.sourceUrl || "").trim()) return;
     void bootstrapProvider(activeProvider, { silent: true });
   }, [activeProvider, activeStatus?.sourceUrl, bootstrapProvider, match]);
+
+  useEffect(() => {
+    if (!match) return;
+
+    let cancelled = false;
+    void (async () => {
+      for (const item of PROVIDER_META) {
+        if (cancelled) return;
+        const status = statusByProvider[item.provider];
+        if (!String(status?.sourceUrl || "").trim()) continue;
+
+        const now = Date.now();
+        const lastAttemptAt = backgroundBootstrapAtRef.current[item.provider] || 0;
+        if (now - lastAttemptAt < AUTO_BOOTSTRAP_RETRY_MS) continue;
+
+        backgroundBootstrapAtRef.current[item.provider] = now;
+        await bootstrapProvider(item.provider, { silent: true });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [bootstrapProvider, match, statusByProvider]);
 
   useEffect(() => {
     if (!match) return;

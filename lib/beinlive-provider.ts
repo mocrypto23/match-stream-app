@@ -969,16 +969,10 @@ export const beinliveProvider: LiveStreamProvider = {
 
         if (unchangedSequence) {
           lastError = "media-sequence-unchanged";
-          const isActiveCandidate = candidateIndex === updatedState.activeIndex;
-          if (Date.now() < waitDeadlineAt && (isActiveCandidate || !allowRotate || updatedState.candidates.length <= 1)) {
+          if (Date.now() < waitDeadlineAt) {
             shouldRetry = true;
             await sleep(WAIT_RETRY_INTERVAL_MS);
             break;
-          }
-          if (allowRotate && updatedState.candidates.length > 1) {
-            state = recordCandidateFailure(updatedState, candidateIndex, "media-sequence-unchanged");
-            rotated = true;
-            continue;
           }
         }
 
