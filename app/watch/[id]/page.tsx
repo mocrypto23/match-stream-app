@@ -35,6 +35,8 @@ const STATUS_POLL_MS = 4_000;
 const ACTIVE_WARMING_POLL_MS = 1_250;
 const AUTO_BOOTSTRAP_RETRY_MS = 12_000;
 const ACTIVE_RECOVERY_RETRY_MS = 3_500;
+const PLAYBACK_STALL_CHECK_MS = 2_000;
+const PLAYBACK_STALL_RECOVERY_MS = 7_000;
 const PROVIDER_META: Array<{ provider: StreamProviderId; order: number; label: string }> = [
   { provider: "livekora", order: 1, label: "livekora vip" },
   { provider: "beinlive", order: 2, label: "bein-live" },
@@ -172,6 +174,17 @@ export default function WatchPage() {
     beinlive: 0,
     siiir: 0,
   });
+  const playbackWatchRef = useRef<{
+    provider: StreamProviderId | null;
+    streamUrl: string;
+    lastTime: number;
+    lastAdvanceAt: number;
+  }>({
+    provider: null,
+    streamUrl: "",
+    lastTime: 0,
+    lastAdvanceAt: 0,
+  });
 
   const sources = useMemo(
     () =>
@@ -188,10 +201,7 @@ export default function WatchPage() {
   const activeProvider = activeStatus?.provider || selectedProvider;
   const activeProgressPct = progressPct(activeStatus);
   const activePhaseLabel = phaseLabel(activeStatus);
-
-  const streamUrl = useMemo(() => {
-    const direct = String(activeStatus?.playlistUrl || "").trim();
-    if (direct) return direct;
+  const fallbackPlaylistUrl = useMemo(() => {
     if (activeProvider === "livekora") {
       const fallback = String(match?.livekoraPlaylistUrl || "").trim();
       return fallback || null;
@@ -202,13 +212,27 @@ export default function WatchPage() {
     }
     const fallback = String(match?.siiirPlaylistUrl || "").trim();
     return fallback || null;
-  }, [activeProvider, activeStatus?.playlistUrl, match?.beinlivePlaylistUrl, match?.livekoraPlaylistUrl, match?.siiirPlaylistUrl]);
+  }, [activeProvider, match?.beinlivePlaylistUrl, match?.livekoraPlaylistUrl, match?.siiirPlaylistUrl]);
+
+  const streamUrl = useMemo(() => {
+    if (activeStatus) {
+      if (activeStatus.state !== "ready") return null;
+      const direct = String(activeStatus.playlistUrl || fallbackPlaylistUrl || "").trim();
+      return direct || null;
+    }
+    return fallbackPlaylistUrl;
+  }, [activeStatus, fallbackPlaylistUrl]);
 
   const directSourceUrl = useMemo(() => {
     if (activeProvider === "livekora") return String(match?.stream_url_4 || "").trim() || null;
     if (activeProvider === "beinlive") return String(match?.stream_url || "").trim() || null;
     return String(match?.stream_url_2 || "").trim() || null;
   }, [activeProvider, match?.stream_url, match?.stream_url_2, match?.stream_url_4]);
+  const providerSourceUrl = useMemo(() => {
+    const current = String(activeStatus?.sourceUrl || "").trim();
+    if (current) return current;
+    return directSourceUrl;
+  }, [activeStatus?.sourceUrl, directSourceUrl]);
 
   const applyProviderStatus = useCallback((provider: StreamProviderId, status: StreamSourceStatus | null | undefined) => {
     if (!status) return;
@@ -370,9 +394,9 @@ export default function WatchPage() {
 
   useEffect(() => {
     if (!match) return;
-    if (!String(activeStatus?.sourceUrl || "").trim()) return;
+    if (!providerSourceUrl) return;
     void bootstrapProvider(activeProvider, { silent: true });
-  }, [activeProvider, activeStatus?.sourceUrl, bootstrapProvider, match]);
+  }, [activeProvider, bootstrapProvider, match, providerSourceUrl]);
 
   useEffect(() => {
     if (!match) return;
@@ -406,7 +430,7 @@ export default function WatchPage() {
 
   useEffect(() => {
     if (!match) return;
-    if (!String(activeStatus?.sourceUrl || "").trim()) return;
+    if (!providerSourceUrl) return;
     if (activeStatus?.reason !== "not-bootstrapped") return;
     if ((pendingBootstraps[activeProvider] || 0) > 0) return;
 
@@ -419,10 +443,10 @@ export default function WatchPage() {
   }, [
     activeProvider,
     activeStatus?.reason,
-    activeStatus?.sourceUrl,
     bootstrapProvider,
     match,
     pendingBootstraps,
+    providerSourceUrl,
   ]);
 
   useEffect(() => {
@@ -435,19 +459,21 @@ export default function WatchPage() {
 
   useEffect(() => {
     if (!matchId || Number.isNaN(matchId)) return;
-    if (activeStatus?.state !== "warming") return;
+    if (!providerSourceUrl) return;
+    if (!playbackRequested && activeStatus?.state !== "warming") return;
+    if (activeStatus?.state === "ready") return;
     const id = window.setInterval(() => {
       void refreshProviderStatus(activeProvider);
     }, ACTIVE_WARMING_POLL_MS);
     return () => window.clearInterval(id);
-  }, [activeProvider, activeStatus?.state, matchId, refreshProviderStatus]);
+  }, [activeProvider, activeStatus?.state, matchId, playbackRequested, providerSourceUrl, refreshProviderStatus]);
 
   useEffect(() => {
     if (!playbackRequested) {
       selectedRecoveryPendingRef.current = false;
       return;
     }
-    if (!String(activeStatus?.sourceUrl || "").trim()) return;
+    if (!providerSourceUrl) return;
 
     const isReady = activeStatus?.state === "ready" && !!String(streamUrl || "").trim();
     if (!isReady) {
@@ -463,12 +489,35 @@ export default function WatchPage() {
     setPageError(null);
     setPlaybackStarting(true);
     setPlayerSessionNonce((current) => current + 1);
-  }, [activeStatus?.sourceUrl, activeStatus?.state, playbackRequested, streamUrl]);
+  }, [activeStatus?.state, playbackRequested, providerSourceUrl, streamUrl]);
+
+  useEffect(() => {
+    const stream = String(streamUrl || "").trim();
+    const watch = playbackWatchRef.current;
+    const now = Date.now();
+    if (!playbackRequested || !stream) {
+      playbackWatchRef.current = {
+        provider: activeProvider,
+        streamUrl: stream,
+        lastTime: 0,
+        lastAdvanceAt: now,
+      };
+      return;
+    }
+    if (watch.provider !== activeProvider || watch.streamUrl !== stream) {
+      playbackWatchRef.current = {
+        provider: activeProvider,
+        streamUrl: stream,
+        lastTime: 0,
+        lastAdvanceAt: now,
+      };
+    }
+  }, [activeProvider, playbackRequested, streamUrl]);
 
   useEffect(() => {
     if (!match) return;
     if (!playbackRequested) return;
-    if (!String(activeStatus?.sourceUrl || "").trim()) return;
+    if (!providerSourceUrl) return;
     if ((pendingBootstraps[activeProvider] || 0) > 0) return;
 
     const selectedIsUnavailable = activeStatus?.state !== "ready" || !String(streamUrl || "").trim();
@@ -484,12 +533,84 @@ export default function WatchPage() {
     void refreshProviderStatus(activeProvider);
   }, [
     activeProvider,
-    activeStatus?.sourceUrl,
     activeStatus?.state,
     bootstrapProvider,
     match,
     pendingBootstraps,
     playbackRequested,
+    providerSourceUrl,
+    refreshProviderStatus,
+    streamUrl,
+  ]);
+
+  useEffect(() => {
+    if (!playbackRequested) return;
+
+    const id = window.setInterval(() => {
+      const video = videoRef.current;
+      if (!video) return;
+
+      const stream = String(streamUrl || "").trim();
+      const now = Date.now();
+      const watch = playbackWatchRef.current;
+      const currentTime = Number(video.currentTime || 0);
+      const providerChanged = watch.provider !== activeProvider;
+      const streamChanged = watch.streamUrl !== stream;
+      const progressed = currentTime > watch.lastTime + 0.35;
+
+      if (providerChanged || streamChanged) {
+        playbackWatchRef.current = {
+          provider: activeProvider,
+          streamUrl: stream,
+          lastTime: currentTime,
+          lastAdvanceAt: now,
+        };
+        return;
+      }
+
+      if (progressed) {
+        playbackWatchRef.current = {
+          provider: activeProvider,
+          streamUrl: stream,
+          lastTime: currentTime,
+          lastAdvanceAt: now,
+        };
+        return;
+      }
+
+      playbackWatchRef.current = {
+        provider: activeProvider,
+        streamUrl: stream,
+        lastTime: currentTime,
+        lastAdvanceAt: watch.lastAdvanceAt,
+      };
+
+      if (!stream) return;
+      if (video.paused) return;
+
+      const stalledForMs = now - playbackWatchRef.current.lastAdvanceAt;
+      const selectedUnavailable = activeStatus?.state !== "ready";
+      const playerSeemsStuck = playbackStarting || video.readyState < 2 || selectedUnavailable;
+      if (!playerSeemsStuck || stalledForMs < PLAYBACK_STALL_RECOVERY_MS) return;
+
+      const lastRecoveryAt = activeRecoveryAtRef.current[activeProvider] || 0;
+      if (now - lastRecoveryAt < PLAYBACK_STALL_RECOVERY_MS) return;
+
+      activeRecoveryAtRef.current[activeProvider] = now;
+      selectedRecoveryPendingRef.current = true;
+      setPlaybackStarting(true);
+      void refreshProviderStatus(activeProvider);
+      void bootstrapProvider(activeProvider, { silent: true });
+      setPlayerSessionNonce((current) => current + 1);
+    }, PLAYBACK_STALL_CHECK_MS);
+
+    return () => window.clearInterval(id);
+  }, [
+    activeProvider,
+    activeStatus?.state,
+    bootstrapProvider,
+    playbackRequested,
+    playbackStarting,
     refreshProviderStatus,
     streamUrl,
   ]);
@@ -625,9 +746,8 @@ export default function WatchPage() {
   const isBootstrapPending = (pendingBootstraps[activeProvider] || 0) > 0;
   const showPreparationProgress =
     !streamUrl &&
-    !!activeStatus &&
-    !!String(activeStatus.sourceUrl || "").trim() &&
-    (activeStatus.state === "warming" || activeStatus.reason === "not-bootstrapped" || activeStatus.phase === "queued");
+    !!providerSourceUrl &&
+    (activeStatus?.state === "warming" || activeStatus?.reason === "not-bootstrapped" || activeStatus?.phase === "queued");
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(15,118,110,0.28),_transparent_35%),linear-gradient(180deg,_#020617_0%,_#07111f_55%,_#020617_100%)] text-white">
