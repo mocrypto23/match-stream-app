@@ -4,17 +4,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { cairoDayStringFromOffset, dayToOffset, type DayKey, type MatchRow } from "@/lib/home-page-shared";
 
-const MATCH_NOTICE_ENABLED = false;
+const MATCH_NOTICE_ENABLED = true;
 const MATCHES_REQUEST_TIMEOUT_MS = 12_000;
 const MATCHES_REQUEST_RETRIES = 2;
-
-type BannerAtOptions = {
-  key: string;
-  format: "iframe";
-  height: number;
-  width: number;
-  params: Record<string, string>;
-};
 
 type HomePageClientProps = {
   initialDay: DayKey;
@@ -22,10 +14,60 @@ type HomePageClientProps = {
   initialLoadError?: string | null;
 };
 
-declare global {
-  interface Window {
-    atOptions?: BannerAtOptions;
-  }
+
+const ADSTERRA_BANNER_728_SRCDOC = String.raw`<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+      }
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      #ad-wrap {
+        width: 728px;
+        height: 90px;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="ad-wrap">
+      <script>
+        atOptions = {
+          key: "6a12e1a77f6425cf6359cb652cff80e3",
+          format: "iframe",
+          height: 90,
+          width: 728,
+          params: {}
+        };
+      </script>
+      <script async src="https://www.highperformanceformat.com/6a12e1a77f6425cf6359cb652cff80e3/invoke.js"></script>
+    </div>
+  </body>
+</html>`;
+
+function SafeAdsterraBanner728() {
+  return (
+    <iframe
+      title="TwoFooty Sponsor"
+      srcDoc={ADSTERRA_BANNER_728_SRCDOC}
+      sandbox="allow-scripts"
+      loading="lazy"
+      referrerPolicy="no-referrer"
+      className="mx-auto h-[90px] w-[728px] min-w-[728px] overflow-hidden rounded-md border-0 bg-transparent"
+    />
+  );
 }
 
 function isValidHttpUrl(raw: unknown): raw is string {
@@ -156,7 +198,6 @@ export default function HomePageClient({
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(initialLoadError);
   const [reloadNonce, setReloadNonce] = useState(0);
-  const noticeBannerRef = useRef<HTMLDivElement | null>(null);
   const skipInitialFetchRef = useRef(true);
 
   const tabs = useMemo(
@@ -247,33 +288,6 @@ export default function HomePageClient({
     };
   }, [day, reloadNonce]);
 
-  useEffect(() => {
-    if (!MATCH_NOTICE_ENABLED || loading) return;
-    const container = noticeBannerRef.current;
-    if (!container) return;
-
-    container.innerHTML = "";
-
-    window.atOptions = {
-      key: "6a12e1a77f6425cf6359cb652cff80e3",
-      format: "iframe",
-      height: 90,
-      width: 728,
-      params: {},
-    };
-
-    const script = document.createElement("script");
-    script.type = "text/javascript";
-    script.src = "https://www.highperformanceformat.com/6a12e1a77f6425cf6359cb652cff80e3/invoke.js";
-    script.async = true;
-
-    container.appendChild(script);
-
-    return () => {
-      container.innerHTML = "";
-    };
-  }, [loading]);
-
   const sortedMatches = useMemo(() => {
     const arr = [...matches];
     const rank = (s: string) => (s === "live" ? 0 : s === "upcoming" ? 1 : 2);
@@ -335,7 +349,7 @@ export default function HomePageClient({
             </p>
 
             <div className="mt-3 overflow-x-auto" dir="ltr">
-              <div ref={noticeBannerRef} className="mx-auto h-[90px] w-[728px] min-w-[728px]" />
+              <SafeAdsterraBanner728 />
             </div>
 
             <div className="absolute -left-5 -bottom-5 opacity-5" aria-hidden="true">
