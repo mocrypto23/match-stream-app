@@ -73,16 +73,13 @@ export default function VideoPlayerControls({
     const controlsTimeoutRef = useRef<number | null>(null);
     const containerRef = useRef<HTMLDivElement>(null);
 
-    // Handle inactivity to hide controls
     const resetControlsTimeout = useCallback(() => {
         setShowControls(true);
-        if (controlsTimeoutRef.current) window.clearTimeout(controlsTimeoutRef.current);
-        if (isPlaying) {
-            controlsTimeoutRef.current = window.setTimeout(() => {
-                setShowControls(false);
-            }, 3000);
+        if (controlsTimeoutRef.current) {
+            window.clearTimeout(controlsTimeoutRef.current);
+            controlsTimeoutRef.current = null;
         }
-    }, [isPlaying]);
+    }, []);
 
     useEffect(() => {
         const video = videoRef.current;
@@ -123,6 +120,10 @@ export default function VideoPlayerControls({
         setIsMuted(video.muted);
 
         return () => {
+            if (controlsTimeoutRef.current) {
+                window.clearTimeout(controlsTimeoutRef.current);
+                controlsTimeoutRef.current = null;
+            }
             video.removeEventListener("play", onPlay);
             video.removeEventListener("pause", onPause);
             video.removeEventListener("volumechange", onVolumeChange);
@@ -204,8 +205,7 @@ export default function VideoPlayerControls({
     return (
         <div
             ref={containerRef}
-            className={`absolute inset-0 z-50 flex flex-col justify-between transition-opacity duration-300 ${showControls ? "opacity-100" : "opacity-0 hover:opacity-100"
-                }`}
+            className="pointer-events-none absolute inset-0 z-50 flex flex-col justify-between transition-opacity duration-300 opacity-100"
             onMouseMove={resetControlsTimeout}
             style={{ background: showControls ? "linear-gradient(to top, rgba(0,0,0,0.8), transparent 30%)" : "transparent" }}
         >
@@ -243,7 +243,7 @@ export default function VideoPlayerControls({
 
             {/* Bottom Controls */}
             <div
-                className="bg-black/40 backdrop-blur-md border-t border-white/10"
+                className="pointer-events-auto bg-black/40 backdrop-blur-md border-t border-white/10"
                 style={{
                     paddingLeft: "max(1rem, env(safe-area-inset-left))",
                     paddingRight: "max(1rem, env(safe-area-inset-right))",
