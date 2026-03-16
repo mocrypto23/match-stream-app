@@ -8,6 +8,8 @@ const PAGE_SETTLE_TIMEOUT_MS = 3500;
 const PAGE_NETWORK_IDLE_TIMEOUT_MS = 3000;
 const OVERALL_TIMEOUT_MS = 24000;
 const MAX_PAGE_VISITS = 8;
+const PLAYER_OPTION_WAIT_MS = 1400;
+const SUCCESS_COLLECTION_WINDOW_MS = 6000;
 const LIVEKORA_HOST_SUFFIXES = ["sportsurges.cc", "livekora.vip", "koooralive.click", "kooraxx.com"];
 
 function normalizeHttpUrl(rawUrl) {
@@ -65,6 +67,32 @@ function looksLikeManifestUrl(rawUrl) {
     );
   } catch {
     return false;
+  }
+}
+
+function looksLikeSegmentUrl(rawUrl) {
+  const url = normalizeHttpUrl(rawUrl);
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    const pathname = String(parsed.pathname || "").toLowerCase();
+    return /\.(?:ts|m4s|aac|mp3|mp4)(?:$|[?#])/i.test(pathname);
+  } catch {
+    return false;
+  }
+}
+
+function streamKeyFromUrl(rawUrl) {
+  const url = normalizeHttpUrl(rawUrl);
+  if (!url) return "";
+  try {
+    const pathname = String(new URL(url).pathname || "");
+    const filename = pathname.split("/").filter(Boolean).at(-1) || "";
+    const base = filename.replace(/\.(?:m3u8|ts|m4s|aac|mp3|mp4)$/i, "");
+    const match = base.match(/^([a-z0-9]+?)(?:-\d+)?$/i);
+    return String(match && match[1] ? match[1] : base).trim().toLowerCase();
+  } catch {
+    return "";
   }
 }
 
@@ -340,6 +368,35 @@ async function clickLikelyPlayTarget(page) {
   return false;
 }
 
+async function clickPlayerOptionButtons(page, budgetMs) {
+  const startedAt = Date.now();
+  const clicked = new Set();
+  while (Date.now() - startedAt < budgetMs) {
+    const buttons = await page
+      .locator("button")
+      .evaluateAll((elements) =>
+        elements
+          .map((element, index) => ({
+            index,
+            text: String(element.textContent || "").trim(),
+          }))
+          .filter((item) => /(?:مشغل|player|sd|hd)/i.test(item.text))
+      )
+      .catch(() => []);
+    if (!buttons.length) return;
+    let clickedAny = false;
+    for (const button of buttons) {
+      const text = String(button.text || "").trim();
+      if (!text || clicked.has(text)) continue;
+      clicked.add(text);
+      clickedAny = true;
+      await page.getByRole("button", { name: text, exact: true }).click({ force: true }).catch(() => null);
+      await page.waitForTimeout(PLAYER_OPTION_WAIT_MS).catch(() => {});
+    }
+    if (!clickedAny) return;
+  }
+}
+
 async function main() {
   if (!sourceUrl) {
     console.log(JSON.stringify({ ok: false, error: "missing-channel-url" }));
@@ -379,37 +436,72 @@ async function main() {
   let lastReferrerUrl = normalizeHttpUrl(playbackCandidates[0] || sourceUrl) || sourceUrl;
   let lastPlaybackUrl = lastReferrerUrl;
   let lastError = "";
-  let manifestResolved = false;
+  let successCollectionDeadlineAt = 0;
   const pendingTasks = new Set();
   const deadlineAt = Date.now() + OVERALL_TIMEOUT_MS;
   const queuedUrls = [...playbackCandidates];
   const visitedUrls = new Set();
+  const manifestCandidates = new Map();
 
-  const updateManifestCandidate = ({ manifestUrl, requestHeaders, referrerUrl }) => {
+  const registerManifestCandidate = ({ manifestUrl, requestHeaders, referrerUrl, playbackUrl, manifestBody }) => {
     const normalizedManifestUrl = normalizeHttpUrl(manifestUrl);
-    if (!normalizedManifestUrl || !looksLikeManifestUrl(normalizedManifestUrl)) return;
-    lastManifestUrl = normalizedManifestUrl;
-    if (requestHeaders && typeof requestHeaders === "object") {
-      lastManifestRequestHeaders = requestHeaders;
+    if (!normalizedManifestUrl || !looksLikeManifestUrl(normalizedManifestUrl)) return null;
+    const key = normalizedManifestUrl.toLowerCase();
+    const existing = manifestCandidates.get(key);
+    const candidate = {
+      manifestUrl: normalizedManifestUrl,
+      manifestBody: String(manifestBody || existing?.manifestBody || "").trim(),
+      manifestRequestHeaders:
+        requestHeaders && typeof requestHeaders === "object"
+          ? requestHeaders
+          : existing?.manifestRequestHeaders || {},
+      referrerUrl: normalizeHttpUrl(referrerUrl || existing?.referrerUrl || lastReferrerUrl || sourceUrl) || sourceUrl,
+      playbackUrl: normalizeHttpUrl(playbackUrl || existing?.playbackUrl || lastPlaybackUrl || sourceUrl) || sourceUrl,
+      discoveredAt: existing?.discoveredAt || Date.now(),
+      segmentHits: Number(existing?.segmentHits || 0),
+      streamKey: streamKeyFromUrl(normalizedManifestUrl),
+    };
+    manifestCandidates.set(key, candidate);
+    lastManifestUrl = candidate.manifestUrl;
+    lastManifestRequestHeaders = candidate.manifestRequestHeaders;
+    lastReferrerUrl = candidate.referrerUrl;
+    lastPlaybackUrl = candidate.playbackUrl;
+    if (candidate.manifestBody) {
+      lastManifestBody = candidate.manifestBody;
+      successCollectionDeadlineAt ||= Math.min(deadlineAt, Date.now() + SUCCESS_COLLECTION_WINDOW_MS);
     }
-    const normalizedReferrerUrl = normalizeHttpUrl(referrerUrl);
-    if (normalizedReferrerUrl) lastReferrerUrl = normalizedReferrerUrl;
+    return candidate;
   };
 
-  const emitAndExit = async (payload) => {
-    if (manifestResolved) return;
-    manifestResolved = true;
-    console.log(JSON.stringify(payload));
-    await page.close().catch(() => {});
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
-    process.exit(0);
+  const noteSegmentTraffic = (rawUrl) => {
+    const normalizedUrl = normalizeHttpUrl(rawUrl);
+    if (!normalizedUrl || !looksLikeSegmentUrl(normalizedUrl)) return;
+    const segmentKey = streamKeyFromUrl(normalizedUrl);
+    if (!segmentKey) return;
+    for (const candidate of manifestCandidates.values()) {
+      if (!candidate.streamKey || candidate.streamKey !== segmentKey) continue;
+      candidate.segmentHits += 1;
+      successCollectionDeadlineAt ||= Math.min(deadlineAt, Date.now() + SUCCESS_COLLECTION_WINDOW_MS);
+    }
+  };
+
+  const updateManifestCandidate = ({ manifestUrl, requestHeaders, referrerUrl }) => {
+    registerManifestCandidate({
+      manifestUrl,
+      requestHeaders,
+      referrerUrl,
+      playbackUrl: lastPlaybackUrl || sourceUrl,
+    });
   };
 
   page.on("request", (request) => {
     const url = normalizeHttpUrl(request.url());
     const headers = request.headers();
     const accept = String(headers.accept || "").toLowerCase();
+    if (looksLikeSegmentUrl(url)) {
+      noteSegmentTraffic(url);
+      return;
+    }
     if (!url || (!looksLikeManifestUrl(url) && !accept.includes("mpegurl") && !accept.includes("x-mpegurl"))) return;
     updateManifestCandidate({
       manifestUrl: url,
@@ -430,27 +522,26 @@ async function main() {
 
   page.on("response", (response) => {
     const task = (async () => {
-      if (manifestResolved) return;
       const url = normalizeHttpUrl(response.url());
       const contentType = String(response.headers()["content-type"] || "").toLowerCase();
+      if (looksLikeSegmentUrl(url)) {
+        noteSegmentTraffic(url);
+        return;
+      }
       if (!url || (!looksLikeManifestUrl(url) && !contentType.includes("mpegurl"))) return;
-      updateManifestCandidate({
+      const candidate = registerManifestCandidate({
         manifestUrl: url,
         requestHeaders: response.request().headers(),
         referrerUrl: normalizeHttpUrl(page.url()) || lastReferrerUrl || sourceUrl,
+        playbackUrl: lastPlaybackUrl || sourceUrl,
       });
       try {
         const body = await response.text().catch(() => "");
         if (!body.trim() || !/^\s*#extm3u/im.test(body) || !hasMediaSegments(body, url)) return;
+        if (!candidate) return;
+        candidate.manifestBody = body;
         lastManifestBody = body;
-        await emitAndExit({
-          ok: true,
-          manifestUrl: url,
-          manifestBody: body,
-          referrerUrl: normalizeHttpUrl(page.url()) || lastReferrerUrl || sourceUrl,
-          manifestRequestHeaders: response.request().headers(),
-          playbackUrl: lastPlaybackUrl || sourceUrl,
-        });
+        successCollectionDeadlineAt ||= Math.min(deadlineAt, Date.now() + SUCCESS_COLLECTION_WINDOW_MS);
       } catch {}
     })();
     pendingTasks.add(task);
@@ -459,8 +550,56 @@ async function main() {
     });
   });
 
+  const chooseBestCandidate = async () => {
+    const candidates = Array.from(manifestCandidates.values())
+      .map((candidate) => ({ ...candidate }))
+      .sort((left, right) => {
+        if (right.segmentHits !== left.segmentHits) return right.segmentHits - left.segmentHits;
+        if (!!right.manifestBody !== !!left.manifestBody) return right.manifestBody ? 1 : -1;
+        return right.discoveredAt - left.discoveredAt;
+      });
+
+    let finalCandidate = candidates[0] || null;
+    let helperFetchError = "";
+    let helperFetchSnippet = "";
+    if (finalCandidate && !finalCandidate.manifestBody) {
+      try {
+        const fetchedManifest = await fetchManifestWithHeaders(
+          finalCandidate.manifestUrl,
+          finalCandidate.manifestRequestHeaders,
+          finalCandidate.referrerUrl || finalCandidate.playbackUrl || sourceUrl
+        );
+        helperFetchError = String((fetchedManifest && fetchedManifest.error) || "").trim();
+        helperFetchSnippet = String((fetchedManifest && fetchedManifest.snippet) || "").slice(0, 160);
+        if (fetchedManifest && fetchedManifest.finalUrl && fetchedManifest.manifestBody) {
+          finalCandidate = {
+            ...finalCandidate,
+            manifestUrl: fetchedManifest.finalUrl,
+            manifestBody: fetchedManifest.manifestBody,
+          };
+        }
+      } catch (error) {
+        helperFetchError = error instanceof Error ? error.message : String(error || "helper-fetch-failed");
+      }
+    }
+
+    return {
+      ok: !!(finalCandidate && finalCandidate.manifestUrl),
+      error: lastError,
+      manifestUrl: finalCandidate?.manifestUrl || lastManifestUrl,
+      manifestBody: finalCandidate?.manifestBody || lastManifestBody,
+      referrerUrl: finalCandidate?.referrerUrl || lastReferrerUrl || normalizeHttpUrl(page.url()) || sourceUrl,
+      manifestRequestHeaders: finalCandidate?.manifestRequestHeaders || lastManifestRequestHeaders,
+      playbackUrl: finalCandidate?.playbackUrl || lastPlaybackUrl || sourceUrl,
+      helperFetchError,
+      helperFetchSnippet,
+      segmentHits: finalCandidate?.segmentHits || 0,
+    };
+  };
+
   try {
-    while (!manifestResolved && queuedUrls.length && visitedUrls.size < MAX_PAGE_VISITS && Date.now() < deadlineAt) {
+    while (queuedUrls.length && visitedUrls.size < MAX_PAGE_VISITS && Date.now() < deadlineAt) {
+      if (successCollectionDeadlineAt && Date.now() >= successCollectionDeadlineAt) break;
       const currentUrl = normalizeHttpUrl(queuedUrls.shift());
       if (!currentUrl || visitedUrls.has(currentUrl)) continue;
       visitedUrls.add(currentUrl);
@@ -479,17 +618,16 @@ async function main() {
         }).catch(() => {});
 
         await clickLikelyPlayTarget(page).catch(() => false);
+        await clickPlayerOptionButtons(page, Math.max(0, Math.min(6000, deadlineAt - Date.now()))).catch(() => {});
         if (Date.now() < deadlineAt) {
           await page.waitForTimeout(Math.max(500, Math.min(PAGE_SETTLE_TIMEOUT_MS, deadlineAt - Date.now())));
         }
 
-        if (!manifestResolved) {
-          for (const linkedUrl of await collectLinkedUrls(page, page.url() || currentUrl)) {
-            if (!visitedUrls.has(linkedUrl)) queuedUrls.push(linkedUrl);
-          }
+        for (const linkedUrl of await collectLinkedUrls(page, page.url() || currentUrl)) {
+          if (!visitedUrls.has(linkedUrl)) queuedUrls.push(linkedUrl);
         }
 
-        if (!manifestResolved && pendingTasks.size) {
+        if (pendingTasks.size) {
           await Promise.race([
             Promise.allSettled(Array.from(pendingTasks)),
             page.waitForTimeout(Math.max(250, Math.min(1200, deadlineAt - Date.now()))),
@@ -500,46 +638,11 @@ async function main() {
       }
     }
   } finally {
-    if (!manifestResolved) {
-      await page.close().catch(() => {});
-      await context.close().catch(() => {});
-      await browser.close().catch(() => {});
-
-      let finalManifestUrl = lastManifestUrl;
-      let finalManifestBody = lastManifestBody;
-      let helperFetchError = "";
-      let helperFetchSnippet = "";
-      if (finalManifestUrl && !finalManifestBody) {
-        try {
-          const fetchedManifest = await fetchManifestWithHeaders(
-            finalManifestUrl,
-            lastManifestRequestHeaders,
-            lastReferrerUrl || lastPlaybackUrl || sourceUrl
-          );
-          helperFetchError = String((fetchedManifest && fetchedManifest.error) || "").trim();
-          helperFetchSnippet = String((fetchedManifest && fetchedManifest.snippet) || "").slice(0, 160);
-          if (fetchedManifest && fetchedManifest.finalUrl && fetchedManifest.manifestBody) {
-            finalManifestUrl = fetchedManifest.finalUrl;
-            finalManifestBody = fetchedManifest.manifestBody;
-          }
-        } catch (error) {
-          helperFetchError = error instanceof Error ? error.message : String(error || "helper-fetch-failed");
-        }
-      }
-      console.log(
-        JSON.stringify({
-          ok: !!finalManifestUrl,
-          error: lastError,
-          manifestUrl: finalManifestUrl,
-          manifestBody: finalManifestBody,
-          referrerUrl: lastReferrerUrl || normalizeHttpUrl(page.url()) || sourceUrl,
-          manifestRequestHeaders: lastManifestRequestHeaders,
-          playbackUrl: lastPlaybackUrl || sourceUrl,
-          helperFetchError,
-          helperFetchSnippet,
-        })
-      );
-    }
+    const payload = await chooseBestCandidate();
+    await page.close().catch(() => {});
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+    console.log(JSON.stringify(payload));
   }
 }
 
