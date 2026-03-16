@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import path from "node:path";
 import axios from "axios";
 import type { StreamProviderId } from "@/lib/stream-source-types";
+import { albaRuntimeAdapter } from "@/lib/repack-runtime-adapters/alba";
 
 export type MatchRowLike = {
   stream_url?: string | null;
@@ -644,6 +645,56 @@ export function buildLivekoraSessionManifestUrl(matchId: number, internalOrigin:
   return `${String(internalOrigin || resolveInternalAppOrigin()).replace(/\/+$/, "")}/api/livekora/session-manifest?matchId=${encodeURIComponent(String(matchId))}`;
 }
 
+function mapLivekoraManifestResult(
+  result: Awaited<ReturnType<typeof albaRuntimeAdapter.currentManifest>>,
+  playbackUrl: string
+): ProviderManifestResult {
+  if (!result.ok) {
+    return {
+      ok: false,
+      error: result.error,
+      playbackUrl: result.playbackUrl || playbackUrl,
+      currentSource: result.currentSource,
+      mediaSequence: result.mediaSequence,
+      targetDurationSec: result.targetDurationSec,
+      refreshed: result.refreshed,
+      rotated: result.rotated,
+      adapterKind: "livekora",
+      candidatesFound: result.candidatesFound,
+      candidatesTried: result.candidatesTried,
+    };
+  }
+
+  return {
+    ok: true,
+    manifestBody: result.manifestBody,
+    finalUrl: result.finalUrl,
+    targetUrl: result.targetUrl,
+    fetchUrl: result.fetchUrl,
+    referrerUrl: result.referrerUrl,
+    playbackUrl: result.playbackUrl || playbackUrl,
+    currentSource: result.currentSource,
+    mediaSequence: result.mediaSequence,
+    targetDurationSec: result.targetDurationSec,
+    refreshed: result.refreshed,
+    rotated: result.rotated,
+    adapterKind: "livekora",
+    candidatesFound: result.candidatesFound,
+    candidatesTried: result.candidatesTried,
+    sessionOwned: true,
+  };
+}
+
+function mapLivekoraAssetResult(result: Awaited<ReturnType<typeof albaRuntimeAdapter.fetchAsset>>): ProviderAssetResult {
+  return {
+    ok: !!result.ok,
+    status: Number(result.status || 0),
+    contentType: String(result.contentType || ""),
+    bodyBase64: String(result.bodyBase64 || ""),
+    error: String(result.error || ""),
+  };
+}
+
 export const livekoraProvider: LiveStreamProvider = {
   id: "livekora",
   label: "livekora vip",
@@ -652,132 +703,26 @@ export const livekoraProvider: LiveStreamProvider = {
   sourceSelector: pickLivekoraSourceUrl,
   isAllowedSource: isAllowedLivekoraSource,
   async extractCurrentManifest(input, options) {
-    const waitForMediaSequence =
-      Number.isFinite(Number(options?.waitForMediaSequence)) ? Number(options?.waitForMediaSequence) : null;
-    const waitDeadlineAt =
-      waitForMediaSequence !== null
-        ? Date.now() + Math.max(1_000, Math.min(12_000, Number(options?.waitTimeoutMs || 5_000)))
-        : 0;
-    const maxAttempts =
-      waitForMediaSequence !== null
-        ? Math.max(3, Math.ceil(Math.max(0, waitDeadlineAt - Date.now()) / WAIT_RETRY_INTERVAL_MS) + 2)
-        : 3;
-
-    let state = readSourceState(input.sourceUrl);
-    let attempts = 0;
-    let lastError = "livekora-manifest-unavailable";
-
-    while (attempts < maxAttempts) {
-      attempts += 1;
-      let discoveredResolved:
-        | {
-            manifestBody: string;
-            finalUrl: string;
-            mediaSequence: number | null;
-            targetDurationSec: number;
-          }
-        | null = null;
-      if (!state || options?.forceRefresh) {
-        let discovered:
-          | Awaited<ReturnType<typeof discoverLivekoraState>>
-          | null = null;
-        try {
-          discovered = await withTimeout(
-            discoverLivekoraState(input),
-            DIRECT_EXTRACT_TIMEOUT_MS + 5_000,
-            "livekora-direct-discovery-timeout"
-          );
-        } catch (error) {
-          lastError = error instanceof Error ? error.message : String(error || "livekora-direct-discovery-failed");
-          state = null;
-          continue;
-        }
-        if (!discovered.ok) {
-          lastError = discovered.error;
-          state = null;
-          continue;
-        }
-        state = discovered.state;
-        discoveredResolved = {
-          manifestBody: discovered.manifestBody,
-          finalUrl: discovered.finalUrl,
-          mediaSequence: parseMediaSequence(discovered.manifestBody),
-          targetDurationSec: parseTargetDurationSec(discovered.manifestBody),
-        };
-      }
-
-      const resolved = discoveredResolved || (await resolveManifestFromState(input, state));
-      if (!resolved) {
-        lastError = "livekora-manifest-fetch-failed";
-        livekoraSourceState.delete(buildSourceStateKey(input.sourceUrl));
-        state = null;
-        continue;
-      }
-
-      const unchangedSequence =
-        waitForMediaSequence !== null &&
-        resolved.mediaSequence !== null &&
-        resolved.mediaSequence <= waitForMediaSequence &&
-        !isSequenceRollback(resolved.mediaSequence, waitForMediaSequence);
-
-      if (
-        unchangedSequence &&
-        Date.now() < waitDeadlineAt
-      ) {
-        lastError = "media-sequence-unchanged";
-        await sleep(WAIT_RETRY_INTERVAL_MS);
-        continue;
-      }
-
-      return {
-        ok: true,
-        manifestBody: rewriteManifestForSession({
-          manifest: resolved.manifestBody,
-          baseUrl: resolved.finalUrl,
-          internalOrigin: input.internalOrigin,
-          sourceUrl: input.sourceUrl,
-          referrerUrl: state.referrerUrl,
-        }),
-        finalUrl: resolved.finalUrl,
-        targetUrl: resolved.finalUrl,
-        fetchUrl: resolved.finalUrl,
-        referrerUrl: state.referrerUrl,
-        playbackUrl: state.playbackUrl || input.sourceUrl,
-        currentSource: resolved.finalUrl,
-        mediaSequence: resolved.mediaSequence,
-        targetDurationSec: resolved.targetDurationSec,
-        refreshed: attempts > 1,
-        rotated: false,
-        adapterKind: "livekora",
-        candidatesFound: 1,
-        candidatesTried: attempts,
-        sessionOwned: true,
-      };
-    }
-
-    return {
-      ok: false,
-      error: lastError,
-      playbackUrl: input.sourceUrl,
-      currentSource: state?.manifestUrl || "",
-      mediaSequence: state?.lastMediaSequence ?? null,
-      targetDurationSec: 0,
-      refreshed: attempts > 1,
-      rotated: false,
-      adapterKind: "livekora",
-      candidatesFound: state ? 1 : 0,
-      candidatesTried: attempts,
-    };
+    const resolved = await albaRuntimeAdapter.currentManifest(
+      {
+        sourceUrl: input.sourceUrl,
+        slotServer: 4,
+        internalOrigin: input.internalOrigin,
+      },
+      options
+    );
+    return mapLivekoraManifestResult(resolved, input.sourceUrl);
   },
   async fetchAsset(input) {
-    const state = readSourceState(input.sourceUrl);
-    const referrerUrl =
-      normalizeHttpUrl(String(input.referrerUrl || "").trim()) || state?.referrerUrl || input.sourceUrl;
-    return await fetchBinaryWithHeaders({
-      url: input.assetUrl,
-      requestHeaders: state?.requestHeaders,
-      referrerUrl,
-      timeoutMs: input.timeoutMs,
-    });
+    return mapLivekoraAssetResult(
+      await albaRuntimeAdapter.fetchAsset({
+        sourceUrl: input.sourceUrl,
+        slotServer: 4,
+        internalOrigin: input.internalOrigin,
+        assetUrl: input.assetUrl,
+        referrerUrl: input.referrerUrl,
+        timeoutMs: input.timeoutMs,
+      })
+    );
   },
 };

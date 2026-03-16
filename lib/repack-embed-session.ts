@@ -384,7 +384,12 @@ function looksLikeChallengePageHtml(body: string) {
     text.includes("just a moment") ||
     text.includes("_cf_chl_opt") ||
     text.includes("challenge-platform") ||
-    text.includes("enable javascript and cookies to continue")
+    text.includes("enable javascript and cookies to continue") ||
+    text.includes("cf-error-details") ||
+    text.includes("error code 522") ||
+    text.includes("connection timed out") ||
+    text.includes("gateway time-out") ||
+    text.includes("host error")
   );
 }
 
@@ -906,6 +911,10 @@ function createExtractorInitScript() {
       const nav = navigator as Navigator & {
         webdriver?: boolean;
         userAgentData?: unknown;
+        maxTouchPoints?: number;
+        hardwareConcurrency?: number;
+        deviceMemory?: number;
+        vendor?: string;
       };
       try {
         Object.defineProperty(nav, "webdriver", {
@@ -926,6 +935,30 @@ function createExtractorInitScript() {
         });
       } catch {}
       try {
+        Object.defineProperty(nav, "vendor", {
+          configurable: true,
+          get: () => "Google Inc.",
+        });
+      } catch {}
+      try {
+        Object.defineProperty(nav, "maxTouchPoints", {
+          configurable: true,
+          get: () => 0,
+        });
+      } catch {}
+      try {
+        Object.defineProperty(nav, "hardwareConcurrency", {
+          configurable: true,
+          get: () => 8,
+        });
+      } catch {}
+      try {
+        Object.defineProperty(nav, "deviceMemory", {
+          configurable: true,
+          get: () => 8,
+        });
+      } catch {}
+      try {
         Object.defineProperty(nav, "plugins", {
           configurable: true,
           get: () => [
@@ -935,15 +968,77 @@ function createExtractorInitScript() {
           ],
         });
       } catch {}
+      try {
+        Object.defineProperty(nav, "userAgentData", {
+          configurable: true,
+          get: () => ({
+            brands: [
+              { brand: "Google Chrome", version: "145" },
+              { brand: "Chromium", version: "145" },
+              { brand: "Not=A?Brand", version: "24" },
+            ],
+            mobile: false,
+            platform: "Windows",
+            getHighEntropyValues: async () => ({
+              architecture: "x86",
+              bitness: "64",
+              mobile: false,
+              model: "",
+              platform: "Windows",
+              platformVersion: "10.0.0",
+              uaFullVersion: "145.0.0.0",
+              wow64: false,
+            }),
+            toJSON: () => ({
+              brands: [
+                { brand: "Google Chrome", version: "145" },
+                { brand: "Chromium", version: "145" },
+                { brand: "Not=A?Brand", version: "24" },
+              ],
+              mobile: false,
+              platform: "Windows",
+            }),
+          }),
+        });
+      } catch {}
     } catch {}
 
     try {
       const runtime = {};
       (
         window as Window & {
-          chrome?: { runtime?: Record<string, never> };
+          chrome?: {
+            runtime?: Record<string, never>;
+            app?: Record<string, unknown>;
+            csi?: () => Record<string, unknown>;
+            loadTimes?: () => Record<string, unknown>;
+          };
         }
-      ).chrome = { runtime };
+      ).chrome = {
+        runtime,
+        app: {
+          isInstalled: false,
+          InstallState: {
+            DISABLED: "disabled",
+            INSTALLED: "installed",
+            NOT_INSTALLED: "not_installed",
+          },
+          RunningState: {
+            CANNOT_RUN: "cannot_run",
+            READY_TO_RUN: "ready_to_run",
+            RUNNING: "running",
+          },
+        },
+        csi: () => ({}),
+        loadTimes: () => ({
+          requestTime: Date.now() / 1000,
+          startLoadTime: Date.now() / 1000,
+          commitLoadTime: Date.now() / 1000,
+          finishDocumentLoadTime: Date.now() / 1000,
+          finishLoadTime: Date.now() / 1000,
+          firstPaintTime: Date.now() / 1000,
+        }),
+      };
     } catch {}
 
     try {

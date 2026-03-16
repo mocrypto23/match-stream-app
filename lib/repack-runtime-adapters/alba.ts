@@ -115,15 +115,16 @@ function buildAlbaVariants(sourceUrl: string) {
       if (!normalized || variants.includes(normalized)) return;
       variants.push(normalized);
     };
-    for (const origin of originVariants) {
-      pushVariant(`${origin}/${slug}/`);
-    }
+
     pushVariant(parsed.toString());
     for (const origin of originVariants) {
       pushVariant(`${origin}/albaplayer/${slug}/`);
       for (const serv of ["2", "5", "1", "0", "3", "4"]) {
         pushVariant(`${origin}/albaplayer/${slug}/?serv=${serv}`);
       }
+    }
+    for (const origin of originVariants) {
+      pushVariant(`${origin}/${slug}/`);
     }
     return variants;
   } catch {
