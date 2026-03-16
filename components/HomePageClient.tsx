@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { cairoDayStringFromOffset, dayToOffset, type DayKey, type MatchRow } from "@/lib/home-page-shared";
 
-const MATCH_NOTICE_ENABLED = true;
+const MATCH_NOTICE_ENABLED = false;
 const MATCHES_REQUEST_TIMEOUT_MS = 12_000;
 const MATCHES_REQUEST_RETRIES = 2;
 
