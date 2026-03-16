@@ -229,7 +229,6 @@ function buildPlaybackCandidates(rawSourceUrl, rawPlaybackUrl) {
 
   const seedUrls = [rawPlaybackUrl, rawSourceUrl].map((item) => normalizeHttpUrl(item)).filter(Boolean);
   for (const seedUrl of seedUrls) {
-    push(seedUrl);
     try {
       const parsed = new URL(seedUrl);
       const host = String(parsed.hostname || "").toLowerCase();
@@ -259,6 +258,10 @@ function buildPlaybackCandidates(rawSourceUrl, rawPlaybackUrl) {
         push(`${origin}/${slug}/`);
       }
     } catch {}
+  }
+
+  for (const seedUrl of seedUrls) {
+    push(seedUrl);
   }
 
   return ordered;
