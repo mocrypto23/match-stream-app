@@ -44,6 +44,8 @@ export async function buildBeinliveStatus(input: {
       updatedAt: nowIso(),
       label: "bein-live",
       order: 2,
+      phase: null,
+      progressPct: 0,
     } satisfies BeinliveStatus;
   }
 
@@ -61,6 +63,8 @@ export async function buildBeinliveStatus(input: {
       updatedAt: nowIso(),
       label: "bein-live",
       order: 2,
+      phase: "failed",
+      progressPct: 0,
     } satisfies BeinliveStatus;
   }
 
@@ -80,5 +84,7 @@ export async function buildBeinliveStatus(input: {
     updatedAt: agentStatus.updatedAt || nowIso(),
     label: "bein-live",
     order: 2,
+    phase: agentStatus.phase || (agentStatus.exists ? null : "queued"),
+    progressPct: agentStatus.progressPct ?? (agentStatus.exists ? null : 0),
   } satisfies BeinliveStatus;
 }

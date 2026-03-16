@@ -5,7 +5,7 @@ import { useParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import VideoPlayerControls from "@/components/VideoPlayerControls";
-import type { StreamProviderId, StreamSourceStatus } from "@/lib/stream-source-types";
+import type { StreamProviderId, StreamSourcePhase, StreamSourceStatus } from "@/lib/stream-source-types";
 
 type MatchPayload = {
   id: number;
@@ -29,14 +29,20 @@ type MatchPayload = {
 };
 
 type StatusMap = Record<StreamProviderId, StreamSourceStatus | null>;
+type PendingBootstrapMap = Record<StreamProviderId, number>;
 
 const STATUS_POLL_MS = 4_000;
+const ACTIVE_WARMING_POLL_MS = 1_250;
 const AUTO_BOOTSTRAP_RETRY_MS = 12_000;
 const PROVIDER_META: Array<{ provider: StreamProviderId; order: number; label: string }> = [
   { provider: "livekora", order: 1, label: "livekora vip" },
   { provider: "beinlive", order: 2, label: "bein-live" },
   { provider: "siiir", order: 3, label: "siiir.tv" },
 ];
+
+function createPendingBootstrapMap(): PendingBootstrapMap {
+  return { livekora: 0, beinlive: 0, siiir: 0 };
+}
 
 function formatKickoff(value: string | null | undefined) {
   if (!value) return "موعد المباراة غير متوفر";
@@ -66,6 +72,47 @@ function stateTone(status: StreamSourceStatus | null) {
   return "bg-rose-600";
 }
 
+function progressPct(status: StreamSourceStatus | null) {
+  if (!status) return 0;
+  if (status.state === "ready") return 100;
+  const value = Number(status.progressPct);
+  if (!Number.isFinite(value)) return status.reason === "not-bootstrapped" ? 0 : status.state === "warming" ? 8 : 0;
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function phaseLabel(status: StreamSourceStatus | null) {
+  const phase = status?.phase as StreamSourcePhase | null | undefined;
+  switch (phase) {
+    case "queued":
+      return "\u0641\u064a \u0627\u0646\u062a\u0638\u0627\u0631 \u0628\u062f\u0621 \u0627\u0644\u062a\u062c\u0647\u064a\u0632";
+    case "resolving_source":
+      return "\u062c\u0627\u0631\u064a \u0627\u0644\u0648\u0635\u0648\u0644 \u0625\u0644\u0649 \u0627\u0644\u0645\u0635\u062f\u0631";
+    case "fetching_manifest":
+      return "\u062c\u0627\u0631\u064a \u0633\u062d\u0628 \u0631\u0627\u0628\u0637 \u0627\u0644\u0628\u062b";
+    case "resolving_variant":
+      return "\u062c\u0627\u0631\u064a \u062a\u062d\u062f\u064a\u062f \u0645\u0633\u0627\u0631 \u0627\u0644\u0628\u062b";
+    case "mirroring_assets":
+      return "\u062c\u0627\u0631\u064a \u062a\u062c\u0647\u064a\u0632 \u0645\u0642\u0627\u0637\u0639 \u0627\u0644\u0628\u062b";
+    case "publishing_playlist":
+      return "\u062c\u0627\u0631\u064a \u0646\u0634\u0631 \u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0628\u062b";
+    case "ready":
+      return "\u0627\u0644\u0628\u062b \u062c\u0627\u0647\u0632";
+    case "failed":
+      return "\u0641\u0634\u0644 \u062a\u062c\u0647\u064a\u0632 \u0627\u0644\u0645\u0635\u062f\u0631";
+    default:
+      if (status?.state === "ready") return "\u0627\u0644\u0628\u062b \u062c\u0627\u0647\u0632";
+      if (status?.state === "warming") return "\u062c\u0627\u0631\u064a \u062a\u062c\u0647\u064a\u0632 \u0627\u0644\u0628\u062b";
+      return "\u0627\u0644\u0645\u0635\u062f\u0631 \u063a\u064a\u0631 \u062c\u0627\u0647\u0632";
+  }
+}
+
+function progressTone(status: StreamSourceStatus | null) {
+  if (!status) return "bg-slate-500";
+  if (status.state === "ready") return "bg-emerald-500";
+  if (status.state === "warming") return "bg-teal-400";
+  return "bg-rose-500";
+}
+
 function buildStatusMap(payload: MatchPayload | null): StatusMap {
   return {
     livekora: payload?.livekoraStatus || null,
@@ -91,7 +138,7 @@ export default function WatchPage() {
   const [selectedProvider, setSelectedProvider] = useState<StreamProviderId>("livekora");
   const [pageError, setPageError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [bootstrapPendingProvider, setBootstrapPendingProvider] = useState<StreamProviderId | null>(null);
+  const [pendingBootstraps, setPendingBootstraps] = useState<PendingBootstrapMap>(createPendingBootstrapMap);
   const [playbackRequested, setPlaybackRequested] = useState(false);
   const [playbackStarting, setPlaybackStarting] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -122,6 +169,8 @@ export default function WatchPage() {
   }, [selectedProvider, sources]);
 
   const activeProvider = activeStatus?.provider || selectedProvider;
+  const activeProgressPct = progressPct(activeStatus);
+  const activePhaseLabel = phaseLabel(activeStatus);
 
   const streamUrl = useMemo(() => {
     const direct = String(activeStatus?.playlistUrl || "").trim();
@@ -207,7 +256,10 @@ export default function WatchPage() {
   const bootstrapProvider = useCallback(
     async (provider: StreamProviderId, opts?: { silent?: boolean }) => {
       if (!Number.isFinite(matchId) || matchId <= 0) return;
-      setBootstrapPendingProvider(provider);
+      setPendingBootstraps((current) => ({
+        ...current,
+        [provider]: (current[provider] || 0) + 1,
+      }));
       try {
         const response = await fetch(`/api/${provider}/bootstrap`, {
           method: "POST",
@@ -236,7 +288,10 @@ export default function WatchPage() {
           setPageError(error instanceof Error ? error.message : "bootstrap-failed");
         }
       } finally {
-        setBootstrapPendingProvider((current) => (current === provider ? null : current));
+        setPendingBootstraps((current) => ({
+          ...current,
+          [provider]: Math.max(0, (current[provider] || 0) - 1),
+        }));
       }
     },
     [applyProviderStatus, matchId]
@@ -281,6 +336,7 @@ export default function WatchPage() {
     backgroundBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     lastAutoBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     setStatusByProvider({ livekora: null, beinlive: null, siiir: null });
+    setPendingBootstraps(createPendingBootstrapMap());
     setSelectedProvider("livekora");
   }, [matchId, resetPlaybackState]);
 
@@ -301,18 +357,24 @@ export default function WatchPage() {
 
     let cancelled = false;
     void (async () => {
-      for (const item of PROVIDER_META) {
-        if (cancelled) return;
+      const providersToBootstrap = PROVIDER_META.filter((item) => {
         const status = statusByProvider[item.provider];
-        if (!String(status?.sourceUrl || "").trim()) continue;
+        if (!String(status?.sourceUrl || "").trim()) return false;
 
         const now = Date.now();
         const lastAttemptAt = backgroundBootstrapAtRef.current[item.provider] || 0;
-        if (now - lastAttemptAt < AUTO_BOOTSTRAP_RETRY_MS) continue;
+        if (now - lastAttemptAt < AUTO_BOOTSTRAP_RETRY_MS) return false;
 
         backgroundBootstrapAtRef.current[item.provider] = now;
-        await bootstrapProvider(item.provider, { silent: true });
-      }
+        return true;
+      }).map((item) => item.provider);
+
+      await Promise.all(
+        providersToBootstrap.map(async (provider) => {
+          if (cancelled) return;
+          await bootstrapProvider(provider, { silent: true });
+        })
+      );
     })();
 
     return () => {
@@ -324,7 +386,7 @@ export default function WatchPage() {
     if (!match) return;
     if (!String(activeStatus?.sourceUrl || "").trim()) return;
     if (activeStatus?.reason !== "not-bootstrapped") return;
-    if (bootstrapPendingProvider === activeProvider) return;
+    if ((pendingBootstraps[activeProvider] || 0) > 0) return;
 
     const now = Date.now();
     const lastAttemptAt = lastAutoBootstrapAtRef.current[activeProvider] || 0;
@@ -336,9 +398,9 @@ export default function WatchPage() {
     activeProvider,
     activeStatus?.reason,
     activeStatus?.sourceUrl,
-    bootstrapPendingProvider,
     bootstrapProvider,
     match,
+    pendingBootstraps,
   ]);
 
   useEffect(() => {
@@ -348,6 +410,15 @@ export default function WatchPage() {
     }, STATUS_POLL_MS);
     return () => window.clearInterval(id);
   }, [matchId, refreshAllStatuses]);
+
+  useEffect(() => {
+    if (!matchId || Number.isNaN(matchId)) return;
+    if (activeStatus?.state !== "warming") return;
+    const id = window.setInterval(() => {
+      void refreshProviderStatus(activeProvider);
+    }, ACTIVE_WARMING_POLL_MS);
+    return () => window.clearInterval(id);
+  }, [activeProvider, activeStatus?.state, matchId, refreshProviderStatus]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -477,7 +548,8 @@ export default function WatchPage() {
   }
 
   const title = [match.home_team || "الفريق الأول", match.away_team || "الفريق الثاني"].join(" × ");
-  const isBootstrapPending = bootstrapPendingProvider === activeProvider;
+  const isBootstrapPending = (pendingBootstraps[activeProvider] || 0) > 0;
+  const showPreparationProgress = !streamUrl && !!activeStatus && activeStatus.state === "warming";
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(15,118,110,0.28),_transparent_35%),linear-gradient(180deg,_#020617_0%,_#07111f_55%,_#020617_100%)] text-white">
@@ -529,10 +601,30 @@ export default function WatchPage() {
 
               {!streamUrl ? (
                 <div className="absolute inset-0 z-[55] flex flex-col items-center justify-center gap-3 bg-black/70 px-6 text-center">
-                  <div className="text-2xl font-bold">{stateLabel(activeStatus)}</div>
-                  <div className="text-sm text-slate-300">
-                    {activeStatus?.reason || pageError || "waiting-for-playlist"}
+                  <div className="text-2xl font-bold">
+                    {showPreparationProgress ? "جاري تجهيز البث" : stateLabel(activeStatus)}
                   </div>
+                  {showPreparationProgress ? (
+                    <div className="w-full max-w-md">
+                      <div className="flex items-center justify-between text-xs text-slate-300">
+                        <span>{activePhaseLabel}</span>
+                        <span>{activeProgressPct}%</span>
+                      </div>
+                      <div className="mt-2 h-2.5 overflow-hidden rounded-full bg-white/10">
+                        <div
+                          className={`h-full rounded-full transition-[width] duration-500 ${progressTone(activeStatus)}`}
+                          style={{ width: `${activeProgressPct}%` }}
+                        />
+                      </div>
+                      <div className="mt-3 text-sm text-slate-300">
+                        {activeStatus?.reason === "warming" ? "يتم تجهيز الرابط النهائي الآن." : activeStatus?.reason || pageError || "warming"}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-sm text-slate-300">
+                      {activeStatus?.reason || pageError || "waiting-for-playlist"}
+                    </div>
+                  )}
                 </div>
               ) : null}
 
@@ -544,6 +636,17 @@ export default function WatchPage() {
                   <div className="text-sm text-slate-200">
                     {hasPlayedRef.current ? "قد يتأخر لثوانٍ بسيطة ثم يكمل." : "انتظر لحظة حتى يبدأ البث."}
                   </div>
+                  {!hasPlayedRef.current ? (
+                    <div className="w-full max-w-sm">
+                      <div className="flex items-center justify-between text-xs text-slate-200">
+                        <span>تم تجهيز الرابط</span>
+                        <span>100%</span>
+                      </div>
+                      <div className="mt-2 h-2 overflow-hidden rounded-full bg-white/15">
+                        <div className="h-full w-full rounded-full bg-emerald-400" />
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
 
@@ -599,6 +702,20 @@ export default function WatchPage() {
                       <div className="text-xs text-slate-400">مصدر {item.order}</div>
                       <div className="mt-1 font-semibold text-white">{status?.label || item.label}</div>
                       <div className="mt-2 text-xs text-slate-300">{stateLabel(status)}</div>
+                      {status ? (
+                        <div className="mt-3">
+                          <div className="flex items-center justify-between text-[11px] text-slate-400">
+                            <span>{status.state === "warming" ? phaseLabel(status) : stateLabel(status)}</span>
+                            <span>{progressPct(status)}%</span>
+                          </div>
+                          <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-white/8">
+                            <div
+                              className={`h-full rounded-full transition-[width] duration-500 ${progressTone(status)}`}
+                              style={{ width: `${progressPct(status)}%` }}
+                            />
+                          </div>
+                        </div>
+                      ) : null}
                     </button>
                   );
                 })}
@@ -611,6 +728,19 @@ export default function WatchPage() {
                 <div className={`rounded-full px-3 py-1 text-xs font-bold ${stateTone(activeStatus)}`}>{stateLabel(activeStatus)}</div>
               </div>
               <div className="mt-4 space-y-3 text-sm text-slate-200">
+                <div>
+                  <div className="flex items-center justify-between text-slate-400">
+                    <span>نسبة التجهيز</span>
+                    <span className="font-mono text-xs">{activeProgressPct}%</span>
+                  </div>
+                  <div className="mt-2 h-2 overflow-hidden rounded-full bg-white/10">
+                    <div
+                      className={`h-full rounded-full transition-[width] duration-500 ${progressTone(activeStatus)}`}
+                      style={{ width: `${activeProgressPct}%` }}
+                    />
+                  </div>
+                  <div className="mt-2 text-xs text-slate-300">{activePhaseLabel}</div>
+                </div>
                 <div>
                   <div className="text-slate-400">المصدر المختار</div>
                   <div className="font-semibold">{activeStatus?.label || PROVIDER_META.find((item) => item.provider === activeProvider)?.label || activeProvider}</div>

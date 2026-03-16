@@ -53,6 +53,8 @@ export async function buildSiiirStatus(input: {
       updatedAt: nowIso(),
       label: "siiir.tv",
       order: 3,
+      phase: null,
+      progressPct: 0,
     } satisfies SiiirStatus;
   }
 
@@ -70,6 +72,8 @@ export async function buildSiiirStatus(input: {
       updatedAt: nowIso(),
       label: "siiir.tv",
       order: 3,
+      phase: "failed",
+      progressPct: 0,
     } satisfies SiiirStatus;
   }
 
@@ -87,5 +91,7 @@ export async function buildSiiirStatus(input: {
     updatedAt: agentStatus.updatedAt || nowIso(),
     label: "siiir.tv",
     order: 3,
+    phase: agentStatus.phase || (agentStatus.exists ? null : "queued"),
+    progressPct: agentStatus.progressPct ?? (agentStatus.exists ? null : 0),
   } satisfies SiiirStatus;
 }

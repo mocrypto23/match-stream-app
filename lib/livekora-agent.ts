@@ -44,6 +44,8 @@ export async function buildLivekoraStatus(input: {
       updatedAt: nowIso(),
       label: "livekora vip",
       order: 1,
+      phase: null,
+      progressPct: 0,
     } satisfies LivekoraStatus;
   }
 
@@ -61,6 +63,8 @@ export async function buildLivekoraStatus(input: {
       updatedAt: nowIso(),
       label: "livekora vip",
       order: 1,
+      phase: "failed",
+      progressPct: 0,
     } satisfies LivekoraStatus;
   }
 
@@ -80,5 +84,7 @@ export async function buildLivekoraStatus(input: {
     updatedAt: agentStatus.updatedAt || nowIso(),
     label: "livekora vip",
     order: 1,
+    phase: agentStatus.phase || (agentStatus.exists ? null : "queued"),
+    progressPct: agentStatus.progressPct ?? (agentStatus.exists ? null : 0),
   } satisfies LivekoraStatus;
 }

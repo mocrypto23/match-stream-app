@@ -32,6 +32,12 @@ function toInt(raw, fallback, min = Number.MIN_SAFE_INTEGER) {
   return Math.max(min, n);
 }
 
+function clampProgress(value, fallback = 0) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(0, Math.min(100, Math.round(numeric)));
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 }
@@ -381,6 +387,8 @@ class LivekoraJob {
     this.lastCurrentSource = "";
     this.lastPlaylistFingerprint = "";
     this.consecutiveFailures = 0;
+    this.phase = "queued";
+    this.progressPct = 0;
     this.assetsBySourceUrl = new Map();
     this.syncTimer = null;
     this.syncPromise = null;
@@ -398,9 +406,16 @@ class LivekoraJob {
     this.lastTouchedAt = Date.now();
   }
 
+  setProgress(phase, progressPct) {
+    this.phase = String(phase || "").trim() || this.phase || "queued";
+    this.progressPct = clampProgress(progressPct, this.progressPct);
+    this.touch();
+  }
+
   start() {
     this.touch();
     this.state = "running";
+    this.setProgress("queued", 5);
     this.scheduleNextSync(0);
   }
 
@@ -419,6 +434,7 @@ class LivekoraJob {
       this.state = "running";
       this.consecutiveFailures = 0;
       this.lastError = "";
+      this.setProgress("queued", 5);
     }
   }
 
@@ -463,6 +479,8 @@ class LivekoraJob {
 
   toStatus(nowMs = Date.now()) {
     const publicState = this.derivePublicStatus(nowMs);
+    const isReady = publicState.state === "ready";
+    const isFailed = publicState.state === "down";
     return {
       exists: true,
       provider: this.providerId,
@@ -473,6 +491,8 @@ class LivekoraJob {
       currentSource: this.lastCurrentSource || null,
       reason: publicState.reason,
       updatedAt: nowIso(),
+      phase: isReady ? "ready" : isFailed ? "failed" : this.phase || "queued",
+      progressPct: isReady ? 100 : isFailed ? clampProgress(this.progressPct, 0) : clampProgress(this.progressPct, 0),
     };
   }
 
@@ -554,6 +574,7 @@ class LivekoraJob {
   }
 
   async fetchManifestDocument(options = {}) {
+    this.setProgress(options.forceRefresh ? "resolving_source" : "fetching_manifest", options.forceRefresh ? 18 : 14);
     const buildFetchUrl = (rawUrl) => {
       if (!isSessionManifestUrl(rawUrl)) return rawUrl;
       try {
@@ -705,6 +726,7 @@ class LivekoraJob {
           finalUrl: fetched.finalUrl,
         };
       }
+      this.setProgress("resolving_variant", 35);
       currentUrl = variantUrl;
     }
 
@@ -802,6 +824,7 @@ class LivekoraJob {
 
   async performSync() {
     try {
+      this.setProgress("resolving_source", 8);
       for (let syncAttempt = 0; syncAttempt < 2; syncAttempt += 1) {
         const manifest = await this.fetchManifestDocument({ forceRefresh: syncAttempt > 0 });
         if (!manifest.ok) {
@@ -810,6 +833,7 @@ class LivekoraJob {
           this.consecutiveFailures += 1;
           if (this.consecutiveFailures >= this.manager.config.maxConsecutiveFailures) {
             this.state = "degraded";
+            this.setProgress("failed", this.progressPct);
           }
           return {
             ok: false,
@@ -837,12 +861,25 @@ class LivekoraJob {
           uploads.push(record);
         }
 
+        this.setProgress("mirroring_assets", uploads.length ? 52 : 86);
         const failedUploads = [];
+        let completedUploads = 0;
+        const updateMirroringProgress = () => {
+          if (!uploads.length) {
+            this.setProgress("mirroring_assets", 86);
+            return;
+          }
+          const nextProgress = 52 + Math.round((completedUploads / uploads.length) * 36);
+          this.setProgress("mirroring_assets", nextProgress);
+        };
         await mapLimit(uploads, this.manager.config.mirrorAssetConcurrency, async (record) => {
           try {
             await this.uploadAsset(record);
           } catch (error) {
             failedUploads.push({ record, error: error instanceof Error ? error.message : String(error) });
+          } finally {
+            completedUploads += 1;
+            updateMirroringProgress();
           }
         });
 
@@ -862,6 +899,7 @@ class LivekoraJob {
             );
           if (!hasMediaSegments(publishManifestBody, this.publicPlaylistUrl)) {
             if (allSegment403 && syncAttempt === 0) {
+              this.setProgress("resolving_source", 32);
               this.manager.log("warn", "retrying manifest sync after segment 403", {
                 matchId: this.matchId,
                 provider: this.providerId,
@@ -875,6 +913,7 @@ class LivekoraJob {
 
         await this.cleanupStaleAssets(nowMs, rewritten.currentAssetUrls);
         const fingerprint = hashHex(publishManifestBody);
+        this.setProgress("publishing_playlist", 94);
         if (
           fingerprint !== this.lastPlaylistFingerprint ||
           !this.lastPublishAt ||
@@ -887,6 +926,7 @@ class LivekoraJob {
         this.state = "running";
         this.consecutiveFailures = 0;
         this.lastError = "";
+        this.setProgress("ready", 100);
         const nextDelayMs = Math.max(
           600,
           Math.min(8000, Math.round(Math.max(2, this.lastObservedTargetDurationSec || 2) * 1000 * 0.45))
@@ -901,6 +941,7 @@ class LivekoraJob {
       this.consecutiveFailures += 1;
       if (this.consecutiveFailures >= this.manager.config.maxConsecutiveFailures) {
         this.state = "degraded";
+        this.setProgress("failed", this.progressPct);
       }
       return {
         ok: false,
@@ -1064,6 +1105,8 @@ class LivekoraManager {
         currentSource: null,
         reason: "not-bootstrapped",
         updatedAt: nowIso(),
+        phase: "queued",
+        progressPct: 0,
       };
     }
     return job.toStatus();
@@ -1083,6 +1126,8 @@ class LivekoraManager {
         currentSource: job.lastCurrentSource || null,
         playlistUrl: job.publicPlaylistUrl,
         lastError: job.lastError || null,
+        phase: job.phase || null,
+        progressPct: job.progressPct,
       })),
     };
   }
