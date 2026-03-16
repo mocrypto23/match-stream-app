@@ -34,6 +34,7 @@ type PendingBootstrapMap = Record<StreamProviderId, number>;
 const STATUS_POLL_MS = 4_000;
 const ACTIVE_WARMING_POLL_MS = 1_250;
 const AUTO_BOOTSTRAP_RETRY_MS = 12_000;
+const ACTIVE_RECOVERY_RETRY_MS = 3_500;
 const PROVIDER_META: Array<{ provider: StreamProviderId; order: number; label: string }> = [
   { provider: "livekora", order: 1, label: "livekora vip" },
   { provider: "beinlive", order: 2, label: "bein-live" },
@@ -141,16 +142,23 @@ export default function WatchPage() {
   const [pendingBootstraps, setPendingBootstraps] = useState<PendingBootstrapMap>(createPendingBootstrapMap);
   const [playbackRequested, setPlaybackRequested] = useState(false);
   const [playbackStarting, setPlaybackStarting] = useState(false);
+  const [playerSessionNonce, setPlayerSessionNonce] = useState(0);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   const waitingOverlayTimerRef = useRef<number | null>(null);
   const hasPlayedRef = useRef(false);
+  const selectedRecoveryPendingRef = useRef(false);
   const lastAutoBootstrapAtRef = useRef<Record<StreamProviderId, number>>({
     livekora: 0,
     beinlive: 0,
     siiir: 0,
   });
   const backgroundBootstrapAtRef = useRef<Record<StreamProviderId, number>>({
+    livekora: 0,
+    beinlive: 0,
+    siiir: 0,
+  });
+  const activeRecoveryAtRef = useRef<Record<StreamProviderId, number>>({
     livekora: 0,
     beinlive: 0,
     siiir: 0,
@@ -321,8 +329,10 @@ export default function WatchPage() {
       }
       setPlaybackRequested(false);
       setPlaybackStarting(false);
+      setPlayerSessionNonce(0);
       clearWaitingOverlayTimer();
       hasPlayedRef.current = false;
+      selectedRecoveryPendingRef.current = false;
     },
     [clearWaitingOverlayTimer]
   );
@@ -338,6 +348,9 @@ export default function WatchPage() {
     setStatusByProvider({ livekora: null, beinlive: null, siiir: null });
     setPendingBootstraps(createPendingBootstrapMap());
     setSelectedProvider("livekora");
+    activeRecoveryAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
+    selectedRecoveryPendingRef.current = false;
+    setPlayerSessionNonce(0);
   }, [matchId, resetPlaybackState]);
 
   useEffect(() => {
@@ -419,6 +432,58 @@ export default function WatchPage() {
     }, ACTIVE_WARMING_POLL_MS);
     return () => window.clearInterval(id);
   }, [activeProvider, activeStatus?.state, matchId, refreshProviderStatus]);
+
+  useEffect(() => {
+    if (!playbackRequested) {
+      selectedRecoveryPendingRef.current = false;
+      return;
+    }
+    if (!String(activeStatus?.sourceUrl || "").trim()) return;
+
+    const isReady = activeStatus?.state === "ready" && !!String(streamUrl || "").trim();
+    if (!isReady) {
+      selectedRecoveryPendingRef.current = true;
+      if (hasPlayedRef.current) {
+        setPlaybackStarting(true);
+      }
+      return;
+    }
+
+    if (!selectedRecoveryPendingRef.current) return;
+    selectedRecoveryPendingRef.current = false;
+    setPageError(null);
+    setPlaybackStarting(true);
+    setPlayerSessionNonce((current) => current + 1);
+  }, [activeStatus?.sourceUrl, activeStatus?.state, playbackRequested, streamUrl]);
+
+  useEffect(() => {
+    if (!match) return;
+    if (!playbackRequested) return;
+    if (!String(activeStatus?.sourceUrl || "").trim()) return;
+    if ((pendingBootstraps[activeProvider] || 0) > 0) return;
+
+    const selectedIsUnavailable = activeStatus?.state !== "ready" || !String(streamUrl || "").trim();
+    if (!selectedIsUnavailable) return;
+
+    const now = Date.now();
+    const lastAttemptAt = activeRecoveryAtRef.current[activeProvider] || 0;
+    if (now - lastAttemptAt < ACTIVE_RECOVERY_RETRY_MS) return;
+
+    activeRecoveryAtRef.current[activeProvider] = now;
+    setPlaybackStarting(true);
+    void bootstrapProvider(activeProvider, { silent: true });
+    void refreshProviderStatus(activeProvider);
+  }, [
+    activeProvider,
+    activeStatus?.sourceUrl,
+    activeStatus?.state,
+    bootstrapProvider,
+    match,
+    pendingBootstraps,
+    playbackRequested,
+    refreshProviderStatus,
+    streamUrl,
+  ]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -523,7 +588,7 @@ export default function WatchPage() {
       hls.destroy();
       if (hlsRef.current === hls) hlsRef.current = null;
     };
-  }, [clearWaitingOverlayTimer, playbackRequested, streamUrl]);
+  }, [clearWaitingOverlayTimer, playbackRequested, playerSessionNonce, streamUrl]);
 
   if (loading) {
     return (
