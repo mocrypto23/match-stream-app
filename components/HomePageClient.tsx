@@ -394,20 +394,13 @@ export default function HomePageClient({
             })();
 
             const canNavigate = day !== "yesterday" && Boolean(match?.id);
-            const watchHref = `/watch/${match.id}`;
-
-            return (
-              <div
-                key={match.id}
-                onClick={() => {
-                  if (!canNavigate) return;
-                  window.location.href = watchHref;
-                }}
-                className={[
-                  "bg-[#121212] border border-gray-800 p-6 rounded-[2rem] flex justify-between items-center shadow-2xl group",
-                  canNavigate ? "hover:border-blue-600 hover:scale-[1.01] transition-all cursor-pointer" : "opacity-90",
-                ].join(" ")}
-              >
+            const watchHref = `https://tf-player.site/watch/${match.id}`;
+            const cardClassName = [
+              "bg-[#121212] border border-gray-800 p-6 rounded-[2rem] flex justify-between items-center shadow-2xl group",
+              canNavigate ? "hover:border-blue-600 hover:scale-[1.01] transition-all cursor-pointer" : "opacity-90",
+            ].join(" ");
+            const cardContent = (
+              <>
                 <div className="flex flex-col items-center gap-3 flex-1">
                   <div className="w-16 h-16 bg-gray-900 rounded-full flex items-center justify-center p-2 border border-gray-800 group-hover:border-blue-500 transition-colors">
                     <TeamLogo logo={match.home_logo} team={match.home_team} />
@@ -439,7 +432,25 @@ export default function HomePageClient({
                   </div>
                   <span className="text-sm sm:text-lg font-black text-center">{match.away_team}</span>
                 </div>
-              </div>
+              </>
+            );
+
+            if (!canNavigate) {
+              return (
+                <div key={match.id} className={cardClassName}>
+                  {cardContent}
+                </div>
+              );
+            }
+
+            return (
+              <a
+                key={match.id}
+                href={watchHref}
+                className={cardClassName}
+              >
+                {cardContent}
+              </a>
             );
           })
         ) : (

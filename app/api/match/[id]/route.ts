@@ -1,13 +1,10 @@
 import { NextResponse } from "next/server";
 
 import { buildBeinliveStatus } from "@/lib/beinlive-agent";
-import { beinliveProvider } from "@/lib/beinlive-provider";
 import { buildLivekoraStatus } from "@/lib/livekora-agent";
 import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
 import { pickLivekoraSourceUrl } from "@/lib/live-providers";
 import { buildSiiirStatus } from "@/lib/siiir-agent";
-import { siiirProvider } from "@/lib/siiir-provider";
-import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -30,23 +27,26 @@ export async function GET(_req: Request, ctx: Ctx) {
   }
 
   const sourceUrl = pickLivekoraSourceUrl(data);
-  const beinliveSourceUrl = await resolveProviderSourceUrl(beinliveProvider, data);
-  const siiirSourceUrl = await resolveProviderSourceUrl(siiirProvider, data);
-  const livekoraStatus = await buildLivekoraStatus({
-    matchId,
-    row: data,
-    sourceUrl,
-  });
-  const beinliveStatus = await buildBeinliveStatus({
-    matchId,
-    row: data,
-    sourceUrl: beinliveSourceUrl,
-  });
-  const siiirStatus = await buildSiiirStatus({
-    matchId,
-    row: data,
-    sourceUrl: siiirSourceUrl,
-  });
+  const beinliveSourceUrl = String(data.stream_url || "").trim() || null;
+  const siiirSourceUrl = String(data.stream_url_2 || "").trim() || null;
+
+  const [livekoraStatus, beinliveStatus, siiirStatus] = await Promise.all([
+    buildLivekoraStatus({
+      matchId,
+      row: data,
+      sourceUrl,
+    }),
+    buildBeinliveStatus({
+      matchId,
+      row: data,
+      sourceUrl: beinliveSourceUrl,
+    }),
+    buildSiiirStatus({
+      matchId,
+      row: data,
+      sourceUrl: siiirSourceUrl,
+    }),
+  ]);
   const streamSources = [livekoraStatus, beinliveStatus, siiirStatus].sort((left, right) => left.order - right.order);
 
   const response = NextResponse.json({
