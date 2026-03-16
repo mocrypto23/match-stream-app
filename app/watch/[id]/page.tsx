@@ -62,6 +62,9 @@ function formatKickoff(value: string | null | undefined) {
 function stateLabel(status: StreamSourceStatus | null) {
   if (!status) return "جاري التحميل";
   if (status.state === "ready") return "البث جاهز";
+  if (String(status.sourceUrl || "").trim() && (status.state === "warming" || status.reason === "not-bootstrapped" || status.phase === "queued")) {
+    return "جاري تجهيز البث";
+  }
   if (status.state === "warming") return "جاري تجهيز البث";
   return "البث غير جاهز";
 }
@@ -69,6 +72,9 @@ function stateLabel(status: StreamSourceStatus | null) {
 function stateTone(status: StreamSourceStatus | null) {
   if (!status) return "bg-slate-700";
   if (status.state === "ready") return "bg-emerald-600";
+  if (String(status.sourceUrl || "").trim() && (status.state === "warming" || status.reason === "not-bootstrapped" || status.phase === "queued")) {
+    return "bg-amber-500";
+  }
   if (status.state === "warming") return "bg-amber-500";
   return "bg-rose-600";
 }
@@ -85,7 +91,7 @@ function phaseLabel(status: StreamSourceStatus | null) {
   const phase = status?.phase as StreamSourcePhase | null | undefined;
   switch (phase) {
     case "queued":
-      return "\u0641\u064a \u0627\u0646\u062a\u0638\u0627\u0631 \u0628\u062f\u0621 \u0627\u0644\u062a\u062c\u0647\u064a\u0632";
+      return "\u062c\u0627\u0631\u064a \u062a\u062c\u0647\u064a\u0632 \u0627\u0644\u0628\u062b";
     case "resolving_source":
       return "\u062c\u0627\u0631\u064a \u0627\u0644\u0648\u0635\u0648\u0644 \u0625\u0644\u0649 \u0627\u0644\u0645\u0635\u062f\u0631";
     case "fetching_manifest":
@@ -102,6 +108,9 @@ function phaseLabel(status: StreamSourceStatus | null) {
       return "\u0641\u0634\u0644 \u062a\u062c\u0647\u064a\u0632 \u0627\u0644\u0645\u0635\u062f\u0631";
     default:
       if (status?.state === "ready") return "\u0627\u0644\u0628\u062b \u062c\u0627\u0647\u0632";
+      if (String(status?.sourceUrl || "").trim() && (status?.state === "warming" || status?.reason === "not-bootstrapped" || status?.phase === "queued")) {
+        return "\u062c\u0627\u0631\u064a \u062a\u062c\u0647\u064a\u0632 \u0627\u0644\u0628\u062b";
+      }
       if (status?.state === "warming") return "\u062c\u0627\u0631\u064a \u062a\u062c\u0647\u064a\u0632 \u0627\u0644\u0628\u062b";
       return "\u0627\u0644\u0645\u0635\u062f\u0631 \u063a\u064a\u0631 \u062c\u0627\u0647\u0632";
   }
@@ -614,7 +623,11 @@ export default function WatchPage() {
 
   const title = [match.home_team || "الفريق الأول", match.away_team || "الفريق الثاني"].join(" × ");
   const isBootstrapPending = (pendingBootstraps[activeProvider] || 0) > 0;
-  const showPreparationProgress = !streamUrl && !!activeStatus && activeStatus.state === "warming";
+  const showPreparationProgress =
+    !streamUrl &&
+    !!activeStatus &&
+    !!String(activeStatus.sourceUrl || "").trim() &&
+    (activeStatus.state === "warming" || activeStatus.reason === "not-bootstrapped" || activeStatus.phase === "queued");
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(15,118,110,0.28),_transparent_35%),linear-gradient(180deg,_#020617_0%,_#07111f_55%,_#020617_100%)] text-white">
