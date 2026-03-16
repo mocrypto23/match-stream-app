@@ -1,5 +1,6 @@
 import HomePageClient from "@/components/HomePageClient";
-import { cairoDayStringFromOffset, readMatchesForDay, type MatchRow } from "@/lib/home-matches";
+import { readMatchesForDay } from "@/lib/home-matches";
+import { cairoDayStringFromOffset, type MatchRow } from "@/lib/home-page-shared";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";

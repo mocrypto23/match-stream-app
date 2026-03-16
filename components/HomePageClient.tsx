@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { cairoDayStringFromOffset, dayToOffset, type DayKey, type MatchRow } from "@/lib/home-matches";
+import { cairoDayStringFromOffset, dayToOffset, type DayKey, type MatchRow } from "@/lib/home-page-shared";
 
 const MATCH_NOTICE_ENABLED = true;
 const MATCHES_REQUEST_TIMEOUT_MS = 12_000;
