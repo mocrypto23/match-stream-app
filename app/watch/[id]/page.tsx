@@ -88,7 +88,7 @@ function phaseLabel(status: StreamSourceStatus | null) {
     case "resolving_source":
       return "\u062c\u0627\u0631\u064a \u0627\u0644\u0648\u0635\u0648\u0644 \u0625\u0644\u0649 \u0627\u0644\u0645\u0635\u062f\u0631";
     case "fetching_manifest":
-      return "\u062c\u0627\u0631\u064a \u0633\u062d\u0628 \u0631\u0627\u0628\u0637 \u0627\u0644\u0628\u062b";
+      return "\u062c\u0627\u0631\u064a \u062a\u062c\u0647\u064a\u0632 \u0627\u0644\u0628\u062b";
     case "resolving_variant":
       return "\u062c\u0627\u0631\u064a \u062a\u062d\u062f\u064a\u062f \u0645\u0633\u0627\u0631 \u0627\u0644\u0628\u062b";
     case "mirroring_assets":
@@ -601,9 +601,6 @@ export default function WatchPage() {
 
               {!streamUrl ? (
                 <div className="absolute inset-0 z-[55] flex flex-col items-center justify-center gap-3 bg-black/70 px-6 text-center">
-                  <div className="text-2xl font-bold">
-                    {showPreparationProgress ? "جاري تجهيز البث" : stateLabel(activeStatus)}
-                  </div>
                   {showPreparationProgress ? (
                     <div className="w-full max-w-md">
                       <div className="flex items-center justify-between text-xs text-slate-300">
@@ -616,14 +613,14 @@ export default function WatchPage() {
                           style={{ width: `${activeProgressPct}%` }}
                         />
                       </div>
-                      <div className="mt-3 text-sm text-slate-300">
-                        {activeStatus?.reason === "warming" ? "يتم تجهيز الرابط النهائي الآن." : activeStatus?.reason || pageError || "warming"}
-                      </div>
                     </div>
                   ) : (
-                    <div className="text-sm text-slate-300">
-                      {activeStatus?.reason || pageError || "waiting-for-playlist"}
-                    </div>
+                    <>
+                      <div className="text-2xl font-bold">{stateLabel(activeStatus)}</div>
+                      <div className="text-sm text-slate-300">
+                        {activeStatus?.reason || pageError || "waiting-for-playlist"}
+                      </div>
+                    </>
                   )}
                 </div>
               ) : null}
