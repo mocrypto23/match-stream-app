@@ -100,17 +100,33 @@ type DirectExtractorOutput = {
   referrerUrl?: string;
   manifestRequestHeaders?: Record<string, string>;
   playbackUrl?: string;
+  candidates?: Array<{
+    manifestUrl?: string;
+    manifestBody?: string;
+    referrerUrl?: string;
+    manifestRequestHeaders?: Record<string, string>;
+    playbackUrl?: string;
+  }>;
   error?: string;
 };
 
-type CachedSourceState = {
-  sourceUrl: string;
+type CachedSourceCandidateState = {
   manifestUrl: string;
   referrerUrl: string;
   requestHeaders: Record<string, string>;
   playbackUrl: string;
   updatedAt: number;
   lastMediaSequence: number | null;
+  lastError: string;
+  failureCount: number;
+};
+
+type CachedSourceState = {
+  sourceUrl: string;
+  updatedAt: number;
+  activeIndex: number;
+  lastMediaSequence: number | null;
+  candidates: CachedSourceCandidateState[];
 };
 
 const LIVEKORA_HOST_SUFFIXES = ["sportsurges.cc", "livekora.vip", "koooralive.click", "kooraxx.com"] as const;
@@ -298,9 +314,42 @@ function buildSourceStateKey(sourceUrl: string) {
   return normalizeHttpUrl(sourceUrl).toLowerCase();
 }
 
+function buildCandidateStateKey(candidate: {
+  manifestUrl: string;
+  playbackUrl: string;
+}) {
+  return `${normalizeHttpUrl(candidate.manifestUrl).toLowerCase()}::${normalizeHttpUrl(candidate.playbackUrl).toLowerCase()}`;
+}
+
+function sanitizeSourceState(state: CachedSourceState | null) {
+  if (!state) return null;
+  const candidates = (state.candidates || [])
+    .map((candidate) => ({
+      manifestUrl: normalizeHttpUrl(candidate.manifestUrl),
+      referrerUrl: normalizeHttpUrl(candidate.referrerUrl),
+      requestHeaders: normalizeHeaderMap(candidate.requestHeaders),
+      playbackUrl: normalizeHttpUrl(candidate.playbackUrl),
+      updatedAt: Number(candidate.updatedAt || Date.now()),
+      lastMediaSequence: Number.isFinite(candidate.lastMediaSequence) ? Number(candidate.lastMediaSequence) : null,
+      lastError: String(candidate.lastError || ""),
+      failureCount: Math.max(0, Number(candidate.failureCount || 0)),
+    }))
+    .filter((candidate) => candidate.manifestUrl && candidate.referrerUrl && candidate.playbackUrl);
+
+  if (!candidates.length) return null;
+
+  return {
+    sourceUrl: normalizeHttpUrl(state.sourceUrl),
+    updatedAt: Number(state.updatedAt || Date.now()),
+    activeIndex: Math.max(0, Math.min(candidates.length - 1, Number(state.activeIndex || 0))),
+    lastMediaSequence: Number.isFinite(state.lastMediaSequence) ? Number(state.lastMediaSequence) : null,
+    candidates,
+  } satisfies CachedSourceState;
+}
+
 function readSourceState(sourceUrl: string) {
   const key = buildSourceStateKey(sourceUrl);
-  const cached = livekoraSourceState.get(key);
+  const cached = sanitizeSourceState(livekoraSourceState.get(key) || null);
   if (!cached) return null;
   if (cached.updatedAt + SOURCE_STATE_TTL_MS <= Date.now()) {
     livekoraSourceState.delete(key);
@@ -310,8 +359,10 @@ function readSourceState(sourceUrl: string) {
 }
 
 function writeSourceState(state: CachedSourceState) {
-  livekoraSourceState.set(buildSourceStateKey(state.sourceUrl), state);
-  return state;
+  const normalized = sanitizeSourceState(state);
+  if (!normalized) return null;
+  livekoraSourceState.set(buildSourceStateKey(normalized.sourceUrl), normalized);
+  return normalized;
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorText: string) {
@@ -338,6 +389,7 @@ function buildFetchHeaders(input: {
   requestHeaders?: Record<string, string> | null;
   referrerUrl: string;
   accept: string;
+  extraHeaders?: Record<string, string> | null;
 }) {
   const requestHeaders = normalizeHeaderMap(input.requestHeaders);
   const referrerUrl = normalizeHttpUrl(input.referrerUrl);
@@ -360,6 +412,9 @@ function buildFetchHeaders(input: {
     "sec-fetch-dest",
   ]) {
     if (requestHeaders[key]) out[key] = requestHeaders[key];
+  }
+  for (const [key, value] of Object.entries(normalizeHeaderMap(input.extraHeaders))) {
+    out[key] = value;
   }
   return out;
 }
@@ -397,6 +452,7 @@ async function fetchBinaryWithHeaders(input: {
   requestHeaders?: Record<string, string> | null;
   referrerUrl: string;
   timeoutMs?: number;
+  extraHeaders?: Record<string, string> | null;
 }) {
   const targetUrl = normalizeHttpUrl(input.url);
   if (!targetUrl) {
@@ -412,6 +468,7 @@ async function fetchBinaryWithHeaders(input: {
         requestHeaders: input.requestHeaders,
         referrerUrl: input.referrerUrl,
         accept: "*/*",
+        extraHeaders: input.extraHeaders,
       }),
     });
     if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) {
@@ -440,6 +497,175 @@ async function fetchBinaryWithHeaders(input: {
       error: error instanceof Error ? error.message : String(error || "asset-fetch-failed"),
     };
   }
+}
+
+function pickFirstMediaSegmentUrl(manifestText: string, baseUrl: string) {
+  let previousExtInf = false;
+  for (const line of String(manifestText || "").split(/\r?\n/)) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith("#EXTINF")) {
+      previousExtInf = true;
+      continue;
+    }
+    if (trimmed.startsWith("#")) {
+      if (!trimmed.startsWith("#EXT-X-BYTERANGE")) previousExtInf = false;
+      continue;
+    }
+    const absolute = resolveManifestUrl(trimmed, baseUrl);
+    if (!absolute) {
+      previousExtInf = false;
+      continue;
+    }
+    if (previousExtInf) return absolute;
+    previousExtInf = false;
+  }
+  return "";
+}
+
+type LivekoraCandidateResolution =
+  | {
+      ok: true;
+      manifestBody: string;
+      finalUrl: string;
+      mediaSequence: number | null;
+      targetDurationSec: number;
+    }
+  | {
+      ok: false;
+      error: string;
+    };
+
+type LivekoraResolvedStateResult = {
+  state: CachedSourceState;
+  manifestBody: string;
+  finalUrl: string;
+  mediaSequence: number | null;
+  targetDurationSec: number;
+  rotated: boolean;
+};
+
+type LivekoraResolveFromStateResult =
+  | LivekoraResolvedStateResult
+  | {
+      error: string;
+      state: CachedSourceState;
+      rotated: boolean;
+    };
+
+function normalizeLivekoraCandidate(raw: {
+  manifestUrl?: string;
+  referrerUrl?: string;
+  manifestRequestHeaders?: Record<string, string>;
+  playbackUrl?: string;
+} | null | undefined) {
+  const manifestUrl = normalizeHttpUrl(String(raw?.manifestUrl || "").trim());
+  const referrerUrl = normalizeHttpUrl(String(raw?.referrerUrl || "").trim());
+  const playbackUrl = normalizeHttpUrl(String(raw?.playbackUrl || "").trim());
+  if (!manifestUrl || !referrerUrl || !playbackUrl) return null;
+  return {
+    manifestUrl,
+    referrerUrl,
+    requestHeaders: normalizeHeaderMap(raw?.manifestRequestHeaders),
+    playbackUrl,
+    updatedAt: Date.now(),
+    lastMediaSequence: null,
+    lastError: "",
+    failureCount: 0,
+  } satisfies CachedSourceCandidateState;
+}
+
+function orderLivekoraCandidates(candidates: CachedSourceCandidateState[]) {
+  return [...candidates].sort((left, right) => {
+    if (left.failureCount !== right.failureCount) return left.failureCount - right.failureCount;
+    return left.updatedAt - right.updatedAt;
+  });
+}
+
+function buildDiscoveredLivekoraCandidates(input: ProviderContext, extracted: DirectExtractorOutput | null) {
+  const orderedCandidates: CachedSourceCandidateState[] = [];
+  const seen = new Set<string>();
+  const pushCandidate = (raw: {
+    manifestUrl?: string;
+    referrerUrl?: string;
+    manifestRequestHeaders?: Record<string, string>;
+    playbackUrl?: string;
+  } | null | undefined) => {
+    const normalized = normalizeLivekoraCandidate(raw);
+    if (!normalized) return;
+    const key = buildCandidateStateKey(normalized);
+    if (seen.has(key)) return;
+    seen.add(key);
+    orderedCandidates.push(normalized);
+  };
+
+  for (const candidate of extracted?.candidates || []) {
+    pushCandidate(candidate);
+  }
+  pushCandidate({
+    manifestUrl: extracted?.manifestUrl,
+    referrerUrl: extracted?.referrerUrl || input.sourceUrl,
+    manifestRequestHeaders: extracted?.manifestRequestHeaders,
+    playbackUrl: extracted?.playbackUrl || input.sourceUrl,
+  });
+
+  if (!orderedCandidates.length) return [];
+  return orderLivekoraCandidates(orderedCandidates);
+}
+
+async function resolveLivekoraCandidateManifest(
+  candidate: CachedSourceCandidateState,
+  options?: { verifySegment?: boolean }
+): Promise<LivekoraCandidateResolution> {
+  let manifestBody = await fetchTextWithHeaders({
+    url: candidate.manifestUrl,
+    requestHeaders: candidate.requestHeaders,
+    referrerUrl: candidate.referrerUrl,
+  });
+  if (!manifestBody || !/^\s*#extm3u/im.test(manifestBody)) {
+    return { ok: false, error: "livekora-manifest-fetch-failed" };
+  }
+
+  let finalUrl = candidate.manifestUrl;
+  if (!hasMediaSegments(manifestBody, finalUrl)) {
+    const variantUrl = pickVariantManifestUrl(manifestBody, finalUrl);
+    if (!variantUrl) return { ok: false, error: "livekora-variant-missing" };
+    const variantBody = await fetchTextWithHeaders({
+      url: variantUrl,
+      requestHeaders: candidate.requestHeaders,
+      referrerUrl: candidate.referrerUrl,
+    });
+    if (!variantBody || !hasMediaSegments(variantBody, variantUrl)) {
+      return { ok: false, error: "livekora-variant-fetch-failed" };
+    }
+    manifestBody = variantBody;
+    finalUrl = variantUrl;
+  }
+
+  if (options?.verifySegment) {
+    const segmentUrl = pickFirstMediaSegmentUrl(manifestBody, finalUrl);
+    if (!segmentUrl) return { ok: false, error: "livekora-segment-missing" };
+    const segmentProbe = await fetchBinaryWithHeaders({
+      url: segmentUrl,
+      requestHeaders: candidate.requestHeaders,
+      referrerUrl: candidate.referrerUrl,
+      timeoutMs: 6_000,
+      extraHeaders: {
+        range: "bytes=0-2047",
+      },
+    });
+    if (!segmentProbe.ok) {
+      return { ok: false, error: segmentProbe.error || "livekora-segment-probe-failed" };
+    }
+  }
+
+  return {
+    ok: true,
+    manifestBody,
+    finalUrl,
+    mediaSequence: parseMediaSequence(manifestBody),
+    targetDurationSec: parseTargetDurationSec(manifestBody),
+  };
 }
 
 export function isAllowedLivekoraSource(rawUrl: string) {
@@ -527,10 +753,8 @@ function runDirectLivekoraExtractor(sourceUrl: string) {
 
 async function discoverLivekoraState(input: ProviderContext) {
   const extracted = await runDirectLivekoraExtractor(input.sourceUrl);
-  const manifestUrl = normalizeHttpUrl(String(extracted?.manifestUrl || "").trim());
-  const requestHeaders = normalizeHeaderMap(extracted?.manifestRequestHeaders);
-  const referrerUrl = normalizeHttpUrl(String(extracted?.referrerUrl || "").trim()) || input.sourceUrl;
-  if (!manifestUrl) {
+  const discoveredCandidates = buildDiscoveredLivekoraCandidates(input, extracted);
+  if (!discoveredCandidates.length) {
     return {
       ok: false as const,
       error: String(extracted?.error || "direct-manifest-url-missing"),
@@ -538,105 +762,105 @@ async function discoverLivekoraState(input: ProviderContext) {
     };
   }
 
-  let manifestBody = String(extracted?.manifestBody || "").trim();
-  if (!manifestBody || !/^\s*#extm3u/im.test(manifestBody)) {
-    manifestBody = String(
-      (await fetchTextWithHeaders({
-        url: manifestUrl,
-        requestHeaders,
-        referrerUrl,
-      })) || ""
-    ).trim();
-  }
-  if (!manifestBody || !/^\s*#extm3u/im.test(manifestBody)) {
+  const state: CachedSourceState = {
+    sourceUrl: input.sourceUrl,
+    updatedAt: Date.now(),
+    activeIndex: 0,
+    lastMediaSequence: null,
+    candidates: discoveredCandidates,
+  };
+
+  let lastError = String(extracted?.error || "livekora-candidate-probe-failed");
+  for (let index = 0; index < state.candidates.length; index += 1) {
+    const candidate = state.candidates[index];
+    const resolved = await resolveLivekoraCandidateManifest(candidate, { verifySegment: true });
+    if (!resolved.ok) {
+      candidate.failureCount += 1;
+      candidate.lastError = resolved.error;
+      candidate.updatedAt = Date.now();
+      lastError = resolved.error;
+      continue;
+    }
+
+    candidate.manifestUrl = resolved.finalUrl;
+    candidate.lastMediaSequence = resolved.mediaSequence;
+    candidate.updatedAt = Date.now();
+    candidate.lastError = "";
+    candidate.failureCount = 0;
+    state.activeIndex = index;
+    state.updatedAt = Date.now();
+    state.lastMediaSequence = resolved.mediaSequence;
+    const cached = writeSourceState(state) || state;
     return {
-      ok: false as const,
-      error: String(extracted?.error || "direct-manifest-body-missing"),
-      extracted,
+      ok: true as const,
+      state: cached,
+      manifestBody: resolved.manifestBody,
+      finalUrl: resolved.finalUrl,
+      rotated: index > 0,
     };
   }
 
-  let finalUrl = manifestUrl;
-  if (!hasMediaSegments(manifestBody, finalUrl)) {
-    const variantUrl = pickVariantManifestUrl(manifestBody, finalUrl);
-    if (!variantUrl) {
-      return {
-        ok: false as const,
-        error: "direct-variant-missing",
-        extracted,
-      };
-    }
-    const variantBody = await fetchTextWithHeaders({
-      url: variantUrl,
-      requestHeaders,
-      referrerUrl,
-    });
-    if (!variantBody || !hasMediaSegments(variantBody, variantUrl)) {
-      return {
-        ok: false as const,
-        error: "direct-variant-fetch-failed",
-        extracted,
-      };
-    }
-    manifestBody = variantBody;
-    finalUrl = variantUrl;
-  }
-
-  const cached = writeSourceState({
-    sourceUrl: input.sourceUrl,
-    manifestUrl: finalUrl,
-    referrerUrl,
-    requestHeaders,
-    playbackUrl: normalizeHttpUrl(String(extracted?.playbackUrl || "").trim()) || input.sourceUrl,
-    updatedAt: Date.now(),
-    lastMediaSequence: parseMediaSequence(manifestBody),
-  });
-
+  writeSourceState(state);
   return {
-    ok: true as const,
-    state: cached,
-    manifestBody,
-    finalUrl,
+    ok: false as const,
+    error: lastError,
+    extracted,
   };
 }
 
-async function resolveManifestFromState(input: ProviderContext, state: CachedSourceState) {
-  let manifestBody = await fetchTextWithHeaders({
-    url: state.manifestUrl,
-    requestHeaders: state.requestHeaders,
-    referrerUrl: state.referrerUrl,
-  });
-  if (!manifestBody || !/^\s*#extm3u/im.test(manifestBody)) {
-    return null;
+async function resolveManifestFromState(
+  _input: ProviderContext,
+  state: CachedSourceState,
+  options?: { allowRotate?: boolean }
+): Promise<LivekoraResolveFromStateResult> {
+  const originalActiveIndex = Math.max(0, Math.min(state.candidates.length - 1, state.activeIndex || 0));
+  const orderedIndices = [originalActiveIndex];
+  if (options?.allowRotate) {
+    for (let index = 0; index < state.candidates.length; index += 1) {
+      if (index === originalActiveIndex) continue;
+      orderedIndices.push(index);
+    }
   }
 
-  let finalUrl = state.manifestUrl;
-  if (!hasMediaSegments(manifestBody, finalUrl)) {
-    const variantUrl = pickVariantManifestUrl(manifestBody, finalUrl);
-    if (!variantUrl) return null;
-    const variantBody = await fetchTextWithHeaders({
-      url: variantUrl,
-      requestHeaders: state.requestHeaders,
-      referrerUrl: state.referrerUrl,
+  let lastError = "livekora-manifest-fetch-failed";
+  for (const index of orderedIndices) {
+    const candidate = state.candidates[index];
+    if (!candidate) continue;
+    const resolved = await resolveLivekoraCandidateManifest(candidate, {
+      verifySegment: index !== originalActiveIndex,
     });
-    if (!variantBody || !hasMediaSegments(variantBody, variantUrl)) return null;
-    manifestBody = variantBody;
-    finalUrl = variantUrl;
+    if (!resolved.ok) {
+      candidate.failureCount += 1;
+      candidate.lastError = resolved.error;
+      candidate.updatedAt = Date.now();
+      lastError = resolved.error;
+      continue;
+    }
+
+    candidate.manifestUrl = resolved.finalUrl;
+    candidate.lastMediaSequence = resolved.mediaSequence;
+    candidate.updatedAt = Date.now();
+    candidate.lastError = "";
+    candidate.failureCount = 0;
+    state.activeIndex = index;
+    state.updatedAt = Date.now();
+    state.lastMediaSequence = resolved.mediaSequence;
+    const cached = writeSourceState(state) || state;
+    return {
+      manifestBody: resolved.manifestBody,
+      finalUrl: resolved.finalUrl,
+      mediaSequence: resolved.mediaSequence,
+      targetDurationSec: resolved.targetDurationSec,
+      state: cached,
+      rotated: index !== originalActiveIndex,
+    };
   }
 
-  const mediaSequence = parseMediaSequence(manifestBody);
-  writeSourceState({
-    ...state,
-    manifestUrl: finalUrl,
-    updatedAt: Date.now(),
-    lastMediaSequence: mediaSequence,
-  });
-
+  writeSourceState(state);
   return {
-    manifestBody,
-    finalUrl,
-    mediaSequence,
-    targetDurationSec: parseTargetDurationSec(manifestBody),
+    error: lastError,
+    state,
+    rotated: false,
   };
 }
 
@@ -671,10 +895,12 @@ export const livekoraProvider: LiveStreamProvider = {
       attempts += 1;
       let discoveredResolved:
         | {
+            state: CachedSourceState;
             manifestBody: string;
             finalUrl: string;
             mediaSequence: number | null;
             targetDurationSec: number;
+            rotated: boolean;
           }
         | null = null;
       if (!state || options?.forceRefresh) {
@@ -699,26 +925,36 @@ export const livekoraProvider: LiveStreamProvider = {
         }
         state = discovered.state;
         discoveredResolved = {
+          state: discovered.state,
           manifestBody: discovered.manifestBody,
           finalUrl: discovered.finalUrl,
           mediaSequence: parseMediaSequence(discovered.manifestBody),
           targetDurationSec: parseTargetDurationSec(discovered.manifestBody),
+          rotated: discovered.rotated,
         };
       }
 
-      const resolved = discoveredResolved || (await resolveManifestFromState(input, state));
-      if (!resolved) {
-        lastError = "livekora-manifest-fetch-failed";
+      const resolved = discoveredResolved || (await resolveManifestFromState(input, state, { allowRotate: options?.allowRotate }));
+      if ("error" in resolved) {
+        lastError = resolved.error || "livekora-manifest-fetch-failed";
         livekoraSourceState.delete(buildSourceStateKey(input.sourceUrl));
         state = null;
         continue;
       }
+      const successfulResolved: LivekoraResolvedStateResult = resolved;
+      state = successfulResolved.state;
+      const activeState = state;
+      if (!activeState) {
+        lastError = "livekora-state-missing";
+        continue;
+      }
+      const activeCandidate = activeState.candidates[activeState.activeIndex] || null;
 
       const unchangedSequence =
         waitForMediaSequence !== null &&
-        resolved.mediaSequence !== null &&
-        resolved.mediaSequence <= waitForMediaSequence &&
-        !isSequenceRollback(resolved.mediaSequence, waitForMediaSequence);
+        successfulResolved.mediaSequence !== null &&
+        successfulResolved.mediaSequence <= waitForMediaSequence &&
+        !isSequenceRollback(successfulResolved.mediaSequence, waitForMediaSequence);
 
       if (
         unchangedSequence &&
@@ -732,50 +968,53 @@ export const livekoraProvider: LiveStreamProvider = {
       return {
         ok: true,
         manifestBody: rewriteManifestForSession({
-          manifest: resolved.manifestBody,
-          baseUrl: resolved.finalUrl,
+          manifest: successfulResolved.manifestBody,
+          baseUrl: successfulResolved.finalUrl,
           internalOrigin: input.internalOrigin,
           sourceUrl: input.sourceUrl,
-          referrerUrl: state.referrerUrl,
+          referrerUrl: activeCandidate?.referrerUrl || input.sourceUrl,
         }),
-        finalUrl: resolved.finalUrl,
-        targetUrl: resolved.finalUrl,
-        fetchUrl: resolved.finalUrl,
-        referrerUrl: state.referrerUrl,
-        playbackUrl: state.playbackUrl || input.sourceUrl,
-        currentSource: resolved.finalUrl,
-        mediaSequence: resolved.mediaSequence,
-        targetDurationSec: resolved.targetDurationSec,
+        finalUrl: successfulResolved.finalUrl,
+        targetUrl: successfulResolved.finalUrl,
+        fetchUrl: successfulResolved.finalUrl,
+        referrerUrl: activeCandidate?.referrerUrl || input.sourceUrl,
+        playbackUrl: activeCandidate?.playbackUrl || input.sourceUrl,
+        currentSource: successfulResolved.finalUrl,
+        mediaSequence: successfulResolved.mediaSequence,
+        targetDurationSec: successfulResolved.targetDurationSec,
         refreshed: attempts > 1,
-        rotated: false,
+        rotated: successfulResolved.rotated,
         adapterKind: "livekora",
-        candidatesFound: 1,
+        candidatesFound: activeState.candidates.length,
         candidatesTried: attempts,
         sessionOwned: true,
       };
     }
 
+    const failedActiveIndex = state ? state.activeIndex : -1;
+
     return {
       ok: false,
       error: lastError,
       playbackUrl: input.sourceUrl,
-      currentSource: state?.manifestUrl || "",
+      currentSource: (failedActiveIndex >= 0 ? state?.candidates[failedActiveIndex]?.manifestUrl : "") || "",
       mediaSequence: state?.lastMediaSequence ?? null,
       targetDurationSec: 0,
       refreshed: attempts > 1,
       rotated: false,
       adapterKind: "livekora",
-      candidatesFound: state ? 1 : 0,
+      candidatesFound: state?.candidates.length || 0,
       candidatesTried: attempts,
     };
   },
   async fetchAsset(input) {
     const state = readSourceState(input.sourceUrl);
+    const activeCandidate = state?.candidates[state.activeIndex];
     const referrerUrl =
-      normalizeHttpUrl(String(input.referrerUrl || "").trim()) || state?.referrerUrl || input.sourceUrl;
+      normalizeHttpUrl(String(input.referrerUrl || "").trim()) || activeCandidate?.referrerUrl || input.sourceUrl;
     return await fetchBinaryWithHeaders({
       url: input.assetUrl,
-      requestHeaders: state?.requestHeaders,
+      requestHeaders: activeCandidate?.requestHeaders,
       referrerUrl,
       timeoutMs: input.timeoutMs,
     });
