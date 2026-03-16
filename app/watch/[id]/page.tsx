@@ -259,20 +259,30 @@ export default function WatchPage() {
     }
   }, []);
 
+  const resetPlaybackState = useCallback(
+    (opts?: { clearError?: boolean }) => {
+      if (opts?.clearError !== false) {
+        setPageError(null);
+      }
+      setPlaybackRequested(false);
+      setPlaybackStarting(false);
+      clearWaitingOverlayTimer();
+      hasPlayedRef.current = false;
+    },
+    [clearWaitingOverlayTimer]
+  );
+
   useEffect(() => {
     void loadMatch();
   }, [loadMatch]);
 
   useEffect(() => {
-    setPlaybackRequested(false);
-    setPlaybackStarting(false);
-    clearWaitingOverlayTimer();
-    hasPlayedRef.current = false;
+    resetPlaybackState({ clearError: false });
     backgroundBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     lastAutoBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     setStatusByProvider({ livekora: null, beinlive: null, siiir: null });
     setSelectedProvider("livekora");
-  }, [clearWaitingOverlayTimer, matchId]);
+  }, [matchId, resetPlaybackState]);
 
   useEffect(() => {
     return () => {
@@ -573,7 +583,11 @@ export default function WatchPage() {
                       key={item.provider}
                       type="button"
                       onClick={() => {
-                        setPageError(null);
+                        if (item.provider !== selectedProvider) {
+                          resetPlaybackState();
+                        } else {
+                          setPageError(null);
+                        }
                         setSelectedProvider(item.provider);
                       }}
                       className={`rounded-2xl border px-4 py-3 text-right transition ${
