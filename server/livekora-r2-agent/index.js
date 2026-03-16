@@ -1158,7 +1158,7 @@ function loadConfig() {
     idleStopMs: toInt(process.env.LIVEKORA_R2_IDLE_STOP_MS, 10 * 60 * 1000, 60_000),
     uploadPollMs: toInt(process.env.LIVEKORA_R2_UPLOAD_POLL_MS, 2200, 400),
     playlistPublishMinIntervalMs: toInt(process.env.LIVEKORA_R2_PLAYLIST_PUBLISH_MIN_INTERVAL_MS, 2500, 1000),
-    manifestFetchTimeoutMs: toInt(process.env.LIVEKORA_R2_MANIFEST_FETCH_TIMEOUT_MS, 15_000, 2000),
+    manifestFetchTimeoutMs: toInt(process.env.LIVEKORA_R2_MANIFEST_FETCH_TIMEOUT_MS, 35_000, 2000),
     assetFetchTimeoutMs: toInt(process.env.LIVEKORA_R2_ASSET_FETCH_TIMEOUT_MS, 22_000, 3000),
     mirrorAssetConcurrency: toInt(process.env.LIVEKORA_R2_ASSET_CONCURRENCY, 6, 1),
     remoteRetentionMs: toInt(process.env.LIVEKORA_R2_REMOTE_RETENTION_MS, 45_000, 5000),
