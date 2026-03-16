@@ -5,6 +5,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 type DayKey = "yesterday" | "today" | "tomorrow";
 const TZ = "Africa/Cairo";
 const MATCH_NOTICE_ENABLED = true; // Switch ON/OFF the top matches notice
+const MATCHES_REQUEST_TIMEOUT_MS = 12_000;
+const MATCHES_REQUEST_RETRIES = 2;
 
 type MatchRow = {
   id: number;
@@ -183,6 +185,8 @@ export default function Home() {
   const [day, setDay] = useState<DayKey>("today");
   const [matches, setMatches] = useState<MatchRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
   const noticeBannerRef = useRef<HTMLDivElement | null>(null);
 
   const tabs = useMemo(
@@ -196,41 +200,69 @@ export default function Home() {
 
   useEffect(() => {
     const ac = new AbortController();
+    let cancelled = false;
 
     const fetchMatches = async () => {
       setLoading(true);
+      setLoadError(null);
       const matchDay = cairoDayStringFromOffset(dayToOffset(day));
 
-      try {
-        // ✅ بدل supabase client: هنجيب من API
-        const res = await fetch(`/api/matches?day=${encodeURIComponent(matchDay)}`, {
-          method: "GET",
-          signal: ac.signal,
-          headers: { Accept: "application/json" },
-        });
+      for (let attempt = 0; attempt < MATCHES_REQUEST_RETRIES; attempt += 1) {
+        const requestController = new AbortController();
+        const onAbort = () => requestController.abort();
+        const timeoutId = window.setTimeout(() => requestController.abort(), MATCHES_REQUEST_TIMEOUT_MS);
+        ac.signal.addEventListener("abort", onAbort, { once: true });
 
-        const json = (await res.json().catch(() => null)) as any;
+        try {
+          const res = await fetch(`/api/matches?day=${encodeURIComponent(matchDay)}`, {
+            method: "GET",
+            signal: requestController.signal,
+            headers: { Accept: "application/json" },
+          });
 
-        if (!res.ok) {
-          console.error("API error:", json?.error || `HTTP ${res.status}`);
-          setMatches([]);
-          setLoading(false);
+          const json = (await res.json().catch(() => null)) as any;
+
+          if (!res.ok) {
+            const message = String(json?.error || `HTTP ${res.status}`);
+            console.error("API error:", message);
+            if (attempt < MATCHES_REQUEST_RETRIES - 1) continue;
+            if (!cancelled) {
+              setMatches([]);
+              setLoadError("تعذر تحميل المباريات الآن. حاول التحديث بعد لحظات.");
+              setLoading(false);
+            }
+            return;
+          }
+
+          if (!cancelled) {
+            setMatches((Array.isArray(json) ? json : json?.data || []) as MatchRow[]);
+            setLoading(false);
+          }
           return;
+        } catch (e: any) {
+          if (cancelled || ac.signal.aborted) return;
+          const message = e?.name === "AbortError" ? "request-timeout" : e?.message || e;
+          console.error("Fetch error:", message);
+          if (attempt < MATCHES_REQUEST_RETRIES - 1) continue;
+          if (!cancelled) {
+            setMatches([]);
+            setLoadError("تأخر تحميل المباريات أكثر من المتوقع. حاول مرة أخرى.");
+            setLoading(false);
+          }
+          return;
+        } finally {
+          window.clearTimeout(timeoutId);
+          ac.signal.removeEventListener("abort", onAbort);
         }
-
-        setMatches((Array.isArray(json) ? json : json?.data || []) as MatchRow[]);
-        setLoading(false);
-      } catch (e: any) {
-        if (e?.name === "AbortError") return;
-        console.error("Fetch error:", e?.message || e);
-        setMatches([]);
-        setLoading(false);
       }
     };
 
     fetchMatches();
-    return () => ac.abort();
-  }, [day]);
+    return () => {
+      cancelled = true;
+      ac.abort();
+    };
+  }, [day, reloadNonce]);
 
   useEffect(() => {
     if (!MATCH_NOTICE_ENABLED || loading) return;
@@ -352,6 +384,19 @@ export default function Home() {
       </div>
 
       <main className="max-w-4xl mx-auto grid gap-6">
+        {loadError ? (
+          <div className="rounded-3xl border border-amber-500/30 bg-amber-500/10 px-5 py-4 text-center">
+            <div className="text-sm font-bold text-amber-200">{loadError}</div>
+            <button
+              type="button"
+              onClick={() => setReloadNonce((value) => value + 1)}
+              className="mt-3 rounded-full bg-amber-400 px-4 py-2 text-sm font-black text-slate-950 transition hover:bg-amber-300"
+            >
+              إعادة المحاولة
+            </button>
+          </div>
+        ) : null}
+
         {sortedMatches.length > 0 ? (
           sortedMatches.map((match) => {
             const scores = hasScores(match);
