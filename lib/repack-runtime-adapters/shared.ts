@@ -626,10 +626,13 @@ function parseTargetDurationSec(manifestText: string) {
 function buildCandidateQueue(
   input: RuntimeAdapterInput,
   runtimeState: LiveEmbedSessionRuntimeState,
-  options: RuntimeResolutionOptions
+  options: RuntimeResolutionOptions,
+  queueOptions?: {
+    ignoreHint?: boolean;
+  }
 ) {
   const now = Date.now();
-  const hint = readActiveHint(input);
+  const hint = queueOptions?.ignoreHint ? null : readActiveHint(input);
   const queue = new Map<string, SessionCandidate>();
   const addCandidate = (candidate: SessionCandidate | null | undefined) => {
     if (!candidate) return;
@@ -676,7 +679,7 @@ function buildCandidateQueue(
 
   if (hint) {
     const hinted = buildHintCandidate(hint);
-    hinted.score = 8_000;
+    hinted.score = 4_000;
     addCandidate(hinted);
   }
 
@@ -721,9 +724,12 @@ function buildCandidateQueue(
 async function currentSourceFromRuntimeState(
   input: RuntimeAdapterInput,
   runtimeState: LiveEmbedSessionRuntimeState,
-  options: RuntimeResolutionOptions
+  options: RuntimeResolutionOptions,
+  queueOptions?: {
+    ignoreHint?: boolean;
+  }
 ): Promise<RuntimeCurrentSourceResult> {
-  const candidates = buildCandidateQueue(input, runtimeState, options);
+  const candidates = buildCandidateQueue(input, runtimeState, options, queueOptions);
   const current = candidates[0];
   return {
     ok: !!current,
@@ -918,9 +924,10 @@ export async function resolveRuntimeOwnedManifest(
       timeoutMs: opTimeoutMs,
     });
     lastPlaybackUrl = String(runtimeState.playbackUrl || "").trim();
-    const currentSource = await currentSourceFromRuntimeState(input, runtimeState, options);
+    const queueOptions = { ignoreHint: !!queryOptions?.forceRefresh };
+    const currentSource = await currentSourceFromRuntimeState(input, runtimeState, options, queueOptions);
     lastCurrentSource = currentSource.currentSource;
-    const candidates = buildCandidateQueue(input, runtimeState, options);
+    const candidates = buildCandidateQueue(input, runtimeState, options, queueOptions);
     lastCandidatesFound = candidates.length;
     if (!candidates.length) {
       lastError = runtimeState.lastError || currentSource.error || "embed-session-empty";
