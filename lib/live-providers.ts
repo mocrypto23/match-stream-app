@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import https from "node:https";
 import path from "node:path";
 import axios from "axios";
 import type { StreamProviderId } from "@/lib/stream-source-types";
@@ -114,7 +115,24 @@ type CachedSourceState = {
   lastMediaSequence: number | null;
 };
 
-const LIVEKORA_HOST_SUFFIXES = ["sportsurges.cc", "livekora.vip", "koooralive.click", "kooraxx.com"] as const;
+type CachedLivekoraDayPage = {
+  fetchedAt: number;
+  matches: Array<{
+    homeTeam: string;
+    awayTeam: string;
+    href: string;
+  }>;
+};
+
+const LIVEKORA_HOST_SUFFIXES = [
+  "sportsurges.cc",
+  "sportsurges.online",
+  "livekora.vip",
+  "koooralive.click",
+  "kooraxx.com",
+] as const;
+const LIVEKORA_DAY_PAGE_URLS = ["https://www.livekora.vip/today-matches/", "https://www.livekora.vip/"] as const;
+const LIVEKORA_DAY_PAGE_CACHE_TTL_MS = 90_000;
 const DIRECT_EXTRACT_TIMEOUT_MS = 22_000;
 const DIRECT_FETCH_TIMEOUT_MS = 15_000;
 const WAIT_RETRY_INTERVAL_MS = 700;
@@ -123,6 +141,8 @@ const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
 const livekoraSourceState = new Map<string, CachedSourceState>();
+const LIVEKORA_INSECURE_HTTPS_AGENT = new https.Agent({ rejectUnauthorized: false });
+let cachedLivekoraDayPage: CachedLivekoraDayPage | null = null;
 
 function normalizeHttpUrl(rawUrl: string) {
   try {
@@ -180,6 +200,51 @@ function parseTargetDurationSec(manifestText: string) {
     if (Number.isFinite(value) && value > 0) return value;
   }
   return 0;
+}
+
+function normalizeTeamName(value: unknown) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[\u064b-\u065f\u0670\u0610-\u061a]/g, "")
+    .replace(/[\u0623\u0625\u0622]/g, "\u0627")
+    .replace(/\u0649/g, "\u064a")
+    .replace(/\u0624/g, "\u0648")
+    .replace(/\u0626/g, "\u064a")
+    .replace(/\u0629/g, "\u0647")
+    .replace(/[^a-z0-9\u0600-\u06ff]+/g, "");
+}
+
+function unorderedPairKey(home: unknown, away: unknown) {
+  const left = normalizeTeamName(home);
+  const right = normalizeTeamName(away);
+  if (!left || !right) return "";
+  return [left, right].sort().join("|");
+}
+
+function decodeHtmlEntities(value: string) {
+  return String(value || "")
+    .replace(/&#8211;/g, "-")
+    .replace(/&#8217;/g, "'")
+    .replace(/&#8220;/g, '"')
+    .replace(/&#8221;/g, '"')
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&");
+}
+
+function parseLivekoraTodayMatches(html: string) {
+  const out: CachedLivekoraDayPage["matches"] = [];
+  const cardRe =
+    /<a[^>]+href=["']([^"'?#]+)["'][^>]*>[\s\S]*?<div[^>]+class=["'][^"']*\bteam-name\b[^"']*["'][^>]*>\s*([^<]+?)\s*<\/div>[\s\S]*?<div[^>]+class=["'][^"']*\bteam-name\b[^"']*["'][^>]*>\s*([^<]+?)\s*<\/div>/gi;
+
+  let match: RegExpExecArray | null = null;
+  while ((match = cardRe.exec(html))) {
+    const href = normalizeHttpUrl(String(match[1] || "").trim());
+    const homeTeam = decodeHtmlEntities(String(match[2] || "").trim());
+    const awayTeam = decodeHtmlEntities(String(match[3] || "").trim());
+    if (!href || !homeTeam || !awayTeam) continue;
+    out.push({ homeTeam, awayTeam, href });
+  }
+  return out;
 }
 
 function isSequenceRollback(nextMediaSequence: number | null, previousMediaSequence: number | null) {
@@ -453,9 +518,52 @@ export function isAllowedLivekoraSource(rawUrl: string) {
   }
 }
 
-export function pickLivekoraSourceUrl(row: MatchRowLike) {
+async function fetchLivekoraTodayMatches() {
+  if (cachedLivekoraDayPage && cachedLivekoraDayPage.fetchedAt + LIVEKORA_DAY_PAGE_CACHE_TTL_MS > Date.now()) {
+    return cachedLivekoraDayPage.matches;
+  }
+
+  let matches: CachedLivekoraDayPage["matches"] = [];
+  for (const pageUrl of LIVEKORA_DAY_PAGE_URLS) {
+    try {
+      const response = await axios.get<string>(pageUrl, {
+        responseType: "text",
+        timeout: 14_000,
+        maxRedirects: 5,
+        validateStatus: () => true,
+        httpsAgent: pageUrl.startsWith("https://") ? LIVEKORA_INSECURE_HTTPS_AGENT : undefined,
+        headers: {
+          "user-agent": DEFAULT_USER_AGENT,
+          accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "accept-language": "ar,en;q=0.9",
+        },
+      });
+      const html = String(response.data || "");
+      const parsed = Number(response.status || 0) >= 200 && Number(response.status || 0) < 300 ? parseLivekoraTodayMatches(html) : [];
+      if (parsed.length) {
+        matches = parsed;
+        break;
+      }
+    } catch {}
+  }
+
+  cachedLivekoraDayPage = {
+    fetchedAt: Date.now(),
+    matches,
+  };
+  return matches;
+}
+
+export async function pickLivekoraSourceUrl(row: MatchRowLike) {
   const raw = String(row?.stream_url_4 || "").trim();
-  return isAllowedLivekoraSource(raw) ? raw : null;
+  if (isAllowedLivekoraSource(raw)) return raw;
+
+  const pairKey = unorderedPairKey(row?.home_team, row?.away_team);
+  if (!pairKey) return null;
+
+  const matches = await fetchLivekoraTodayMatches().catch(() => [] as CachedLivekoraDayPage["matches"]);
+  const found = matches.find((candidate) => unorderedPairKey(candidate.homeTeam, candidate.awayTeam) === pairKey);
+  return found?.href || null;
 }
 
 export function buildLivekoraPublicPlaylistUrl(matchId: number, publicBaseUrl?: string) {
@@ -695,6 +803,121 @@ function mapLivekoraAssetResult(result: Awaited<ReturnType<typeof albaRuntimeAda
   };
 }
 
+async function extractLivekoraDirectManifest(input: ProviderContext, options?: ManifestOptions): Promise<ProviderManifestResult> {
+  const waitForMediaSequence =
+    Number.isFinite(Number(options?.waitForMediaSequence)) ? Number(options?.waitForMediaSequence) : null;
+  const waitDeadlineAt =
+    waitForMediaSequence !== null
+      ? Date.now() + Math.max(1_000, Math.min(12_000, Number(options?.waitTimeoutMs || 5_000)))
+      : 0;
+  const maxAttempts =
+    waitForMediaSequence !== null
+      ? Math.max(3, Math.ceil(Math.max(0, waitDeadlineAt - Date.now()) / WAIT_RETRY_INTERVAL_MS) + 2)
+      : 3;
+
+  let state = options?.forceRefresh ? null : readSourceState(input.sourceUrl);
+  let attempts = 0;
+  let lastError = "livekora-manifest-unavailable";
+
+  while (attempts < maxAttempts) {
+    attempts += 1;
+    let discoveredResolved:
+      | {
+          manifestBody: string;
+          finalUrl: string;
+          mediaSequence: number | null;
+          targetDurationSec: number;
+        }
+      | null = null;
+
+    if (!state || options?.forceRefresh) {
+      let discovered: Awaited<ReturnType<typeof discoverLivekoraState>> | null = null;
+      try {
+        discovered = await withTimeout(
+          discoverLivekoraState(input),
+          DIRECT_EXTRACT_TIMEOUT_MS + 5_000,
+          "livekora-direct-discovery-timeout"
+        );
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error || "livekora-direct-discovery-failed");
+        state = null;
+        continue;
+      }
+      if (!discovered.ok) {
+        lastError = discovered.error;
+        state = null;
+        continue;
+      }
+      state = discovered.state;
+      discoveredResolved = {
+        manifestBody: discovered.manifestBody,
+        finalUrl: discovered.finalUrl,
+        mediaSequence: parseMediaSequence(discovered.manifestBody),
+        targetDurationSec: parseTargetDurationSec(discovered.manifestBody),
+      };
+    }
+
+    const resolved = discoveredResolved || (state ? await resolveManifestFromState(input, state) : null);
+    if (!resolved || !state) {
+      lastError = "livekora-manifest-fetch-failed";
+      livekoraSourceState.delete(buildSourceStateKey(input.sourceUrl));
+      state = null;
+      continue;
+    }
+
+    const unchangedSequence =
+      waitForMediaSequence !== null &&
+      resolved.mediaSequence !== null &&
+      resolved.mediaSequence <= waitForMediaSequence &&
+      !isSequenceRollback(resolved.mediaSequence, waitForMediaSequence);
+
+    if (unchangedSequence && Date.now() < waitDeadlineAt) {
+      lastError = "media-sequence-unchanged";
+      await sleep(WAIT_RETRY_INTERVAL_MS);
+      continue;
+    }
+
+    return {
+      ok: true,
+      manifestBody: rewriteManifestForSession({
+        manifest: resolved.manifestBody,
+        baseUrl: resolved.finalUrl,
+        internalOrigin: input.internalOrigin,
+        sourceUrl: input.sourceUrl,
+        referrerUrl: state.referrerUrl,
+      }),
+      finalUrl: resolved.finalUrl,
+      targetUrl: resolved.finalUrl,
+      fetchUrl: resolved.finalUrl,
+      referrerUrl: state.referrerUrl,
+      playbackUrl: state.playbackUrl || input.sourceUrl,
+      currentSource: resolved.finalUrl,
+      mediaSequence: resolved.mediaSequence,
+      targetDurationSec: resolved.targetDurationSec,
+      refreshed: attempts > 1,
+      rotated: false,
+      adapterKind: "livekora",
+      candidatesFound: 1,
+      candidatesTried: attempts,
+      sessionOwned: true,
+    };
+  }
+
+  return {
+    ok: false,
+    error: lastError,
+    playbackUrl: input.sourceUrl,
+    currentSource: state?.manifestUrl || "",
+    mediaSequence: state?.lastMediaSequence ?? null,
+    targetDurationSec: 0,
+    refreshed: attempts > 1,
+    rotated: false,
+    adapterKind: "livekora",
+    candidatesFound: state ? 1 : 0,
+    candidatesTried: attempts,
+  };
+}
+
 export const livekoraProvider: LiveStreamProvider = {
   id: "livekora",
   label: "livekora vip",
@@ -703,6 +926,11 @@ export const livekoraProvider: LiveStreamProvider = {
   sourceSelector: pickLivekoraSourceUrl,
   isAllowedSource: isAllowedLivekoraSource,
   async extractCurrentManifest(input, options) {
+    const directResolved = await extractLivekoraDirectManifest(input, options);
+    if (directResolved.ok) {
+      return directResolved;
+    }
+
     const resolved = await albaRuntimeAdapter.currentManifest(
       {
         sourceUrl: input.sourceUrl,
@@ -711,16 +939,45 @@ export const livekoraProvider: LiveStreamProvider = {
       },
       options
     );
-    return mapLivekoraManifestResult(resolved, input.sourceUrl);
+    const runtimeResolved = mapLivekoraManifestResult(resolved, input.sourceUrl);
+    if (runtimeResolved.ok) {
+      return runtimeResolved;
+    }
+
+    return {
+      ...runtimeResolved,
+      error: runtimeResolved.error || directResolved.error || "livekora-manifest-unavailable",
+      currentSource: runtimeResolved.currentSource || directResolved.currentSource,
+      mediaSequence: runtimeResolved.mediaSequence ?? directResolved.mediaSequence,
+      targetDurationSec: runtimeResolved.targetDurationSec || directResolved.targetDurationSec,
+      refreshed: runtimeResolved.refreshed || directResolved.refreshed,
+      candidatesFound: Math.max(runtimeResolved.candidatesFound, directResolved.candidatesFound),
+      candidatesTried: runtimeResolved.candidatesTried + directResolved.candidatesTried,
+    };
   },
   async fetchAsset(input) {
+    const state = readSourceState(input.sourceUrl);
+    const referrerUrl =
+      normalizeHttpUrl(String(input.referrerUrl || "").trim()) || state?.referrerUrl || input.sourceUrl;
+    if (state) {
+      const directAsset = await fetchBinaryWithHeaders({
+        url: input.assetUrl,
+        requestHeaders: state.requestHeaders,
+        referrerUrl,
+        timeoutMs: input.timeoutMs,
+      });
+      if (directAsset.ok) {
+        return directAsset;
+      }
+    }
+
     return mapLivekoraAssetResult(
       await albaRuntimeAdapter.fetchAsset({
         sourceUrl: input.sourceUrl,
         slotServer: 4,
         internalOrigin: input.internalOrigin,
         assetUrl: input.assetUrl,
-        referrerUrl: input.referrerUrl,
+        referrerUrl,
         timeoutMs: input.timeoutMs,
       })
     );

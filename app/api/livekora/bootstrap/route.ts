@@ -22,7 +22,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ accepted: false, error: "match-not-found" }, { status: 404 });
   }
 
-  const sourceUrl = pickLivekoraSourceUrl(data);
+  const sourceUrl = await pickLivekoraSourceUrl(data);
   if (!sourceUrl) {
     const livekoraStatus = await buildLivekoraStatus({ matchId, row: data, sourceUrl: null });
     return NextResponse.json({ accepted: false, livekoraStatus }, { status: 409 });

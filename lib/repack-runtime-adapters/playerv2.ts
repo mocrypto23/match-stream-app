@@ -1,3 +1,5 @@
+import axios from "axios";
+
 import { fetchLiveEmbedText } from "@/lib/repack-embed-session";
 import {
   buildPlayerv2Candidates,
@@ -14,6 +16,9 @@ import {
   type RuntimeAdapterInput,
   type RuntimeHintCandidate,
 } from "./shared";
+
+const DEFAULT_PLAYERV2_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
 function looksLikePlayerv2Source(rawUrl: string) {
   try {
@@ -40,18 +45,47 @@ function uniqHints(candidates: RuntimeHintCandidate[]) {
 
 async function derivePlayerv2HintCandidates(input: RuntimeAdapterInput) {
   const referrerUrl = input.sourceUrl;
-  const fetched = await fetchLiveEmbedText({
-    sourceUrl: input.sourceUrl,
-    requestOrigin: input.internalOrigin,
-    slotServerId: input.slotServer,
-    targetUrl: input.sourceUrl,
-    fetchUrl: input.sourceUrl,
-    referrerUrl,
-    timeoutMs: 9_000,
-  }).catch(() => null);
-  const body = String(fetched?.body || "").trim();
-  const finalUrl = String(fetched?.finalUrl || input.sourceUrl).trim() || input.sourceUrl;
-  const contextUrl = looksLikePlayerv2PageUrl(finalUrl) ? finalUrl : input.sourceUrl;
+  let body = "";
+  let contextUrl = input.sourceUrl;
+
+  if (looksLikePlayerv2PageUrl(input.sourceUrl)) {
+    const direct = await axios
+      .get<string>(input.sourceUrl, {
+        responseType: "text",
+        timeout: 9_000,
+        maxRedirects: 5,
+        validateStatus: () => true,
+        headers: {
+          "user-agent": DEFAULT_PLAYERV2_USER_AGENT,
+          accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "accept-language": "ar,en;q=0.9",
+          referer: referrerUrl,
+        },
+      })
+      .catch(() => null);
+    const directBody =
+      Number(direct?.status || 0) >= 200 && Number(direct?.status || 0) < 300 ? String(direct?.data || "").trim() : "";
+    if (directBody && looksLikePlayerv2Html(directBody)) {
+      body = directBody;
+      contextUrl = input.sourceUrl;
+    }
+  }
+
+  if (!body) {
+    const fetched = await fetchLiveEmbedText({
+      sourceUrl: input.sourceUrl,
+      requestOrigin: input.internalOrigin,
+      slotServerId: input.slotServer,
+      targetUrl: input.sourceUrl,
+      fetchUrl: input.sourceUrl,
+      referrerUrl,
+      timeoutMs: 9_000,
+    }).catch(() => null);
+    body = String(fetched?.body || "").trim();
+    const finalUrl = String(fetched?.finalUrl || input.sourceUrl).trim() || input.sourceUrl;
+    contextUrl = looksLikePlayerv2PageUrl(finalUrl) ? finalUrl : input.sourceUrl;
+  }
+
   if (!body || !looksLikePlayerv2Html(body)) return [] as RuntimeHintCandidate[];
 
   const candidates = await buildPlayerv2Candidates(contextUrl, body, 5_500, input.internalOrigin).catch(() => []);

@@ -10,7 +10,13 @@ const OVERALL_TIMEOUT_MS = 24000;
 const MAX_PAGE_VISITS = 8;
 const PLAYER_OPTION_WAIT_MS = 1400;
 const SUCCESS_COLLECTION_WINDOW_MS = 6000;
-const LIVEKORA_HOST_SUFFIXES = ["sportsurges.cc", "livekora.vip", "koooralive.click", "kooraxx.com"];
+const LIVEKORA_HOST_SUFFIXES = [
+  "sportsurges.cc",
+  "sportsurges.online",
+  "livekora.vip",
+  "koooralive.click",
+  "kooraxx.com",
+];
 
 function normalizeHttpUrl(rawUrl) {
   try {
@@ -272,7 +278,7 @@ function buildPlaybackCandidates(rawSourceUrl, rawPlaybackUrl) {
       const originVariants = new Set([parsed.origin]);
       for (const familyHost of LIVEKORA_HOST_SUFFIXES) {
         originVariants.add(`${scheme}://${familyHost}`);
-        if (familyHost === "sportsurges.cc" && firstLabel && /^\d+$/.test(firstLabel)) {
+        if (familyHost.startsWith("sportsurges.") && firstLabel && /^\d+$/.test(firstLabel)) {
           originVariants.add(`${scheme}://${firstLabel}.${familyHost}`);
         }
       }

@@ -25,7 +25,7 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok: false, error: "match-not-found" }, { status: 404 });
   }
 
-  const sourceUrl = pickLivekoraSourceUrl(data);
+  const sourceUrl = await pickLivekoraSourceUrl(data);
   if (!sourceUrl) {
     return NextResponse.json({ ok: false, error: "missing-source" }, { status: 409 });
   }

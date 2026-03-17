@@ -3,8 +3,11 @@ import { NextResponse } from "next/server";
 import { buildBeinliveStatus } from "@/lib/beinlive-agent";
 import { buildLivekoraStatus } from "@/lib/livekora-agent";
 import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
-import { pickLivekoraSourceUrl } from "@/lib/live-providers";
 import { buildSiiirStatus } from "@/lib/siiir-agent";
+import { beinliveProvider } from "@/lib/beinlive-provider";
+import { livekoraProvider } from "@/lib/live-providers";
+import { siiirProvider } from "@/lib/siiir-provider";
+import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -26,9 +29,11 @@ export async function GET(_req: Request, ctx: Ctx) {
     return NextResponse.json({ error: "match-not-found" }, { status: 404 });
   }
 
-  const sourceUrl = pickLivekoraSourceUrl(data);
-  const beinliveSourceUrl = String(data.stream_url || "").trim() || null;
-  const siiirSourceUrl = String(data.stream_url_2 || "").trim() || null;
+  const [sourceUrl, beinliveSourceUrl, siiirSourceUrl] = await Promise.all([
+    resolveProviderSourceUrl(livekoraProvider, data),
+    resolveProviderSourceUrl(beinliveProvider, data),
+    resolveProviderSourceUrl(siiirProvider, data),
+  ]);
 
   const [livekoraStatus, beinliveStatus, siiirStatus] = await Promise.all([
     buildLivekoraStatus({

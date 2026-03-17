@@ -22,10 +22,11 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "match-not-found" }, { status: 404 });
   }
 
+  const sourceUrl = await pickLivekoraSourceUrl(data);
   const status = await buildLivekoraStatus({
     matchId,
     row: data,
-    sourceUrl: pickLivekoraSourceUrl(data),
+    sourceUrl,
   });
   return NextResponse.json({ livekoraStatus: status }, { headers: { "Cache-Control": "no-store" } });
 }

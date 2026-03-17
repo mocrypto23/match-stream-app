@@ -12,7 +12,7 @@ import { playerv2RuntimeAdapter } from "@/lib/repack-runtime-adapters/playerv2";
 const SIIIR_DAY_PAGE_URL = "https://w6.siiir.tv/today-matches/";
 const SIIIR_HOST_SUFFIXES = ["siiir.tv", "yallashot.us"] as const;
 const DAY_PAGE_CACHE_TTL_MS = 90_000;
-const RUNTIME_SOURCE_TTL_MS = 10 * 60_000;
+const RUNTIME_SOURCE_TTL_MS = 90_000;
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
@@ -42,6 +42,11 @@ function normalizeHttpUrl(rawUrl: string) {
   } catch {
     return "";
   }
+}
+
+function isTemplatedRuntimeUrl(rawUrl: string) {
+  const value = String(rawUrl || "").trim();
+  return value.includes("${") || /encodeURIComponent\s*\(/i.test(value);
 }
 
 function hostMatchesAnySuffix(host: string, suffixes: readonly string[]) {
@@ -91,6 +96,15 @@ function readCachedRuntimeSource(sourceUrl: string) {
   if (!key) return null;
   const cached = cachedRuntimeSources.get(key);
   if (!cached) return null;
+  if (
+    !normalizeHttpUrl(cached.runtimeSourceUrl) ||
+    !normalizeHttpUrl(cached.playbackUrl) ||
+    isTemplatedRuntimeUrl(cached.runtimeSourceUrl) ||
+    isTemplatedRuntimeUrl(cached.playbackUrl)
+  ) {
+    cachedRuntimeSources.delete(key);
+    return null;
+  }
   if (cached.updatedAt + RUNTIME_SOURCE_TTL_MS <= Date.now()) {
     cachedRuntimeSources.delete(key);
     return null;
@@ -175,9 +189,19 @@ async function fetchTodayMatches() {
   return matches;
 }
 
+async function findTodayMatchSource(row: MatchRowLike) {
+  const pairKey = unorderedPairKey(row?.home_team, row?.away_team);
+  if (!pairKey) return null;
+  const dayMatches = await fetchTodayMatches().catch(() => [] as CachedDayPage["matches"]);
+  return dayMatches.find((candidate) => unorderedPairKey(candidate.homeTeam, candidate.awayTeam) === pairKey) || null;
+}
+
 function extractPlayerv2UrlFromHardPage(pageUrl: string, html: string) {
+  const directMatch = String(html.match(/https?:\/\/[^"'`\s]+\/playerv2\.php\?[^"'`\s]+/i)?.[0] || "").trim();
   const directUrl =
-    normalizeHttpUrl(String(html.match(/https?:\/\/[^"'`\s]+\/playerv2\.php\?[^"'`\s]+/i)?.[0] || "").trim()) || "";
+    directMatch && !directMatch.includes("${") && !/encodeURIComponent\s*\(/i.test(directMatch)
+      ? normalizeHttpUrl(directMatch)
+      : "";
   if (directUrl) return directUrl;
 
   const playerTemplateMatch = html.match(
@@ -190,9 +214,10 @@ function extractPlayerv2UrlFromHardPage(pageUrl: string, html: string) {
   return "";
 }
 
-async function resolveSiiirRuntimeSource(sourceUrl: string) {
+async function resolveSiiirRuntimeSource(sourceUrl: string, options?: { forceRefresh?: boolean }) {
   const normalized = normalizeHttpUrl(sourceUrl);
   if (!normalized) return null;
+  if (isTemplatedRuntimeUrl(normalized)) return null;
   if (String(new URL(normalized).pathname || "").toLowerCase().includes("/playerv2.php")) {
     return {
       runtimeSourceUrl: normalized,
@@ -200,7 +225,7 @@ async function resolveSiiirRuntimeSource(sourceUrl: string) {
     };
   }
 
-  const cached = readCachedRuntimeSource(normalized);
+  const cached = options?.forceRefresh ? null : readCachedRuntimeSource(normalized);
   if (cached) {
     return {
       runtimeSourceUrl: cached.runtimeSourceUrl,
@@ -223,7 +248,7 @@ async function resolveSiiirRuntimeSource(sourceUrl: string) {
   if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) return null;
   const html = String(response.data || "");
   const runtimeSourceUrl = extractPlayerv2UrlFromHardPage(normalized, html);
-  if (!runtimeSourceUrl) return null;
+  if (!runtimeSourceUrl || isTemplatedRuntimeUrl(runtimeSourceUrl)) return null;
 
   writeCachedRuntimeSource({
     sourceUrl: normalized,
@@ -299,15 +324,14 @@ export function isAllowedSiiirSource(rawUrl: string) {
 }
 
 export async function pickSiiirSourceUrl(row: MatchRowLike) {
+  const canonicalTodayMatch = await findTodayMatchSource(row);
+  if (canonicalTodayMatch?.href && isSiiirUsableSource(canonicalTodayMatch.href)) {
+    return canonicalTodayMatch.href;
+  }
+
   const direct = String(row?.stream_url_2 || "").trim();
   if (isSiiirUsableSource(direct)) return direct;
-
-  const pairKey = unorderedPairKey(row?.home_team, row?.away_team);
-  if (!pairKey) return null;
-
-  const dayMatches = await fetchTodayMatches().catch(() => [] as CachedDayPage["matches"]);
-  const found = dayMatches.find((candidate) => unorderedPairKey(candidate.homeTeam, candidate.awayTeam) === pairKey);
-  return found?.href || null;
+  return canonicalTodayMatch?.href || null;
 }
 
 export function buildSiiirSessionManifestUrl(matchId: number, internalOrigin: string) {
@@ -322,7 +346,7 @@ export const siiirProvider: LiveStreamProvider = {
   sourceSelector: pickSiiirSourceUrl,
   isAllowedSource: isAllowedSiiirSource,
   async extractCurrentManifest(input: ProviderContext, options) {
-    const runtimeSource = await resolveSiiirRuntimeSource(input.sourceUrl);
+    const runtimeSource = await resolveSiiirRuntimeSource(input.sourceUrl, { forceRefresh: !!options?.forceRefresh });
     if (!runtimeSource?.runtimeSourceUrl) {
       return {
         ok: false,

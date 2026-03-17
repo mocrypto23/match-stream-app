@@ -48,6 +48,7 @@ const HOST_ALLOWLIST_BY_SLOT: Record<SlotServerId, string[]> = {
     "sia-bth.net",
     "baranewssumsel.online",
     "sportsurges.cc",
+    "sportsurges.online",
   ],
 };
 

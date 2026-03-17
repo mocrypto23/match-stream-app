@@ -676,7 +676,7 @@ function buildCandidateQueue(
 
   if (hint) {
     const hinted = buildHintCandidate(hint);
-    hinted.score = 4_000;
+    hinted.score = 8_000;
     addCandidate(hinted);
   }
 

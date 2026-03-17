@@ -13,7 +13,13 @@ import {
   type RuntimeHintCandidate,
 } from "./shared";
 
-const LIVEKORA_FAMILY_BASE_HOSTS = ["sportsurges.cc", "livekora.vip", "koooralive.click", "kooraxx.com"] as const;
+const LIVEKORA_FAMILY_BASE_HOSTS = [
+  "sportsurges.cc",
+  "sportsurges.online",
+  "livekora.vip",
+  "koooralive.click",
+  "kooraxx.com",
+] as const;
 
 function looksLikeAlbaSource(rawUrl: string) {
   try {
@@ -81,16 +87,7 @@ function buildAlbaVariants(sourceUrl: string) {
   try {
     const parsed = new URL(String(sourceUrl || "").trim());
     const host = String(parsed.hostname || "").toLowerCase();
-    if (
-      !host.endsWith("sportsurges.cc") &&
-      host !== "sportsurges.cc" &&
-      !host.endsWith("livekora.vip") &&
-      host !== "livekora.vip" &&
-      !host.endsWith("koooralive.click") &&
-      host !== "koooralive.click" &&
-      !host.endsWith("kooraxx.com") &&
-      host !== "kooraxx.com"
-    ) {
+    if (!isLivekoraFamilyHost(host)) {
       return [parsed.toString()];
     }
     const scheme = parsed.protocol === "http:" ? "http" : "https";
@@ -99,7 +96,7 @@ function buildAlbaVariants(sourceUrl: string) {
     const originVariants = new Set<string>([parsed.origin]);
     for (const familyHost of LIVEKORA_FAMILY_BASE_HOSTS) {
       originVariants.add(`${scheme}://${familyHost}`);
-      if (familyHost === "sportsurges.cc" && firstLabel && /^\d+$/.test(firstLabel)) {
+      if (familyHost.startsWith("sportsurges.") && firstLabel && /^\d+$/.test(firstLabel)) {
         originVariants.add(`${scheme}://${firstLabel}.${familyHost}`);
       }
     }

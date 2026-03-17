@@ -186,6 +186,17 @@ function normalizePlayerv2Path(raw?: string | null) {
   return value.replace(/\/{2,}/g, "/");
 }
 
+function buildPlayerv2PathVariants(raw?: string | null) {
+  const normalized = normalizePlayerv2Path(raw);
+  if (!normalized) return [] as string[];
+  const base = normalized.replace(/\.m3u8$/i, "");
+  return Array.from(
+    new Set([base, `${base}.m3u8`, `${base}_hd`, `${base}_hd.m3u8`, `${base}_sd`, `${base}_sd.m3u8`])
+  )
+    .map((value) => normalizePlayerv2Path(value))
+    .filter(Boolean);
+}
+
 function buildPlayerv2NonceCandidates() {
   const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   const pick = (length: number) => {
@@ -1077,20 +1088,8 @@ export async function buildPlayerv2Candidates(sourceUrl: string, html: string, t
     out.push(raw);
   };
 
-  for (const fallbackCandidate of buildPlayerv2ChannelFallbackCandidates(sourceUrl)) {
-    pushCandidate(fallbackCandidate);
-  }
-  for (const seededCandidate of config.randomCandidates) {
-    pushCandidate(seededCandidate);
-    if (requestOrigin) {
-      const proxied = buildInternalEmbedProxyUrl({
-        sourceUrl: seededCandidate,
-        requestOrigin,
-        referrerUrl: sourceUrl,
-      });
-      if (proxied) pushCandidate(proxied);
-    }
-  }
+  const deferredRandomCandidates = [...config.randomCandidates];
+  const deferredFallbackCandidates = buildPlayerv2ChannelFallbackCandidates(sourceUrl);
 
   const maxPaths = Math.min(4, config.paths.length);
   for (const rawPath of config.paths.slice(0, maxPaths)) {
@@ -1124,18 +1123,17 @@ export async function buildPlayerv2Candidates(sourceUrl: string, html: string, t
 
     const ts = String(Math.floor(Date.now() / 1000));
     const nonces = buildPlayerv2NonceCandidates();
-    const basePath = pathValue.replace(/\.m3u8$/i, "");
-    const pathVariants = Array.from(new Set([basePath, `${basePath}.m3u8`]));
+    const pathVariants = buildPlayerv2PathVariants(pathValue);
 
     for (const domain of config.domains.slice(0, 4).map((item) => normalizeDomainPrefix(item, sourceUrl)).filter(Boolean)) {
-      for (const variantPath of pathVariants) {
-        let absolute = "";
-        try {
-          absolute = new URL(variantPath.replace(/^\/+/, ""), ensureTrailingSlash(domain) || domain).toString();
-        } catch {
-          continue;
-        }
-        for (const nonce of nonces) {
+      for (const nonce of nonces) {
+        for (const variantPath of pathVariants) {
+          let absolute = "";
+          try {
+            absolute = new URL(variantPath.replace(/^\/+/, ""), ensureTrailingSlash(domain) || domain).toString();
+          } catch {
+            continue;
+          }
           const queryVariants = [
             // Keep sid as the primary auth key for yallashot/playerv2.
             new URLSearchParams({ ts, nonce, token: token.token, sid: token.sessionId, session_id: token.sessionId }).toString(),
@@ -1159,6 +1157,22 @@ export async function buildPlayerv2Candidates(sourceUrl: string, html: string, t
         }
       }
     }
+  }
+
+  for (const seededCandidate of deferredRandomCandidates) {
+    pushCandidate(seededCandidate);
+    if (requestOrigin) {
+      const proxied = buildInternalEmbedProxyUrl({
+        sourceUrl: seededCandidate,
+        requestOrigin,
+        referrerUrl: sourceUrl,
+      });
+      if (proxied) pushCandidate(proxied);
+    }
+  }
+
+  for (const fallbackCandidate of deferredFallbackCandidates) {
+    pushCandidate(fallbackCandidate);
   }
 
   const deduped = new Set<string>();

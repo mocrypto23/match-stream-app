@@ -11,7 +11,13 @@ import {
 
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
-const LIVEKORA_FAMILY_BASE_HOSTS = ["sportsurges.cc", "livekora.vip", "koooralive.click", "kooraxx.com"] as const;
+const LIVEKORA_FAMILY_BASE_HOSTS = [
+  "sportsurges.cc",
+  "sportsurges.online",
+  "livekora.vip",
+  "koooralive.click",
+  "kooraxx.com",
+] as const;
 
 const ENABLE_LIVE_EMBED_SESSION =
   String(process.env.REPACK_LIVE_EMBED_SESSION_ENABLED || "1").trim() !== "0";
@@ -260,11 +266,28 @@ function hostMatchesAnySuffix(hostname: string, suffixes: string[]) {
   return suffixes.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
 }
 
+function isSiiirBrowserSensitivePage(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    const pathname = String(parsed.pathname || "").toLowerCase();
+    if (!(host === "yallashot.us" || host.endsWith(".yallashot.us"))) return false;
+    return pathname.includes("/playerv2.php") || pathname.includes("/hard/");
+  } catch {
+    return false;
+  }
+}
+
 function isDirectCrawlPreferred(rawUrl: string) {
   if (!isValidHttpUrl(rawUrl)) return false;
-  // Livekora must stay behind embed-proxy so the browser session follows
-  // the same in-page chain that worked before the R2 rewrite.
-  return false;
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    return hostMatchesAnySuffix(host, [...LIVEKORA_FAMILY_BASE_HOSTS]) || isSiiirBrowserSensitivePage(rawUrl);
+  } catch {
+    return false;
+  }
 }
 
 function pickPreferredDirectPlaybackUrl(rawUrl: string) {
@@ -325,7 +348,7 @@ function expandLivekoraSportsurgesVariants(rawUrl: string) {
     const originVariants = new Set<string>([parsed.origin]);
     for (const familyHost of LIVEKORA_FAMILY_BASE_HOSTS) {
       originVariants.add(`${scheme}://${familyHost}`);
-      if (familyHost === "sportsurges.cc" && firstLabel && /^\d+$/.test(firstLabel)) {
+      if (familyHost.startsWith("sportsurges.") && firstLabel && /^\d+$/.test(firstLabel)) {
         originVariants.add(`${scheme}://${firstLabel}.${familyHost}`);
       }
     }
@@ -417,6 +440,8 @@ function looksLikeNavigableStreamPage(rawUrl: string) {
       host === "bein-live.com" ||
       host.endsWith(".sportsurges.cc") ||
       host === "sportsurges.cc" ||
+      host.endsWith(".sportsurges.online") ||
+      host === "sportsurges.online" ||
       host.endsWith(".yallashoot2026.com") ||
       host === "yallashoot2026.com" ||
       host.endsWith(".yallashot.us") ||
@@ -440,7 +465,12 @@ function isBeinLiveMatchPageUrl(rawUrl: string) {
 }
 
 function shouldNavigateSeedInBrowser(rawUrl: string) {
-  return isLikelyAlbaLandingUrl(rawUrl) || looksLikePlayerv2PageUrl(rawUrl) || isBeinLiveMatchPageUrl(rawUrl);
+  return (
+    isLikelyAlbaLandingUrl(rawUrl) ||
+    looksLikePlayerv2PageUrl(rawUrl) ||
+    isBeinLiveMatchPageUrl(rawUrl) ||
+    isSiiirBrowserSensitivePage(rawUrl)
+  );
 }
 
 function looksLikeManifestUrl(rawUrl: string) {
@@ -1977,6 +2007,7 @@ class LiveEmbedSession {
       .map((candidate) => ({
         fetchUrl: candidate.fetchUrl || candidate.targetUrl,
         targetUrl: candidate.targetUrl,
+        referrerUrl: candidate.referrerUrl || this.fallbackReferrer,
       }))
       .filter((candidate) => isValidHttpUrl(candidate.fetchUrl) && isValidHttpUrl(candidate.targetUrl))
       .slice(0, 8);
@@ -1988,6 +2019,7 @@ class LiveEmbedSession {
           const out: Array<{
             fetchUrl: string;
             targetUrl: string;
+            referrerUrl: string;
             finalUrl: string;
             status: number;
             body: string;
@@ -2007,6 +2039,7 @@ class LiveEmbedSession {
               out.push({
                 fetchUrl: pendingTarget.fetchUrl,
                 targetUrl: pendingTarget.targetUrl,
+                referrerUrl: pendingTarget.referrerUrl,
                 finalUrl: String(response.url || pendingTarget.fetchUrl),
                 status: Number(response.status || 0),
                 body,
@@ -2016,6 +2049,7 @@ class LiveEmbedSession {
               out.push({
                 fetchUrl: pendingTarget.fetchUrl,
                 targetUrl: pendingTarget.targetUrl,
+                referrerUrl: pendingTarget.referrerUrl,
                 finalUrl: pendingTarget.fetchUrl,
                 status: 0,
                 body: "",
@@ -2033,16 +2067,51 @@ class LiveEmbedSession {
 
       for (const item of Array.isArray(fetched) ? fetched : []) {
         const targetUrl = normalizeHttpUrl(String(item?.targetUrl || "").trim());
-        const finalUrl = normalizeHttpUrl(String(item?.finalUrl || targetUrl).trim()) || targetUrl;
-        const body = String(item?.body || "").trim();
-        const status = Number(item?.status || 0);
-        const contentType = String(item?.contentType || "").trim();
-        if (!targetUrl || status < 200 || status >= 300) continue;
-        if (!hasHlsManifestBody(contentType, body)) continue;
+        const fetchUrl = normalizeHttpUrl(String(item?.fetchUrl || targetUrl).trim()) || targetUrl;
+        const referrerUrl =
+          normalizeHttpUrl(String(item?.referrerUrl || this.fallbackReferrer || this.sourceUrl).trim()) ||
+          this.fallbackReferrer ||
+          this.sourceUrl;
+        if (!targetUrl || !fetchUrl) continue;
+
+        let finalUrl = normalizeHttpUrl(String(item?.finalUrl || targetUrl).trim()) || targetUrl;
+        let body = String(item?.body || "").trim();
+        let status = Number(item?.status || 0);
+        let contentType = String(item?.contentType || "").trim();
+        let ok = status >= 200 && status < 300 && hasHlsManifestBody(contentType, body);
+
+        if (!ok) {
+          const directFetchUrl =
+            !sameOrigin(fetchUrl, this.requestOrigin)
+              ? fetchUrl
+              : !sameOrigin(targetUrl, this.requestOrigin)
+                ? targetUrl
+                : "";
+          if (directFetchUrl) {
+            const direct = await fetchTextDocument({
+              url: directFetchUrl,
+              referrerUrl,
+              timeoutMs: Math.max(2_000, Math.min(15_000, SESSION_PAGE_FETCH_TIMEOUT_MS)),
+            });
+            const directFinalUrl =
+              normalizeHttpUrl(direct.targetUrl || "") ||
+              unwrapProxyTarget(direct.finalUrl || "") ||
+              targetUrl;
+            if (direct.ok && String(direct.body || "").trim() && hasHlsManifestBody(direct.contentType, direct.body)) {
+              finalUrl = directFinalUrl;
+              body = String(direct.body || "").trim();
+              status = Number(direct.status || 200);
+              contentType = String(direct.contentType || "").trim();
+              ok = true;
+            }
+          }
+        }
+
+        if (!ok) continue;
         this.rememberCandidate({
-          fetchUrl: String(item?.fetchUrl || finalUrl).trim(),
+          fetchUrl,
           targetUrl,
-          referrerUrl: this.fallbackReferrer,
+          referrerUrl,
           manifestBody: body,
           manifestBaseUrl: finalUrl,
           via: "network-manifest",
@@ -2504,6 +2573,40 @@ class LiveEmbedSession {
       let ok = !!fetched?.ok;
       let error = String(fetched?.error || "");
       let status = Number(fetched?.status || 0);
+
+      const shouldAttemptDirectServerFetch =
+        (!ok || !body.trim() || !hasHlsManifestBody(contentType, body)) &&
+        (!sameOrigin(normalizedFetchUrl, this.requestOrigin) || !sameOrigin(normalizedTargetUrl, this.requestOrigin));
+      if (shouldAttemptDirectServerFetch) {
+        const directFetchUrl = !sameOrigin(normalizedFetchUrl, this.requestOrigin)
+          ? normalizedFetchUrl
+          : normalizedTargetUrl;
+        const direct = await fetchTextDocument({
+          url: directFetchUrl,
+          referrerUrl: normalizedReferrerUrl,
+          timeoutMs,
+        });
+        const directFinalUrl =
+          normalizeHttpUrl(direct.targetUrl || "") ||
+          unwrapProxyTarget(direct.finalUrl || "") ||
+          normalizedTargetUrl;
+        const directLooksLikeManifest = hasHlsManifestBody(direct.contentType, direct.body);
+        if (direct.ok && direct.body.trim() && directLooksLikeManifest) {
+          ok = true;
+          body = direct.body;
+          contentType = direct.contentType;
+          finalUrl = directFinalUrl;
+          error = "";
+          status = Number(direct.status || status || 200);
+        } else if (!ok) {
+          ok = direct.ok;
+          body = direct.body;
+          contentType = direct.contentType;
+          finalUrl = directFinalUrl;
+          error = String(direct.error || (direct.ok ? "manifest-not-hls" : `text-http-${direct.status || 0}`));
+          status = Number(direct.status || status || 0);
+        }
+      }
 
       const shouldRelay = !ok || !body.trim() || !hasHlsManifestBody(contentType, body);
       if (shouldRelay) {
