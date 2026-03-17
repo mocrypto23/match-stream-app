@@ -150,6 +150,11 @@ export default function WatchPage() {
   const [selectedProvider, setSelectedProvider] = useState<StreamProviderId>("livekora");
   const [pageError, setPageError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [retainedPlaylistUrls, setRetainedPlaylistUrls] = useState<Record<StreamProviderId, string>>({
+    livekora: "",
+    beinlive: "",
+    siiir: "",
+  });
   const [pendingBootstraps, setPendingBootstraps] = useState<PendingBootstrapMap>(createPendingBootstrapMap);
   const [playbackRequested, setPlaybackRequested] = useState(false);
   const [playbackStarting, setPlaybackStarting] = useState(false);
@@ -215,13 +220,15 @@ export default function WatchPage() {
   }, [activeProvider, match?.beinlivePlaylistUrl, match?.livekoraPlaylistUrl, match?.siiirPlaylistUrl]);
 
   const streamUrl = useMemo(() => {
+    const retained = String(retainedPlaylistUrls[activeProvider] || "").trim();
     if (activeStatus) {
-      if (activeStatus.state !== "ready") return null;
-      const direct = String(activeStatus.playlistUrl || fallbackPlaylistUrl || "").trim();
-      return direct || null;
+      const direct =
+        activeStatus.state === "ready" ? String(activeStatus.playlistUrl || fallbackPlaylistUrl || "").trim() : "";
+      if (direct) return direct;
+      return retained || null;
     }
-    return fallbackPlaylistUrl;
-  }, [activeStatus, fallbackPlaylistUrl]);
+    return retained || fallbackPlaylistUrl;
+  }, [activeProvider, activeStatus, fallbackPlaylistUrl, retainedPlaylistUrls]);
 
   const directSourceUrl = useMemo(() => {
     if (activeProvider === "livekora") return String(match?.stream_url_4 || "").trim() || null;
@@ -379,12 +386,29 @@ export default function WatchPage() {
     backgroundBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     lastAutoBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     setStatusByProvider({ livekora: null, beinlive: null, siiir: null });
+    setRetainedPlaylistUrls({ livekora: "", beinlive: "", siiir: "" });
     setPendingBootstraps(createPendingBootstrapMap());
     setSelectedProvider("livekora");
     activeRecoveryAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     selectedRecoveryPendingRef.current = false;
     setPlayerSessionNonce(0);
   }, [matchId, resetPlaybackState]);
+
+  useEffect(() => {
+    setRetainedPlaylistUrls((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const provider of ["livekora", "beinlive", "siiir"] as StreamProviderId[]) {
+        const status = statusByProvider[provider];
+        const playlistUrl = String(status?.playlistUrl || "").trim();
+        if (status?.state === "ready" && playlistUrl && next[provider] !== playlistUrl) {
+          next[provider] = playlistUrl;
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [statusByProvider]);
 
   useEffect(() => {
     return () => {
@@ -475,10 +499,13 @@ export default function WatchPage() {
     }
     if (!providerSourceUrl) return;
 
-    const isReady = activeStatus?.state === "ready" && !!String(streamUrl || "").trim();
+    const hasUsableStream = !!String(streamUrl || "").trim();
+    const isReady = activeStatus?.state === "ready" && hasUsableStream;
     if (!isReady) {
-      selectedRecoveryPendingRef.current = true;
-      if (hasPlayedRef.current) {
+      if (!hasPlayedRef.current || !hasUsableStream) {
+        selectedRecoveryPendingRef.current = true;
+      }
+      if (hasPlayedRef.current && !hasUsableStream) {
         setPlaybackStarting(true);
       }
       return;
@@ -520,7 +547,7 @@ export default function WatchPage() {
     if (!providerSourceUrl) return;
     if ((pendingBootstraps[activeProvider] || 0) > 0) return;
 
-    const selectedIsUnavailable = activeStatus?.state !== "ready" || !String(streamUrl || "").trim();
+    const selectedIsUnavailable = !String(streamUrl || "").trim();
     if (!selectedIsUnavailable) return;
 
     const now = Date.now();
@@ -589,7 +616,7 @@ export default function WatchPage() {
       if (video.paused) return;
 
       const stalledForMs = now - playbackWatchRef.current.lastAdvanceAt;
-      const selectedUnavailable = activeStatus?.state !== "ready";
+      const selectedUnavailable = !stream;
       const playerSeemsStuck = playbackStarting || video.readyState < 2 || selectedUnavailable;
       if (!playerSeemsStuck || stalledForMs < PLAYBACK_STALL_RECOVERY_MS) return;
 
