@@ -23,7 +23,7 @@ const DEFAULT_PLAYERV2_USER_AGENT =
 function looksLikePlayerv2Source(rawUrl: string) {
   try {
     const parsed = new URL(String(rawUrl || "").trim());
-    return String(parsed.pathname || "").toLowerCase().includes("/playerv2.php");
+    return /\/playerv\d+\.php/i.test(String(parsed.pathname || "").toLowerCase());
   } catch {
     return false;
   }
@@ -116,7 +116,7 @@ const playerv2BaseAdapter = buildSessionOwnedRuntimeAdapter(
     runtimeWatchdogReadyStates: ["healthy", "refreshing"],
     runtimeWatchdogWarmingStates: ["recovering", "stalled", "refreshing"],
     preferUrlIncludes: ["/kooora/", "token=", "sid=", "nonce=", ".m3u8"],
-    preferReferrerIncludes: ["/playerv2.php", "siiir", "yallashot"],
+    preferReferrerIncludes: ["/playerv", "siiir", "yallashot"],
     preferManifestIncludes: ["/kooora/", "#extm3u"],
   }
 );

@@ -76,7 +76,7 @@ function isSiiirUsableSource(rawUrl: string) {
     const host = parsed.hostname.toLowerCase();
     const pathname = String(parsed.pathname || "").toLowerCase();
     if (hostMatchesAnySuffix(host, ["yallashot.us"])) {
-      return pathname.includes("/hard/") || pathname.includes("/playerv2.php");
+      return pathname.includes("/hard/") || /\/playerv\d+\.php/i.test(pathname);
     }
     if (hostMatchesAnySuffix(host, ["siiir.tv"])) {
       return !isSiiirGenericPage(normalized);
@@ -197,7 +197,7 @@ async function findTodayMatchSource(row: MatchRowLike) {
 }
 
 function extractPlayerv2UrlFromHardPage(pageUrl: string, html: string) {
-  const directMatch = String(html.match(/https?:\/\/[^"'`\s]+\/playerv2\.php\?[^"'`\s]+/i)?.[0] || "").trim();
+  const directMatch = String(html.match(/https?:\/\/[^"'`\s]+\/playerv\d+\.php\?[^"'`\s]+/i)?.[0] || "").trim();
   const directUrl =
     directMatch && !directMatch.includes("${") && !/encodeURIComponent\s*\(/i.test(directMatch)
       ? normalizeHttpUrl(directMatch)
@@ -205,7 +205,7 @@ function extractPlayerv2UrlFromHardPage(pageUrl: string, html: string) {
   if (directUrl) return directUrl;
 
   const playerTemplateMatch = html.match(
-    /playerUrl\s*=\s*`(https?:\/\/[^`]+?\/playerv2\.php\?match=match)\$\{encodeURIComponent\(matchId\)\}(&key=[^`]+)`/i
+    /playerUrl\s*=\s*`(https?:\/\/[^`]+?\/playerv\d+\.php\?match=match)\$\{encodeURIComponent\(matchId\)\}(&key=[^`]+)`/i
   );
   const sourceMatchId = String(new URL(pageUrl).searchParams.get("match") || "").trim();
   if (playerTemplateMatch?.[1] && playerTemplateMatch?.[2] && sourceMatchId) {
@@ -218,7 +218,7 @@ async function resolveSiiirRuntimeSource(sourceUrl: string, options?: { forceRef
   const normalized = normalizeHttpUrl(sourceUrl);
   if (!normalized) return null;
   if (isTemplatedRuntimeUrl(normalized)) return null;
-  if (String(new URL(normalized).pathname || "").toLowerCase().includes("/playerv2.php")) {
+  if (/\/playerv\d+\.php/i.test(String(new URL(normalized).pathname || "").toLowerCase())) {
     return {
       runtimeSourceUrl: normalized,
       playbackUrl: normalized,

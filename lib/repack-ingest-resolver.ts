@@ -95,6 +95,8 @@ const PLAYERV2_FALLBACK_DOMAINS = [
 ];
 const PLAYERV2_ALLOW_SESSION_ID_ONLY =
   String(process.env.REPACK_PLAYERV2_ALLOW_SESSION_ID_ONLY || "0").trim() === "1";
+const PLAYERV_PAGE_PATH_RE = /\/playerv\d+\.php/i;
+const PLAYERV_TOKEN_ACTION_RE = /playerv\d+\.php\?action=generate_token/i;
 
 function normalizeHttpUrl(raw: unknown) {
   const value = String(raw || "").trim();
@@ -696,7 +698,7 @@ function buildPlayerv2ChannelFallbackCandidates(sourceUrl: string) {
   try {
     const u = new URL(sourceUrl);
     const pathname = String(u.pathname || "").toLowerCase();
-    if (!pathname.includes("/playerv2.php")) return [] as string[];
+    if (!PLAYERV_PAGE_PATH_RE.test(pathname)) return [] as string[];
     const matchRaw = String(u.searchParams.get("match") || "").trim();
     const num = Number.parseInt((matchRaw.match(/\d+/) || [])[0] || "", 10);
     if (!Number.isFinite(num) || num <= 0) return [] as string[];
@@ -814,7 +816,7 @@ export function looksLikePlayerv2PageUrl(rawUrl: string) {
   if (!isValidHttpUrl(rawUrl)) return false;
   try {
     const u = new URL(rawUrl);
-    return String(u.pathname || "").toLowerCase().includes("/playerv2.php");
+    return PLAYERV_PAGE_PATH_RE.test(String(u.pathname || "").toLowerCase());
   } catch {
     return false;
   }
@@ -824,11 +826,23 @@ export function looksLikePlayerv2Html(html: string) {
   const text = normalizeHtmlForScan(html).toLowerCase();
   return (
     text.includes("window.tabsconfig") ||
-    text.includes("playerv2.php?action=generate_token") ||
+    PLAYERV_TOKEN_ACTION_RE.test(text) ||
     text.includes("data-mobile-path=") ||
     text.includes("data-path=") ||
     text.includes("albaplayer_name")
   );
+}
+
+function buildPlayervGenerateTokenUrl(sourceUrl: string) {
+  try {
+    const source = new URL(sourceUrl);
+    const pathname = String(source.pathname || "");
+    const match = pathname.match(/\/(playerv\d+)\.php/i);
+    const scriptName = match?.[1] ? `${match[1]}.php` : "playerv2.php";
+    return new URL(`/${scriptName}?action=generate_token`, `${source.protocol}//${source.host}`).toString();
+  } catch {
+    return "";
+  }
 }
 
 function resolvePlayerv2ContextUrl(rawUrl: string, referrerUrl?: string) {
@@ -849,13 +863,7 @@ async function requestPlayerv2TokenViaProxy(input: {
   timeoutMs: number;
   requestOrigin: string;
 }) {
-  const endpoint = (() => {
-    try {
-      return new URL("/playerv2.php?action=generate_token", input.playerv2Url).toString();
-    } catch {
-      return "";
-    }
-  })();
+  const endpoint = buildPlayervGenerateTokenUrl(input.playerv2Url);
   if (!endpoint) return null as { token: string; sessionId: string } | null;
 
   const proxyEndpoint = buildInternalEmbedProxyUrl({
@@ -1107,14 +1115,7 @@ export async function buildPlayerv2Candidates(sourceUrl: string, html: string, t
     const token =
       tokenViaProxy ||
       (await requestPlayerv2Token({
-        tokenEndpoint: (() => {
-          try {
-            const source = new URL(sourceUrl);
-            return new URL("/playerv2.php?action=generate_token", `${source.protocol}//${source.host}`).toString();
-          } catch {
-            return "";
-          }
-        })(),
+        tokenEndpoint: buildPlayervGenerateTokenUrl(sourceUrl),
         pathValue,
         timeoutMs: Math.max(1200, timeoutMs),
         sourceUrl,
@@ -1379,7 +1380,7 @@ function shouldWrapCandidateForInternalProxy(candidateUrl: string, sourceUrl: st
     if (looksLikeHlsManifestUrl(candidateUrl)) return true;
     return (
       pathname.includes("/albaplayer/") ||
-      pathname.includes("/playerv2.php") ||
+      PLAYERV_PAGE_PATH_RE.test(pathname) ||
       pathname.includes("/embed") ||
       pathname.includes("/player") ||
       pathname.includes("/hls/") ||
