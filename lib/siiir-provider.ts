@@ -346,8 +346,8 @@ export const siiirProvider: LiveStreamProvider = {
   sourceSelector: pickSiiirSourceUrl,
   isAllowedSource: isAllowedSiiirSource,
   async extractCurrentManifest(input: ProviderContext, options) {
-    const runtimeSource = await resolveSiiirRuntimeSource(input.sourceUrl, { forceRefresh: !!options?.forceRefresh });
-    if (!runtimeSource?.runtimeSourceUrl) {
+    const initialRuntimeSource = await resolveSiiirRuntimeSource(input.sourceUrl, { forceRefresh: !!options?.forceRefresh });
+    if (!initialRuntimeSource?.runtimeSourceUrl) {
       return {
         ok: false,
         error: "siiir-runtime-source-missing",
@@ -363,7 +363,8 @@ export const siiirProvider: LiveStreamProvider = {
       };
     }
 
-    const resolved = await playerv2RuntimeAdapter.currentManifest(
+    let runtimeSource = initialRuntimeSource;
+    let resolved = await playerv2RuntimeAdapter.currentManifest(
       {
         sourceUrl: runtimeSource.runtimeSourceUrl,
         slotServer: 2,
@@ -371,20 +372,63 @@ export const siiirProvider: LiveStreamProvider = {
       },
       options
     );
+
+    if (!resolved.ok) {
+      const refreshedRuntimeSource = await resolveSiiirRuntimeSource(input.sourceUrl, { forceRefresh: true });
+      if (refreshedRuntimeSource?.runtimeSourceUrl) {
+        runtimeSource = refreshedRuntimeSource;
+        resolved = await playerv2RuntimeAdapter.currentManifest(
+          {
+            sourceUrl: runtimeSource.runtimeSourceUrl,
+            slotServer: 2,
+            internalOrigin: input.internalOrigin,
+          },
+          {
+            ...options,
+            forceRefresh: true,
+          }
+        );
+      }
+    }
+
     return mapManifestResult(resolved, runtimeSource.playbackUrl);
   },
   async fetchAsset(input) {
-    const runtimeSource = await resolveSiiirRuntimeSource(input.sourceUrl);
-    const effectiveSourceUrl = runtimeSource?.runtimeSourceUrl || input.sourceUrl;
+    const initialRuntimeSource = await resolveSiiirRuntimeSource(input.sourceUrl);
+    let effectiveSourceUrl = initialRuntimeSource?.runtimeSourceUrl || input.sourceUrl;
+    let assetResult = await playerv2RuntimeAdapter.fetchAsset({
+      sourceUrl: effectiveSourceUrl,
+      slotServer: 2,
+      internalOrigin: input.internalOrigin,
+      assetUrl: input.assetUrl,
+      referrerUrl: input.referrerUrl,
+      timeoutMs: input.timeoutMs,
+    });
+
+    const shouldRetryWithFreshRuntimeSource =
+      !assetResult.ok &&
+      (Number(assetResult.status || 0) === 0 ||
+        Number(assetResult.status || 0) === 403 ||
+        Number(assetResult.status || 0) === 404 ||
+        Number(assetResult.status || 0) >= 500);
+
+    if (shouldRetryWithFreshRuntimeSource) {
+      const refreshedRuntimeSource = await resolveSiiirRuntimeSource(input.sourceUrl, { forceRefresh: true });
+      if (refreshedRuntimeSource?.runtimeSourceUrl && refreshedRuntimeSource.runtimeSourceUrl !== effectiveSourceUrl) {
+        effectiveSourceUrl = refreshedRuntimeSource.runtimeSourceUrl;
+        assetResult = await playerv2RuntimeAdapter.fetchAsset({
+          sourceUrl: effectiveSourceUrl,
+          slotServer: 2,
+          internalOrigin: input.internalOrigin,
+          assetUrl: input.assetUrl,
+          referrerUrl: input.referrerUrl,
+          timeoutMs: input.timeoutMs,
+        });
+      }
+    }
+
     return mapAssetResult(
-      await playerv2RuntimeAdapter.fetchAsset({
-        sourceUrl: effectiveSourceUrl,
-        slotServer: 2,
-        internalOrigin: input.internalOrigin,
-        assetUrl: input.assetUrl,
-        referrerUrl: input.referrerUrl,
-        timeoutMs: input.timeoutMs,
-      })
+      assetResult
     );
   },
 };
