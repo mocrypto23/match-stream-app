@@ -36,7 +36,7 @@ export async function bootstrapR2MirrorAgent(input: {
   ingestUrl: string;
 }) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 25_000);
+  const timeoutId = setTimeout(() => controller.abort(), 4_500);
   try {
     const response = await fetch(localAgentUrl("/bootstrap"), {
       method: "POST",
