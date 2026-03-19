@@ -430,6 +430,15 @@ export default function WatchPage() {
       const providersToBootstrap = PROVIDER_META.filter((item) => {
         const status = statusByProvider[item.provider];
         if (!String(status?.sourceUrl || "").trim()) return false;
+        if ((pendingBootstraps[item.provider] || 0) > 0) return false;
+
+        const hasPlaylistUrl = !!String(status?.playlistUrl || "").trim();
+        const needsBootstrap =
+          !status ||
+          status.reason === "not-bootstrapped" ||
+          (!hasPlaylistUrl && status.state !== "ready") ||
+          (status.state === "down" && !hasPlaylistUrl);
+        if (!needsBootstrap) return false;
 
         const now = Date.now();
         const lastAttemptAt = backgroundBootstrapAtRef.current[item.provider] || 0;
@@ -450,7 +459,7 @@ export default function WatchPage() {
     return () => {
       cancelled = true;
     };
-  }, [bootstrapProvider, match, statusByProvider]);
+  }, [bootstrapProvider, match, pendingBootstraps, statusByProvider]);
 
   useEffect(() => {
     if (!match) return;

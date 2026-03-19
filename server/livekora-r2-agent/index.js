@@ -575,11 +575,15 @@ class LivekoraJob {
 
   async fetchManifestDocument(options = {}) {
     this.setProgress(options.forceRefresh ? "resolving_source" : "fetching_manifest", options.forceRefresh ? 18 : 14);
-    const buildFetchUrl = (rawUrl) => {
+    const buildFetchUrl = (rawUrl, fetchOptions = {}) => {
       if (!isSessionManifestUrl(rawUrl)) return rawUrl;
       try {
         const parsed = new URL(rawUrl);
-        if (Number.isFinite(this.lastRuntimeMediaSequence) && this.lastRuntimeMediaSequence !== null) {
+        if (
+          !fetchOptions.skipWaitForMediaSequence &&
+          Number.isFinite(this.lastRuntimeMediaSequence) &&
+          this.lastRuntimeMediaSequence !== null
+        ) {
           parsed.searchParams.set("waitForMediaSequence", String(this.lastRuntimeMediaSequence));
           parsed.searchParams.set(
             "waitTimeoutMs",
@@ -604,8 +608,8 @@ class LivekoraJob {
       }
     };
 
-    const fetchOnce = async (rawUrl) => {
-      const requestUrl = buildFetchUrl(rawUrl);
+    const fetchOnce = async (rawUrl, fetchOptions = {}) => {
+      const requestUrl = buildFetchUrl(rawUrl, fetchOptions);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), this.manager.config.manifestFetchTimeoutMs);
       try {
@@ -692,7 +696,19 @@ class LivekoraJob {
 
     let currentUrl = this.ingestUrl;
     for (let depth = 0; depth < 3; depth += 1) {
-      const fetched = await fetchOnce(currentUrl);
+      let fetched = await fetchOnce(currentUrl);
+      if (
+        !fetched.ok &&
+        isSessionManifestUrl(currentUrl) &&
+        /manifest-fetch-failed:.*aborted/i.test(String(fetched.reason || ""))
+      ) {
+        this.manager.log("warn", "retrying manifest fetch without media-sequence wait", {
+          matchId: this.matchId,
+          provider: this.providerId,
+          currentSource: this.lastCurrentSource,
+        });
+        fetched = await fetchOnce(currentUrl, { skipWaitForMediaSequence: true });
+      }
       if (!fetched.ok) return fetched;
       if (Number.isFinite(fetched.runtimeTargetDurationSec) && fetched.runtimeTargetDurationSec > 0) {
         this.lastObservedTargetDurationSec = fetched.runtimeTargetDurationSec;
