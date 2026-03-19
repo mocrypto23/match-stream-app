@@ -187,6 +187,11 @@ export default function WatchPage() {
     beinlive: 0,
     siiir: 0,
   });
+  const sourceRecoveryPendingRef = useRef<Record<StreamProviderId, boolean>>({
+    livekora: false,
+    beinlive: false,
+    siiir: false,
+  });
   const playbackWatchRef = useRef<{
     provider: StreamProviderId | null;
     streamUrl: string;
@@ -408,6 +413,7 @@ export default function WatchPage() {
     setSelectedProvider("livekora");
     activeRecoveryAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     softRecoveryAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
+    sourceRecoveryPendingRef.current = { livekora: false, beinlive: false, siiir: false };
     selectedRecoveryPendingRef.current = false;
     setPlayerSessionNonce(0);
   }, [matchId, resetPlaybackState]);
@@ -523,6 +529,7 @@ export default function WatchPage() {
   useEffect(() => {
     if (!playbackRequested) {
       selectedRecoveryPendingRef.current = false;
+      sourceRecoveryPendingRef.current[activeProvider] = false;
       return;
     }
     if (!providerSourceUrl) return;
@@ -532,6 +539,9 @@ export default function WatchPage() {
     if (!isReady) {
       if (!hasPlayedRef.current || !hasUsableStream) {
         selectedRecoveryPendingRef.current = true;
+      }
+      if (hasPlayedRef.current) {
+        sourceRecoveryPendingRef.current[activeProvider] = true;
       }
       if (hasPlayedRef.current && !hasUsableStream) {
         setPlaybackStarting(true);
@@ -545,6 +555,42 @@ export default function WatchPage() {
     setPlaybackStarting(true);
     setPlayerSessionNonce((current) => current + 1);
   }, [activeStatus?.state, playbackRequested, providerSourceUrl, streamUrl]);
+
+  useEffect(() => {
+    if (!playbackRequested) return;
+    if (!hasPlayedRef.current) return;
+    if (!providerSourceUrl) return;
+    if (activeStatus?.state !== "ready") return;
+    if (!sourceRecoveryPendingRef.current[activeProvider]) return;
+
+    sourceRecoveryPendingRef.current[activeProvider] = false;
+
+    const video = videoRef.current;
+    const stream = String(streamUrl || "").trim();
+    const now = Date.now();
+    const watch = playbackWatchRef.current;
+    const stalledForMs = now - watch.lastAdvanceAt;
+    const playerLooksStuck =
+      !video ||
+      video.readyState < 2 ||
+      (watch.provider === activeProvider && watch.streamUrl === stream && stalledForMs >= SOFT_PLAYBACK_STALL_RECOVERY_MS);
+
+    if (!playerLooksStuck) return;
+
+    const lastRecoveryAt = activeRecoveryAtRef.current[activeProvider] || 0;
+    if (now - lastRecoveryAt < SOFT_PLAYBACK_STALL_RECOVERY_MS) return;
+
+    activeRecoveryAtRef.current[activeProvider] = now;
+    selectedRecoveryPendingRef.current = true;
+    setPlaybackStarting(true);
+    setPlayerSessionNonce((current) => current + 1);
+  }, [
+    activeProvider,
+    activeStatus?.state,
+    playbackRequested,
+    providerSourceUrl,
+    streamUrl,
+  ]);
 
   useEffect(() => {
     const stream = String(streamUrl || "").trim();
