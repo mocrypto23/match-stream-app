@@ -36,7 +36,9 @@ const ACTIVE_WARMING_POLL_MS = 1_250;
 const AUTO_BOOTSTRAP_RETRY_MS = 12_000;
 const ACTIVE_RECOVERY_RETRY_MS = 3_500;
 const PLAYBACK_STALL_CHECK_MS = 2_000;
-const PLAYBACK_STALL_RECOVERY_MS = 7_000;
+const SOFT_PLAYBACK_STALL_RECOVERY_MS = 2_500;
+const HARD_PLAYBACK_STALL_RECOVERY_MS = 9_000;
+const WAITING_OVERLAY_DELAY_MS = 3_500;
 const PROVIDER_META: Array<{ provider: StreamProviderId; order: number; label: string }> = [
   { provider: "livekora", order: 1, label: "livekora vip" },
   { provider: "beinlive", order: 2, label: "bein-live" },
@@ -176,6 +178,11 @@ export default function WatchPage() {
     siiir: 0,
   });
   const activeRecoveryAtRef = useRef<Record<StreamProviderId, number>>({
+    livekora: 0,
+    beinlive: 0,
+    siiir: 0,
+  });
+  const softRecoveryAtRef = useRef<Record<StreamProviderId, number>>({
     livekora: 0,
     beinlive: 0,
     siiir: 0,
@@ -400,6 +407,7 @@ export default function WatchPage() {
     setPendingBootstraps(createPendingBootstrapMap());
     setSelectedProvider("livekora");
     activeRecoveryAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
+    softRecoveryAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     selectedRecoveryPendingRef.current = false;
     setPlayerSessionNonce(0);
   }, [matchId, resetPlaybackState]);
@@ -638,10 +646,28 @@ export default function WatchPage() {
       const stalledForMs = now - playbackWatchRef.current.lastAdvanceAt;
       const selectedUnavailable = !stream;
       const playerSeemsStuck = playbackStarting || video.readyState < 2 || selectedUnavailable;
-      if (!playerSeemsStuck || stalledForMs < PLAYBACK_STALL_RECOVERY_MS) return;
+      if (!playerSeemsStuck) return;
+
+      const hls = hlsRef.current;
+      const sourceStillReady = activeStatus?.state === "ready" && !selectedUnavailable;
+      const lastSoftRecoveryAt = softRecoveryAtRef.current[activeProvider] || 0;
+      if (sourceStillReady && hls && stalledForMs >= SOFT_PLAYBACK_STALL_RECOVERY_MS && now - lastSoftRecoveryAt >= SOFT_PLAYBACK_STALL_RECOVERY_MS) {
+        softRecoveryAtRef.current[activeProvider] = now;
+        try {
+          hls.startLoad();
+          hls.recoverMediaError();
+        } catch {}
+        if (video.paused) {
+          void video.play().catch(() => {});
+        }
+        return;
+      }
+
+      const hardRecoveryThresholdMs = sourceStillReady ? HARD_PLAYBACK_STALL_RECOVERY_MS : ACTIVE_RECOVERY_RETRY_MS;
+      if (stalledForMs < hardRecoveryThresholdMs) return;
 
       const lastRecoveryAt = activeRecoveryAtRef.current[activeProvider] || 0;
-      if (now - lastRecoveryAt < PLAYBACK_STALL_RECOVERY_MS) return;
+      if (now - lastRecoveryAt < hardRecoveryThresholdMs) return;
 
       activeRecoveryAtRef.current[activeProvider] = now;
       selectedRecoveryPendingRef.current = true;
@@ -658,6 +684,7 @@ export default function WatchPage() {
     bootstrapProvider,
     playbackRequested,
     playbackStarting,
+    activeStatus?.state,
     refreshProviderStatus,
     streamUrl,
   ]);
@@ -712,7 +739,7 @@ export default function WatchPage() {
       waitingOverlayTimerRef.current = window.setTimeout(() => {
         setPlaybackStarting(true);
         waitingOverlayTimerRef.current = null;
-      }, 1200);
+      }, WAITING_OVERLAY_DELAY_MS);
     };
 
     if (video.canPlayType("application/vnd.apple.mpegurl")) {
