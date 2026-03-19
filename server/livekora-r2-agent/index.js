@@ -1097,9 +1097,18 @@ class LivekoraManager {
       });
     } else {
       job.updateSeed(input);
+      job.scheduleNextSync(0);
     }
 
-    await job.syncNow();
+    if (!job.syncPromise) {
+      void job.syncNow().catch((error) => {
+        this.log("warn", "bootstrap sync kickoff failed", {
+          provider: providerId,
+          matchId: input.matchId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
     return {
       accepted: true,
       reason: "accepted",
