@@ -158,6 +158,7 @@ export default function WatchPage() {
   const [pendingBootstraps, setPendingBootstraps] = useState<PendingBootstrapMap>(createPendingBootstrapMap);
   const [playbackRequested, setPlaybackRequested] = useState(false);
   const [playbackStarting, setPlaybackStarting] = useState(false);
+  const [playbackStarted, setPlaybackStarted] = useState(false);
   const [playerSessionNonce, setPlayerSessionNonce] = useState(0);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
@@ -369,6 +370,7 @@ export default function WatchPage() {
       }
       setPlaybackRequested(false);
       setPlaybackStarting(false);
+      setPlaybackStarted(false);
       setPlayerSessionNonce(0);
       clearWaitingOverlayTimer();
       hasPlayedRef.current = false;
@@ -428,6 +430,7 @@ export default function WatchPage() {
     let cancelled = false;
     void (async () => {
       const providersToBootstrap = PROVIDER_META.filter((item) => {
+        if (item.provider !== activeProvider && !playbackStarted) return false;
         const status = statusByProvider[item.provider];
         if (!String(status?.sourceUrl || "").trim()) return false;
         if ((pendingBootstraps[item.provider] || 0) > 0) return false;
@@ -459,7 +462,7 @@ export default function WatchPage() {
     return () => {
       cancelled = true;
     };
-  }, [bootstrapProvider, match, pendingBootstraps, statusByProvider]);
+  }, [activeProvider, bootstrapProvider, match, pendingBootstraps, playbackStarted, statusByProvider]);
 
   useEffect(() => {
     if (!match) return;
@@ -681,8 +684,15 @@ export default function WatchPage() {
     const onPlaying = () => {
       clearWaitingOverlayTimer();
       hasPlayedRef.current = true;
+      setPlaybackStarted(true);
       setPlaybackStarting(false);
       setPageError(null);
+    };
+
+    const onPlayable = () => {
+      if (!playbackRequested) return;
+      if (video.readyState < 2) return;
+      setPlaybackStarting(false);
     };
 
     const onWaiting = () => {
@@ -701,10 +711,14 @@ export default function WatchPage() {
       video.src = src;
       video.addEventListener("playing", onPlaying);
       video.addEventListener("waiting", onWaiting);
+      video.addEventListener("loadeddata", onPlayable);
+      video.addEventListener("canplay", onPlayable);
       startPlayback();
       return () => {
         video.removeEventListener("playing", onPlaying);
         video.removeEventListener("waiting", onWaiting);
+        video.removeEventListener("loadeddata", onPlayable);
+        video.removeEventListener("canplay", onPlayable);
       };
     }
 
@@ -743,6 +757,8 @@ export default function WatchPage() {
 
     video.addEventListener("playing", onPlaying);
     video.addEventListener("waiting", onWaiting);
+    video.addEventListener("loadeddata", onPlayable);
+    video.addEventListener("canplay", onPlayable);
 
     hls.loadSource(src);
     hls.attachMedia(video);
@@ -751,6 +767,8 @@ export default function WatchPage() {
       clearWaitingOverlayTimer();
       video.removeEventListener("playing", onPlaying);
       video.removeEventListener("waiting", onWaiting);
+      video.removeEventListener("loadeddata", onPlayable);
+      video.removeEventListener("canplay", onPlayable);
       hls.destroy();
       if (hlsRef.current === hls) hlsRef.current = null;
     };
