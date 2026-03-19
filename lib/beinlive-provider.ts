@@ -922,26 +922,34 @@ export const beinliveProvider: LiveStreamProvider = {
         : 0;
     const allowRotate = options?.allowRotate !== false;
 
-    let state = options?.forceRefresh ? null : readSourceState(input.sourceUrl);
+    let state = readSourceState(input.sourceUrl);
+    let preservedState = state;
     let attempts = 0;
     let candidatesTried = 0;
     let lastError = "beinlive-manifest-unavailable";
     let rotated = false;
     let refreshed = !!options?.forceRefresh;
+    let parentRefreshFailed = false;
+    let shouldRediscover = !!options?.forceRefresh || !state;
 
     while (attempts < 4) {
       attempts += 1;
       if (!state || !state.candidates.length) {
         state = await discoverBeinliveSourceState({
           sourceUrl: input.sourceUrl,
-          currentSource: state?.candidates[state.activeIndex]?.manifestUrl || "",
+          currentSource: preservedState?.candidates[preservedState.activeIndex]?.manifestUrl || "",
         }).catch(() => null);
         if (!state) {
-          clearSourceState(input.sourceUrl);
+          parentRefreshFailed = true;
           lastError = "beinlive-iframe-manifest-missing";
+          if (!preservedState?.candidates.length) {
+            clearSourceState(input.sourceUrl);
+          }
           break;
         }
+        preservedState = state;
         refreshed = true;
+        shouldRediscover = false;
       }
 
       const order = candidateAttemptOrder(state.activeIndex, state.candidates.length, allowRotate);
@@ -961,6 +969,7 @@ export const beinliveProvider: LiveStreamProvider = {
           mediaSequence: resolved.mediaSequence,
         });
         const updatedState = readSourceState(input.sourceUrl) || state;
+        preservedState = updatedState;
         const unchangedSequence =
           waitForMediaSequence !== null &&
           resolved.mediaSequence !== null &&
@@ -993,21 +1002,31 @@ export const beinliveProvider: LiveStreamProvider = {
 
       if (shouldRetry && Date.now() < waitDeadlineAt) continue;
 
+      if (!state?.candidates.length) break;
+      if (!shouldRediscover) {
+        shouldRediscover = true;
+      }
+
       state = await discoverBeinliveSourceState({
         sourceUrl: input.sourceUrl,
         currentSource: state?.candidates[state.activeIndex]?.manifestUrl || "",
       }).catch(() => null);
       refreshed = true;
       if (!state) {
-        clearSourceState(input.sourceUrl);
+        parentRefreshFailed = true;
+        if (!preservedState?.candidates.length) {
+          clearSourceState(input.sourceUrl);
+        }
         break;
       }
+      preservedState = state;
+      shouldRediscover = false;
     }
 
-    const fallbackState = readSourceState(input.sourceUrl) || state;
+    const fallbackState = readSourceState(input.sourceUrl) || preservedState || state;
     return {
       ok: false,
-      error: lastError,
+      error: parentRefreshFailed && fallbackState?.candidates.length ? `${lastError}:parent-refresh-failed` : lastError,
       playbackUrl: fallbackState?.candidates[fallbackState.activeIndex]?.playbackUrl || input.sourceUrl,
       currentSource: fallbackState?.candidates[fallbackState.activeIndex]?.manifestUrl || "",
       mediaSequence: fallbackState?.lastMediaSequence ?? null,
