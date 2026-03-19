@@ -135,11 +135,34 @@ function buildStatusMap(payload: MatchPayload | null): StatusMap {
   };
 }
 
+function getMatchSourceUrl(payload: MatchPayload | null, provider: StreamProviderId) {
+  if (provider === "livekora") return String(payload?.stream_url_4 || "").trim();
+  if (provider === "beinlive") return String(payload?.stream_url || "").trim();
+  return String(payload?.stream_url_2 || "").trim();
+}
+
+function getProviderSourceCandidate(
+  payload: MatchPayload | null,
+  statuses: StatusMap,
+  provider: StreamProviderId
+) {
+  const status = statuses[provider];
+  return String(
+    status?.sourceUrl || status?.currentSource || status?.playlistUrl || getMatchSourceUrl(payload, provider)
+  ).trim();
+}
+
+function providerHasMatch(payload: MatchPayload | null, statuses: StatusMap, provider: StreamProviderId) {
+  return !!getProviderSourceCandidate(payload, statuses, provider);
+}
+
 function pickInitialProvider(payload: MatchPayload | null) {
   const statuses = buildStatusMap(payload);
-  const readyProvider = PROVIDER_META.find((item) => statuses[item.provider]?.state === "ready");
+  const readyProvider = PROVIDER_META.find(
+    (item) => statuses[item.provider]?.state === "ready" && providerHasMatch(payload, statuses, item.provider)
+  );
   if (readyProvider) return readyProvider.provider;
-  const withSource = PROVIDER_META.find((item) => String(statuses[item.provider]?.sourceUrl || "").trim());
+  const withSource = PROVIDER_META.find((item) => providerHasMatch(payload, statuses, item.provider));
   if (withSource) return withSource.provider;
   return "livekora" satisfies StreamProviderId;
 }
@@ -212,6 +235,15 @@ export default function WatchPage() {
     [statusByProvider]
   );
 
+  const providerHasMatchById = useMemo(
+    () => ({
+      livekora: providerHasMatch(match, statusByProvider, "livekora"),
+      beinlive: providerHasMatch(match, statusByProvider, "beinlive"),
+      siiir: providerHasMatch(match, statusByProvider, "siiir"),
+    }),
+    [match, statusByProvider]
+  );
+
   const activeStatus = useMemo(() => {
     return sources.find((item) => item.provider === selectedProvider) || sources[0] || null;
   }, [selectedProvider, sources]);
@@ -244,10 +276,8 @@ export default function WatchPage() {
   }, [activeProvider, activeStatus, fallbackPlaylistUrl, retainedPlaylistUrls]);
 
   const directSourceUrl = useMemo(() => {
-    if (activeProvider === "livekora") return String(match?.stream_url_4 || "").trim() || null;
-    if (activeProvider === "beinlive") return String(match?.stream_url || "").trim() || null;
-    return String(match?.stream_url_2 || "").trim() || null;
-  }, [activeProvider, match?.stream_url, match?.stream_url_2, match?.stream_url_4]);
+    return getMatchSourceUrl(match, activeProvider) || null;
+  }, [activeProvider, match]);
   const providerSourceUrl = useMemo(() => {
     const current = String(activeStatus?.sourceUrl || "").trim();
     if (current) return current;
@@ -398,6 +428,14 @@ export default function WatchPage() {
     }
     resetPlaybackState({ clearError: false });
   }, [resetPlaybackState]);
+
+  useEffect(() => {
+    if (providerHasMatchById[selectedProvider]) return;
+    const fallbackProvider = PROVIDER_META.find((item) => providerHasMatchById[item.provider])?.provider;
+    if (!fallbackProvider || fallbackProvider === selectedProvider) return;
+    resetPlaybackState({ clearError: false });
+    setSelectedProvider(fallbackProvider);
+  }, [providerHasMatchById, resetPlaybackState, selectedProvider]);
 
   useEffect(() => {
     void loadMatch();
@@ -1017,12 +1055,14 @@ export default function WatchPage() {
               <div className="mt-4 grid grid-cols-2 gap-3">
                 {PROVIDER_META.map((item) => {
                   const status = statusByProvider[item.provider];
+                  const providerUnavailable = !providerHasMatchById[item.provider];
                   const isActive = activeProvider === item.provider;
                   return (
                     <button
                       key={item.provider}
                       type="button"
                       onClick={() => {
+                        if (providerUnavailable) return;
                         if (item.provider !== selectedProvider) {
                           resetPlaybackState();
                         } else {
@@ -1031,24 +1071,37 @@ export default function WatchPage() {
                         setSelectedProvider(item.provider);
                       }}
                       className={`rounded-2xl border px-4 py-3 text-right transition ${
-                        isActive
+                        providerUnavailable
+                          ? "cursor-not-allowed border-rose-500/60 bg-rose-500/10 text-rose-100 opacity-80"
+                          : isActive
                           ? "border-teal-400 bg-teal-500/15"
                           : "border-white/10 bg-slate-950/30 hover:bg-white/10"
                       }`}
+                      disabled={providerUnavailable}
                     >
                       <div className="text-xs text-slate-400">مصدر {item.order}</div>
                       <div className="mt-1 font-semibold text-white">{status?.label || item.label}</div>
-                      <div className="mt-2 text-xs text-slate-300">{stateLabel(status)}</div>
-                      {status ? (
+                      <div className={`mt-2 text-xs ${providerUnavailable ? "text-rose-200" : "text-slate-300"}`}>
+                        {providerUnavailable ? "المصدر لا يعرض المباراة" : stateLabel(status)}
+                      </div>
+                      {status || providerUnavailable ? (
                         <div className="mt-3">
                           <div className="flex items-center justify-between text-[11px] text-slate-400">
-                            <span>{status.state === "warming" ? phaseLabel(status) : stateLabel(status)}</span>
-                            <span>{progressPct(status)}%</span>
+                            <span>
+                              {providerUnavailable
+                                ? "المصدر لا يعرض المباراة"
+                                : status?.state === "warming"
+                                  ? phaseLabel(status)
+                                  : stateLabel(status)}
+                            </span>
+                            <span>{providerUnavailable ? "0%" : `${progressPct(status)}%`}</span>
                           </div>
                           <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-white/8">
                             <div
-                              className={`h-full rounded-full transition-[width] duration-500 ${progressTone(status)}`}
-                              style={{ width: `${progressPct(status)}%` }}
+                              className={`h-full rounded-full transition-[width] duration-500 ${
+                                providerUnavailable ? "bg-rose-500" : progressTone(status)
+                              }`}
+                              style={{ width: `${providerUnavailable ? 100 : progressPct(status)}%` }}
                             />
                           </div>
                         </div>
