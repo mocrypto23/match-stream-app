@@ -379,6 +379,14 @@ export default function WatchPage() {
     [clearWaitingOverlayTimer]
   );
 
+  const stopPlaybackSession = useCallback(() => {
+    const video = videoRef.current;
+    if (video) {
+      video.pause();
+    }
+    resetPlaybackState({ clearError: false });
+  }, [resetPlaybackState]);
+
   useEffect(() => {
     void loadMatch();
   }, [loadMatch]);
@@ -831,10 +839,10 @@ export default function WatchPage() {
                     return;
                   }
                   if (video.paused) {
-                    void video.play().catch(() => {});
+                    requestPlaybackStart();
                     return;
                   }
-                  video.pause();
+                  stopPlaybackSession();
                 }}
               />
 
@@ -899,7 +907,14 @@ export default function WatchPage() {
                 </div>
               ) : null}
 
-              <VideoPlayerControls videoRef={videoRef} hls={hlsRef.current} title={title} isLive />
+              <VideoPlayerControls
+                videoRef={videoRef}
+                hls={hlsRef.current}
+                title={title}
+                isLive
+                onPlayRequest={requestPlaybackStart}
+                onPauseRequest={stopPlaybackSession}
+              />
             </div>
           </div>
 

@@ -8,6 +8,8 @@ interface VideoPlayerControlsProps {
     hls?: Hls | null;
     title?: string;
     isLive?: boolean;
+    onPlayRequest?: () => void;
+    onPauseRequest?: () => void;
 }
 
 function inferHeightFromBitrate(bitrate: number) {
@@ -61,6 +63,8 @@ export default function VideoPlayerControls({
     hls,
     title,
     isLive = true,
+    onPlayRequest,
+    onPauseRequest,
 }: VideoPlayerControlsProps) {
     const [isPlaying, setIsPlaying] = useState(false);
     const [volume, setVolume] = useState(1);
@@ -147,12 +151,22 @@ export default function VideoPlayerControls({
         const video = videoRef.current;
         if (!video) return;
         if (video.paused) {
+            if (onPlayRequest) {
+                onPlayRequest();
+                resetControlsTimeout();
+                return;
+            }
             video.play().catch(() => { });
         } else {
+            if (onPauseRequest) {
+                onPauseRequest();
+                resetControlsTimeout();
+                return;
+            }
             video.pause();
         }
         resetControlsTimeout();
-    }, [videoRef, resetControlsTimeout]);
+    }, [onPauseRequest, onPlayRequest, videoRef, resetControlsTimeout]);
 
     const toggleMute = useCallback((e?: React.MouseEvent) => {
         e?.stopPropagation();
