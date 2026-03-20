@@ -245,6 +245,7 @@ export default function WatchPage() {
   const [playbackStarted, setPlaybackStarted] = useState(false);
   const [playerSessionNonce, setPlayerSessionNonce] = useState(0);
   const [p2pStats, setP2pStats] = useState<P2PStats>(EMPTY_P2P_STATS);
+  const p2pStatsStoreRef = useRef<Record<string, P2PStats>>({});
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   const waitingOverlayTimerRef = useRef<number | null>(null);
@@ -515,6 +516,7 @@ export default function WatchPage() {
     setStatusByProvider({ livekora: null, beinlive: null, siiir: null });
     setRetainedPlaylistUrls({ livekora: "", beinlive: "", siiir: "" });
     setPendingBootstraps(createPendingBootstrapMap());
+    p2pStatsStoreRef.current = {};
     setP2pStats(EMPTY_P2P_STATS);
     setSelectedProvider("livekora");
     activeRecoveryAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
@@ -850,6 +852,8 @@ export default function WatchPage() {
   useEffect(() => {
     const video = videoRef.current;
     const src = String(streamUrl || "").trim();
+    const p2pStoreKey = `${matchId}:${activeProvider}`;
+    const persistedP2PStats = p2pStatsStoreRef.current[p2pStoreKey];
 
     clearWaitingOverlayTimer();
     if (hlsRef.current) {
@@ -861,7 +865,11 @@ export default function WatchPage() {
     video.pause();
     video.removeAttribute("src");
     video.load();
-    setP2pStats(EMPTY_P2P_STATS);
+    if (persistedP2PStats?.enabled) {
+      setP2pStats(persistedP2PStats);
+    } else {
+      setP2pStats(EMPTY_P2P_STATS);
+    }
 
     if (!src || !playbackRequested) {
       setPlaybackStarting(false);
@@ -927,19 +935,22 @@ export default function WatchPage() {
 
     let disposed = false;
     let p2pFlushTimer: number | null = null;
+    let p2pHeartbeatTimer: number | null = null;
     let p2pEngine: HlsJsP2PEngineInstance | null = null;
     let hls: Hls | null = null;
     const p2pPeers = new Set<string>();
-    const p2pSnapshot: P2PStats = {
-      enabled: true,
-      supported: true,
-      peers: 0,
-      httpDownloadedBytes: 0,
-      p2pDownloadedBytes: 0,
-      uploadedBytes: 0,
-      ratioPct: 0,
-      status: "P2P: جاري البحث عن peers",
-    };
+    const p2pSnapshot: P2PStats = persistedP2PStats?.enabled
+      ? { ...persistedP2PStats }
+      : {
+          enabled: true,
+          supported: true,
+          peers: 0,
+          httpDownloadedBytes: 0,
+          p2pDownloadedBytes: 0,
+          uploadedBytes: 0,
+          ratioPct: 0,
+          status: "P2P: جاري البحث عن peers",
+        };
     const updateP2PStats = () => {
       if (disposed) return;
       const totalDownloaded = p2pSnapshot.httpDownloadedBytes + p2pSnapshot.p2pDownloadedBytes;
@@ -948,7 +959,9 @@ export default function WatchPage() {
       if (p2pSnapshot.peers > 0) {
         p2pSnapshot.status = "P2P: متصلة";
       }
-      setP2pStats({ ...p2pSnapshot });
+      const nextStats = { ...p2pSnapshot };
+      p2pStatsStoreRef.current[p2pStoreKey] = nextStats;
+      setP2pStats(nextStats);
     };
     const scheduleP2PStatsUpdate = () => {
       if (disposed || p2pFlushTimer !== null) return;
@@ -965,6 +978,9 @@ export default function WatchPage() {
       liveSyncDurationCount: 4,
       liveMaxLatencyDurationCount: 10,
     };
+    p2pHeartbeatTimer = window.setInterval(() => {
+      updateP2PStats();
+    }, 1_000);
     const attachHls = (nextHls: Hls) => {
       if (disposed) {
         nextHls.destroy();
@@ -1084,6 +1100,10 @@ export default function WatchPage() {
       if (p2pFlushTimer !== null) {
         window.clearTimeout(p2pFlushTimer);
         p2pFlushTimer = null;
+      }
+      if (p2pHeartbeatTimer !== null) {
+        window.clearInterval(p2pHeartbeatTimer);
+        p2pHeartbeatTimer = null;
       }
       clearWaitingOverlayTimer();
       video.removeEventListener("playing", onPlaying);
