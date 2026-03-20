@@ -65,7 +65,6 @@ const PLAYBACK_STALL_CHECK_MS = 2_000;
 const SOFT_PLAYBACK_STALL_RECOVERY_MS = 2_500;
 const HARD_PLAYBACK_STALL_RECOVERY_MS = 9_000;
 const WAITING_OVERLAY_DELAY_MS = 3_500;
-const INITIAL_PROVIDER_PREFERENCE_MS = 6_000;
 const P2P_STATS_UPDATE_MS = 300;
 const P2P_ANNOUNCE_TRACKERS = [
   "wss://tracker.novage.com.ua",
@@ -257,8 +256,6 @@ export default function WatchPage() {
     beinlive: 0,
     siiir: 0,
   });
-  const initialAutoSelectionStartedAtRef = useRef(0);
-  const userSelectedProviderRef = useRef(false);
   const backgroundBootstrapAtRef = useRef<Record<StreamProviderId, number>>({
     livekora: 0,
     beinlive: 0,
@@ -509,47 +506,11 @@ export default function WatchPage() {
   }, [providerHasMatchById, resetPlaybackState, selectedProvider]);
 
   useEffect(() => {
-    if (!match) return;
-    if (userSelectedProviderRef.current) return;
-    if (playbackStarted) return;
-
-    const selectedStatus = statusByProvider[selectedProvider];
-    const selectedReady = selectedStatus?.state === "ready" && !!String(selectedStatus?.playlistUrl || "").trim();
-    if (selectedReady) return;
-
-    const fallbackReadyProvider = PROVIDER_META.find((item) => {
-      if (!providerHasMatchById[item.provider]) return false;
-      const status = statusByProvider[item.provider];
-      return status?.state === "ready" && !!String(status?.playlistUrl || "").trim();
-    })?.provider;
-
-    if (!fallbackReadyProvider || fallbackReadyProvider === selectedProvider) return;
-
-    const selectedFailed =
-      !providerHasMatchById[selectedProvider] ||
-      selectedStatus?.state === "down" ||
-      selectedStatus?.phase === "failed";
-
-    const withinSourceOnePreferenceWindow =
-      selectedProvider === "livekora" &&
-      providerHasMatchById.livekora &&
-      !selectedFailed &&
-      Date.now() - initialAutoSelectionStartedAtRef.current < INITIAL_PROVIDER_PREFERENCE_MS;
-
-    if (withinSourceOnePreferenceWindow) return;
-
-    setPageError(null);
-    setSelectedProvider(fallbackReadyProvider);
-  }, [match, playbackStarted, providerHasMatchById, selectedProvider, statusByProvider]);
-
-  useEffect(() => {
     void loadMatch();
   }, [loadMatch]);
 
   useEffect(() => {
     resetPlaybackState({ clearError: false });
-    initialAutoSelectionStartedAtRef.current = Date.now();
-    userSelectedProviderRef.current = false;
     backgroundBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     lastAutoBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     setStatusByProvider({ livekora: null, beinlive: null, siiir: null });
@@ -1331,7 +1292,6 @@ export default function WatchPage() {
                       type="button"
                       onClick={() => {
                         if (providerUnavailable) return;
-                        userSelectedProviderRef.current = true;
                         if (item.provider !== selectedProvider) {
                           resetPlaybackState();
                         } else {
