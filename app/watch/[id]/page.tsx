@@ -1029,6 +1029,14 @@ export default function WatchPage() {
             trackerClientVersionPrefix: "TF",
           },
         });
+        const p2pCore = (
+          p2pEngine as unknown as {
+            core?: { setManifestResponseUrl?: (url: string) => void };
+          }
+        ).core;
+        if (src && typeof p2pCore?.setManifestResponseUrl === "function") {
+          p2pCore.setManifestResponseUrl(src);
+        }
 
         p2pEngine.addEventListener("onPeerConnect", (params) => {
           const { peerId } = (params || {}) as { peerId?: string };
