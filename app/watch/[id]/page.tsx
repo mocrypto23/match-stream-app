@@ -1,6 +1,6 @@
 "use client";
 
-import Hls from "hls.js";
+import Hls, { type HlsConfig } from "hls.js";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -30,6 +30,32 @@ type MatchPayload = {
 
 type StatusMap = Record<StreamProviderId, StreamSourceStatus | null>;
 type PendingBootstrapMap = Record<StreamProviderId, number>;
+type P2PEngineModule = {
+  HlsJsP2PEngine: new (config?: {
+    core?: {
+      swarmId?: string;
+      announceTrackers?: string[];
+      rtcConfig?: { iceServers?: Array<{ urls: string | string[] }> };
+      trackerClientVersionPrefix?: string;
+    };
+  }) => {
+    addEventListener: (eventName: string, listener: (...args: unknown[]) => void) => void;
+    getConfigForHlsJs: () => Pick<HlsConfig, "fLoader" | "pLoader">;
+    bindHls: (hls: Hls) => void;
+    destroy: () => void;
+  };
+};
+type HlsJsP2PEngineInstance = InstanceType<P2PEngineModule["HlsJsP2PEngine"]>;
+type P2PStats = {
+  enabled: boolean;
+  supported: boolean;
+  peers: number;
+  httpDownloadedBytes: number;
+  p2pDownloadedBytes: number;
+  uploadedBytes: number;
+  ratioPct: number;
+  status: string;
+};
 
 const STATUS_POLL_MS = 4_000;
 const ACTIVE_WARMING_POLL_MS = 1_250;
@@ -39,14 +65,47 @@ const PLAYBACK_STALL_CHECK_MS = 2_000;
 const SOFT_PLAYBACK_STALL_RECOVERY_MS = 2_500;
 const HARD_PLAYBACK_STALL_RECOVERY_MS = 9_000;
 const WAITING_OVERLAY_DELAY_MS = 3_500;
+const P2P_STATS_UPDATE_MS = 300;
+const P2P_ANNOUNCE_TRACKERS = [
+  "wss://tracker.novage.com.ua",
+  "wss://tracker.webtorrent.dev",
+  "wss://tracker.openwebtorrent.com",
+];
+const P2P_ICE_SERVERS = [{ urls: "stun:stun.cloudflare.com:3478" }, { urls: "stun:stun.l.google.com:19302" }];
 const PROVIDER_META: Array<{ provider: StreamProviderId; order: number; label: string }> = [
   { provider: "livekora", order: 1, label: "livekora vip" },
   { provider: "beinlive", order: 2, label: "bein-live" },
   { provider: "siiir", order: 3, label: "siiir.tv" },
 ];
+const EMPTY_P2P_STATS: P2PStats = {
+  enabled: false,
+  supported: false,
+  peers: 0,
+  httpDownloadedBytes: 0,
+  p2pDownloadedBytes: 0,
+  uploadedBytes: 0,
+  ratioPct: 0,
+  status: "P2P: غير مفعلة",
+};
+let p2pEngineModulePromise: Promise<P2PEngineModule> | null = null;
 
 function createPendingBootstrapMap(): PendingBootstrapMap {
   return { livekora: 0, beinlive: 0, siiir: 0 };
+}
+
+function loadP2PEngineModule() {
+  if (!p2pEngineModulePromise) {
+    p2pEngineModulePromise = import("p2p-media-loader-hlsjs") as Promise<P2PEngineModule>;
+  }
+  return p2pEngineModulePromise;
+}
+
+function formatP2PBytes(bytes: number) {
+  const safeBytes = Math.max(0, Number.isFinite(bytes) ? bytes : 0);
+  const kiloBytes = safeBytes / 1024;
+  if (kiloBytes < 1024) return `${Math.round(kiloBytes)}KB`;
+  const megaBytes = kiloBytes / 1024;
+  return `${megaBytes >= 10 ? megaBytes.toFixed(0) : megaBytes.toFixed(1)}MB`;
 }
 
 function formatKickoff(value: string | null | undefined) {
@@ -185,6 +244,7 @@ export default function WatchPage() {
   const [playbackStarting, setPlaybackStarting] = useState(false);
   const [playbackStarted, setPlaybackStarted] = useState(false);
   const [playerSessionNonce, setPlayerSessionNonce] = useState(0);
+  const [p2pStats, setP2pStats] = useState<P2PStats>(EMPTY_P2P_STATS);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   const waitingOverlayTimerRef = useRef<number | null>(null);
@@ -283,6 +343,12 @@ export default function WatchPage() {
     if (current) return current;
     return directSourceUrl;
   }, [activeStatus?.sourceUrl, directSourceUrl]);
+  const p2pStatusLine = useMemo(() => {
+    if (!p2pStats.enabled) return p2pStats.status;
+    const base = `P2P: ${p2pStats.ratioPct}% | Saved: ${formatP2PBytes(p2pStats.p2pDownloadedBytes)} | Uploaded: ${formatP2PBytes(p2pStats.uploadedBytes)} | Peers: ${p2pStats.peers}`;
+    if (p2pStats.peers > 0 || p2pStats.status === "P2P: متصلة") return base;
+    return `${base} | ${p2pStats.status.replace(/^P2P:\s*/, "")}`;
+  }, [p2pStats]);
 
   const applyProviderStatus = useCallback((provider: StreamProviderId, status: StreamSourceStatus | null | undefined) => {
     if (!status) return;
@@ -414,6 +480,7 @@ export default function WatchPage() {
       setPlaybackStarting(false);
       setPlaybackStarted(false);
       setPlayerSessionNonce(0);
+      setP2pStats(EMPTY_P2P_STATS);
       clearWaitingOverlayTimer();
       hasPlayedRef.current = false;
       selectedRecoveryPendingRef.current = false;
@@ -448,6 +515,7 @@ export default function WatchPage() {
     setStatusByProvider({ livekora: null, beinlive: null, siiir: null });
     setRetainedPlaylistUrls({ livekora: "", beinlive: "", siiir: "" });
     setPendingBootstraps(createPendingBootstrapMap());
+    setP2pStats(EMPTY_P2P_STATS);
     setSelectedProvider("livekora");
     activeRecoveryAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     softRecoveryAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
@@ -477,6 +545,12 @@ export default function WatchPage() {
       clearWaitingOverlayTimer();
     };
   }, [clearWaitingOverlayTimer]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!Hls.isSupported()) return;
+    void loadP2PEngineModule().catch(() => null);
+  }, []);
 
   useEffect(() => {
     if (!match) return;
@@ -787,6 +861,7 @@ export default function WatchPage() {
     video.pause();
     video.removeAttribute("src");
     video.load();
+    setP2pStats(EMPTY_P2P_STATS);
 
     if (!src || !playbackRequested) {
       setPlaybackStarting(false);
@@ -826,72 +901,200 @@ export default function WatchPage() {
       }, WAITING_OVERLAY_DELAY_MS);
     };
 
-    if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = src;
-      video.addEventListener("playing", onPlaying);
-      video.addEventListener("waiting", onWaiting);
-      video.addEventListener("loadeddata", onPlayable);
-      video.addEventListener("canplay", onPlayable);
-      startPlayback();
-      return () => {
-        video.removeEventListener("playing", onPlaying);
-        video.removeEventListener("waiting", onWaiting);
-        video.removeEventListener("loadeddata", onPlayable);
-        video.removeEventListener("canplay", onPlayable);
-      };
-    }
-
     if (!Hls.isSupported()) {
+      if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        setP2pStats({
+          ...EMPTY_P2P_STATS,
+          status: "P2P: غير مدعومة على هذا المتصفح",
+        });
+        video.src = src;
+        video.addEventListener("playing", onPlaying);
+        video.addEventListener("waiting", onWaiting);
+        video.addEventListener("loadeddata", onPlayable);
+        video.addEventListener("canplay", onPlayable);
+        startPlayback();
+        return () => {
+          video.removeEventListener("playing", onPlaying);
+          video.removeEventListener("waiting", onWaiting);
+          video.removeEventListener("loadeddata", onPlayable);
+          video.removeEventListener("canplay", onPlayable);
+        };
+      }
       setPlaybackStarting(false);
       setPageError("المتصفح لا يدعم HLS.");
       return;
     }
 
-    const hls = new Hls({
+    let disposed = false;
+    let p2pFlushTimer: number | null = null;
+    let p2pEngine: HlsJsP2PEngineInstance | null = null;
+    let hls: Hls | null = null;
+    const p2pPeers = new Set<string>();
+    const p2pSnapshot: P2PStats = {
+      enabled: true,
+      supported: true,
+      peers: 0,
+      httpDownloadedBytes: 0,
+      p2pDownloadedBytes: 0,
+      uploadedBytes: 0,
+      ratioPct: 0,
+      status: "P2P: جاري البحث عن peers",
+    };
+    const updateP2PStats = () => {
+      if (disposed) return;
+      const totalDownloaded = p2pSnapshot.httpDownloadedBytes + p2pSnapshot.p2pDownloadedBytes;
+      p2pSnapshot.ratioPct =
+        totalDownloaded > 0 ? Math.max(0, Math.min(100, Math.round((p2pSnapshot.p2pDownloadedBytes / totalDownloaded) * 100))) : 0;
+      if (p2pSnapshot.peers > 0) {
+        p2pSnapshot.status = "P2P: متصلة";
+      }
+      setP2pStats({ ...p2pSnapshot });
+    };
+    const scheduleP2PStatsUpdate = () => {
+      if (disposed || p2pFlushTimer !== null) return;
+      p2pFlushTimer = window.setTimeout(() => {
+        p2pFlushTimer = null;
+        updateP2PStats();
+      }, P2P_STATS_UPDATE_MS);
+    };
+    const hlsConfig: Partial<HlsConfig> = {
       enableWorker: true,
       lowLatencyMode: false,
       backBufferLength: 90,
       maxBufferLength: 30,
       liveSyncDurationCount: 4,
       liveMaxLatencyDurationCount: 10,
-    });
-    hlsRef.current = hls;
-
-    hls.on(Hls.Events.MANIFEST_PARSED, startPlayback);
-    hls.on(Hls.Events.ERROR, (_event, data) => {
-      if (!data?.fatal) return;
-      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-        hls.startLoad();
-        startPlayback();
+    };
+    const attachHls = (nextHls: Hls) => {
+      if (disposed) {
+        nextHls.destroy();
         return;
       }
-      if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-        hls.recoverMediaError();
-        startPlayback();
-        return;
+
+      hls = nextHls;
+      hlsRef.current = nextHls;
+
+      nextHls.on(Hls.Events.MANIFEST_PARSED, startPlayback);
+      nextHls.on(Hls.Events.ERROR, (_event, data) => {
+        if (!data?.fatal) return;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          nextHls.startLoad();
+          startPlayback();
+          return;
+        }
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          nextHls.recoverMediaError();
+          startPlayback();
+          return;
+        }
+        setPlaybackStarting(false);
+        setPageError(`hls-fatal:${String(data.type || "unknown")}`);
+      });
+
+      video.addEventListener("playing", onPlaying);
+      video.addEventListener("waiting", onWaiting);
+      video.addEventListener("loadeddata", onPlayable);
+      video.addEventListener("canplay", onPlayable);
+
+      nextHls.loadSource(src);
+      nextHls.attachMedia(video);
+    };
+
+    void (async () => {
+      try {
+        const { HlsJsP2PEngine } = await loadP2PEngineModule();
+        if (disposed) return;
+
+        p2pEngine = new HlsJsP2PEngine({
+          core: {
+            swarmId: `twofooty:${activeProvider}:m${matchId}`,
+            announceTrackers: P2P_ANNOUNCE_TRACKERS,
+            rtcConfig: { iceServers: P2P_ICE_SERVERS },
+            trackerClientVersionPrefix: "TF",
+          },
+        });
+
+        p2pEngine.addEventListener("onPeerConnect", (params) => {
+          const { peerId } = (params || {}) as { peerId?: string };
+          if (!peerId) return;
+          p2pPeers.add(peerId);
+          p2pSnapshot.peers = p2pPeers.size;
+          scheduleP2PStatsUpdate();
+        });
+        p2pEngine.addEventListener("onPeerClose", (params) => {
+          const { peerId } = (params || {}) as { peerId?: string };
+          if (!peerId) return;
+          p2pPeers.delete(peerId);
+          p2pSnapshot.peers = p2pPeers.size;
+          scheduleP2PStatsUpdate();
+        });
+        p2pEngine.addEventListener("onChunkDownloaded", (...args) => {
+          const bytesLength = Number(args[0] || 0);
+          const downloadSource = String(args[1] || "");
+          if (!Number.isFinite(bytesLength) || bytesLength <= 0) return;
+          if (downloadSource === "p2p") {
+            p2pSnapshot.p2pDownloadedBytes += bytesLength;
+          } else {
+            p2pSnapshot.httpDownloadedBytes += bytesLength;
+          }
+          scheduleP2PStatsUpdate();
+        });
+        p2pEngine.addEventListener("onChunkUploaded", (...args) => {
+          const bytesLength = Number(args[0] || 0);
+          if (!Number.isFinite(bytesLength) || bytesLength <= 0) return;
+          p2pSnapshot.uploadedBytes += bytesLength;
+          scheduleP2PStatsUpdate();
+        });
+        p2pEngine.addEventListener("onTrackerWarning", (params) => {
+          const { warning } = (params || {}) as { warning?: unknown };
+          p2pSnapshot.status = "P2P: tracker warning";
+          scheduleP2PStatsUpdate();
+          console.warn("P2P tracker warning", warning);
+        });
+        p2pEngine.addEventListener("onTrackerError", (params) => {
+          const { error } = (params || {}) as { error?: unknown };
+          p2pSnapshot.status = "P2P: tracker error";
+          scheduleP2PStatsUpdate();
+          console.error("P2P tracker error", error);
+        });
+
+        const p2pHlsConfig = p2pEngine.getConfigForHlsJs() as Pick<HlsConfig, "fLoader" | "pLoader">;
+        const nextHls = new Hls({
+          ...hlsConfig,
+          ...p2pHlsConfig,
+        });
+        p2pEngine.bindHls(nextHls);
+        updateP2PStats();
+        attachHls(nextHls);
+      } catch (error) {
+        p2pEngine?.destroy();
+        p2pEngine = null;
+        if (disposed) return;
+        setP2pStats({
+          ...EMPTY_P2P_STATS,
+          status: "P2P: فشل التهيئة",
+        });
+        console.error("P2P init failed", error);
+        attachHls(new Hls(hlsConfig));
       }
-      setPlaybackStarting(false);
-      setPageError(`hls-fatal:${String(data.type || "unknown")}`);
-    });
-
-    video.addEventListener("playing", onPlaying);
-    video.addEventListener("waiting", onWaiting);
-    video.addEventListener("loadeddata", onPlayable);
-    video.addEventListener("canplay", onPlayable);
-
-    hls.loadSource(src);
-    hls.attachMedia(video);
+    })();
 
     return () => {
+      disposed = true;
+      if (p2pFlushTimer !== null) {
+        window.clearTimeout(p2pFlushTimer);
+        p2pFlushTimer = null;
+      }
       clearWaitingOverlayTimer();
       video.removeEventListener("playing", onPlaying);
       video.removeEventListener("waiting", onWaiting);
       video.removeEventListener("loadeddata", onPlayable);
       video.removeEventListener("canplay", onPlayable);
-      hls.destroy();
+      p2pEngine?.destroy();
+      hls?.destroy();
       if (hlsRef.current === hls) hlsRef.current = null;
     };
-  }, [clearWaitingOverlayTimer, playbackRequested, playerSessionNonce, streamUrl]);
+  }, [activeProvider, clearWaitingOverlayTimer, matchId, playbackRequested, playerSessionNonce, streamUrl]);
 
   if (loading) {
     return (
@@ -1148,6 +1351,10 @@ export default function WatchPage() {
                   <div className="break-all font-mono text-xs">{activeStatus?.currentSource || directSourceUrl || "غير متاح"}</div>
                 </div>
               </div>
+                <div>
+                  <div className="text-slate-400">P2P</div>
+                  <div className="break-all font-mono text-xs text-emerald-200">{p2pStatusLine}</div>
+                </div>
               <div className="mt-5 flex gap-3">
                 <button
                   type="button"
