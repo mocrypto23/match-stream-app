@@ -23,6 +23,8 @@ type ManifestOptions = {
   allowRotate?: boolean;
 };
 
+export type ProviderTimingSummary = string;
+
 export type ProviderManifestResult =
   | {
       ok: true;
@@ -41,6 +43,7 @@ export type ProviderManifestResult =
       candidatesFound: number;
       candidatesTried: number;
       sessionOwned: true;
+      timingSummary?: ProviderTimingSummary;
     }
   | {
       ok: false;
@@ -54,6 +57,7 @@ export type ProviderManifestResult =
       adapterKind: "livekora" | "bein" | "playerv2";
       candidatesFound: number;
       candidatesTried: number;
+      timingSummary?: ProviderTimingSummary;
     };
 
 export type ProviderAssetResult =
@@ -94,6 +98,23 @@ export type LiveStreamProvider = {
     }
   ) => Promise<ProviderAssetResult>;
 };
+
+export function createTimingSummary(
+  path: string,
+  stages: Record<string, number | null | undefined>,
+  extras?: Record<string, string | number | boolean | null | undefined>
+) {
+  const parts = [`path=${String(path || "").trim() || "unknown"}`];
+  for (const [key, value] of Object.entries(stages || {})) {
+    if (!Number.isFinite(Number(value))) continue;
+    parts.push(`${key}=${Math.max(0, Math.round(Number(value)))}`);
+  }
+  for (const [key, value] of Object.entries(extras || {})) {
+    if (value === null || value === undefined || value === "") continue;
+    parts.push(`${key}=${String(value)}`);
+  }
+  return parts.join(" ");
+}
 
 type DirectExtractorOutput = {
   ok?: boolean;
@@ -926,11 +947,20 @@ export const livekoraProvider: LiveStreamProvider = {
   sourceSelector: pickLivekoraSourceUrl,
   isAllowedSource: isAllowedLivekoraSource,
   async extractCurrentManifest(input, options) {
+    const startedAt = Date.now();
     const directResolved = await extractLivekoraDirectManifest(input, options);
+    const directMs = Date.now() - startedAt;
     if (directResolved.ok) {
-      return directResolved;
+      return {
+        ...directResolved,
+        timingSummary: createTimingSummary("direct", {
+          total: directMs,
+          direct: directMs,
+        }),
+      };
     }
 
+    const runtimeStartedAt = Date.now();
     const resolved = await albaRuntimeAdapter.currentManifest(
       {
         sourceUrl: input.sourceUrl,
@@ -939,9 +969,17 @@ export const livekoraProvider: LiveStreamProvider = {
       },
       options
     );
+    const runtimeMs = Date.now() - runtimeStartedAt;
     const runtimeResolved = mapLivekoraManifestResult(resolved, input.sourceUrl);
     if (runtimeResolved.ok) {
-      return runtimeResolved;
+      return {
+        ...runtimeResolved,
+        timingSummary: createTimingSummary("runtime", {
+          total: directMs + runtimeMs,
+          direct: directMs,
+          runtime: runtimeMs,
+        }),
+      };
     }
 
     return {
@@ -953,6 +991,14 @@ export const livekoraProvider: LiveStreamProvider = {
       refreshed: runtimeResolved.refreshed || directResolved.refreshed,
       candidatesFound: Math.max(runtimeResolved.candidatesFound, directResolved.candidatesFound),
       candidatesTried: runtimeResolved.candidatesTried + directResolved.candidatesTried,
+      timingSummary: createTimingSummary("direct+runtime_failed", {
+        total: directMs + runtimeMs,
+        direct: directMs,
+        runtime: runtimeMs,
+      }, {
+        directError: directResolved.error || "",
+        runtimeError: runtimeResolved.error || "",
+      }),
     };
   },
   async fetchAsset(input) {

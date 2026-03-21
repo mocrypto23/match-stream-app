@@ -55,7 +55,13 @@ export async function GET(req: Request) {
         currentSource: resolved.currentSource || null,
         playbackUrl: resolved.playbackUrl || null,
       },
-      { status: 502 }
+      {
+        status: 502,
+        headers: {
+          "x-r2-discovery-timing": resolved.timingSummary || "",
+          "x-livekora-discovery-timing": resolved.timingSummary || "",
+        },
+      }
     );
   }
 
@@ -74,6 +80,8 @@ export async function GET(req: Request) {
       "x-r2-playback-url": resolved.playbackUrl || "",
       "x-r2-media-sequence": String(resolved.mediaSequence ?? ""),
       "x-r2-target-duration": String(resolved.targetDurationSec || 0),
+      "x-r2-discovery-timing": resolved.timingSummary || "",
+      "x-livekora-discovery-timing": resolved.timingSummary || "",
     },
   });
 }

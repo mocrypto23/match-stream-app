@@ -7,6 +7,7 @@ import type {
   ProviderContext,
   ProviderManifestResult,
 } from "@/lib/live-providers";
+import { createTimingSummary } from "@/lib/live-providers";
 import { playerv2RuntimeAdapter } from "@/lib/repack-runtime-adapters/playerv2";
 
 const SIIIR_DAY_PAGE_URL = "https://w6.siiir.tv/today-matches/";
@@ -346,7 +347,13 @@ export const siiirProvider: LiveStreamProvider = {
   sourceSelector: pickSiiirSourceUrl,
   isAllowedSource: isAllowedSiiirSource,
   async extractCurrentManifest(input: ProviderContext, options) {
+    const startedAt = Date.now();
+    let runtimeResolveMs = 0;
+    let manifestAttemptMs = 0;
+    let refreshResolveMs = 0;
+    let refreshManifestMs = 0;
     const initialRuntimeSource = await resolveSiiirRuntimeSource(input.sourceUrl, { forceRefresh: !!options?.forceRefresh });
+    runtimeResolveMs = Date.now() - startedAt;
     if (!initialRuntimeSource?.runtimeSourceUrl) {
       return {
         ok: false,
@@ -360,10 +367,15 @@ export const siiirProvider: LiveStreamProvider = {
         adapterKind: "playerv2",
         candidatesFound: 0,
         candidatesTried: 0,
+        timingSummary: createTimingSummary("runtime_source_missing", {
+          total: runtimeResolveMs,
+          resolveRuntimeSource: runtimeResolveMs,
+        }),
       };
     }
 
     let runtimeSource = initialRuntimeSource;
+    let manifestStartedAt = Date.now();
     let resolved = await playerv2RuntimeAdapter.currentManifest(
       {
         sourceUrl: runtimeSource.runtimeSourceUrl,
@@ -372,11 +384,15 @@ export const siiirProvider: LiveStreamProvider = {
       },
       options
     );
+    manifestAttemptMs = Date.now() - manifestStartedAt;
 
     if (!resolved.ok) {
+      const refreshResolveStartedAt = Date.now();
       const refreshedRuntimeSource = await resolveSiiirRuntimeSource(input.sourceUrl, { forceRefresh: true });
+      refreshResolveMs = Date.now() - refreshResolveStartedAt;
       if (refreshedRuntimeSource?.runtimeSourceUrl) {
         runtimeSource = refreshedRuntimeSource;
+        const refreshManifestStartedAt = Date.now();
         resolved = await playerv2RuntimeAdapter.currentManifest(
           {
             sourceUrl: runtimeSource.runtimeSourceUrl,
@@ -388,10 +404,23 @@ export const siiirProvider: LiveStreamProvider = {
             forceRefresh: true,
           }
         );
+        refreshManifestMs = Date.now() - refreshManifestStartedAt;
       }
     }
 
-    return mapManifestResult(resolved, runtimeSource.playbackUrl);
+    const mapped = mapManifestResult(resolved, runtimeSource.playbackUrl);
+    const totalMs = Date.now() - startedAt;
+    const timingSummary = createTimingSummary(mapped.ok ? "resolved" : "resolved_failed", {
+      total: totalMs,
+      resolveRuntimeSource: runtimeResolveMs,
+      manifest: manifestAttemptMs,
+      refreshResolveRuntimeSource: refreshResolveMs,
+      refreshManifest: refreshManifestMs,
+    });
+    return {
+      ...mapped,
+      timingSummary,
+    };
   },
   async fetchAsset(input) {
     const initialRuntimeSource = await resolveSiiirRuntimeSource(input.sourceUrl);

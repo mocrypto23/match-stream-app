@@ -385,6 +385,7 @@ class LivekoraJob {
     this.lastObservedTargetDurationSec = 0;
     this.lastRuntimeMediaSequence = null;
     this.lastCurrentSource = "";
+    this.lastDiscoveryTiming = "";
     this.lastPlaylistFingerprint = "";
     this.consecutiveFailures = 0;
     this.phase = "queued";
@@ -680,6 +681,9 @@ class LivekoraJob {
             String(response.headers.get("x-r2-target-duration") || response.headers.get("x-livekora-target-duration") || "").trim()
           ),
           currentSource: normalizeHeaderValue(response.headers.get("x-r2-current-source") || response.headers.get("x-livekora-current-source")),
+          discoveryTiming: normalizeHeaderValue(
+            response.headers.get("x-r2-discovery-timing") || response.headers.get("x-livekora-discovery-timing")
+          ),
         };
       } catch (error) {
         return {
@@ -718,6 +722,15 @@ class LivekoraJob {
       }
       if (fetched.currentSource) {
         this.lastCurrentSource = fetched.currentSource;
+      }
+      if (fetched.discoveryTiming && fetched.discoveryTiming !== this.lastDiscoveryTiming) {
+        this.lastDiscoveryTiming = fetched.discoveryTiming;
+        this.manager.log("info", "session-manifest discovery timing", {
+          matchId: this.matchId,
+          provider: this.providerId,
+          timing: fetched.discoveryTiming,
+          currentSource: this.lastCurrentSource || null,
+        });
       }
       if (hasMediaSegments(fetched.body, fetched.finalUrl)) return fetched;
 

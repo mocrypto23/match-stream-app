@@ -10,6 +10,7 @@ import type {
   ProviderContext,
   ProviderManifestResult,
 } from "@/lib/live-providers";
+import { createTimingSummary } from "@/lib/live-providers";
 
 const BEINLIVE_DAY_PAGE_URL = "https://www.bein-live.com/matches-today_3/";
 const BEINLIVE_HOST_SUFFIXES = ["bein-live.com"] as const;
@@ -771,6 +772,7 @@ function buildManifestResult(input: {
   refreshed: boolean;
   rotated: boolean;
   candidatesTried: number;
+  timingSummary?: string;
 }): ProviderManifestResult {
   const candidate = input.state.candidates[input.activeIndex];
   return {
@@ -790,6 +792,7 @@ function buildManifestResult(input: {
     candidatesFound: input.state.candidates.length,
     candidatesTried: input.candidatesTried,
     sessionOwned: true,
+    timingSummary: input.timingSummary,
   };
 }
 
@@ -914,6 +917,7 @@ export const beinliveProvider: LiveStreamProvider = {
   sourceSelector: pickBeinliveSourceUrl,
   isAllowedSource: isAllowedBeinliveSource,
   async extractCurrentManifest(input: ProviderContext, options) {
+    const startedAt = Date.now();
     const waitForMediaSequence =
       Number.isFinite(Number(options?.waitForMediaSequence)) ? Number(options?.waitForMediaSequence) : null;
     const waitDeadlineAt =
@@ -931,14 +935,18 @@ export const beinliveProvider: LiveStreamProvider = {
     let refreshed = !!options?.forceRefresh;
     let parentRefreshFailed = false;
     let shouldRediscover = !!options?.forceRefresh || !state;
+    let discoveryMs = 0;
+    let candidateResolveMs = 0;
 
     while (attempts < 4) {
       attempts += 1;
       if (!state || !state.candidates.length) {
+        const discoveryStartedAt = Date.now();
         state = await discoverBeinliveSourceState({
           sourceUrl: input.sourceUrl,
           currentSource: preservedState?.candidates[preservedState.activeIndex]?.manifestUrl || "",
         }).catch(() => null);
+        discoveryMs += Date.now() - discoveryStartedAt;
         if (!state) {
           parentRefreshFailed = true;
           lastError = "beinlive-iframe-manifest-missing";
@@ -956,7 +964,9 @@ export const beinliveProvider: LiveStreamProvider = {
       let shouldRetry = false;
       for (const candidateIndex of order) {
         candidatesTried += 1;
+        const candidateResolveStartedAt = Date.now();
         const resolved = await resolveManifestFromCandidate(state, candidateIndex).catch(() => null);
+        candidateResolveMs += Date.now() - candidateResolveStartedAt;
         if (!resolved) {
           state = recordCandidateFailure(state, candidateIndex, "beinlive-candidate-failed");
           lastError = "beinlive-candidate-failed";
@@ -997,6 +1007,13 @@ export const beinliveProvider: LiveStreamProvider = {
           refreshed,
           rotated,
           candidatesTried,
+          timingSummary: createTimingSummary("resolved", {
+            total: Date.now() - startedAt,
+            discover: discoveryMs,
+            candidateResolve: candidateResolveMs,
+          }, {
+            attempts,
+          }),
         });
       }
 
@@ -1007,10 +1024,12 @@ export const beinliveProvider: LiveStreamProvider = {
         shouldRediscover = true;
       }
 
+      const rediscoveryStartedAt = Date.now();
       state = await discoverBeinliveSourceState({
         sourceUrl: input.sourceUrl,
         currentSource: state?.candidates[state.activeIndex]?.manifestUrl || "",
       }).catch(() => null);
+      discoveryMs += Date.now() - rediscoveryStartedAt;
       refreshed = true;
       if (!state) {
         parentRefreshFailed = true;
@@ -1036,6 +1055,14 @@ export const beinliveProvider: LiveStreamProvider = {
       adapterKind: "bein",
       candidatesFound: fallbackState?.candidates.length || 0,
       candidatesTried,
+      timingSummary: createTimingSummary("resolved_failed", {
+        total: Date.now() - startedAt,
+        discover: discoveryMs,
+        candidateResolve: candidateResolveMs,
+      }, {
+        attempts,
+        parentRefreshFailed,
+      }),
     };
   },
   async fetchAsset(input) {
