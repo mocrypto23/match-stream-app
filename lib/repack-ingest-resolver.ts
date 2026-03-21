@@ -1099,17 +1099,16 @@ export async function buildPlayerv2Candidates(sourceUrl: string, html: string, t
   const deferredRandomCandidates = [...config.randomCandidates];
   const deferredFallbackCandidates = buildPlayerv2ChannelFallbackCandidates(sourceUrl);
 
-  const maxPaths = Math.min(2, config.paths.length);
+  const maxPaths = Math.min(4, config.paths.length);
   for (const rawPath of config.paths.slice(0, maxPaths)) {
     const pathValue = normalizePlayerv2Path(rawPath);
     if (!pathValue) continue;
-    const tokenTimeoutMs = Math.max(1200, Math.min(2200, timeoutMs));
 
     const tokenViaProxy = requestOrigin
       ? await requestPlayerv2TokenViaProxy({
           playerv2Url: sourceUrl,
           pathValue,
-          timeoutMs: tokenTimeoutMs,
+          timeoutMs: Math.max(1200, timeoutMs),
           requestOrigin,
         })
       : null;
@@ -1118,7 +1117,7 @@ export async function buildPlayerv2Candidates(sourceUrl: string, html: string, t
       (await requestPlayerv2Token({
         tokenEndpoint: buildPlayervGenerateTokenUrl(sourceUrl),
         pathValue,
-        timeoutMs: tokenTimeoutMs,
+        timeoutMs: Math.max(1200, timeoutMs),
         sourceUrl,
       }));
     if (!token) continue;
