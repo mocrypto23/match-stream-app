@@ -4,12 +4,12 @@ const { chromium } = require("playwright");
 const sourceUrl = String(process.argv[2] || "").trim();
 const playbackUrlArg = String(process.argv[3] || "").trim();
 const PAGE_GOTO_TIMEOUT_MS = 12000;
-const PAGE_SETTLE_TIMEOUT_MS = 3500;
-const PAGE_NETWORK_IDLE_TIMEOUT_MS = 3000;
+const PAGE_SETTLE_TIMEOUT_MS = 1500;
+const PAGE_NETWORK_IDLE_TIMEOUT_MS = 1500;
 const OVERALL_TIMEOUT_MS = 24000;
 const MAX_PAGE_VISITS = 8;
-const PLAYER_OPTION_WAIT_MS = 1400;
-const SUCCESS_COLLECTION_WINDOW_MS = 6000;
+const PLAYER_OPTION_WAIT_MS = 700;
+const SUCCESS_COLLECTION_WINDOW_MS = 1800;
 const LIVEKORA_HOST_SUFFIXES = [
   "sportsurges.cc",
   "sportsurges.online",

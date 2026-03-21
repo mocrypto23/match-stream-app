@@ -19,6 +19,8 @@ import {
 
 const DEFAULT_PLAYERV2_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+const PLAYERV2_DIRECT_HINT_FETCH_TIMEOUT_MS = 2_500;
+const PLAYERV2_HINT_BUILD_TIMEOUT_MS = 2_200;
 
 function looksLikePlayerv2Source(rawUrl: string) {
   try {
@@ -47,12 +49,13 @@ async function derivePlayerv2HintCandidates(input: RuntimeAdapterInput) {
   const referrerUrl = input.sourceUrl;
   let body = "";
   let contextUrl = input.sourceUrl;
+  const isDirectPlayerv2Page = looksLikePlayerv2PageUrl(input.sourceUrl);
 
-  if (looksLikePlayerv2PageUrl(input.sourceUrl)) {
+  if (isDirectPlayerv2Page) {
     const direct = await axios
       .get<string>(input.sourceUrl, {
         responseType: "text",
-        timeout: 9_000,
+        timeout: PLAYERV2_DIRECT_HINT_FETCH_TIMEOUT_MS,
         maxRedirects: 5,
         validateStatus: () => true,
         headers: {
@@ -71,7 +74,7 @@ async function derivePlayerv2HintCandidates(input: RuntimeAdapterInput) {
     }
   }
 
-  if (!body) {
+  if (!body && !isDirectPlayerv2Page) {
     const fetched = await fetchLiveEmbedText({
       sourceUrl: input.sourceUrl,
       requestOrigin: input.internalOrigin,
@@ -79,7 +82,7 @@ async function derivePlayerv2HintCandidates(input: RuntimeAdapterInput) {
       targetUrl: input.sourceUrl,
       fetchUrl: input.sourceUrl,
       referrerUrl,
-      timeoutMs: 9_000,
+      timeoutMs: PLAYERV2_DIRECT_HINT_FETCH_TIMEOUT_MS,
     }).catch(() => null);
     body = String(fetched?.body || "").trim();
     const finalUrl = String(fetched?.finalUrl || input.sourceUrl).trim() || input.sourceUrl;
@@ -88,7 +91,12 @@ async function derivePlayerv2HintCandidates(input: RuntimeAdapterInput) {
 
   if (!body || !looksLikePlayerv2Html(body)) return [] as RuntimeHintCandidate[];
 
-  const candidates = await buildPlayerv2Candidates(contextUrl, body, 5_500, input.internalOrigin).catch(() => []);
+  const candidates = await buildPlayerv2Candidates(
+    contextUrl,
+    body,
+    PLAYERV2_HINT_BUILD_TIMEOUT_MS,
+    input.internalOrigin
+  ).catch(() => []);
   return uniqHints(
     candidates
       .filter((candidate) => candidate && !candidate.includes("/api/embed-proxy"))
