@@ -30,6 +30,8 @@ type MatchPayload = {
 
 type StatusMap = Record<StreamProviderId, StreamSourceStatus | null>;
 type PendingBootstrapMap = Record<StreamProviderId, number>;
+type DisplayProgressMap = Record<StreamProviderId, number>;
+type DisplayProgressMetaMap = Record<StreamProviderId, { animating: boolean; startedAt: number }>;
 type P2PEngineModule = {
   HlsJsP2PEngine: new (config?: {
     core?: {
@@ -65,6 +67,8 @@ const PLAYBACK_STALL_CHECK_MS = 2_000;
 const SOFT_PLAYBACK_STALL_RECOVERY_MS = 2_500;
 const HARD_PLAYBACK_STALL_RECOVERY_MS = 9_000;
 const WAITING_OVERLAY_DELAY_MS = 3_500;
+const PREPARATION_PROGRESS_TICK_MS = 250;
+const PREPARATION_PROGRESS_CAP_PCT = 95;
 const P2P_STATS_UPDATE_MS = 300;
 const P2P_ANNOUNCE_TRACKERS = [
   "wss://tracker.novage.com.ua",
@@ -77,6 +81,11 @@ const PROVIDER_META: Array<{ provider: StreamProviderId; order: number; label: s
   { provider: "beinlive", order: 2, label: "bein-live" },
   { provider: "siiir", order: 3, label: "siiir.tv" },
 ];
+const PROVIDER_WARMUP_ESTIMATE_MS: Record<StreamProviderId, number> = {
+  livekora: 12_000,
+  beinlive: 2_500,
+  siiir: 10_000,
+};
 const EMPTY_P2P_STATS: P2PStats = {
   enabled: false,
   supported: false,
@@ -91,6 +100,18 @@ let p2pEngineModulePromise: Promise<P2PEngineModule> | null = null;
 
 function createPendingBootstrapMap(): PendingBootstrapMap {
   return { livekora: 0, beinlive: 0, siiir: 0 };
+}
+
+function createDisplayProgressMap(): DisplayProgressMap {
+  return { livekora: 0, beinlive: 0, siiir: 0 };
+}
+
+function createDisplayProgressMetaMap(): DisplayProgressMetaMap {
+  return {
+    livekora: { animating: false, startedAt: 0 },
+    beinlive: { animating: false, startedAt: 0 },
+    siiir: { animating: false, startedAt: 0 },
+  };
 }
 
 function loadP2PEngineModule() {
@@ -194,6 +215,36 @@ function buildStatusMap(payload: MatchPayload | null): StatusMap {
   };
 }
 
+function phaseProgressFloor(phase: StreamSourcePhase | null | undefined) {
+  switch (phase) {
+    case "queued":
+      return 6;
+    case "resolving_source":
+      return 18;
+    case "fetching_manifest":
+      return 32;
+    case "resolving_variant":
+      return 52;
+    case "mirroring_assets":
+      return 74;
+    case "publishing_playlist":
+      return 88;
+    case "ready":
+      return 100;
+    default:
+      return 0;
+  }
+}
+
+function shouldAnimatePreparation(status: StreamSourceStatus | null, hasSource: boolean) {
+  if (!hasSource) return false;
+  if (status?.state === "ready") return false;
+  if (status?.phase && status.phase !== "ready" && status.phase !== "failed") return true;
+  if (status?.state === "warming") return true;
+  if (status?.reason === "not-bootstrapped") return true;
+  return false;
+}
+
 function getMatchSourceUrl(payload: MatchPayload | null, provider: StreamProviderId) {
   if (provider === "livekora") return String(payload?.stream_url_4 || "").trim();
   if (provider === "beinlive") return String(payload?.stream_url || "").trim();
@@ -234,6 +285,7 @@ export default function WatchPage() {
   const [selectedProvider, setSelectedProvider] = useState<StreamProviderId>("livekora");
   const [pageError, setPageError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [displayProgressByProvider, setDisplayProgressByProvider] = useState<DisplayProgressMap>(createDisplayProgressMap);
   const [retainedPlaylistUrls, setRetainedPlaylistUrls] = useState<Record<StreamProviderId, string>>({
     livekora: "",
     beinlive: "",
@@ -249,6 +301,7 @@ export default function WatchPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   const waitingOverlayTimerRef = useRef<number | null>(null);
+  const displayProgressMetaRef = useRef<DisplayProgressMetaMap>(createDisplayProgressMetaMap());
   const hasPlayedRef = useRef(false);
   const selectedRecoveryPendingRef = useRef(false);
   const lastAutoBootstrapAtRef = useRef<Record<StreamProviderId, number>>({
@@ -344,6 +397,13 @@ export default function WatchPage() {
     if (current) return current;
     return directSourceUrl;
   }, [activeStatus?.sourceUrl, directSourceUrl]);
+  const activeDisplayProgressPct = useMemo(() => {
+    if (activeStatus?.state === "ready") return 100;
+    return Math.max(0, Math.min(100, Math.round(displayProgressByProvider[activeProvider] ?? activeProgressPct)));
+  }, [activeProgressPct, activeProvider, activeStatus?.state, displayProgressByProvider]);
+  const activePreparationActive = useMemo(() => {
+    return shouldAnimatePreparation(activeStatus, !!providerSourceUrl) || (pendingBootstraps[activeProvider] || 0) > 0;
+  }, [activeProvider, activeStatus, pendingBootstraps, providerSourceUrl]);
   const p2pStatusLine = useMemo(() => {
     if (!p2pStats.enabled) return p2pStats.status;
     const base = `P2P: ${p2pStats.ratioPct}% | Saved: ${formatP2PBytes(p2pStats.p2pDownloadedBytes)} | Uploaded: ${formatP2PBytes(p2pStats.uploadedBytes)} | Peers: ${p2pStats.peers}`;
@@ -514,6 +574,8 @@ export default function WatchPage() {
     backgroundBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     lastAutoBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     setStatusByProvider({ livekora: null, beinlive: null, siiir: null });
+    setDisplayProgressByProvider(createDisplayProgressMap());
+    displayProgressMetaRef.current = createDisplayProgressMetaMap();
     setRetainedPlaylistUrls({ livekora: "", beinlive: "", siiir: "" });
     setPendingBootstraps(createPendingBootstrapMap());
     p2pStatsStoreRef.current = {};
@@ -541,6 +603,89 @@ export default function WatchPage() {
       return changed ? next : current;
     });
   }, [statusByProvider]);
+
+  useEffect(() => {
+    const tick = () => {
+      setDisplayProgressByProvider((current) => {
+        const now = Date.now();
+        const next = { ...current };
+        let changed = false;
+
+        for (const item of PROVIDER_META) {
+          const provider = item.provider;
+          const status = statusByProvider[provider];
+          const hasSource = providerHasMatchById[provider];
+          const rawPct = progressPct(status);
+          const meta = displayProgressMetaRef.current[provider];
+          const animating = shouldAnimatePreparation(status, hasSource);
+
+          if (!hasSource) {
+            meta.animating = false;
+            meta.startedAt = 0;
+            if (next[provider] !== 0) {
+              next[provider] = 0;
+              changed = true;
+            }
+            continue;
+          }
+
+          if (status?.state === "ready") {
+            meta.animating = false;
+            meta.startedAt = 0;
+            if (next[provider] !== 100) {
+              next[provider] = 100;
+              changed = true;
+            }
+            continue;
+          }
+
+          if (animating) {
+            const startFloor = Math.max(
+              phaseProgressFloor(status?.phase),
+              rawPct > 0 && rawPct < 100 ? Math.min(rawPct, PREPARATION_PROGRESS_CAP_PCT) : 0
+            );
+            if (!meta.animating) {
+              meta.animating = true;
+              meta.startedAt = now;
+              if (next[provider] !== startFloor) {
+                next[provider] = startFloor;
+                changed = true;
+              }
+            }
+
+            const elapsedMs = Math.max(0, now - meta.startedAt);
+            const estimatedMs = Math.max(1_500, PROVIDER_WARMUP_ESTIMATE_MS[provider] || 6_000);
+            const elapsedPct = Math.min(
+              PREPARATION_PROGRESS_CAP_PCT,
+              Math.round((elapsedMs / estimatedMs) * PREPARATION_PROGRESS_CAP_PCT)
+            );
+            const phaseFloor = phaseProgressFloor(status?.phase);
+            const targetPct = Math.max(startFloor, phaseFloor, elapsedPct);
+            const nextValue = Math.max(next[provider], Math.min(PREPARATION_PROGRESS_CAP_PCT, targetPct));
+            if (nextValue !== next[provider]) {
+              next[provider] = nextValue;
+              changed = true;
+            }
+            continue;
+          }
+
+          meta.animating = false;
+          meta.startedAt = 0;
+          const settledPct = rawPct > 0 ? rawPct : 0;
+          if (next[provider] !== settledPct) {
+            next[provider] = settledPct;
+            changed = true;
+          }
+        }
+
+        return changed ? next : current;
+      });
+    };
+
+    tick();
+    const id = window.setInterval(tick, PREPARATION_PROGRESS_TICK_MS);
+    return () => window.clearInterval(id);
+  }, [providerHasMatchById, statusByProvider]);
 
   useEffect(() => {
     return () => {
@@ -1146,10 +1291,9 @@ export default function WatchPage() {
 
   const title = [match.home_team || "الفريق الأول", match.away_team || "الفريق الثاني"].join(" × ");
   const isBootstrapPending = (pendingBootstraps[activeProvider] || 0) > 0;
-  const showPreparationProgress =
-    !streamUrl &&
-    !!providerSourceUrl &&
-    (activeStatus?.state === "warming" || activeStatus?.reason === "not-bootstrapped" || activeStatus?.phase === "queued");
+  const showPreparationProgress = !streamUrl && !!providerSourceUrl && (activePreparationActive || activeDisplayProgressPct > 0);
+  const startupProgressPct = streamUrl && activeStatus?.state === "ready" ? 100 : activeDisplayProgressPct;
+  const startupProgressLabel = streamUrl && activeStatus?.state === "ready" ? "تم تجهيز الرابط" : activePhaseLabel;
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(15,118,110,0.28),_transparent_35%),linear-gradient(180deg,_#020617_0%,_#07111f_55%,_#020617_100%)] text-white">
@@ -1205,12 +1349,12 @@ export default function WatchPage() {
                     <div className="w-full max-w-md">
                       <div className="flex items-center justify-between text-xs text-slate-300">
                         <span>{activePhaseLabel}</span>
-                        <span>{activeProgressPct}%</span>
+                        <span>{activeDisplayProgressPct}%</span>
                       </div>
                       <div className="mt-2 h-2.5 overflow-hidden rounded-full bg-white/10">
                         <div
                           className={`h-full rounded-full transition-[width] duration-500 ${progressTone(activeStatus)}`}
-                          style={{ width: `${activeProgressPct}%` }}
+                          style={{ width: `${activeDisplayProgressPct}%` }}
                         />
                       </div>
                     </div>
@@ -1225,7 +1369,7 @@ export default function WatchPage() {
                 </div>
               ) : null}
 
-              {playbackRequested && playbackStarting ? (
+              {playbackRequested && playbackStarting && (hasPlayedRef.current || !!streamUrl) ? (
                 <div className="pointer-events-none absolute inset-0 z-[56] flex flex-col items-center justify-center gap-3 bg-black/35 px-6 text-center">
                   <div className="text-2xl font-bold text-white">
                     {hasPlayedRef.current ? "جاري استعادة البث" : "جاري بدء البث"}
@@ -1236,11 +1380,14 @@ export default function WatchPage() {
                   {!hasPlayedRef.current ? (
                     <div className="w-full max-w-sm">
                       <div className="flex items-center justify-between text-xs text-slate-200">
-                        <span>تم تجهيز الرابط</span>
-                        <span>100%</span>
+                        <span>{startupProgressLabel}</span>
+                        <span>{startupProgressPct}%</span>
                       </div>
                       <div className="mt-2 h-2 overflow-hidden rounded-full bg-white/15">
-                        <div className="h-full w-full rounded-full bg-emerald-400" />
+                        <div
+                          className="h-full rounded-full bg-emerald-400 transition-[width] duration-500"
+                          style={{ width: `${startupProgressPct}%` }}
+                        />
                       </div>
                     </div>
                   ) : null}
@@ -1323,14 +1470,20 @@ export default function WatchPage() {
                                   ? phaseLabel(status)
                                   : stateLabel(status)}
                             </span>
-                            <span>{providerUnavailable ? "0%" : `${progressPct(status)}%`}</span>
+                            <span>
+                              {providerUnavailable
+                                ? "0%"
+                                : `${status?.state === "ready" ? 100 : Math.round(displayProgressByProvider[item.provider] ?? progressPct(status))}%`}
+                            </span>
                           </div>
                           <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-white/8">
                             <div
                               className={`h-full rounded-full transition-[width] duration-500 ${
                                 providerUnavailable ? "bg-rose-500" : progressTone(status)
                               }`}
-                              style={{ width: `${providerUnavailable ? 100 : progressPct(status)}%` }}
+                              style={{
+                                width: `${providerUnavailable ? 100 : status?.state === "ready" ? 100 : Math.round(displayProgressByProvider[item.provider] ?? progressPct(status))}%`,
+                              }}
                             />
                           </div>
                         </div>
@@ -1350,12 +1503,12 @@ export default function WatchPage() {
                 <div>
                   <div className="flex items-center justify-between text-slate-400">
                     <span>نسبة التجهيز</span>
-                    <span className="font-mono text-xs">{activeProgressPct}%</span>
+                    <span className="font-mono text-xs">{activeDisplayProgressPct}%</span>
                   </div>
                   <div className="mt-2 h-2 overflow-hidden rounded-full bg-white/10">
                     <div
                       className={`h-full rounded-full transition-[width] duration-500 ${progressTone(activeStatus)}`}
-                      style={{ width: `${activeProgressPct}%` }}
+                      style={{ width: `${activeDisplayProgressPct}%` }}
                     />
                   </div>
                   <div className="mt-2 text-xs text-slate-300">{activePhaseLabel}</div>
