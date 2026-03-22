@@ -77,12 +77,52 @@ export default function VideoPlayerControls({
     const controlsTimeoutRef = useRef<number | null>(null);
     const containerRef = useRef<HTMLDivElement>(null);
 
-    const resetControlsTimeout = useCallback(() => {
-        setShowControls(true);
+    const clearControlsTimeout = useCallback(() => {
         if (controlsTimeoutRef.current) {
             window.clearTimeout(controlsTimeoutRef.current);
             controlsTimeoutRef.current = null;
         }
+    }, []);
+
+    const resetControlsTimeout = useCallback(() => {
+        setShowControls(true);
+        clearControlsTimeout();
+        const video = videoRef.current;
+        if (!video || video.paused) return;
+        controlsTimeoutRef.current = window.setTimeout(() => {
+            setShowControls(false);
+        }, isFullscreen ? 1600 : 2200);
+    }, [clearControlsTimeout, isFullscreen, videoRef]);
+
+    useEffect(() => {
+        const target = containerRef.current?.parentElement || videoRef.current;
+        if (!target) return;
+
+        const revealControls = () => resetControlsTimeout();
+        target.addEventListener("mousemove", revealControls);
+        target.addEventListener("touchstart", revealControls, { passive: true });
+        target.addEventListener("pointerdown", revealControls);
+
+        return () => {
+            target.removeEventListener("mousemove", revealControls);
+            target.removeEventListener("touchstart", revealControls);
+            target.removeEventListener("pointerdown", revealControls);
+        };
+    }, [resetControlsTimeout, videoRef]);
+
+    useEffect(() => {
+        if (isPlaying) {
+            resetControlsTimeout();
+            return;
+        }
+        setShowControls(true);
+        clearControlsTimeout();
+    }, [clearControlsTimeout, isPlaying, resetControlsTimeout]);
+
+    useEffect(() => {
+        return () => {
+            clearControlsTimeout();
+        };
     }, []);
 
     useEffect(() => {
@@ -96,6 +136,7 @@ export default function VideoPlayerControls({
         const onPause = () => {
             setIsPlaying(false);
             setShowControls(true);
+            clearControlsTimeout();
         };
         const onVolumeChange = () => {
             setVolume(video.volume);
@@ -109,6 +150,7 @@ export default function VideoPlayerControls({
         };
         const onError = () => {
             setShowControls(true);
+            clearControlsTimeout();
         };
 
         video.addEventListener("play", onPlay);
@@ -124,10 +166,6 @@ export default function VideoPlayerControls({
         setIsMuted(video.muted);
 
         return () => {
-            if (controlsTimeoutRef.current) {
-                window.clearTimeout(controlsTimeoutRef.current);
-                controlsTimeoutRef.current = null;
-            }
             video.removeEventListener("play", onPlay);
             video.removeEventListener("pause", onPause);
             video.removeEventListener("volumechange", onVolumeChange);
@@ -135,12 +173,14 @@ export default function VideoPlayerControls({
             video.removeEventListener("durationchange", onDurationChange);
             video.removeEventListener("error", onError);
         };
-    }, [videoRef, resetControlsTimeout]);
+    }, [clearControlsTimeout, videoRef, resetControlsTimeout]);
 
     // Handle Fullscreen changes
     useEffect(() => {
         const onFsChange = () => {
             setIsFullscreen(!!document.fullscreenElement);
+            setShowControls(true);
+            resetControlsTimeout();
         };
         document.addEventListener("fullscreenchange", onFsChange);
         return () => document.removeEventListener("fullscreenchange", onFsChange);
@@ -219,7 +259,9 @@ export default function VideoPlayerControls({
     return (
         <div
             ref={containerRef}
-            className="pointer-events-none absolute inset-0 z-50 flex flex-col justify-between transition-opacity duration-300 opacity-100"
+            className={`pointer-events-none absolute inset-0 z-50 flex flex-col justify-between transition-opacity duration-300 ${
+                showControls || !isPlaying ? "opacity-100" : "opacity-0"
+            }`}
             onMouseMove={resetControlsTimeout}
             style={{ background: showControls ? "linear-gradient(to top, rgba(0,0,0,0.8), transparent 30%)" : "transparent" }}
         >
@@ -257,7 +299,9 @@ export default function VideoPlayerControls({
 
             {/* Bottom Controls */}
             <div
-                className="pointer-events-auto bg-black/40 backdrop-blur-md border-t border-white/10"
+                className={`bg-black/40 backdrop-blur-md border-t border-white/10 ${
+                    showControls || !isPlaying ? "pointer-events-auto" : "pointer-events-none"
+                }`}
                 style={{
                     paddingLeft: "max(1rem, env(safe-area-inset-left))",
                     paddingRight: "max(1rem, env(safe-area-inset-right))",
