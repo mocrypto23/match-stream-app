@@ -576,6 +576,16 @@ class LivekoraJob {
 
   async fetchManifestDocument(options = {}) {
     this.setProgress(options.forceRefresh ? "resolving_source" : "fetching_manifest", options.forceRefresh ? 18 : 14);
+    const computeManifestFetchTimeoutMs = (rawUrl) => {
+      const defaultTimeoutMs = this.manager.config.manifestFetchTimeoutMs;
+      if (!isSessionManifestUrl(rawUrl)) return defaultTimeoutMs;
+      const isColdBootstrap = !this.lastPublishAt && !this.lastCurrentSource;
+      if (!isColdBootstrap) return defaultTimeoutMs;
+      if (this.providerId === "siiir") {
+        return Math.max(defaultTimeoutMs, 40_000);
+      }
+      return defaultTimeoutMs;
+    };
     const buildFetchUrl = (rawUrl, fetchOptions = {}) => {
       if (!isSessionManifestUrl(rawUrl)) return rawUrl;
       try {
@@ -611,8 +621,9 @@ class LivekoraJob {
 
     const fetchOnce = async (rawUrl, fetchOptions = {}) => {
       const requestUrl = buildFetchUrl(rawUrl, fetchOptions);
+      const requestTimeoutMs = computeManifestFetchTimeoutMs(requestUrl);
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), this.manager.config.manifestFetchTimeoutMs);
+      const timeoutId = setTimeout(() => controller.abort(), requestTimeoutMs);
       try {
         const response = await fetch(requestUrl, {
           method: "GET",
