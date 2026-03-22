@@ -485,7 +485,7 @@ export function rewriteManifestForSessionMirror(
   return out.join("\n");
 }
 
-async function resolveSessionCandidateMediaManifest(input: {
+export async function resolveSessionCandidateMediaManifest(input: {
   sourceUrl: string;
   slotServer: SlotServerId;
   internalOrigin: string;
