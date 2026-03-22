@@ -14,12 +14,12 @@
     "@aws-sdk/client-s3": "^3.884.0",
     "@ghostery/adblocker-playwright": "^2.13.3",
     "@supabase/supabase-js": "^2.90.1",
-    "@swarmcloud/hls": "^2.17.17",
     "axios": "^1.13.2",
     "cross-fetch": "^4.1.0",
     "dotenv": "^17.2.3",
     "hls.js": "^1.6.15",
     "next": "16.1.1",
+    "p2p-media-loader-hlsjs": "^2.2.2",
     "playwright": "^1.57.0",
     "react": "19.2.3",
     "react-dom": "19.2.3"
