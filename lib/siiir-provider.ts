@@ -8,7 +8,18 @@ import type {
   ProviderManifestResult,
 } from "@/lib/live-providers";
 import { createTimingSummary } from "@/lib/live-providers";
+import { fetchLiveEmbedText } from "@/lib/repack-embed-session";
+import {
+  buildPlayerv2Candidates,
+  looksLikePlayerv2Html,
+  looksLikePlayerv2PageUrl,
+} from "@/lib/repack-ingest-resolver";
 import { playerv2RuntimeAdapter } from "@/lib/repack-runtime-adapters/playerv2";
+import {
+  primeRuntimeHint,
+  resolveSessionCandidateMediaManifest,
+  rewriteManifestForSessionMirror,
+} from "@/lib/repack-runtime-adapters/shared";
 
 const SIIIR_DAY_PAGE_URL = "https://w6.siiir.tv/today-matches/";
 const SIIIR_HOST_SUFFIXES = ["siiir.tv", "yallashot.us"] as const;
@@ -33,6 +44,17 @@ type CachedRuntimeSource = {
   updatedAt: number;
 };
 
+type DirectSiiirAttempt = {
+  ok: boolean;
+  result?: ProviderManifestResult;
+  error?: string;
+  candidatesFound: number;
+  candidatesTried: number;
+  playervFetchMs: number;
+  candidateBuildMs: number;
+  manifestProbeMs: number;
+};
+
 let cachedDayPage: CachedDayPage | null = null;
 const cachedRuntimeSources = new Map<string, CachedRuntimeSource>();
 
@@ -54,6 +76,20 @@ function hostMatchesAnySuffix(host: string, suffixes: readonly string[]) {
   const normalized = String(host || "").trim().toLowerCase().replace(/\.$/, "");
   if (!normalized) return false;
   return suffixes.some((suffix) => normalized === suffix || normalized.endsWith(`.${suffix}`));
+}
+
+function parseMediaSequence(manifestText: string) {
+  const match = String(manifestText || "").match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/i);
+  return match ? Number.parseInt(match[1], 10) : null;
+}
+
+function parseTargetDurationSec(manifestText: string) {
+  for (const line of String(manifestText || "").split(/\r?\n/)) {
+    const match = String(line || "").trim().match(/^#EXT-X-TARGETDURATION:(\d+(?:\.\d+)?)/i);
+    if (!match) continue;
+    return Number.parseFloat(match[1]);
+  }
+  return 0;
 }
 
 function isSiiirGenericPage(rawUrl: string) {
@@ -264,6 +300,148 @@ async function resolveSiiirRuntimeSource(sourceUrl: string, options?: { forceRef
   };
 }
 
+function isDirectSiiirKoooraCandidate(candidate: string) {
+  const value = String(candidate || "").trim();
+  if (!value || value.includes("/api/embed-proxy")) return false;
+  return value.includes("/kooora/") && value.includes("token=") && (value.includes("sid=") || value.includes("session_id="));
+}
+
+async function tryDirectSiiirKoooraManifest(
+  input: ProviderContext,
+  runtimeSource: { runtimeSourceUrl: string; playbackUrl: string }
+): Promise<DirectSiiirAttempt> {
+  const normalizedRuntimeSourceUrl = normalizeHttpUrl(runtimeSource.runtimeSourceUrl);
+  if (!normalizedRuntimeSourceUrl || !looksLikePlayerv2PageUrl(normalizedRuntimeSourceUrl)) {
+    return {
+      ok: false,
+      error: "direct-playerv-missing",
+      candidatesFound: 0,
+      candidatesTried: 0,
+      playervFetchMs: 0,
+      candidateBuildMs: 0,
+      manifestProbeMs: 0,
+    };
+  }
+
+  const normalizedPlaybackUrl = normalizeHttpUrl(runtimeSource.playbackUrl) || input.sourceUrl;
+  const playervFetchStartedAt = Date.now();
+  const fetched = await fetchLiveEmbedText({
+    sourceUrl: normalizedRuntimeSourceUrl,
+    requestOrigin: input.internalOrigin,
+    slotServerId: 2,
+    targetUrl: normalizedRuntimeSourceUrl,
+    fetchUrl: normalizedRuntimeSourceUrl,
+    referrerUrl: normalizedPlaybackUrl,
+    timeoutMs: 9_000,
+  }).catch(() => null);
+  const playervFetchMs = Date.now() - playervFetchStartedAt;
+  const playervBody = String(fetched?.body || "").trim();
+  const playervContextUrl = normalizeHttpUrl(String(fetched?.finalUrl || normalizedRuntimeSourceUrl).trim()) || normalizedRuntimeSourceUrl;
+  if (!fetched?.ok || !playervBody || !looksLikePlayerv2Html(playervBody)) {
+    return {
+      ok: false,
+      error: "direct-playerv-html-missing",
+      candidatesFound: 0,
+      candidatesTried: 0,
+      playervFetchMs,
+      candidateBuildMs: 0,
+      manifestProbeMs: 0,
+    };
+  }
+
+  const candidateBuildStartedAt = Date.now();
+  const candidates = (
+    await buildPlayerv2Candidates(playervContextUrl, playervBody, 5_500, input.internalOrigin).catch(() => [] as string[])
+  )
+    .filter((candidate) => isDirectSiiirKoooraCandidate(candidate))
+    .slice(0, 4);
+  const candidateBuildMs = Date.now() - candidateBuildStartedAt;
+  if (!candidates.length) {
+    return {
+      ok: false,
+      error: "direct-kooora-candidates-missing",
+      candidatesFound: 0,
+      candidatesTried: 0,
+      playervFetchMs,
+      candidateBuildMs,
+      manifestProbeMs: 0,
+    };
+  }
+
+  const manifestProbeStartedAt = Date.now();
+  let candidatesTried = 0;
+  for (const candidate of candidates) {
+    candidatesTried += 1;
+    const resolved = await resolveSessionCandidateMediaManifest({
+      sourceUrl: normalizedRuntimeSourceUrl,
+      slotServer: 2,
+      internalOrigin: input.internalOrigin,
+      targetUrl: candidate,
+      fetchUrl: candidate,
+      referrerUrl: playervContextUrl,
+      timeoutMs: 9_000,
+    });
+    if (!resolved.ok) continue;
+
+    const manifestProbeMs = Date.now() - manifestProbeStartedAt;
+    primeRuntimeHint(
+      {
+        sourceUrl: normalizedRuntimeSourceUrl,
+        slotServer: 2,
+        internalOrigin: input.internalOrigin,
+      },
+      {
+        targetUrl: candidate,
+        fetchUrl: candidate,
+        referrerUrl: playervContextUrl,
+      }
+    );
+
+    return {
+      ok: true,
+      result: {
+        ok: true,
+        manifestBody: rewriteManifestForSessionMirror(
+          resolved.body,
+          resolved.finalUrl,
+          input.internalOrigin,
+          normalizedRuntimeSourceUrl,
+          2
+        ),
+        finalUrl: resolved.finalUrl,
+        targetUrl: candidate,
+        fetchUrl: candidate,
+        referrerUrl: playervContextUrl,
+        playbackUrl: normalizedPlaybackUrl,
+        currentSource: candidate,
+        mediaSequence: parseMediaSequence(resolved.body),
+        targetDurationSec: parseTargetDurationSec(resolved.body),
+        refreshed: false,
+        rotated: false,
+        adapterKind: "playerv2",
+        candidatesFound: candidates.length,
+        candidatesTried,
+        sessionOwned: true,
+      },
+      candidatesFound: candidates.length,
+      candidatesTried,
+      playervFetchMs,
+      candidateBuildMs,
+      manifestProbeMs,
+    };
+  }
+
+  return {
+    ok: false,
+    error: "direct-kooora-manifest-missing",
+    candidatesFound: candidates.length,
+    candidatesTried,
+    playervFetchMs,
+    candidateBuildMs,
+    manifestProbeMs: Date.now() - manifestProbeStartedAt,
+  };
+}
+
 function mapManifestResult(
   result: Awaited<ReturnType<typeof playerv2RuntimeAdapter.currentManifest>>,
   playbackUrl: string
@@ -349,9 +527,15 @@ export const siiirProvider: LiveStreamProvider = {
   async extractCurrentManifest(input: ProviderContext, options) {
     const startedAt = Date.now();
     let runtimeResolveMs = 0;
+    let directPlayervFetchMs = 0;
+    let directCandidateBuildMs = 0;
+    let directManifestProbeMs = 0;
     let manifestAttemptMs = 0;
     let refreshResolveMs = 0;
     let refreshManifestMs = 0;
+    let directCandidatesFound = 0;
+    let directCandidatesTried = 0;
+    let directError = "";
     const initialRuntimeSource = await resolveSiiirRuntimeSource(input.sourceUrl, { forceRefresh: !!options?.forceRefresh });
     runtimeResolveMs = Date.now() - startedAt;
     if (!initialRuntimeSource?.runtimeSourceUrl) {
@@ -375,6 +559,34 @@ export const siiirProvider: LiveStreamProvider = {
     }
 
     let runtimeSource = initialRuntimeSource;
+    const canTryDirectKoooraPath =
+      !options?.forceRefresh &&
+      (!Number.isFinite(Number(options?.waitForMediaSequence)) || Number(options?.waitForMediaSequence) < 0);
+    if (canTryDirectKoooraPath) {
+      const directResult = await tryDirectSiiirKoooraManifest(input, runtimeSource);
+      directPlayervFetchMs = directResult.playervFetchMs;
+      directCandidateBuildMs = directResult.candidateBuildMs;
+      directManifestProbeMs = directResult.manifestProbeMs;
+      directCandidatesFound = directResult.candidatesFound;
+      directCandidatesTried = directResult.candidatesTried;
+      directError = String(directResult.error || "");
+      if (directResult.ok && directResult.result?.ok) {
+        return {
+          ...directResult.result,
+          timingSummary: createTimingSummary("direct_kooora", {
+            total: Date.now() - startedAt,
+            resolveRuntimeSource: runtimeResolveMs,
+            directPlayervFetch: directPlayervFetchMs,
+            directCandidateBuild: directCandidateBuildMs,
+            directManifestProbe: directManifestProbeMs,
+          }, {
+            directCandidatesFound,
+            directCandidatesTried,
+          }),
+        };
+      }
+    }
+
     let manifestStartedAt = Date.now();
     let resolved = await playerv2RuntimeAdapter.currentManifest(
       {
@@ -413,9 +625,16 @@ export const siiirProvider: LiveStreamProvider = {
     const timingSummary = createTimingSummary(mapped.ok ? "resolved" : "resolved_failed", {
       total: totalMs,
       resolveRuntimeSource: runtimeResolveMs,
+      directPlayervFetch: directPlayervFetchMs,
+      directCandidateBuild: directCandidateBuildMs,
+      directManifestProbe: directManifestProbeMs,
       manifest: manifestAttemptMs,
       refreshResolveRuntimeSource: refreshResolveMs,
       refreshManifest: refreshManifestMs,
+    }, {
+      directCandidatesFound,
+      directCandidatesTried,
+      directError,
     });
     return {
       ...mapped,
