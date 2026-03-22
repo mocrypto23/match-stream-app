@@ -496,15 +496,21 @@ export default function WatchPage() {
     });
     setMatch((current) => {
       if (!current) return current;
+      const nextStreamUrl = payload.stream_url ?? current.stream_url ?? null;
+      const nextStreamUrl2 = payload.stream_url_2 ?? current.stream_url_2 ?? null;
+      const nextStreamUrl4 = payload.stream_url_4 ?? current.stream_url_4 ?? null;
+      if (
+        nextStreamUrl === (current.stream_url ?? null) &&
+        nextStreamUrl2 === (current.stream_url_2 ?? null) &&
+        nextStreamUrl4 === (current.stream_url_4 ?? null)
+      ) {
+        return current;
+      }
       return {
         ...current,
-        stream_url: payload.stream_url ?? current.stream_url ?? null,
-        stream_url_2: payload.stream_url_2 ?? current.stream_url_2 ?? null,
-        stream_url_4: payload.stream_url_4 ?? current.stream_url_4 ?? null,
-        livekoraStatus: payload.livekoraStatus ?? current.livekoraStatus ?? null,
-        beinliveStatus: payload.beinliveStatus ?? current.beinliveStatus ?? null,
-        siiirStatus: payload.siiirStatus ?? current.siiirStatus ?? null,
-        streamSources: payload.streamSources ?? current.streamSources ?? null,
+        stream_url: nextStreamUrl,
+        stream_url_2: nextStreamUrl2,
+        stream_url_4: nextStreamUrl4,
       };
     });
   }, []);
@@ -801,20 +807,20 @@ export default function WatchPage() {
   }, []);
 
   useEffect(() => {
-    if (!match) return;
+    if (!matchId || Number.isNaN(matchId)) return;
     if (!providerSourceUrl) return;
     void bootstrapProvider(activeProvider, { silent: true });
-  }, [activeProvider, bootstrapProvider, match, providerSourceUrl]);
+  }, [activeProvider, bootstrapProvider, matchId, providerSourceUrl]);
 
   useEffect(() => {
-    if (!match) return;
+    if (!matchId || Number.isNaN(matchId)) return;
 
     let cancelled = false;
     void (async () => {
       const providersToBootstrap = PROVIDER_META.filter((item) => {
         if (item.provider === activeProvider) return false;
         const status = statusByProvider[item.provider];
-        if (!providerHasMatch(match, statusByProvider, item.provider)) return false;
+        if (!providerHasMatchById[item.provider]) return false;
         if ((pendingBootstraps[item.provider] || 0) > 0) return false;
 
         const hasPlaylistUrl = !!String(status?.playlistUrl || "").trim();
@@ -842,10 +848,10 @@ export default function WatchPage() {
     return () => {
       cancelled = true;
     };
-  }, [activeProvider, bootstrapProvider, match, pendingBootstraps, statusByProvider]);
+  }, [activeProvider, bootstrapProvider, matchId, pendingBootstraps, providerHasMatchById, statusByProvider]);
 
   useEffect(() => {
-    if (!match) return;
+    if (!matchId || Number.isNaN(matchId)) return;
     if (!providerSourceUrl) return;
     if (activeStatus?.reason !== "not-bootstrapped") return;
     if ((pendingBootstraps[activeProvider] || 0) > 0) return;
@@ -860,7 +866,7 @@ export default function WatchPage() {
     activeProvider,
     activeStatus?.reason,
     bootstrapProvider,
-    match,
+    matchId,
     pendingBootstraps,
     providerSourceUrl,
   ]);
