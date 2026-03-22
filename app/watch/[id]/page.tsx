@@ -39,6 +39,12 @@ type SwarmCloudP2PConfig = {
   hlsjsInstance?: Hls;
   p2pEnabled?: boolean;
   httpLoadTime?: number;
+  token?: string;
+  channelId?: ((m3u8Url: string) => string) | string;
+  swAutoRegister?: boolean;
+  swFile?: string;
+  swScope?: string;
+  sharePlaylist?: boolean;
   getStats?: (
     totalP2PDownloadedKB: number,
     totalP2PUploadedKB: number,
@@ -55,8 +61,12 @@ type SwarmCloudEngineInstance = {
   on: (name: string, listener: (...args: unknown[]) => void) => SwarmCloudEngineInstance;
   off: (name: string, listener: (...args: unknown[]) => void) => SwarmCloudEngineInstance;
 };
+type SwarmCloudEngineClass = {
+  new (config?: SwarmCloudP2PConfig): SwarmCloudEngineInstance;
+  tryRegisterServiceWorker: (config?: SwarmCloudP2PConfig) => Promise<void>;
+};
 type SwarmCloudModule = {
-  default: new (config?: SwarmCloudP2PConfig) => SwarmCloudEngineInstance;
+  default: SwarmCloudEngineClass;
 };
 type P2PStats = {
   enabled: boolean;
@@ -84,6 +94,9 @@ const P2P_ENABLE_AFTER_STABLE_PLAYBACK_MS = 2_000;
 const P2P_MIN_ENABLED_BEFORE_FALLBACK_MS = 1_500;
 const SWARMCLOUD_HTTP_LOAD_TIME_MS = 2_000;
 const SWARMCLOUD_TRACKER_ZONE: "eu" | "hk" | "us" | "cn" = "eu";
+const SWARMCLOUD_TOKEN = "vRC1O25vR";
+const SWARMCLOUD_SW_FILE = "/sw.js";
+const SWARMCLOUD_SW_SCOPE = "/";
 const PROVIDER_META: Array<{ provider: StreamProviderId; order: number; label: string }> = [
   { provider: "livekora", order: 1, label: "livekora vip" },
   { provider: "beinlive", order: 2, label: "bein-live" },
@@ -1253,30 +1266,44 @@ export default function WatchPage() {
       nextHls.attachMedia(video);
     };
 
-    void (async () => {
-      try {
-        const { default: P2pEngineHls } = await loadP2PEngineModule();
-        if (disposed) return;
+      void (async () => {
+        try {
+          const { default: P2pEngineHls } = await loadP2PEngineModule();
+          if (disposed) return;
 
-        const nextHls = new Hls(hlsConfig);
-        p2pEngine = new P2pEngineHls({
-          live: true,
-          trackerZone: SWARMCLOUD_TRACKER_ZONE,
-          showSlogan: false,
-          p2pEnabled: false,
-          httpLoadTime: SWARMCLOUD_HTTP_LOAD_TIME_MS,
-          hlsjsInstance: nextHls,
-          getStats: (totalP2PDownloadedKB, totalP2PUploadedKB, totalHTTPDownloadedKB) => {
-            p2pSnapshot.p2pDownloadedBytes = Math.max(0, Math.round(totalP2PDownloadedKB * 1024));
-            p2pSnapshot.uploadedBytes = Math.max(0, Math.round(totalP2PUploadedKB * 1024));
-            p2pSnapshot.httpDownloadedBytes = Math.max(0, Math.round(totalHTTPDownloadedKB * 1024));
+          const nextHls = new Hls(hlsConfig);
+          const swarmCloudConfig: SwarmCloudP2PConfig = {
+            live: true,
+            trackerZone: SWARMCLOUD_TRACKER_ZONE,
+            showSlogan: false,
+            p2pEnabled: false,
+            httpLoadTime: SWARMCLOUD_HTTP_LOAD_TIME_MS,
+            token: SWARMCLOUD_TOKEN,
+            channelId: `twofooty:${activeProvider}:m${matchId}`,
+            swAutoRegister: true,
+            swFile: SWARMCLOUD_SW_FILE,
+            swScope: SWARMCLOUD_SW_SCOPE,
+            sharePlaylist: true,
+            hlsjsInstance: nextHls,
+            getStats: (totalP2PDownloadedKB, totalP2PUploadedKB, totalHTTPDownloadedKB) => {
+              p2pSnapshot.p2pDownloadedBytes = Math.max(0, Math.round(totalP2PDownloadedKB * 1024));
+              p2pSnapshot.uploadedBytes = Math.max(0, Math.round(totalP2PUploadedKB * 1024));
+              p2pSnapshot.httpDownloadedBytes = Math.max(0, Math.round(totalHTTPDownloadedKB * 1024));
             scheduleP2PStatsUpdate();
           },
-          getPeersInfo: (peers) => {
-            p2pSnapshot.peers = Array.isArray(peers) ? peers.length : 0;
-            scheduleP2PStatsUpdate();
-          },
-        });
+            getPeersInfo: (peers) => {
+              p2pSnapshot.peers = Array.isArray(peers) ? peers.length : 0;
+              scheduleP2PStatsUpdate();
+            },
+          };
+
+          try {
+            await P2pEngineHls.tryRegisterServiceWorker(swarmCloudConfig);
+          } catch (error) {
+            console.warn("SwarmCloud service worker registration failed", error);
+          }
+
+          p2pEngine = new P2pEngineHls(swarmCloudConfig);
         p2pEngine.on("error", (error) => {
           p2pSnapshot.status = "P2P: engine error";
           scheduleP2PStatsUpdate();
