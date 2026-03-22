@@ -96,7 +96,6 @@ const WAITING_OVERLAY_DELAY_MS = 3_500;
 const PREPARATION_PROGRESS_TICK_MS = 250;
 const PREPARATION_PROGRESS_CAP_PCT = 95;
 const P2P_STATS_UPDATE_MS = 300;
-const P2P_ENABLE_AFTER_STABLE_PLAYBACK_MS = 1_750;
 const P2P_MIN_ENABLED_BEFORE_FALLBACK_MS = 1_500;
 const P2P_ANNOUNCE_TRACKERS = [
   "wss://tracker.novage.com.ua",
@@ -104,16 +103,16 @@ const P2P_ANNOUNCE_TRACKERS = [
   "wss://tracker.openwebtorrent.com",
 ];
 const P2P_ICE_SERVERS = [{ urls: "stun:stun.cloudflare.com:3478" }, { urls: "stun:stun.l.google.com:19302" }];
-const P2P_HTTP_FIRST_CORE_CONFIG = {
-  highDemandTimeWindow: 20,
+const P2P_CORE_CONFIG = {
+  highDemandTimeWindow: 15,
   httpDownloadTimeWindow: 3_000,
-  p2pDownloadTimeWindow: 2_500,
+  p2pDownloadTimeWindow: 6_000,
   simultaneousHttpDownloads: 2,
-  simultaneousP2PDownloads: 2,
-  httpNotReceivingBytesTimeoutMs: 2_500,
-  p2pNotReceivingBytesTimeoutMs: 1_100,
-  httpErrorRetries: 2,
-  p2pErrorRetries: 1,
+  simultaneousP2PDownloads: 3,
+  httpNotReceivingBytesTimeoutMs: 3_000,
+  p2pNotReceivingBytesTimeoutMs: 2_000,
+  httpErrorRetries: 3,
+  p2pErrorRetries: 3,
 } as const;
 const PROVIDER_META: Array<{ provider: StreamProviderId; order: number; label: string }> = [
   { provider: "livekora", order: 1, label: "livekora vip" },
@@ -1210,7 +1209,7 @@ export default function WatchPage() {
       if (!p2pEngine) return;
       p2pEngine.applyDynamicConfig({
         core: {
-          ...P2P_HTTP_FIRST_CORE_CONFIG,
+          ...P2P_CORE_CONFIG,
           isP2PDisabled: !enabled,
           isP2PUploadDisabled: !enabled,
         },
@@ -1228,7 +1227,7 @@ export default function WatchPage() {
       p2pEnableTimer = window.setTimeout(() => {
         if (disposed || !p2pEngine || p2pControlRef.current.enabled) return;
         applyP2PMode(true);
-      }, P2P_ENABLE_AFTER_STABLE_PLAYBACK_MS);
+      }, 1_500);
     };
     p2pControlRef.current = {
       enabled: false,
@@ -1298,9 +1297,9 @@ export default function WatchPage() {
             announceTrackers: P2P_ANNOUNCE_TRACKERS,
             rtcConfig: { iceServers: P2P_ICE_SERVERS },
             trackerClientVersionPrefix: "TF",
-            ...P2P_HTTP_FIRST_CORE_CONFIG,
-            isP2PDisabled: true,
-            isP2PUploadDisabled: true,
+            ...P2P_CORE_CONFIG,
+            isP2PDisabled: false,
+            isP2PUploadDisabled: false,
           },
         });
 
@@ -1363,7 +1362,7 @@ export default function WatchPage() {
           ...p2pHlsConfig,
         });
         p2pEngine.bindHls(nextHls);
-        applyP2PMode(false);
+        applyP2PMode(true);
         updateP2PStats();
         attachHls(nextHls);
       } catch (error) {
