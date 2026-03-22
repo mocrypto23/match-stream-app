@@ -32,48 +32,32 @@ type StatusMap = Record<StreamProviderId, StreamSourceStatus | null>;
 type PendingBootstrapMap = Record<StreamProviderId, number>;
 type DisplayProgressMap = Record<StreamProviderId, number>;
 type DisplayProgressMetaMap = Record<StreamProviderId, { animating: boolean; startedAt: number }>;
-type P2PEngineModule = {
-  HlsJsP2PEngine: new (config?: {
-    core?: {
-      swarmId?: string;
-      announceTrackers?: string[];
-      rtcConfig?: { iceServers?: Array<{ urls: string | string[] }> };
-      trackerClientVersionPrefix?: string;
-      highDemandTimeWindow?: number;
-      httpDownloadTimeWindow?: number;
-      p2pDownloadTimeWindow?: number;
-      simultaneousHttpDownloads?: number;
-      simultaneousP2PDownloads?: number;
-      httpNotReceivingBytesTimeoutMs?: number;
-      p2pNotReceivingBytesTimeoutMs?: number;
-      httpErrorRetries?: number;
-      p2pErrorRetries?: number;
-      isP2PDisabled?: boolean;
-      isP2PUploadDisabled?: boolean;
-    };
-  }) => {
-    addEventListener: (eventName: string, listener: (...args: unknown[]) => void) => void;
-    applyDynamicConfig: (config: {
-      core?: {
-        highDemandTimeWindow?: number;
-        httpDownloadTimeWindow?: number;
-        p2pDownloadTimeWindow?: number;
-        simultaneousHttpDownloads?: number;
-        simultaneousP2PDownloads?: number;
-        httpNotReceivingBytesTimeoutMs?: number;
-        p2pNotReceivingBytesTimeoutMs?: number;
-        httpErrorRetries?: number;
-        p2pErrorRetries?: number;
-        isP2PDisabled?: boolean;
-        isP2PUploadDisabled?: boolean;
-      };
-    }) => void;
-    getConfigForHlsJs: () => Pick<HlsConfig, "fLoader" | "pLoader">;
-    bindHls: (hls: Hls) => void;
-    destroy: () => void;
-  };
+type SwarmCloudP2PConfig = {
+  live?: boolean;
+  logLevel?: boolean | "warn" | "error" | "none";
+  trackerZone?: "eu" | "hk" | "us" | "cn";
+  hlsjsInstance?: Hls;
+  p2pEnabled?: boolean;
+  httpLoadTime?: number;
+  getStats?: (
+    totalP2PDownloadedKB: number,
+    totalP2PUploadedKB: number,
+    totalHTTPDownloadedKB: number,
+    p2pDownloadSpeed: number,
+  ) => void;
+  getPeersInfo?: (peers: string[]) => void;
+  showSlogan?: boolean;
 };
-type HlsJsP2PEngineInstance = InstanceType<P2PEngineModule["HlsJsP2PEngine"]>;
+type SwarmCloudEngineInstance = {
+  enableP2P: () => void;
+  disableP2P: () => void;
+  destroy: () => void;
+  on: (name: string, listener: (...args: unknown[]) => void) => SwarmCloudEngineInstance;
+  off: (name: string, listener: (...args: unknown[]) => void) => SwarmCloudEngineInstance;
+};
+type SwarmCloudModule = {
+  default: new (config?: SwarmCloudP2PConfig) => SwarmCloudEngineInstance;
+};
 type P2PStats = {
   enabled: boolean;
   supported: boolean;
@@ -96,25 +80,10 @@ const WAITING_OVERLAY_DELAY_MS = 3_500;
 const PREPARATION_PROGRESS_TICK_MS = 250;
 const PREPARATION_PROGRESS_CAP_PCT = 95;
 const P2P_STATS_UPDATE_MS = 300;
-const P2P_ENABLE_AFTER_STABLE_PLAYBACK_MS = 4_000;
+const P2P_ENABLE_AFTER_STABLE_PLAYBACK_MS = 2_000;
 const P2P_MIN_ENABLED_BEFORE_FALLBACK_MS = 1_500;
-const P2P_ANNOUNCE_TRACKERS = [
-  "wss://tracker.novage.com.ua",
-  "wss://tracker.webtorrent.dev",
-  "wss://tracker.openwebtorrent.com",
-];
-const P2P_ICE_SERVERS = [{ urls: "stun:stun.cloudflare.com:3478" }, { urls: "stun:stun.l.google.com:19302" }];
-const P2P_HTTP_FIRST_CORE_CONFIG = {
-  highDemandTimeWindow: 20,
-  httpDownloadTimeWindow: 6_000,
-  p2pDownloadTimeWindow: 3_000,
-  simultaneousHttpDownloads: 4,
-  simultaneousP2PDownloads: 1,
-  httpNotReceivingBytesTimeoutMs: 2_500,
-  p2pNotReceivingBytesTimeoutMs: 1_200,
-  httpErrorRetries: 2,
-  p2pErrorRetries: 1,
-} as const;
+const SWARMCLOUD_HTTP_LOAD_TIME_MS = 2_000;
+const SWARMCLOUD_TRACKER_ZONE: "eu" | "hk" | "us" | "cn" = "eu";
 const PROVIDER_META: Array<{ provider: StreamProviderId; order: number; label: string }> = [
   { provider: "livekora", order: 1, label: "livekora vip" },
   { provider: "beinlive", order: 2, label: "bein-live" },
@@ -135,7 +104,7 @@ const EMPTY_P2P_STATS: P2PStats = {
   ratioPct: 0,
   status: "P2P: غير مفعلة",
 };
-let p2pEngineModulePromise: Promise<P2PEngineModule> | null = null;
+let p2pEngineModulePromise: Promise<SwarmCloudModule> | null = null;
 
 function createPendingBootstrapMap(): PendingBootstrapMap {
   return { livekora: 0, beinlive: 0, siiir: 0 };
@@ -155,7 +124,7 @@ function createDisplayProgressMetaMap(): DisplayProgressMetaMap {
 
 function loadP2PEngineModule() {
   if (!p2pEngineModulePromise) {
-    p2pEngineModulePromise = import("p2p-media-loader-hlsjs") as Promise<P2PEngineModule>;
+    p2pEngineModulePromise = import("@swarmcloud/hls") as Promise<SwarmCloudModule>;
   }
   return p2pEngineModulePromise;
 }
@@ -1156,13 +1125,8 @@ export default function WatchPage() {
     let p2pFlushTimer: number | null = null;
     let p2pHeartbeatTimer: number | null = null;
     let p2pEnableTimer: number | null = null;
-    let p2pEngine: HlsJsP2PEngineInstance | null = null;
+    let p2pEngine: SwarmCloudEngineInstance | null = null;
     let hls: Hls | null = null;
-    const p2pPeers = new Set<string>();
-    const isLikelyMobileUploader =
-      typeof window !== "undefined" &&
-      (window.matchMedia?.("(pointer: coarse)")?.matches ||
-        /Android|iPhone|iPad|iPod|Mobile/i.test(window.navigator.userAgent || ""));
     const p2pSnapshot: P2PStats = persistedP2PStats?.enabled
       ? { ...persistedP2PStats }
       : {
@@ -1184,16 +1148,14 @@ export default function WatchPage() {
     const updateP2PModeStatus = (fallbackReason?: string) => {
       if (disposed || !p2pSnapshot.supported) return;
       if (p2pControlRef.current.enabled) {
-        p2pSnapshot.status = p2pSnapshot.peers > 0 ? "P2P: connected" : "P2P: searching peers";
+        p2pSnapshot.status = p2pSnapshot.peers > 0 ? "P2P: متصلة" : "P2P: جاري البحث عن peers";
         return;
       }
       if (fallbackReason) {
         p2pSnapshot.status = fallbackReason;
         return;
       }
-      p2pSnapshot.status = isLikelyMobileUploader
-        ? "P2P: download-only after stable playback"
-        : "P2P: waiting for stable playback";
+      p2pSnapshot.status = "P2P: waiting for stable playback";
     };
     const updateP2PStats = () => {
       if (disposed) return;
@@ -1214,13 +1176,11 @@ export default function WatchPage() {
     };
     const applyP2PMode = (enabled: boolean, fallbackReason?: string) => {
       if (!p2pEngine) return;
-      p2pEngine.applyDynamicConfig({
-        core: {
-          ...P2P_HTTP_FIRST_CORE_CONFIG,
-          isP2PDisabled: !enabled,
-          isP2PUploadDisabled: !enabled || isLikelyMobileUploader,
-        },
-      });
+      if (enabled) {
+        p2pEngine.enableP2P();
+      } else {
+        p2pEngine.disableP2P();
+      }
       p2pControlRef.current.enabled = enabled;
       p2pControlRef.current.enabledAt = enabled ? Date.now() : 0;
       updateP2PModeStatus(fallbackReason);
@@ -1295,79 +1255,38 @@ export default function WatchPage() {
 
     void (async () => {
       try {
-        const { HlsJsP2PEngine } = await loadP2PEngineModule();
+        const { default: P2pEngineHls } = await loadP2PEngineModule();
         if (disposed) return;
 
-        p2pEngine = new HlsJsP2PEngine({
-          core: {
-            swarmId: `twofooty:${activeProvider}:m${matchId}`,
-            announceTrackers: P2P_ANNOUNCE_TRACKERS,
-            rtcConfig: { iceServers: P2P_ICE_SERVERS },
-            trackerClientVersionPrefix: "TF",
-            ...P2P_HTTP_FIRST_CORE_CONFIG,
-            isP2PDisabled: true,
-            isP2PUploadDisabled: true,
+        const nextHls = new Hls(hlsConfig);
+        p2pEngine = new P2pEngineHls({
+          live: true,
+          trackerZone: SWARMCLOUD_TRACKER_ZONE,
+          showSlogan: false,
+          p2pEnabled: false,
+          httpLoadTime: SWARMCLOUD_HTTP_LOAD_TIME_MS,
+          hlsjsInstance: nextHls,
+          getStats: (totalP2PDownloadedKB, totalP2PUploadedKB, totalHTTPDownloadedKB) => {
+            p2pSnapshot.p2pDownloadedBytes = Math.max(0, Math.round(totalP2PDownloadedKB * 1024));
+            p2pSnapshot.uploadedBytes = Math.max(0, Math.round(totalP2PUploadedKB * 1024));
+            p2pSnapshot.httpDownloadedBytes = Math.max(0, Math.round(totalHTTPDownloadedKB * 1024));
+            scheduleP2PStatsUpdate();
+          },
+          getPeersInfo: (peers) => {
+            p2pSnapshot.peers = Array.isArray(peers) ? peers.length : 0;
+            scheduleP2PStatsUpdate();
           },
         });
-        const p2pCore = (
-          p2pEngine as unknown as {
-            core?: { setManifestResponseUrl?: (url: string) => void };
-          }
-        ).core;
-        if (src && typeof p2pCore?.setManifestResponseUrl === "function") {
-          p2pCore.setManifestResponseUrl(src);
-        }
-
-        p2pEngine.addEventListener("onPeerConnect", (params) => {
-          const { peerId } = (params || {}) as { peerId?: string };
-          if (!peerId) return;
-          p2pPeers.add(peerId);
-          p2pSnapshot.peers = p2pPeers.size;
+        p2pEngine.on("error", (error) => {
+          p2pSnapshot.status = "P2P: engine error";
           scheduleP2PStatsUpdate();
+          console.error("SwarmCloud P2P error", error);
         });
-        p2pEngine.addEventListener("onPeerClose", (params) => {
-          const { peerId } = (params || {}) as { peerId?: string };
-          if (!peerId) return;
-          p2pPeers.delete(peerId);
-          p2pSnapshot.peers = p2pPeers.size;
+        p2pEngine.on("warning", (warning) => {
+          p2pSnapshot.status = "P2P: warning";
           scheduleP2PStatsUpdate();
+          console.warn("SwarmCloud P2P warning", warning);
         });
-        p2pEngine.addEventListener("onChunkDownloaded", (...args) => {
-          const bytesLength = Number(args[0] || 0);
-          const downloadSource = String(args[1] || "");
-          if (!Number.isFinite(bytesLength) || bytesLength <= 0) return;
-          if (downloadSource === "p2p") {
-            p2pSnapshot.p2pDownloadedBytes += bytesLength;
-          } else {
-            p2pSnapshot.httpDownloadedBytes += bytesLength;
-          }
-          scheduleP2PStatsUpdate();
-        });
-        p2pEngine.addEventListener("onChunkUploaded", (...args) => {
-          const bytesLength = Number(args[0] || 0);
-          if (!Number.isFinite(bytesLength) || bytesLength <= 0) return;
-          p2pSnapshot.uploadedBytes += bytesLength;
-          scheduleP2PStatsUpdate();
-        });
-        p2pEngine.addEventListener("onTrackerWarning", (params) => {
-          const { warning } = (params || {}) as { warning?: unknown };
-          p2pSnapshot.status = "P2P: tracker warning";
-          scheduleP2PStatsUpdate();
-          console.warn("P2P tracker warning", warning);
-        });
-        p2pEngine.addEventListener("onTrackerError", (params) => {
-          const { error } = (params || {}) as { error?: unknown };
-          p2pSnapshot.status = "P2P: tracker error";
-          scheduleP2PStatsUpdate();
-          console.error("P2P tracker error", error);
-        });
-
-        const p2pHlsConfig = p2pEngine.getConfigForHlsJs() as Pick<HlsConfig, "fLoader" | "pLoader">;
-        const nextHls = new Hls({
-          ...hlsConfig,
-          ...p2pHlsConfig,
-        });
-        p2pEngine.bindHls(nextHls);
         applyP2PMode(false);
         updateP2PStats();
         attachHls(nextHls);
