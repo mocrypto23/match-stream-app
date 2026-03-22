@@ -515,7 +515,7 @@ async function resolveFastPlayervManifest(input: {
         "user-agent": DEFAULT_USER_AGENT,
         accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "accept-language": "ar,en;q=0.9",
-        referer: input.runtimeSourceUrl,
+        referer: input.playbackUrl || input.runtimeSourceUrl,
       },
     })
     .catch(() => null);
