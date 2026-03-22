@@ -546,7 +546,7 @@ export default function WatchPage() {
     }
     const request = (async () => {
       try {
-        const response = await fetch(`/api/watch-state/${matchId}`);
+        const response = await fetch(`/api/livekora/watch-state/${matchId}`);
         const payload = (await response.json().catch(() => null)) as WatchStatePayload | { error?: string } | null;
         if (!response.ok || !payload || !("matchId" in payload)) return;
         applyWatchState(payload);
