@@ -39,9 +39,35 @@ type P2PEngineModule = {
       announceTrackers?: string[];
       rtcConfig?: { iceServers?: Array<{ urls: string | string[] }> };
       trackerClientVersionPrefix?: string;
+      highDemandTimeWindow?: number;
+      httpDownloadTimeWindow?: number;
+      p2pDownloadTimeWindow?: number;
+      simultaneousHttpDownloads?: number;
+      simultaneousP2PDownloads?: number;
+      httpNotReceivingBytesTimeoutMs?: number;
+      p2pNotReceivingBytesTimeoutMs?: number;
+      httpErrorRetries?: number;
+      p2pErrorRetries?: number;
+      isP2PDisabled?: boolean;
+      isP2PUploadDisabled?: boolean;
     };
   }) => {
     addEventListener: (eventName: string, listener: (...args: unknown[]) => void) => void;
+    applyDynamicConfig: (config: {
+      core?: {
+        highDemandTimeWindow?: number;
+        httpDownloadTimeWindow?: number;
+        p2pDownloadTimeWindow?: number;
+        simultaneousHttpDownloads?: number;
+        simultaneousP2PDownloads?: number;
+        httpNotReceivingBytesTimeoutMs?: number;
+        p2pNotReceivingBytesTimeoutMs?: number;
+        httpErrorRetries?: number;
+        p2pErrorRetries?: number;
+        isP2PDisabled?: boolean;
+        isP2PUploadDisabled?: boolean;
+      };
+    }) => void;
     getConfigForHlsJs: () => Pick<HlsConfig, "fLoader" | "pLoader">;
     bindHls: (hls: Hls) => void;
     destroy: () => void;
@@ -70,12 +96,25 @@ const WAITING_OVERLAY_DELAY_MS = 3_500;
 const PREPARATION_PROGRESS_TICK_MS = 250;
 const PREPARATION_PROGRESS_CAP_PCT = 95;
 const P2P_STATS_UPDATE_MS = 300;
+const P2P_ENABLE_AFTER_STABLE_PLAYBACK_MS = 4_000;
+const P2P_MIN_ENABLED_BEFORE_FALLBACK_MS = 1_500;
 const P2P_ANNOUNCE_TRACKERS = [
   "wss://tracker.novage.com.ua",
   "wss://tracker.webtorrent.dev",
   "wss://tracker.openwebtorrent.com",
 ];
 const P2P_ICE_SERVERS = [{ urls: "stun:stun.cloudflare.com:3478" }, { urls: "stun:stun.l.google.com:19302" }];
+const P2P_HTTP_FIRST_CORE_CONFIG = {
+  highDemandTimeWindow: 20,
+  httpDownloadTimeWindow: 6_000,
+  p2pDownloadTimeWindow: 3_000,
+  simultaneousHttpDownloads: 4,
+  simultaneousP2PDownloads: 1,
+  httpNotReceivingBytesTimeoutMs: 2_500,
+  p2pNotReceivingBytesTimeoutMs: 1_200,
+  httpErrorRetries: 2,
+  p2pErrorRetries: 1,
+} as const;
 const PROVIDER_META: Array<{ provider: StreamProviderId; order: number; label: string }> = [
   { provider: "livekora", order: 1, label: "livekora vip" },
   { provider: "beinlive", order: 2, label: "bein-live" },
@@ -339,6 +378,21 @@ export default function WatchPage() {
     streamUrl: "",
     lastTime: 0,
     lastAdvanceAt: 0,
+  });
+  const p2pControlRef = useRef<{
+    enabled: boolean;
+    enabledAt: number;
+    provider: StreamProviderId | null;
+    streamUrl: string;
+    disable: (reason?: string) => void;
+    scheduleEnable: () => void;
+  }>({
+    enabled: false,
+    enabledAt: 0,
+    provider: null,
+    streamUrl: "",
+    disable: () => {},
+    scheduleEnable: () => {},
   });
 
   const sources = useMemo(
@@ -953,6 +1007,27 @@ export default function WatchPage() {
 
       const hls = hlsRef.current;
       const sourceStillReady = activeStatus?.state === "ready" && !selectedUnavailable;
+      const p2pControl = p2pControlRef.current;
+      const currentP2PSession =
+        p2pControl.enabled &&
+        p2pControl.provider === activeProvider &&
+        p2pControl.streamUrl === stream;
+      if (
+        sourceStillReady &&
+        currentP2PSession &&
+        stalledForMs >= SOFT_PLAYBACK_STALL_RECOVERY_MS &&
+        now - p2pControl.enabledAt >= P2P_MIN_ENABLED_BEFORE_FALLBACK_MS
+      ) {
+        p2pControl.disable("P2P: fallback to R2");
+        try {
+          hls?.startLoad();
+          hls?.recoverMediaError();
+        } catch {}
+        if (video.paused) {
+          void video.play().catch(() => {});
+        }
+        return;
+      }
       const lastSoftRecoveryAt = softRecoveryAtRef.current[activeProvider] || 0;
       if (sourceStillReady && hls && stalledForMs >= SOFT_PLAYBACK_STALL_RECOVERY_MS && now - lastSoftRecoveryAt >= SOFT_PLAYBACK_STALL_RECOVERY_MS) {
         softRecoveryAtRef.current[activeProvider] = now;
@@ -1032,6 +1107,7 @@ export default function WatchPage() {
       setPlaybackStarted(true);
       setPlaybackStarting(false);
       setPageError(null);
+      scheduleEnableP2P();
     };
 
     const onPlayable = () => {
@@ -1079,9 +1155,14 @@ export default function WatchPage() {
     let disposed = false;
     let p2pFlushTimer: number | null = null;
     let p2pHeartbeatTimer: number | null = null;
+    let p2pEnableTimer: number | null = null;
     let p2pEngine: HlsJsP2PEngineInstance | null = null;
     let hls: Hls | null = null;
     const p2pPeers = new Set<string>();
+    const isLikelyMobileUploader =
+      typeof window !== "undefined" &&
+      (window.matchMedia?.("(pointer: coarse)")?.matches ||
+        /Android|iPhone|iPad|iPod|Mobile/i.test(window.navigator.userAgent || ""));
     const p2pSnapshot: P2PStats = persistedP2PStats?.enabled
       ? { ...persistedP2PStats }
       : {
@@ -1092,16 +1173,34 @@ export default function WatchPage() {
           p2pDownloadedBytes: 0,
           uploadedBytes: 0,
           ratioPct: 0,
-          status: "P2P: جاري البحث عن peers",
+          status: "P2P: waiting for stable playback",
         };
+    const clearP2PEnableTimer = () => {
+      if (p2pEnableTimer !== null) {
+        window.clearTimeout(p2pEnableTimer);
+        p2pEnableTimer = null;
+      }
+    };
+    const updateP2PModeStatus = (fallbackReason?: string) => {
+      if (disposed || !p2pSnapshot.supported) return;
+      if (p2pControlRef.current.enabled) {
+        p2pSnapshot.status = p2pSnapshot.peers > 0 ? "P2P: connected" : "P2P: searching peers";
+        return;
+      }
+      if (fallbackReason) {
+        p2pSnapshot.status = fallbackReason;
+        return;
+      }
+      p2pSnapshot.status = isLikelyMobileUploader
+        ? "P2P: download-only after stable playback"
+        : "P2P: waiting for stable playback";
+    };
     const updateP2PStats = () => {
       if (disposed) return;
       const totalDownloaded = p2pSnapshot.httpDownloadedBytes + p2pSnapshot.p2pDownloadedBytes;
       p2pSnapshot.ratioPct =
         totalDownloaded > 0 ? Math.max(0, Math.min(100, Math.round((p2pSnapshot.p2pDownloadedBytes / totalDownloaded) * 100))) : 0;
-      if (p2pSnapshot.peers > 0) {
-        p2pSnapshot.status = "P2P: متصلة";
-      }
+      updateP2PModeStatus();
       const nextStats = { ...p2pSnapshot };
       p2pStatsStoreRef.current[p2pStoreKey] = nextStats;
       setP2pStats(nextStats);
@@ -1112,6 +1211,41 @@ export default function WatchPage() {
         p2pFlushTimer = null;
         updateP2PStats();
       }, P2P_STATS_UPDATE_MS);
+    };
+    const applyP2PMode = (enabled: boolean, fallbackReason?: string) => {
+      if (!p2pEngine) return;
+      p2pEngine.applyDynamicConfig({
+        core: {
+          ...P2P_HTTP_FIRST_CORE_CONFIG,
+          isP2PDisabled: !enabled,
+          isP2PUploadDisabled: !enabled || isLikelyMobileUploader,
+        },
+      });
+      p2pControlRef.current.enabled = enabled;
+      p2pControlRef.current.enabledAt = enabled ? Date.now() : 0;
+      updateP2PModeStatus(fallbackReason);
+      scheduleP2PStatsUpdate();
+    };
+    const scheduleEnableP2P = () => {
+      clearP2PEnableTimer();
+      if (disposed || !p2pEngine || p2pControlRef.current.enabled) return;
+      updateP2PModeStatus();
+      scheduleP2PStatsUpdate();
+      p2pEnableTimer = window.setTimeout(() => {
+        if (disposed || !p2pEngine || p2pControlRef.current.enabled) return;
+        applyP2PMode(true);
+      }, P2P_ENABLE_AFTER_STABLE_PLAYBACK_MS);
+    };
+    p2pControlRef.current = {
+      enabled: false,
+      enabledAt: 0,
+      provider: activeProvider,
+      streamUrl: src,
+      disable: (reason?: string) => {
+        clearP2PEnableTimer();
+        applyP2PMode(false, reason);
+      },
+      scheduleEnable: scheduleEnableP2P,
     };
     const hlsConfig: Partial<HlsConfig> = {
       enableWorker: true,
@@ -1170,6 +1304,9 @@ export default function WatchPage() {
             announceTrackers: P2P_ANNOUNCE_TRACKERS,
             rtcConfig: { iceServers: P2P_ICE_SERVERS },
             trackerClientVersionPrefix: "TF",
+            ...P2P_HTTP_FIRST_CORE_CONFIG,
+            isP2PDisabled: true,
+            isP2PUploadDisabled: true,
           },
         });
         const p2pCore = (
@@ -1231,6 +1368,7 @@ export default function WatchPage() {
           ...p2pHlsConfig,
         });
         p2pEngine.bindHls(nextHls);
+        applyP2PMode(false);
         updateP2PStats();
         attachHls(nextHls);
       } catch (error) {
@@ -1256,6 +1394,7 @@ export default function WatchPage() {
         window.clearInterval(p2pHeartbeatTimer);
         p2pHeartbeatTimer = null;
       }
+      clearP2PEnableTimer();
       clearWaitingOverlayTimer();
       video.removeEventListener("playing", onPlaying);
       video.removeEventListener("waiting", onWaiting);
@@ -1264,6 +1403,14 @@ export default function WatchPage() {
       p2pEngine?.destroy();
       hls?.destroy();
       if (hlsRef.current === hls) hlsRef.current = null;
+      p2pControlRef.current = {
+        enabled: false,
+        enabledAt: 0,
+        provider: null,
+        streamUrl: "",
+        disable: () => {},
+        scheduleEnable: () => {},
+      };
     };
   }, [activeProvider, clearWaitingOverlayTimer, matchId, playbackRequested, playerSessionNonce, streamUrl]);
 
