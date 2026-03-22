@@ -8,20 +8,12 @@ import type {
   ProviderManifestResult,
 } from "@/lib/live-providers";
 import { createTimingSummary } from "@/lib/live-providers";
-import { ensureLiveEmbedSessionRuntime } from "@/lib/repack-embed-session";
-import { buildPlayerv2Candidates } from "@/lib/repack-ingest-resolver";
 import { playerv2RuntimeAdapter } from "@/lib/repack-runtime-adapters/playerv2";
-import { primeRuntimeHint, rewriteManifestForSessionMirror } from "@/lib/repack-runtime-adapters/shared";
 
 const SIIIR_DAY_PAGE_URL = "https://w6.siiir.tv/today-matches/";
 const SIIIR_HOST_SUFFIXES = ["siiir.tv", "yallashot.us"] as const;
 const DAY_PAGE_CACHE_TTL_MS = 90_000;
 const RUNTIME_SOURCE_TTL_MS = 90_000;
-const FAST_PLAYERV_PAGE_TIMEOUT_MS = 3_500;
-const FAST_PLAYERV_BUILD_TIMEOUT_MS = 2_600;
-const FAST_MANIFEST_TIMEOUT_MS = 2_400;
-const FAST_MANIFEST_CONCURRENCY = 3;
-const FAST_MANIFEST_MAX_CANDIDATES = 6;
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
@@ -39,15 +31,6 @@ type CachedRuntimeSource = {
   runtimeSourceUrl: string;
   playbackUrl: string;
   updatedAt: number;
-};
-
-type FastResolvedManifest = {
-  candidateUrl: string;
-  targetUrl: string;
-  fetchUrl: string;
-  referrerUrl: string;
-  manifestBody: string;
-  finalUrl: string;
 };
 
 let cachedDayPage: CachedDayPage | null = null;
@@ -331,362 +314,6 @@ function mapAssetResult(result: Awaited<ReturnType<typeof playerv2RuntimeAdapter
   };
 }
 
-function parseMediaSequence(manifestText: string) {
-  const match = String(manifestText || "").match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/i);
-  if (!match?.[1]) return null;
-  const value = Number.parseInt(match[1], 10);
-  return Number.isFinite(value) ? value : null;
-}
-
-function parseTargetDurationSec(manifestText: string) {
-  for (const line of String(manifestText || "").split(/\r?\n/)) {
-    const match = String(line || "").trim().match(/^#EXT-X-TARGETDURATION:(\d+(?:\.\d+)?)/i);
-    if (!match?.[1]) continue;
-    const value = Number.parseFloat(match[1]);
-    if (Number.isFinite(value) && value > 0) return value;
-  }
-  return 0;
-}
-
-function resolveManifestUrl(raw: string, baseUrl: string) {
-  const value = String(raw || "").trim();
-  if (!value) return "";
-  try {
-    const absolute = new URL(value, baseUrl).toString();
-    return normalizeHttpUrl(absolute);
-  } catch {
-    return "";
-  }
-}
-
-function looksLikeManifestResponse(contentType: string, body: string, finalUrl: string) {
-  const text = String(body || "");
-  const ct = String(contentType || "").toLowerCase();
-  if (/^\s*#extm3u/im.test(text)) return true;
-  if (ct.includes("application/vnd.apple.mpegurl") || ct.includes("application/x-mpegurl")) return true;
-  return String(finalUrl || "").toLowerCase().includes(".m3u8");
-}
-
-function hasMediaSegments(manifestText: string, baseUrl: string) {
-  let previousExtInf = false;
-  for (const line of String(manifestText || "").split(/\r?\n/)) {
-    const trimmed = String(line || "").trim();
-    if (!trimmed) continue;
-    if (trimmed.startsWith("#EXTINF")) {
-      previousExtInf = true;
-      continue;
-    }
-    if (trimmed.startsWith("#")) continue;
-    const absolute = resolveManifestUrl(trimmed, baseUrl);
-    if (!absolute) continue;
-    if (previousExtInf) return true;
-    previousExtInf = false;
-  }
-  return false;
-}
-
-function pickVariantManifestUrl(manifestText: string, baseUrl: string) {
-  let pendingBandwidth = -1;
-  const variants: Array<{ url: string; bandwidth: number; order: number }> = [];
-  let order = 0;
-
-  for (const line of String(manifestText || "").split(/\r?\n/)) {
-    const trimmed = String(line || "").trim();
-    if (!trimmed) continue;
-    if (trimmed.startsWith("#EXT-X-STREAM-INF")) {
-      const match = trimmed.match(/BANDWIDTH=(\d+)/i);
-      pendingBandwidth = match?.[1] ? Number.parseInt(match[1], 10) : -1;
-      continue;
-    }
-    if (trimmed.startsWith("#")) continue;
-    const absolute = resolveManifestUrl(trimmed, baseUrl);
-    if (!absolute || !absolute.toLowerCase().includes(".m3u8")) {
-      pendingBandwidth = -1;
-      continue;
-    }
-    variants.push({
-      url: absolute,
-      bandwidth: Number.isFinite(pendingBandwidth) ? pendingBandwidth : -1,
-      order,
-    });
-    order += 1;
-    pendingBandwidth = -1;
-  }
-
-  variants.sort((left, right) => {
-    if (right.bandwidth !== left.bandwidth) return right.bandwidth - left.bandwidth;
-    return left.order - right.order;
-  });
-  return variants[0]?.url || "";
-}
-
-function preferFastPlayervCandidate(candidateUrl: string) {
-  const value = String(candidateUrl || "").trim();
-  let score = 0;
-  if (value.startsWith("/api/embed-proxy?")) score += 200;
-  if (value.includes("/kooora/")) score += 120;
-  if (/[?&]sid=/i.test(value)) score += 60;
-  if (/[?&]token=/i.test(value)) score += 40;
-  if (value.toLowerCase().includes(".m3u8")) score += 20;
-  return score;
-}
-
-function looksLikeFastPlayervPage(body: string) {
-  const text = String(body || "")
-    .replace(/\\u002f/gi, "/")
-    .replace(/\\\//g, "/")
-    .replace(/&amp;/gi, "&")
-    .toLowerCase();
-  return (
-    text.includes("window.tabsconfig") ||
-    /playerv\d+\.php\?action=generate_token/i.test(text) ||
-    text.includes("data-mobile-path=") ||
-    text.includes("data-path=") ||
-    text.includes("albaplayer_name") ||
-    text.includes("/kooora/")
-  );
-}
-
-async function fetchFastManifestResponse(input: {
-  requestUrl: string;
-  referrerUrl: string;
-  timeoutMs: number;
-}) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), input.timeoutMs);
-  try {
-    const response = await fetch(input.requestUrl, {
-      method: "GET",
-      cache: "no-store",
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        "user-agent": DEFAULT_USER_AGENT,
-        accept: "application/vnd.apple.mpegurl,application/x-mpegurl,text/plain,*/*",
-        "accept-language": "ar,en;q=0.9",
-        referer: input.referrerUrl,
-      },
-    });
-    const body = await response.text();
-    const contentType = String(response.headers.get("content-type") || "").trim();
-    const proxiedTarget = normalizeHttpUrl(String(response.headers.get("x-embed-proxy-target") || "").trim());
-    const finalUrl = normalizeHttpUrl(proxiedTarget || response.url || input.requestUrl) || input.requestUrl;
-    return {
-      ok: response.ok,
-      status: Number(response.status || 0),
-      body: String(body || ""),
-      contentType,
-      finalUrl,
-      fetchUrl: String(input.requestUrl || "").trim(),
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      status: 0,
-      body: "",
-      contentType: "",
-      finalUrl: String(input.requestUrl || "").trim(),
-      fetchUrl: String(input.requestUrl || "").trim(),
-      error: error instanceof Error ? error.message : String(error || "fast-manifest-fetch-failed"),
-    };
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
-async function resolveFastPlayervManifest(input: {
-  runtimeSourceUrl: string;
-  playbackUrl: string;
-  internalOrigin: string;
-}) {
-  const startedAt = Date.now();
-  let pageFetchMs = 0;
-  let candidateBuildMs = 0;
-  let manifestProbeMs = 0;
-
-  const pageFetchStartedAt = Date.now();
-  const pageResponse = await axios
-    .get<string>(input.runtimeSourceUrl, {
-      responseType: "text",
-      timeout: FAST_PLAYERV_PAGE_TIMEOUT_MS,
-      maxRedirects: 5,
-      validateStatus: () => true,
-      headers: {
-        "user-agent": DEFAULT_USER_AGENT,
-        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "accept-language": "ar,en;q=0.9",
-        referer: input.playbackUrl || input.runtimeSourceUrl,
-      },
-    })
-    .catch(() => null);
-  pageFetchMs = Date.now() - pageFetchStartedAt;
-
-  const pageHtml =
-    Number(pageResponse?.status || 0) >= 200 && Number(pageResponse?.status || 0) < 300
-      ? String(pageResponse?.data || "").trim()
-      : "";
-  if (!pageHtml || !looksLikeFastPlayervPage(pageHtml)) {
-    return {
-      ok: false as const,
-      timingSummary: createTimingSummary("fast_page_missing", {
-        total: Date.now() - startedAt,
-        fastPageFetch: pageFetchMs,
-      }, {
-        pageStatus: Number(pageResponse?.status || 0),
-        bodyLength: pageHtml.length,
-      }),
-    };
-  }
-
-  const candidateBuildStartedAt = Date.now();
-  const fastCandidates = await buildPlayerv2Candidates(
-    input.runtimeSourceUrl,
-    pageHtml,
-    FAST_PLAYERV_BUILD_TIMEOUT_MS,
-    input.internalOrigin
-  ).catch(() => [] as string[]);
-  candidateBuildMs = Date.now() - candidateBuildStartedAt;
-
-  const orderedCandidates = Array.from(new Set(fastCandidates))
-    .sort((left, right) => preferFastPlayervCandidate(right) - preferFastPlayervCandidate(left))
-    .slice(0, FAST_MANIFEST_MAX_CANDIDATES);
-  if (!orderedCandidates.length) {
-    return {
-      ok: false as const,
-      timingSummary: createTimingSummary("fast_candidates_missing", {
-        total: Date.now() - startedAt,
-        fastPageFetch: pageFetchMs,
-        fastCandidateBuild: candidateBuildMs,
-      }),
-    };
-  }
-
-  let candidatesTried = 0;
-  const probeStartedAt = Date.now();
-  let cursor = 0;
-  let resolved: FastResolvedManifest | null = null;
-
-  const workers = Array.from({ length: Math.min(FAST_MANIFEST_CONCURRENCY, orderedCandidates.length) }, async () => {
-    while (resolved === null && cursor < orderedCandidates.length) {
-      const candidateUrl = orderedCandidates[cursor];
-      cursor += 1;
-      if (!candidateUrl) continue;
-      candidatesTried += 1;
-      const requestUrl = candidateUrl.startsWith("/")
-        ? new URL(candidateUrl, `${String(input.internalOrigin || "").replace(/\/+$/, "")}/`).toString()
-        : candidateUrl;
-      const first = await fetchFastManifestResponse({
-        requestUrl,
-        referrerUrl: input.runtimeSourceUrl,
-        timeoutMs: FAST_MANIFEST_TIMEOUT_MS,
-      });
-      if (!first.ok || !looksLikeManifestResponse(first.contentType, first.body, first.finalUrl)) continue;
-
-      let manifestBody = first.body;
-      let finalUrl = first.finalUrl;
-      let referrerUrl = input.runtimeSourceUrl;
-      if (!hasMediaSegments(manifestBody, finalUrl)) {
-        const variantUrl = pickVariantManifestUrl(manifestBody, finalUrl);
-        if (!variantUrl) continue;
-        const second = await fetchFastManifestResponse({
-          requestUrl: variantUrl,
-          referrerUrl: finalUrl,
-          timeoutMs: FAST_MANIFEST_TIMEOUT_MS,
-        });
-        if (!second.ok || !looksLikeManifestResponse(second.contentType, second.body, second.finalUrl)) continue;
-        if (!hasMediaSegments(second.body, second.finalUrl)) continue;
-        manifestBody = second.body;
-        referrerUrl = finalUrl;
-        finalUrl = second.finalUrl;
-      }
-
-      resolved = {
-        candidateUrl,
-        targetUrl: finalUrl,
-        fetchUrl: requestUrl,
-        referrerUrl,
-        manifestBody,
-        finalUrl,
-      };
-      break;
-    }
-  });
-
-  await Promise.all(workers);
-  manifestProbeMs = Date.now() - probeStartedAt;
-
-  if (!resolved) {
-    return {
-      ok: false as const,
-      timingSummary: createTimingSummary("fast_probe_failed", {
-        total: Date.now() - startedAt,
-        fastPageFetch: pageFetchMs,
-        fastCandidateBuild: candidateBuildMs,
-        fastManifestProbe: manifestProbeMs,
-      }, {
-        candidatesFound: orderedCandidates.length,
-        candidatesTried,
-      }),
-    };
-  }
-
-  const finalResolved = resolved as FastResolvedManifest;
-
-  const runtimeInput = {
-    sourceUrl: input.runtimeSourceUrl,
-    slotServer: 2 as const,
-    internalOrigin: input.internalOrigin,
-  };
-  primeRuntimeHint(runtimeInput, {
-    targetUrl: finalResolved.targetUrl,
-    fetchUrl: finalResolved.fetchUrl,
-    referrerUrl: finalResolved.referrerUrl,
-  });
-  void ensureLiveEmbedSessionRuntime({
-    sourceUrl: input.runtimeSourceUrl,
-    requestOrigin: input.internalOrigin,
-    slotServerId: 2,
-    timeoutMs: 8_000,
-  }).catch(() => null);
-
-  return {
-    ok: true as const,
-    result: {
-      ok: true as const,
-      manifestBody: rewriteManifestForSessionMirror(
-        finalResolved.manifestBody,
-        finalResolved.finalUrl,
-        input.internalOrigin,
-        input.runtimeSourceUrl,
-        2
-      ),
-      finalUrl: finalResolved.finalUrl,
-      targetUrl: finalResolved.targetUrl,
-      fetchUrl: finalResolved.fetchUrl,
-      referrerUrl: finalResolved.referrerUrl,
-      playbackUrl: input.playbackUrl,
-      currentSource: finalResolved.targetUrl,
-      mediaSequence: parseMediaSequence(finalResolved.manifestBody),
-      targetDurationSec: parseTargetDurationSec(finalResolved.manifestBody),
-      refreshed: false,
-      rotated: false,
-      adapterKind: "playerv2" as const,
-      candidatesFound: orderedCandidates.length,
-      candidatesTried,
-      sessionOwned: true as const,
-    },
-    timingSummary: createTimingSummary("fast_resolved", {
-      total: Date.now() - startedAt,
-      fastPageFetch: pageFetchMs,
-      fastCandidateBuild: candidateBuildMs,
-      fastManifestProbe: manifestProbeMs,
-    }, {
-      candidatesFound: orderedCandidates.length,
-      candidatesTried,
-    }),
-  };
-}
-
 export function isAllowedSiiirSource(rawUrl: string) {
   const normalized = normalizeHttpUrl(rawUrl);
   if (!normalized) return false;
@@ -722,7 +349,6 @@ export const siiirProvider: LiveStreamProvider = {
   async extractCurrentManifest(input: ProviderContext, options) {
     const startedAt = Date.now();
     let runtimeResolveMs = 0;
-    let fastPathMs = 0;
     let manifestAttemptMs = 0;
     let refreshResolveMs = 0;
     let refreshManifestMs = 0;
@@ -749,29 +375,6 @@ export const siiirProvider: LiveStreamProvider = {
     }
 
     let runtimeSource = initialRuntimeSource;
-    const fastPathStartedAt = Date.now();
-    const fastPathResult =
-      !options?.forceRefresh
-        ? await resolveFastPlayervManifest({
-            runtimeSourceUrl: runtimeSource.runtimeSourceUrl,
-            playbackUrl: runtimeSource.playbackUrl,
-            internalOrigin: input.internalOrigin,
-          }).catch(() => null)
-        : null;
-    fastPathMs = Date.now() - fastPathStartedAt;
-    if (fastPathResult?.ok) {
-      return {
-        ...fastPathResult.result,
-        timingSummary: createTimingSummary("fast_resolved", {
-          total: Date.now() - startedAt,
-          resolveRuntimeSource: runtimeResolveMs,
-          fastPath: fastPathMs,
-        }, {
-          detail: fastPathResult.timingSummary,
-        }),
-      };
-    }
-
     let manifestStartedAt = Date.now();
     let resolved = await playerv2RuntimeAdapter.currentManifest(
       {
@@ -810,12 +413,9 @@ export const siiirProvider: LiveStreamProvider = {
     const timingSummary = createTimingSummary(mapped.ok ? "resolved" : "resolved_failed", {
       total: totalMs,
       resolveRuntimeSource: runtimeResolveMs,
-      fastPath: fastPathMs,
       manifest: manifestAttemptMs,
       refreshResolveRuntimeSource: refreshResolveMs,
       refreshManifest: refreshManifestMs,
-    }, {
-      fastPathDetail: fastPathResult?.timingSummary || "",
     });
     return {
       ...mapped,
