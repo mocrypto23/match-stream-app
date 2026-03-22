@@ -9,7 +9,7 @@ import type {
 } from "@/lib/live-providers";
 import { createTimingSummary } from "@/lib/live-providers";
 import { ensureLiveEmbedSessionRuntime } from "@/lib/repack-embed-session";
-import { buildPlayerv2Candidates, looksLikePlayerv2Html } from "@/lib/repack-ingest-resolver";
+import { buildPlayerv2Candidates } from "@/lib/repack-ingest-resolver";
 import { playerv2RuntimeAdapter } from "@/lib/repack-runtime-adapters/playerv2";
 import { primeRuntimeHint, rewriteManifestForSessionMirror } from "@/lib/repack-runtime-adapters/shared";
 
@@ -431,6 +431,22 @@ function preferFastPlayervCandidate(candidateUrl: string) {
   return score;
 }
 
+function looksLikeFastPlayervPage(body: string) {
+  const text = String(body || "")
+    .replace(/\\u002f/gi, "/")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/gi, "&")
+    .toLowerCase();
+  return (
+    text.includes("window.tabsconfig") ||
+    /playerv\d+\.php\?action=generate_token/i.test(text) ||
+    text.includes("data-mobile-path=") ||
+    text.includes("data-path=") ||
+    text.includes("albaplayer_name") ||
+    text.includes("/kooora/")
+  );
+}
+
 async function fetchFastManifestResponse(input: {
   requestUrl: string;
   referrerUrl: string;
@@ -509,12 +525,15 @@ async function resolveFastPlayervManifest(input: {
     Number(pageResponse?.status || 0) >= 200 && Number(pageResponse?.status || 0) < 300
       ? String(pageResponse?.data || "").trim()
       : "";
-  if (!pageHtml || !looksLikePlayerv2Html(pageHtml)) {
+  if (!pageHtml || !looksLikeFastPlayervPage(pageHtml)) {
     return {
       ok: false as const,
       timingSummary: createTimingSummary("fast_page_missing", {
         total: Date.now() - startedAt,
         fastPageFetch: pageFetchMs,
+      }, {
+        pageStatus: Number(pageResponse?.status || 0),
+        bodyLength: pageHtml.length,
       }),
     };
   }
