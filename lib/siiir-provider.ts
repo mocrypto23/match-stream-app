@@ -559,9 +559,12 @@ export const siiirProvider: LiveStreamProvider = {
     }
 
     let runtimeSource = initialRuntimeSource;
+    const normalizedWaitForMediaSequence = Number.isFinite(Number(options?.waitForMediaSequence))
+      ? Number(options?.waitForMediaSequence)
+      : null;
     const canTryDirectKoooraPath =
       !options?.forceRefresh &&
-      (!Number.isFinite(Number(options?.waitForMediaSequence)) || Number(options?.waitForMediaSequence) < 0);
+      (normalizedWaitForMediaSequence === null || normalizedWaitForMediaSequence <= 0);
     if (canTryDirectKoooraPath) {
       const directResult = await tryDirectSiiirKoooraManifest(input, runtimeSource);
       directPlayervFetchMs = directResult.playervFetchMs;
