@@ -104,7 +104,7 @@ const P2P_ANNOUNCE_TRACKERS = [
 ];
 const P2P_ICE_SERVERS = [{ urls: "stun:stun.cloudflare.com:3478" }, { urls: "stun:stun.l.google.com:19302" }];
 const P2P_CORE_CONFIG = {
-  highDemandTimeWindow: 15,
+  highDemandTimeWindow: 6,
   httpDownloadTimeWindow: 3_000,
   p2pDownloadTimeWindow: 6_000,
   simultaneousHttpDownloads: 2,
