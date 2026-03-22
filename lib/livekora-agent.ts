@@ -27,8 +27,9 @@ export async function bootstrapLivekoraAgent(input: {
 
 export async function buildLivekoraStatus(input: {
   matchId: number;
-  row: LivekoraMatchRow;
+  row?: LivekoraMatchRow | null;
   sourceUrl: string | null;
+  agentStatus?: LivekoraAgentStatus | null;
 }) {
   const sourceUrl = String(input.sourceUrl || "").trim() || null;
   if (!sourceUrl) {
@@ -49,7 +50,7 @@ export async function buildLivekoraStatus(input: {
     } satisfies LivekoraStatus;
   }
 
-  const agentStatus = await readLivekoraAgentStatus(input.matchId);
+  const agentStatus = input.agentStatus === undefined ? await readLivekoraAgentStatus(input.matchId) : input.agentStatus;
   if (!agentStatus) {
     return {
       provider: "livekora",

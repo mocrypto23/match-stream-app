@@ -36,8 +36,9 @@ export async function bootstrapSiiirAgent(input: {
 
 export async function buildSiiirStatus(input: {
   matchId: number;
-  row: LivekoraMatchRow;
+  row?: LivekoraMatchRow | null;
   sourceUrl: string | null;
+  agentStatus?: SiiirAgentStatus | null;
 }) {
   const sourceUrl = String(input.sourceUrl || "").trim() || null;
   if (!sourceUrl) {
@@ -58,7 +59,7 @@ export async function buildSiiirStatus(input: {
     } satisfies SiiirStatus;
   }
 
-  const agentStatus = await readSiiirAgentStatus(input.matchId);
+  const agentStatus = input.agentStatus === undefined ? await readSiiirAgentStatus(input.matchId) : input.agentStatus;
   if (!agentStatus) {
     return {
       provider: "siiir",

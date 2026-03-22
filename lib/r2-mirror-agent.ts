@@ -1,4 +1,7 @@
 import type { StreamAgentStatus, StreamProviderId } from "@/lib/stream-source-types";
+import type { BeinliveAgentStatus } from "@/lib/beinlive-types";
+import type { LivekoraAgentStatus } from "@/lib/livekora-types";
+import type { SiiirAgentStatus } from "@/lib/siiir-types";
 
 const R2_AGENT_BIND = String(process.env.LIVEKORA_R2_AGENT_BIND || "127.0.0.1").trim() || "127.0.0.1";
 const R2_AGENT_PORT = Number.parseInt(String(process.env.LIVEKORA_R2_AGENT_PORT || "3500"), 10) || 3500;
@@ -21,6 +24,33 @@ export async function readR2MirrorAgentStatus(provider: StreamProviderId, matchI
     });
     if (!response.ok) return null;
     return (await response.json().catch(() => null)) as StreamAgentStatus | null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+export async function readAllR2MirrorAgentStatuses(matchId: number) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 1800);
+  try {
+    const url = new URL(localAgentUrl("/status-all"));
+    url.searchParams.set("matchId", String(matchId));
+    const response = await fetch(url, {
+      method: "GET",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok) return null;
+    return (await response.json().catch(() => null)) as
+      | {
+          livekora: LivekoraAgentStatus | null;
+          beinlive: BeinliveAgentStatus | null;
+          siiir: SiiirAgentStatus | null;
+          updatedAt?: string;
+        }
+      | null;
   } catch {
     return null;
   } finally {

@@ -5,6 +5,7 @@ import { beinliveProvider, buildBeinliveSessionManifestUrl } from "@/lib/beinliv
 import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
 import { resolveInternalAppOrigin } from "@/lib/live-providers";
 import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
+import { seedHotWatchState } from "@/lib/watch-state-cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,6 +26,7 @@ export async function POST(req: Request) {
   }
 
   const sourceUrl = await resolveProviderSourceUrl(beinliveProvider, data);
+  seedHotWatchState({ matchId, beinliveSourceUrl: sourceUrl });
   if (!sourceUrl) {
     const beinliveStatus = await buildBeinliveStatus({ matchId, row: data, sourceUrl: null });
     return NextResponse.json({ accepted: false, beinliveStatus }, { status: 409 });

@@ -27,8 +27,9 @@ export async function bootstrapBeinliveAgent(input: {
 
 export async function buildBeinliveStatus(input: {
   matchId: number;
-  row: LivekoraMatchRow;
+  row?: LivekoraMatchRow | null;
   sourceUrl: string | null;
+  agentStatus?: BeinliveAgentStatus | null;
 }) {
   const sourceUrl = String(input.sourceUrl || "").trim() || null;
   if (!sourceUrl) {
@@ -49,7 +50,7 @@ export async function buildBeinliveStatus(input: {
     } satisfies BeinliveStatus;
   }
 
-  const agentStatus = await readBeinliveAgentStatus(input.matchId);
+  const agentStatus = input.agentStatus === undefined ? await readBeinliveAgentStatus(input.matchId) : input.agentStatus;
   if (!agentStatus) {
     return {
       provider: "beinlive",

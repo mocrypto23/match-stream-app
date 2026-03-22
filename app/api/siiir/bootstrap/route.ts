@@ -5,6 +5,7 @@ import { resolveInternalAppOrigin } from "@/lib/live-providers";
 import { buildSiiirStatus, bootstrapSiiirAgent } from "@/lib/siiir-agent";
 import { buildSiiirSessionManifestUrl, siiirProvider } from "@/lib/siiir-provider";
 import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
+import { seedHotWatchState } from "@/lib/watch-state-cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,6 +26,7 @@ export async function POST(req: Request) {
   }
 
   const sourceUrl = await resolveProviderSourceUrl(siiirProvider, data);
+  seedHotWatchState({ matchId, siiirSourceUrl: sourceUrl });
   if (!sourceUrl) {
     const siiirStatus = await buildSiiirStatus({ matchId, row: data, sourceUrl: null });
     return NextResponse.json({ accepted: false, siiirStatus }, { status: 409 });

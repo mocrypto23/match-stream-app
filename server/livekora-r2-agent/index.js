@@ -1236,6 +1236,15 @@ async function main() {
         const providerId = normalizeProviderId(parsed.searchParams.get("providerId"));
         return sendJson(res, 200, manager.status(providerId, matchId));
       }
+      if (method === "GET" && parsed.pathname === "/status-all") {
+        const matchId = Number.parseInt(String(parsed.searchParams.get("matchId") || "").trim(), 10);
+        return sendJson(res, 200, {
+          livekora: manager.status("livekora", matchId),
+          beinlive: manager.status("beinlive", matchId),
+          siiir: manager.status("siiir", matchId),
+          updatedAt: nowIso(),
+        });
+      }
       if (method === "POST" && parsed.pathname === "/bootstrap") {
         const payload = await readJsonBody(req);
         const result = await manager.bootstrap(payload || {});

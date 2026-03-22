@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { bootstrapLivekoraAgent, buildLivekoraStatus } from "@/lib/livekora-agent";
 import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
 import { buildLivekoraSessionManifestUrl, pickLivekoraSourceUrl, resolveInternalAppOrigin } from "@/lib/live-providers";
+import { seedHotWatchState } from "@/lib/watch-state-cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -23,6 +24,7 @@ export async function POST(req: Request) {
   }
 
   const sourceUrl = await pickLivekoraSourceUrl(data);
+  seedHotWatchState({ matchId, livekoraSourceUrl: sourceUrl });
   if (!sourceUrl) {
     const livekoraStatus = await buildLivekoraStatus({ matchId, row: data, sourceUrl: null });
     return NextResponse.json({ accepted: false, livekoraStatus }, { status: 409 });

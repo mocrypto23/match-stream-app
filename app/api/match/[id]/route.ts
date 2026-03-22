@@ -3,11 +3,13 @@ import { NextResponse } from "next/server";
 import { buildBeinliveStatus } from "@/lib/beinlive-agent";
 import { buildLivekoraStatus } from "@/lib/livekora-agent";
 import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
+import { readAllR2MirrorAgentStatuses } from "@/lib/r2-mirror-agent";
 import { buildSiiirStatus } from "@/lib/siiir-agent";
 import { beinliveProvider } from "@/lib/beinlive-provider";
 import { livekoraProvider } from "@/lib/live-providers";
 import { siiirProvider } from "@/lib/siiir-provider";
 import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
+import { seedHotWatchState } from "@/lib/watch-state-cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -35,21 +37,33 @@ export async function GET(_req: Request, ctx: Ctx) {
     resolveProviderSourceUrl(siiirProvider, data),
   ]);
 
+  seedHotWatchState({
+    matchId,
+    livekoraSourceUrl: sourceUrl,
+    beinliveSourceUrl,
+    siiirSourceUrl,
+  });
+
+  const agentStatuses = await readAllR2MirrorAgentStatuses(matchId);
+
   const [livekoraStatus, beinliveStatus, siiirStatus] = await Promise.all([
     buildLivekoraStatus({
       matchId,
       row: data,
       sourceUrl,
+      agentStatus: agentStatuses?.livekora || null,
     }),
     buildBeinliveStatus({
       matchId,
       row: data,
       sourceUrl: beinliveSourceUrl,
+      agentStatus: agentStatuses?.beinlive || null,
     }),
     buildSiiirStatus({
       matchId,
       row: data,
       sourceUrl: siiirSourceUrl,
+      agentStatus: agentStatuses?.siiir || null,
     }),
   ]);
   const streamSources = [livekoraStatus, beinliveStatus, siiirStatus].sort((left, right) => left.order - right.order);

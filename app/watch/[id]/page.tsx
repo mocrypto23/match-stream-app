@@ -28,6 +28,20 @@ type MatchPayload = {
   streamSources?: StreamSourceStatus[] | null;
 };
 
+type WatchStatePayload = {
+  matchId: number;
+  stream_url?: string | null;
+  stream_url_2?: string | null;
+  stream_url_4?: string | null;
+  livekoraStatus?: StreamSourceStatus | null;
+  beinliveStatus?: StreamSourceStatus | null;
+  siiirStatus?: StreamSourceStatus | null;
+  streamSources?: StreamSourceStatus[] | null;
+  providerHasMatchById?: Partial<Record<StreamProviderId, boolean>> | null;
+  updatedAt?: string | null;
+  version?: string | null;
+};
+
 type StatusMap = Record<StreamProviderId, StreamSourceStatus | null>;
 type PendingBootstrapMap = Record<StreamProviderId, number>;
 type DisplayProgressMap = Record<StreamProviderId, number>;
@@ -85,8 +99,8 @@ type P2PStats = {
   status: string;
 };
 
-const STATUS_POLL_MS = 4_000;
-const ACTIVE_WARMING_POLL_MS = 1_250;
+const STATUS_POLL_MS = 10_000;
+const ACTIVE_WARMING_POLL_MS = 2_500;
 const AUTO_BOOTSTRAP_RETRY_MS = 12_000;
 const ACTIVE_RECOVERY_RETRY_MS = 3_500;
 const PLAYBACK_STALL_CHECK_MS = 2_000;
@@ -339,6 +353,7 @@ export default function WatchPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   const waitingOverlayTimerRef = useRef<number | null>(null);
+  const watchStateRequestRef = useRef<Promise<void> | null>(null);
   const displayProgressMetaRef = useRef<DisplayProgressMetaMap>(createDisplayProgressMetaMap());
   const hasPlayedRef = useRef(false);
   const selectedRecoveryPendingRef = useRef(false);
@@ -472,6 +487,28 @@ export default function WatchPage() {
     }));
   }, []);
 
+  const applyWatchState = useCallback((payload: WatchStatePayload | null | undefined) => {
+    if (!payload) return;
+    setStatusByProvider({
+      livekora: payload.livekoraStatus || null,
+      beinlive: payload.beinliveStatus || null,
+      siiir: payload.siiirStatus || null,
+    });
+    setMatch((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        stream_url: payload.stream_url ?? current.stream_url ?? null,
+        stream_url_2: payload.stream_url_2 ?? current.stream_url_2 ?? null,
+        stream_url_4: payload.stream_url_4 ?? current.stream_url_4 ?? null,
+        livekoraStatus: payload.livekoraStatus ?? current.livekoraStatus ?? null,
+        beinliveStatus: payload.beinliveStatus ?? current.beinliveStatus ?? null,
+        siiirStatus: payload.siiirStatus ?? current.siiirStatus ?? null,
+        streamSources: payload.streamSources ?? current.streamSources ?? null,
+      };
+    });
+  }, []);
+
   const loadMatch = useCallback(async () => {
     if (!Number.isFinite(matchId) || matchId <= 0) {
       setPageError("رقم المباراة غير صالح.");
@@ -501,28 +538,38 @@ export default function WatchPage() {
     }
   }, [matchId]);
 
-  const refreshProviderStatus = useCallback(
-    async (provider: StreamProviderId) => {
-      if (!Number.isFinite(matchId) || matchId <= 0) return;
+  const refreshWatchState = useCallback(async () => {
+    if (!Number.isFinite(matchId) || matchId <= 0) return;
+    if (watchStateRequestRef.current) {
+      await watchStateRequestRef.current;
+      return;
+    }
+    const request = (async () => {
       try {
-        const response = await fetch(`/api/${provider}/status?matchId=${encodeURIComponent(String(matchId))}`, {
-          cache: "no-store",
-        });
-        const payload = (await response.json().catch(() => null)) as
-          | { livekoraStatus?: StreamSourceStatus | null; beinliveStatus?: StreamSourceStatus | null; siiirStatus?: StreamSourceStatus | null }
-          | null;
-        if (!response.ok || !payload) return;
-        if (provider === "livekora") applyProviderStatus(provider, payload.livekoraStatus);
-        if (provider === "beinlive") applyProviderStatus(provider, payload.beinliveStatus);
-        if (provider === "siiir") applyProviderStatus(provider, payload.siiirStatus);
+        const response = await fetch(`/api/watch-state/${matchId}`);
+        const payload = (await response.json().catch(() => null)) as WatchStatePayload | { error?: string } | null;
+        if (!response.ok || !payload || !("matchId" in payload)) return;
+        applyWatchState(payload);
       } catch {}
+    })();
+    watchStateRequestRef.current = request;
+    try {
+      await request;
+    } finally {
+      watchStateRequestRef.current = null;
+    }
+  }, [applyWatchState, matchId]);
+
+  const refreshProviderStatus = useCallback(
+    async (_provider: StreamProviderId) => {
+      await refreshWatchState();
     },
-    [applyProviderStatus, matchId]
+    [refreshWatchState]
   );
 
   const refreshAllStatuses = useCallback(async () => {
-    await Promise.all(PROVIDER_META.map((item) => refreshProviderStatus(item.provider)));
-  }, [refreshProviderStatus]);
+    await refreshWatchState();
+  }, [refreshWatchState]);
 
   const bootstrapProvider = useCallback(
     async (provider: StreamProviderId, opts?: { silent?: boolean }) => {
@@ -624,6 +671,7 @@ export default function WatchPage() {
 
   useEffect(() => {
     resetPlaybackState({ clearError: false });
+    watchStateRequestRef.current = null;
     backgroundBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     lastAutoBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
     setStatusByProvider({ livekora: null, beinlive: null, siiir: null });
