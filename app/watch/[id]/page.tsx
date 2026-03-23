@@ -150,6 +150,21 @@ const EMPTY_P2P_STATS: P2PStats = {
 };
 let p2pEngineModulePromise: Promise<P2PEngineModule> | null = null;
 
+function WatchPageSponsorBanner() {
+  return (
+    <div className="overflow-x-auto" dir="ltr">
+      <iframe
+        title="TF Player Sponsor"
+        src="/ad-frame/tf-player-728"
+        sandbox="allow-scripts allow-same-origin allow-top-navigation-by-user-activation"
+        loading="lazy"
+        referrerPolicy="strict-origin-when-cross-origin"
+        className="mx-auto h-[90px] w-[728px] min-w-[728px] overflow-hidden rounded-md border-0 bg-transparent"
+      />
+    </div>
+  );
+}
+
 function createPendingBootstrapMap(): PendingBootstrapMap {
   return { livekora: 0, beinlive: 0, siiir: 0 };
 }
@@ -1566,8 +1581,9 @@ export default function WatchPage() {
           </a>
         </div>
         <div className="grid gap-6 lg:grid-cols-[1.6fr_0.8fr]">
-          <div className="overflow-hidden rounded-3xl border border-white/10 bg-black/40 shadow-2xl shadow-black/40">
-            <div className="relative aspect-video bg-black">
+          <div className="flex flex-col gap-4">
+            <div className="overflow-hidden rounded-3xl border border-white/10 bg-black/40 shadow-2xl shadow-black/40">
+              <div className="relative aspect-video bg-black">
               <video
                 ref={videoRef}
                 className="h-full w-full"
@@ -1661,6 +1677,14 @@ export default function WatchPage() {
                 onPlayRequest={requestPlaybackStart}
                 onPauseRequest={stopPlaybackSession}
               />
+              </div>
+            </div>
+
+            <div className="rounded-3xl border border-white/10 bg-white/5 p-4 backdrop-blur">
+              <div className="mb-3 text-center text-sm font-medium text-slate-300">
+                إعلان الموقع الوحيد لدعم استمرار البث المجاني
+              </div>
+              <WatchPageSponsorBanner />
             </div>
           </div>
 
