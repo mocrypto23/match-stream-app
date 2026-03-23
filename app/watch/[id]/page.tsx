@@ -111,6 +111,11 @@ const PREPARATION_PROGRESS_TICK_MS = 250;
 const PREPARATION_PROGRESS_CAP_PCT = 95;
 const P2P_STATS_UPDATE_MS = 300;
 const P2P_MIN_ENABLED_BEFORE_FALLBACK_MS = 1_500;
+const EDGE_SHADOW_CHANNEL_PREFIX = "tf-watch-edge-shadow";
+const EDGE_SHADOW_LEASE_PREFIX = "tf-watch-edge-shadow-lease";
+const EDGE_SHADOW_LEASE_TTL_MS = 15_000;
+const EDGE_SHADOW_LEASE_HEARTBEAT_MS = 5_000;
+const EDGE_SHADOW_FOLLOWER_CHECK_MS = 6_000;
 const P2P_ANNOUNCE_TRACKERS = [
   "wss://tracker.novage.com.ua",
   "wss://tracker.webtorrent.dev",
@@ -702,8 +707,63 @@ export default function WatchPage() {
     if (typeof window === "undefined" || typeof WebSocket === "undefined") return;
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const socket = new WebSocket(`${protocol}//${window.location.host}/__edge-watch/ws/${matchId}`);
+    const wsUrl = `${protocol}//${window.location.host}/__edge-watch/ws/${matchId}`;
+    const tabId =
+      typeof window.crypto?.randomUUID === "function"
+        ? window.crypto.randomUUID()
+        : `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const leaseKey = `${EDGE_SHADOW_LEASE_PREFIX}:${matchId}`;
+    const channelName = `${EDGE_SHADOW_CHANNEL_PREFIX}:${matchId}`;
+    const channel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(channelName) : null;
+    let supportsLeaderElection = !!channel;
+    let closed = false;
+    let isLeader = false;
+    let socket: WebSocket | null = null;
+    let reconnectTimer = 0;
     let pingTimer = 0;
+    let leaderHeartbeatTimer = 0;
+    let followerCheckTimer = 0;
+
+    const readLease = () => {
+      if (!supportsLeaderElection) return null;
+      try {
+        const raw = window.localStorage.getItem(leaseKey);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw) as { ownerId?: string; expiresAt?: number };
+        const ownerId = String(parsed?.ownerId || "").trim();
+        const expiresAt = Number(parsed?.expiresAt || 0);
+        if (!ownerId || !Number.isFinite(expiresAt) || expiresAt <= 0) return null;
+        return { ownerId, expiresAt };
+      } catch {
+        supportsLeaderElection = false;
+        return null;
+      }
+    };
+
+    const writeLease = (ownerId: string, expiresAt: number) => {
+      if (!supportsLeaderElection) return;
+      try {
+        window.localStorage.setItem(leaseKey, JSON.stringify({ ownerId, expiresAt }));
+      } catch {
+        supportsLeaderElection = false;
+      }
+    };
+
+    const clearOwnLease = () => {
+      if (!supportsLeaderElection) return;
+      try {
+        const lease = readLease();
+        if (lease?.ownerId === tabId) {
+          window.localStorage.removeItem(leaseKey);
+        }
+      } catch {}
+    };
+
+    const postChannelMessage = (payload: Record<string, unknown>) => {
+      try {
+        channel?.postMessage(payload);
+      } catch {}
+    };
 
     const clearPing = () => {
       if (pingTimer) {
@@ -712,44 +772,219 @@ export default function WatchPage() {
       }
     };
 
-    socket.addEventListener("open", () => {
-      clearPing();
-      pingTimer = window.setInterval(() => {
-        if (socket.readyState === WebSocket.OPEN) {
-          socket.send("ping");
-        }
-      }, 15_000);
-    });
+    const clearReconnect = () => {
+      if (reconnectTimer) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = 0;
+      }
+    };
 
-    socket.addEventListener("message", (event) => {
-      let payload: { type?: string; version?: string | null; payload?: { version?: string | null } | null } | null =
-        null;
-      try {
-        payload = JSON.parse(String(event.data || "")) as {
-          type?: string;
-          version?: string | null;
-          payload?: { version?: string | null } | null;
-        };
-      } catch {
-        return;
+    const clearLeaderHeartbeat = () => {
+      if (leaderHeartbeatTimer) {
+        window.clearInterval(leaderHeartbeatTimer);
+        leaderHeartbeatTimer = 0;
       }
-      if (!payload) return;
-      if (payload.type === "connected" || payload.type === "pong") {
-        watchEdgeShadowLastMessageAtRef.current = Date.now();
-        return;
-      }
-      const version = String(payload.version || payload.payload?.version || "").trim();
-      if (!version) return;
-      watchEdgeShadowVersionRef.current = version;
+    };
+
+    const applyShadowVersion = (version: string) => {
+      const normalizedVersion = String(version || "").trim();
+      if (!normalizedVersion) return;
+      watchEdgeShadowVersionRef.current = normalizedVersion;
       watchEdgeShadowLastMessageAtRef.current = Date.now();
-    });
+    };
 
-    socket.addEventListener("error", clearPing);
-    socket.addEventListener("close", clearPing);
+    const startSocket = () => {
+      if (closed || socket || !isLeader) return;
+      socket = new WebSocket(wsUrl);
+
+      socket.addEventListener("open", () => {
+        clearPing();
+        pingTimer = window.setInterval(() => {
+          if (socket?.readyState === WebSocket.OPEN) {
+            socket.send("ping");
+          }
+        }, 15_000);
+      });
+
+      socket.addEventListener("message", (event) => {
+        let payload: { type?: string; version?: string | null; payload?: { version?: string | null } | null } | null =
+          null;
+        try {
+          payload = JSON.parse(String(event.data || "")) as {
+            type?: string;
+            version?: string | null;
+            payload?: { version?: string | null } | null;
+          };
+        } catch {
+          return;
+        }
+        if (!payload) return;
+        if (payload.type === "connected" || payload.type === "pong") {
+          watchEdgeShadowLastMessageAtRef.current = Date.now();
+          return;
+        }
+        const version = String(payload.version || payload.payload?.version || "").trim();
+        if (!version) return;
+        applyShadowVersion(version);
+        postChannelMessage({
+          type: "shadow-version",
+          ownerId: tabId,
+          version,
+          ts: Date.now(),
+        });
+      });
+
+      const handleSocketClosed = () => {
+        clearPing();
+        socket = null;
+        if (closed || !isLeader) return;
+        clearReconnect();
+        reconnectTimer = window.setTimeout(() => {
+          if (!closed && isLeader) {
+            startSocket();
+          }
+        }, 2_000);
+      };
+
+      socket.addEventListener("error", handleSocketClosed);
+      socket.addEventListener("close", handleSocketClosed);
+    };
+
+    const stopSocket = () => {
+      clearPing();
+      clearReconnect();
+      const currentSocket = socket;
+      socket = null;
+      if (currentSocket) {
+        try {
+          currentSocket.close();
+        } catch {}
+      }
+    };
+
+    const stopLeading = (notify = true) => {
+      if (!isLeader) return;
+      isLeader = false;
+      clearLeaderHeartbeat();
+      stopSocket();
+      clearOwnLease();
+      if (notify) {
+        postChannelMessage({
+          type: "leader-release",
+          ownerId: tabId,
+          ts: Date.now(),
+        });
+      }
+    };
+
+    const startLeaderHeartbeat = () => {
+      clearLeaderHeartbeat();
+      leaderHeartbeatTimer = window.setInterval(() => {
+        if (!isLeader || closed) return;
+        const expiresAt = Date.now() + EDGE_SHADOW_LEASE_TTL_MS;
+        writeLease(tabId, expiresAt);
+        postChannelMessage({
+          type: "leader-heartbeat",
+          ownerId: tabId,
+          ts: Date.now(),
+          expiresAt,
+        });
+      }, EDGE_SHADOW_LEASE_HEARTBEAT_MS);
+    };
+
+    const tryBecomeLeader = () => {
+      if (closed) return false;
+      if (!supportsLeaderElection) {
+        if (!isLeader) {
+          isLeader = true;
+          startSocket();
+        }
+        return true;
+      }
+
+      const now = Date.now();
+      const currentLease = readLease();
+      if (currentLease && currentLease.expiresAt > now && currentLease.ownerId !== tabId) {
+        return false;
+      }
+
+      const expiresAt = now + EDGE_SHADOW_LEASE_TTL_MS;
+      writeLease(tabId, expiresAt);
+      const confirmedLease = readLease();
+      if (!confirmedLease || confirmedLease.ownerId !== tabId) {
+        return false;
+      }
+
+      if (!isLeader) {
+        isLeader = true;
+        startSocket();
+      }
+      startLeaderHeartbeat();
+      postChannelMessage({
+        type: "leader-heartbeat",
+        ownerId: tabId,
+        ts: now,
+        expiresAt,
+      });
+      return true;
+    };
+
+    if (channel) {
+      channel.addEventListener("message", (event) => {
+        const payload = (event.data || {}) as {
+          type?: string;
+          ownerId?: string;
+          version?: string;
+          ts?: number;
+          expiresAt?: number;
+        };
+        if (!payload?.type) return;
+        if (payload.type === "shadow-version") {
+          applyShadowVersion(String(payload.version || ""));
+          return;
+        }
+        if (payload.type === "leader-heartbeat") {
+          if (String(payload.ownerId || "").trim() === tabId) return;
+          if (isLeader) {
+            const currentLease = readLease();
+            if (currentLease && currentLease.ownerId !== tabId) {
+              stopLeading(false);
+            }
+          }
+          watchEdgeShadowLastMessageAtRef.current = Date.now();
+          return;
+        }
+        if (payload.type === "leader-release") {
+          if (!isLeader) {
+            window.setTimeout(() => {
+              void tryBecomeLeader();
+            }, 250);
+          }
+        }
+      });
+    }
+
+    tryBecomeLeader();
+    followerCheckTimer = window.setInterval(() => {
+      if (closed || isLeader || !supportsLeaderElection) return;
+      const lease = readLease();
+      if (!lease || lease.expiresAt <= Date.now()) {
+        void tryBecomeLeader();
+      }
+    }, EDGE_SHADOW_FOLLOWER_CHECK_MS);
 
     return () => {
+      closed = true;
+      if (followerCheckTimer) {
+        window.clearInterval(followerCheckTimer);
+      }
+      stopLeading();
       clearPing();
-      socket.close();
+      clearReconnect();
+      clearLeaderHeartbeat();
+      try {
+        channel?.close();
+      } catch {}
     };
   }, [matchId]);
 

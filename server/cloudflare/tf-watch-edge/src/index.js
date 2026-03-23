@@ -28,6 +28,45 @@ function matchHubName(matchId) {
   return `match:${matchId}`;
 }
 
+function listChangedFields(previous, next, fields) {
+  const changed = [];
+  for (const field of fields) {
+    const left = previous?.[field] ?? null;
+    const right = next?.[field] ?? null;
+    if (JSON.stringify(left) !== JSON.stringify(right)) {
+      changed.push(field);
+    }
+  }
+  return changed;
+}
+
+function buildSnapshotDiff(previous, next) {
+  const changes = [];
+
+  const topLevelMap = [
+    { provider: "livekora", field: "stream_url_4" },
+    { provider: "beinlive", field: "stream_url" },
+    { provider: "siiir", field: "stream_url_2" },
+  ];
+
+  for (const item of topLevelMap) {
+    if ((previous?.[item.field] ?? null) !== (next?.[item.field] ?? null)) {
+      changes.push({ provider: item.provider, fields: [item.field] });
+    }
+  }
+
+  const providerStatusFields = ["state", "playlistUrl", "currentSource", "reason", "phase", "progressPct", "sourceUrl"];
+  for (const provider of ["livekora", "beinlive", "siiir"]) {
+    const statusKey = `${provider}Status`;
+    const changedFields = listChangedFields(previous?.[statusKey], next?.[statusKey], providerStatusFields);
+    if (changedFields.length) {
+      changes.push({ provider, fields: changedFields });
+    }
+  }
+
+  return changes;
+}
+
 function constantTimeEqual(left, right) {
   if (left.length !== right.length) return false;
   let diff = 0;
@@ -234,13 +273,15 @@ export class MatchHub {
         return badRequest("invalid-payload", 400);
       }
 
+      const previousSnapshot = await this.readSnapshot();
       await this.writeSnapshot(normalizedSnapshot);
+      const changes = buildSnapshotDiff(previousSnapshot, normalizedSnapshot);
       this.broadcast({
-        type: "watch-state-change",
+        type: "watch-state-diff",
         matchId,
         version: normalizedSnapshot.version,
         updatedAt: normalizedSnapshot.updatedAt,
-        payload: normalizedSnapshot,
+        changes,
       });
 
       return jsonResponse({
