@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 
+const { createHmac } = require("crypto");
 const http = require("http");
 const path = require("path");
 const dotenv = require("dotenv");
@@ -37,10 +38,40 @@ function writeSseEvent(res, eventName, payload) {
   } catch {}
 }
 
+function hmacSha256Hex(secret, value) {
+  return createHmac("sha256", secret).update(value).digest("hex");
+}
+
+function trimUrl(rawValue, fallback = "") {
+  return String(rawValue || "")
+    .trim()
+    .replace(/\/+$/, "") || fallback;
+}
+
+function compactWatchState(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const matchId = Number.parseInt(String(payload.matchId || "").trim(), 10);
+  if (!Number.isFinite(matchId) || matchId <= 0) return null;
+  return {
+    matchId,
+    version: payload.version ? String(payload.version) : null,
+    updatedAt: payload.updatedAt ? String(payload.updatedAt) : nowIso(),
+    stream_url: payload.stream_url ? String(payload.stream_url) : null,
+    stream_url_2: payload.stream_url_2 ? String(payload.stream_url_2) : null,
+    stream_url_4: payload.stream_url_4 ? String(payload.stream_url_4) : null,
+    livekoraStatus: payload.livekoraStatus && typeof payload.livekoraStatus === "object" ? payload.livekoraStatus : null,
+    beinliveStatus: payload.beinliveStatus && typeof payload.beinliveStatus === "object" ? payload.beinliveStatus : null,
+    siiirStatus: payload.siiirStatus && typeof payload.siiirStatus === "object" ? payload.siiirStatus : null,
+  };
+}
+
 class FanoutServer {
   constructor(config) {
     this.config = config;
     this.clientsByMatchId = new Map();
+    this.snapshotVersionByMatchId = new Map();
+    this.snapshotRefreshPromises = new Map();
+    this.snapshotRefreshPending = new Set();
     this.server = null;
     this.redisSub = null;
     this.heartbeatTimer = null;
@@ -77,6 +108,84 @@ class FanoutServer {
     }
   }
 
+  async fetchCompactSnapshot(matchId) {
+    const response = await fetch(`${this.config.appBaseUrl}/api/livekora/watch-state/${matchId}`, {
+      headers: {
+        accept: "application/json",
+        "cache-control": "no-store",
+      },
+      signal: AbortSignal.timeout(this.config.edgePublishTimeoutMs),
+    });
+    if (!response.ok) {
+      throw new Error(`watch-state-${response.status}`);
+    }
+    const payload = await response.json().catch(() => null);
+    const snapshot = compactWatchState(payload);
+    if (!snapshot) {
+      throw new Error("watch-state-invalid");
+    }
+    return snapshot;
+  }
+
+  async publishCompactSnapshot(snapshot) {
+    if (!this.config.watchEdgeBaseUrl || !this.config.watchEdgePublishSecret) return;
+    const body = JSON.stringify(snapshot);
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const signature = hmacSha256Hex(this.config.watchEdgePublishSecret, `${timestamp}.${body}`);
+    const response = await fetch(`${this.config.watchEdgeBaseUrl}/__edge-watch/publish/${snapshot.matchId}`, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json; charset=utf-8",
+        "x-tf-edge-timestamp": timestamp,
+        "x-tf-edge-signature": signature,
+      },
+      body,
+      signal: AbortSignal.timeout(this.config.edgePublishTimeoutMs),
+    });
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "");
+      throw new Error(`edge-publish-${response.status}${errorText ? `:${errorText.slice(0, 160)}` : ""}`);
+    }
+  }
+
+  async refreshMatchSnapshot(matchId) {
+    const snapshot = await this.fetchCompactSnapshot(matchId);
+    const version = String(snapshot.version || "").trim();
+    if (!version) return;
+    if (this.snapshotVersionByMatchId.get(matchId) === version) return;
+    await this.publishCompactSnapshot(snapshot);
+    this.snapshotVersionByMatchId.set(matchId, version);
+  }
+
+  scheduleSnapshotRefresh(matchId) {
+    if (!this.config.watchEdgeBaseUrl || !this.config.watchEdgePublishSecret) return;
+
+    if (this.snapshotRefreshPromises.has(matchId)) {
+      this.snapshotRefreshPending.add(matchId);
+      return;
+    }
+
+    const run = (async () => {
+      do {
+        this.snapshotRefreshPending.delete(matchId);
+        try {
+          await this.refreshMatchSnapshot(matchId);
+        } catch (error) {
+          this.log("warn", "edge snapshot refresh failed", {
+            matchId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } while (this.snapshotRefreshPending.has(matchId));
+    })().finally(() => {
+      this.snapshotRefreshPromises.delete(matchId);
+      this.snapshotRefreshPending.delete(matchId);
+    });
+
+    this.snapshotRefreshPromises.set(matchId, run);
+  }
+
   async startRedis() {
     const sub = createClient({ url: this.config.redisUrl });
     sub.on("error", (error) => {
@@ -97,6 +206,7 @@ class FanoutServer {
       const matchId = Number.isFinite(matchFromPayload) ? matchFromPayload : channelMatch;
       if (!Number.isFinite(matchId) || matchId <= 0) return;
       this.broadcast(matchId, "watch-state-change", payload);
+      this.scheduleSnapshotRefresh(matchId);
     });
     this.redisSub = sub;
     this.log("info", "redis subscriber connected", { redisUrl: this.config.redisUrl });
@@ -115,6 +225,11 @@ class FanoutServer {
   async start() {
     await this.startRedis();
     this.startHeartbeat();
+    this.log("info", "edge publisher config", {
+      appBaseUrl: this.config.appBaseUrl,
+      watchEdgeEnabled: !!(this.config.watchEdgeBaseUrl && this.config.watchEdgePublishSecret),
+      watchEdgeBaseUrl: this.config.watchEdgeBaseUrl || null,
+    });
 
     this.server = http.createServer((req, res) => {
       const method = String(req.method || "GET").toUpperCase();
@@ -174,6 +289,10 @@ function loadConfig() {
     port: toInt(process.env.WATCH_STATE_FANOUT_PORT, 3601, 1),
     heartbeatMs: toInt(process.env.WATCH_STATE_FANOUT_HEARTBEAT_MS, 15000, 1000),
     redisUrl: String(process.env.WATCH_STATE_REDIS_URL || "redis://127.0.0.1:6379").trim() || "redis://127.0.0.1:6379",
+    appBaseUrl: trimUrl(process.env.WATCH_STATE_APP_BASE_URL, "http://127.0.0.1:3000"),
+    watchEdgeBaseUrl: trimUrl(process.env.WATCH_EDGE_BASE_URL, ""),
+    watchEdgePublishSecret: String(process.env.WATCH_EDGE_PUBLISH_SECRET || "").trim(),
+    edgePublishTimeoutMs: toInt(process.env.WATCH_EDGE_PUBLISH_TIMEOUT_MS, 3000, 250),
   };
 }
 

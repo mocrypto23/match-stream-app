@@ -398,6 +398,8 @@ export default function WatchPage() {
   const waitingOverlayTimerRef = useRef<number | null>(null);
   const watchStateRequestRef = useRef<Promise<void> | null>(null);
   const watchStateVersionRef = useRef<string | null>(null);
+  const watchEdgeShadowVersionRef = useRef<string | null>(null);
+  const watchEdgeShadowLastMessageAtRef = useRef(0);
   const displayProgressMetaRef = useRef<DisplayProgressMetaMap>(createDisplayProgressMetaMap());
   const hasPlayedRef = useRef(false);
   const selectedRecoveryPendingRef = useRef(false);
@@ -694,6 +696,62 @@ export default function WatchPage() {
       stream.close();
     };
   }, [matchId, refreshAllStatuses]);
+
+  useEffect(() => {
+    if (!matchId || Number.isNaN(matchId)) return;
+    if (typeof window === "undefined" || typeof WebSocket === "undefined") return;
+
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${protocol}//${window.location.host}/__edge-watch/ws/${matchId}`);
+    let pingTimer = 0;
+
+    const clearPing = () => {
+      if (pingTimer) {
+        window.clearInterval(pingTimer);
+        pingTimer = 0;
+      }
+    };
+
+    socket.addEventListener("open", () => {
+      clearPing();
+      pingTimer = window.setInterval(() => {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send("ping");
+        }
+      }, 15_000);
+    });
+
+    socket.addEventListener("message", (event) => {
+      let payload: { type?: string; version?: string | null; payload?: { version?: string | null } | null } | null =
+        null;
+      try {
+        payload = JSON.parse(String(event.data || "")) as {
+          type?: string;
+          version?: string | null;
+          payload?: { version?: string | null } | null;
+        };
+      } catch {
+        return;
+      }
+      if (!payload) return;
+      if (payload.type === "connected" || payload.type === "pong") {
+        watchEdgeShadowLastMessageAtRef.current = Date.now();
+        return;
+      }
+      const version = String(payload.version || payload.payload?.version || "").trim();
+      if (!version) return;
+      watchEdgeShadowVersionRef.current = version;
+      watchEdgeShadowLastMessageAtRef.current = Date.now();
+    });
+
+    socket.addEventListener("error", clearPing);
+    socket.addEventListener("close", clearPing);
+
+    return () => {
+      clearPing();
+      socket.close();
+    };
+  }, [matchId]);
 
   const bootstrapProvider = useCallback(
     async (provider: StreamProviderId, opts?: { silent?: boolean }) => {

@@ -209,31 +209,40 @@ export class MatchHub {
         return badRequest("invalid-json", 400);
       }
 
-      const normalized = {
-        type: String(payload?.type || "watch-state-change").trim() || "watch-state-change",
-        matchId,
-        version: payload?.version ? String(payload.version) : null,
-        updatedAt: payload?.updatedAt ? String(payload.updatedAt) : new Date().toISOString(),
-        provider: payload?.provider ? String(payload.provider) : null,
-        payload: payload?.payload && typeof payload.payload === "object" ? payload.payload : payload,
-        receivedAt: new Date().toISOString(),
-      };
+      const normalizedSnapshot =
+        payload && typeof payload === "object"
+          ? {
+              matchId,
+              version: payload?.version ? String(payload.version) : null,
+              updatedAt: payload?.updatedAt ? String(payload.updatedAt) : new Date().toISOString(),
+              stream_url: payload?.stream_url ? String(payload.stream_url) : null,
+              stream_url_2: payload?.stream_url_2 ? String(payload.stream_url_2) : null,
+              stream_url_4: payload?.stream_url_4 ? String(payload.stream_url_4) : null,
+              livekoraStatus:
+                payload?.livekoraStatus && typeof payload.livekoraStatus === "object" ? payload.livekoraStatus : null,
+              beinliveStatus:
+                payload?.beinliveStatus && typeof payload.beinliveStatus === "object" ? payload.beinliveStatus : null,
+              siiirStatus: payload?.siiirStatus && typeof payload.siiirStatus === "object" ? payload.siiirStatus : null,
+            }
+          : null;
+      if (!normalizedSnapshot) {
+        return badRequest("invalid-payload", 400);
+      }
 
-      await this.writeSnapshot(normalized);
+      await this.writeSnapshot(normalizedSnapshot);
       this.broadcast({
-        type: normalized.type,
-        matchId: normalized.matchId,
-        version: normalized.version,
-        updatedAt: normalized.updatedAt,
-        provider: normalized.provider,
-        payload: normalized.payload,
+        type: "watch-state-change",
+        matchId,
+        version: normalizedSnapshot.version,
+        updatedAt: normalizedSnapshot.updatedAt,
+        payload: normalizedSnapshot,
       });
 
       return jsonResponse({
         ok: true,
         matchId,
-        version: normalized.version,
-        updatedAt: normalized.updatedAt,
+        version: normalizedSnapshot.version,
+        updatedAt: normalizedSnapshot.updatedAt,
         connections: this.state.getWebSockets().length,
       });
     }
