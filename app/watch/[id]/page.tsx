@@ -152,7 +152,7 @@ let p2pEngineModulePromise: Promise<P2PEngineModule> | null = null;
 
 function WatchPageSponsorBanner() {
   return (
-    <div className="overflow-x-auto" dir="ltr">
+    <div className="hidden overflow-x-auto md:block" dir="ltr">
       <iframe
         title="TF Player Sponsor"
         src="/ad-frame/tf-player-728"
@@ -1680,9 +1680,9 @@ export default function WatchPage() {
               </div>
             </div>
 
-            <div className="rounded-3xl border border-emerald-400/20 bg-[linear-gradient(135deg,rgba(16,185,129,0.08),rgba(15,23,42,0.68))] p-4 backdrop-blur">
-              <div className="mb-3 rounded-2xl border border-white/10 bg-black/15 px-4 py-3 text-center shadow-inner shadow-black/10">
-                <div className="text-sm font-semibold leading-7 text-slate-100">
+            <div className="rounded-3xl border border-emerald-400/20 bg-[linear-gradient(135deg,rgba(16,185,129,0.08),rgba(15,23,42,0.68))] p-3 sm:p-4 backdrop-blur">
+              <div className="rounded-2xl border border-white/10 bg-black/15 px-3 py-3 text-center shadow-inner shadow-black/10 sm:px-4">
+                <div className="text-xs font-semibold leading-6 text-slate-100 sm:text-sm sm:leading-7">
                   موقعنا <span className="font-black text-emerald-300">مجاني تماماً</span> وبدون إعلانات مزعجة أثناء البث..
                   استمرارنا يعتمد على دعمك بتصفح{" "}
                   <span className="rounded-full border border-emerald-300/25 bg-emerald-400/10 px-2 py-1 text-emerald-200">
@@ -1691,7 +1691,9 @@ export default function WatchPage() {
                   <span className="text-slate-300">(إذا كنت مهتماً به)</span> ويحفزنا على التطوير لضمان أفضل جودة لك.
                 </div>
               </div>
-              <WatchPageSponsorBanner />
+              <div className="mt-3 hidden md:block">
+                <WatchPageSponsorBanner />
+              </div>
             </div>
           </div>
 
