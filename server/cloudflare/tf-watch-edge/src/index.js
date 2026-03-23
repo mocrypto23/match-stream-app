@@ -100,7 +100,12 @@ export default {
       const matchId = toMatchId(wsMatch[1]);
       if (!matchId) return badRequest("invalid-match-id");
       const stub = env.MATCH_HUB.get(env.MATCH_HUB.idFromName(matchHubName(matchId)));
-      return stub.fetch(`https://match-hub.internal/ws?matchId=${matchId}`);
+      return stub.fetch(
+        new Request(`https://match-hub.internal/ws?matchId=${matchId}`, {
+          method: "GET",
+          headers: request.headers,
+        })
+      );
     }
 
     const snapshotMatch = url.pathname.match(SNAPSHOT_PATH_RE);
