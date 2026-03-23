@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { MATCHES_CACHE_TTL_SECONDS, readMatchesForDay } from "@/lib/home-matches";
+import { MATCHES_EDGE_CACHE_SECONDS, readMatchesForDay } from "@/lib/home-matches";
 
 export const runtime = "nodejs";
 
@@ -17,9 +17,9 @@ export async function GET(req: Request) {
     const res = NextResponse.json(normalized);
     res.headers.set(
       "Cache-Control",
-      `public, s-maxage=${MATCHES_CACHE_TTL_SECONDS}, stale-while-revalidate=120`
+      `public, s-maxage=${MATCHES_EDGE_CACHE_SECONDS}, stale-while-revalidate=120`
     );
-    res.headers.set("X-Matches-Cache-TTL", String(MATCHES_CACHE_TTL_SECONDS));
+    res.headers.set("X-Matches-Cache-TTL", String(MATCHES_EDGE_CACHE_SECONDS));
     res.headers.set("Vary", "Accept-Encoding");
     return res;
   } catch (error) {

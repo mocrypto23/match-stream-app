@@ -1,6 +1,9 @@
 import { revalidatePath, revalidateTag } from "next/cache";
 import { NextRequest, NextResponse } from "next/server";
 
+import { readMatchesForDay } from "@/lib/home-matches";
+import { cairoDayStringFromOffset } from "@/lib/home-page-shared";
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -58,10 +61,20 @@ export async function POST(req: NextRequest) {
   // Keep matches API data cache aligned with scraper cron updates.
   revalidateTag("matches-list", "max");
 
+  const prewarmedDays: string[] = [];
+  for (const offset of [-1, 0, 1]) {
+    const day = cairoDayStringFromOffset(offset);
+    try {
+      await readMatchesForDay(day);
+      prewarmedDays.push(day);
+    } catch {}
+  }
+
   return NextResponse.json({
     ok: true,
     revalidated: paths,
     revalidatedTags: ["matches-list"],
+    prewarmedDays,
     at: new Date().toISOString(),
   });
 }

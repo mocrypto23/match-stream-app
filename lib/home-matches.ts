@@ -41,6 +41,10 @@ export const MATCHES_CACHE_TTL_SECONDS = Math.max(
   60,
   Number.parseInt(process.env.MATCHES_CACHE_TTL_SECONDS ?? "1200", 10) || 1200
 );
+export const MATCHES_EDGE_CACHE_SECONDS = Math.max(
+  5,
+  Number.parseInt(process.env.MATCHES_EDGE_CACHE_SECONDS ?? "60", 10) || 60
+);
 
 function asNonEmptyString(raw: unknown) {
   return typeof raw === "string" ? raw.trim() : "";
@@ -320,7 +324,6 @@ async function fetchMatchesForDay(day: string) {
 
 export function getCachedMatchesFetcher(day: string) {
   return unstable_cache(() => fetchMatchesForDay(day), [`matches-day:${day}`], {
-    revalidate: MATCHES_CACHE_TTL_SECONDS,
     tags: ["matches-list", `matches-day:${day}`],
   });
 }
