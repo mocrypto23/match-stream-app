@@ -62,7 +62,7 @@ function SafeAdsterraBanner728() {
     <iframe
       title="TwoFooty Sponsor"
       srcDoc={ADSTERRA_BANNER_728_SRCDOC}
-      sandbox="allow-scripts"
+      sandbox="allow-scripts allow-top-navigation-by-user-activation allow-popups allow-popups-to-escape-sandbox"
       loading="lazy"
       referrerPolicy="no-referrer"
       className="mx-auto h-[90px] w-[728px] min-w-[728px] overflow-hidden rounded-md border-0 bg-transparent"
