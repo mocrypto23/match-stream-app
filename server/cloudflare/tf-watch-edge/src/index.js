@@ -2,6 +2,7 @@ const BASE_PATH = "/__edge-watch";
 const WS_PATH_RE = /^\/__edge-watch\/ws\/(\d+)$/;
 const SNAPSHOT_PATH_RE = /^\/__edge-watch\/snapshot\/(\d+)$/;
 const PUBLISH_PATH_RE = /^\/__edge-watch\/publish\/(\d+)$/;
+const DEFAULT_SHARD_COUNT = 32;
 
 function jsonResponse(payload, init = {}) {
   const headers = new Headers(init.headers || {});
@@ -26,6 +27,22 @@ function toMatchId(rawValue) {
 
 function matchHubName(matchId) {
   return `match:${matchId}`;
+}
+
+function shardHubName(matchId, shardIndex) {
+  return `${matchHubName(matchId)}:shard:${shardIndex}`;
+}
+
+function toShardCount(rawValue, fallback = DEFAULT_SHARD_COUNT) {
+  const value = Number.parseInt(String(rawValue || "").trim(), 10);
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.max(1, Math.min(128, value));
+}
+
+function toShardIndex(rawValue, shardCount) {
+  const value = Number.parseInt(String(rawValue || "").trim(), 10);
+  if (!Number.isFinite(value) || value < 0) return 0;
+  return Math.min(shardCount - 1, value);
 }
 
 function listChangedFields(previous, next, fields) {
@@ -125,11 +142,13 @@ async function verifyPublishRequest(request, env) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const shardCount = toShardCount(env.WATCH_EDGE_SHARD_COUNT, DEFAULT_SHARD_COUNT);
 
     if (request.method === "GET" && url.pathname === `${BASE_PATH}/healthz`) {
       return jsonResponse({
         ok: true,
         service: "tf-watch-edge",
+        shardCount,
         ts: new Date().toISOString(),
       });
     }
@@ -138,9 +157,10 @@ export default {
     if (request.method === "GET" && wsMatch?.[1]) {
       const matchId = toMatchId(wsMatch[1]);
       if (!matchId) return badRequest("invalid-match-id");
-      const stub = env.MATCH_HUB.get(env.MATCH_HUB.idFromName(matchHubName(matchId)));
+      const shardIndex = toShardIndex(url.searchParams.get("shard"), shardCount);
+      const stub = env.MATCH_HUB.get(env.MATCH_HUB.idFromName(shardHubName(matchId, shardIndex)));
       return stub.fetch(
-        new Request(`https://match-hub.internal/ws?matchId=${matchId}`, {
+        new Request(`https://match-hub.internal/ws?matchId=${matchId}&shard=${shardIndex}&shards=${shardCount}`, {
           method: "GET",
           headers: request.headers,
         })
@@ -151,8 +171,43 @@ export default {
     if (request.method === "GET" && snapshotMatch?.[1]) {
       const matchId = toMatchId(snapshotMatch[1]);
       if (!matchId) return badRequest("invalid-match-id");
-      const stub = env.MATCH_HUB.get(env.MATCH_HUB.idFromName(matchHubName(matchId)));
-      return stub.fetch(`https://match-hub.internal/snapshot?matchId=${matchId}`);
+      const shouldAggregate = String(url.searchParams.get("aggregate") || "").trim() === "1";
+      if (shouldAggregate) {
+        const snapshots = await Promise.all(
+          Array.from({ length: shardCount }, async (_, shardIndex) => {
+            const stub = env.MATCH_HUB.get(env.MATCH_HUB.idFromName(shardHubName(matchId, shardIndex)));
+            const response = await stub.fetch(
+              `https://match-hub.internal/snapshot?matchId=${matchId}&shard=${shardIndex}&shards=${shardCount}`
+            );
+            const payload = await response.json().catch(() => null);
+            return {
+              shardIndex,
+              ok: response.ok,
+              payload,
+            };
+          })
+        );
+        const firstSnapshot = snapshots.find((item) => item.ok && item.payload?.snapshot)?.payload || null;
+        const totalConnections = snapshots.reduce((sum, item) => {
+          return sum + Number(item?.payload?.connections || 0);
+        }, 0);
+        return jsonResponse({
+          ok: true,
+          matchId,
+          shardCount,
+          totalConnections,
+          version: firstSnapshot?.version || null,
+          updatedAt: firstSnapshot?.updatedAt || null,
+          snapshot: firstSnapshot?.snapshot || null,
+          shards: snapshots.map((item) => ({
+            shard: item.shardIndex,
+            connections: Number(item?.payload?.connections || 0),
+          })),
+        });
+      }
+      const shardIndex = toShardIndex(url.searchParams.get("shard"), shardCount);
+      const stub = env.MATCH_HUB.get(env.MATCH_HUB.idFromName(shardHubName(matchId, shardIndex)));
+      return stub.fetch(`https://match-hub.internal/snapshot?matchId=${matchId}&shard=${shardIndex}&shards=${shardCount}`);
     }
 
     const publishMatch = url.pathname.match(PUBLISH_PATH_RE);
@@ -161,15 +216,35 @@ export default {
       if (!matchId) return badRequest("invalid-match-id");
       const verification = await verifyPublishRequest(request, env);
       if (!verification.ok) return verification.response;
-      const stub = env.MATCH_HUB.get(env.MATCH_HUB.idFromName(matchHubName(matchId)));
-      return stub.fetch("https://match-hub.internal/publish", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json; charset=utf-8",
-          "x-edge-publish-authenticated": "1",
-          "x-edge-match-id": String(matchId),
-        },
-        body: verification.bodyText,
+      const results = await Promise.all(
+        Array.from({ length: shardCount }, async (_, shardIndex) => {
+          const stub = env.MATCH_HUB.get(env.MATCH_HUB.idFromName(shardHubName(matchId, shardIndex)));
+          const response = await stub.fetch("https://match-hub.internal/publish", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json; charset=utf-8",
+              "x-edge-publish-authenticated": "1",
+              "x-edge-match-id": String(matchId),
+              "x-edge-shard-index": String(shardIndex),
+              "x-edge-shard-count": String(shardCount),
+            },
+            body: verification.bodyText,
+          });
+          const payload = await response.json().catch(() => null);
+          return {
+            shardIndex,
+            ok: response.ok,
+            payload,
+          };
+        })
+      );
+      const firstResult = results.find((item) => item.ok)?.payload || null;
+      return jsonResponse({
+        ok: results.every((item) => item.ok),
+        matchId,
+        shardCount,
+        version: firstResult?.version || null,
+        updatedAt: firstResult?.updatedAt || null,
       });
     }
 
@@ -192,6 +267,7 @@ export class MatchHub {
       return jsonResponse({
         ok: true,
         matchId: snapshot?.matchId || toMatchId(url.searchParams.get("matchId")),
+        shard: toShardIndex(url.searchParams.get("shard"), toShardCount(url.searchParams.get("shards"), DEFAULT_SHARD_COUNT)),
         version: snapshot?.version || null,
         updatedAt: snapshot?.updatedAt || null,
         snapshot,
@@ -218,6 +294,7 @@ export class MatchHub {
         JSON.stringify({
           type: "connected",
           matchId,
+          shard: toShardIndex(url.searchParams.get("shard"), toShardCount(url.searchParams.get("shards"), DEFAULT_SHARD_COUNT)),
           ts: new Date().toISOString(),
         })
       );

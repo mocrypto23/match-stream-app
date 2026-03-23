@@ -113,6 +113,8 @@ const P2P_STATS_UPDATE_MS = 300;
 const P2P_MIN_ENABLED_BEFORE_FALLBACK_MS = 1_500;
 const EDGE_SHADOW_CHANNEL_PREFIX = "tf-watch-edge-shadow";
 const EDGE_SHADOW_LEASE_PREFIX = "tf-watch-edge-shadow-lease";
+const EDGE_SHADOW_VIEWER_ID_STORAGE_KEY = "tf-watch-edge-viewer-id";
+const EDGE_SHADOW_SHARD_COUNT = 32;
 const EDGE_SHADOW_LEASE_TTL_MS = 15_000;
 const EDGE_SHADOW_LEASE_HEARTBEAT_MS = 5_000;
 const EDGE_SHADOW_FOLLOWER_CHECK_MS = 6_000;
@@ -218,6 +220,36 @@ function loadP2PEngineModule() {
     p2pEngineModulePromise = import("p2p-media-loader-hlsjs") as Promise<P2PEngineModule>;
   }
   return p2pEngineModulePromise;
+}
+
+function stableHash(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function getOrCreateEdgeViewerId() {
+  if (typeof window === "undefined") return `viewer-${Date.now()}`;
+  try {
+    const existing = String(window.localStorage.getItem(EDGE_SHADOW_VIEWER_ID_STORAGE_KEY) || "").trim();
+    if (existing) return existing;
+    const nextValue =
+      typeof window.crypto?.randomUUID === "function"
+        ? window.crypto.randomUUID()
+        : `viewer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    window.localStorage.setItem(EDGE_SHADOW_VIEWER_ID_STORAGE_KEY, nextValue);
+    return nextValue;
+  } catch {
+    return `viewer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+}
+
+function getEdgeShardForMatch(matchId: number) {
+  const viewerId = getOrCreateEdgeViewerId();
+  return stableHash(`${viewerId}:${matchId}`) % EDGE_SHADOW_SHARD_COUNT;
 }
 
 function formatP2PBytes(bytes: number) {
@@ -692,13 +724,15 @@ export default function WatchPage() {
 
   const refreshEdgeSnapshot = useCallback(async () => {
     if (!Number.isFinite(matchId) || matchId <= 0) return;
+    const shardIndex = getEdgeShardForMatch(matchId);
     if (watchEdgeSnapshotRequestRef.current) {
       await watchEdgeSnapshotRequestRef.current;
       return;
     }
     const request = (async () => {
       try {
-        const response = await fetch(`/__edge-watch/snapshot/${matchId}`, {
+        const response = await fetch(`/__edge-watch/snapshot/${matchId}?shard=${shardIndex}&shards=${EDGE_SHADOW_SHARD_COUNT}`, {
+          cache: "no-store",
           headers: { accept: "application/json" },
         });
         const payload = (await response.json().catch(() => null)) as
@@ -767,8 +801,9 @@ export default function WatchPage() {
     if (!matchId || Number.isNaN(matchId)) return;
     if (typeof window === "undefined" || typeof WebSocket === "undefined") return;
 
+    const shardIndex = getEdgeShardForMatch(matchId);
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}/__edge-watch/ws/${matchId}`;
+    const wsUrl = `${protocol}//${window.location.host}/__edge-watch/ws/${matchId}?shard=${shardIndex}&shards=${EDGE_SHADOW_SHARD_COUNT}`;
     const tabId =
       typeof window.crypto?.randomUUID === "function"
         ? window.crypto.randomUUID()
