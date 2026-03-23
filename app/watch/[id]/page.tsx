@@ -827,7 +827,6 @@ export default function WatchPage() {
         const needsBootstrap =
           !status ||
           status.reason === "not-bootstrapped" ||
-          (!hasPlaylistUrl && status.state !== "ready") ||
           (status.state === "down" && !hasPlaylistUrl);
         if (!needsBootstrap) return false;
 
