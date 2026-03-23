@@ -1,0 +1,32 @@
+{
+  "name": "tf-watch-edge",
+  "main": "src/index.js",
+  "compatibility_date": "2025-03-24",
+  "workers_dev": true,
+  "routes": [
+    {
+      "pattern": "tf-player.site/__edge-watch/*",
+      "zone_name": "tf-player.site"
+    },
+    {
+      "pattern": "www.tf-player.site/__edge-watch/*",
+      "zone_name": "tf-player.site"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MATCH_HUB",
+        "class_name": "MatchHub"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "MatchHub"
+      ]
+    }
+  ]
+}
