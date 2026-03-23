@@ -1747,7 +1747,7 @@ export default function WatchPage() {
             {shouldShowSponsorAd ? (
               <div className="rounded-3xl border border-emerald-400/20 bg-[linear-gradient(135deg,rgba(16,185,129,0.08),rgba(15,23,42,0.68))] p-3 sm:p-4 backdrop-blur">
                 <div className="rounded-2xl border border-white/10 bg-black/15 px-3 py-3 text-center shadow-inner shadow-black/10 sm:px-4">
-                  <div className="text-xs font-semibold leading-6 text-slate-100 sm:text-sm sm:leading-7">
+                  <div className="text-sm font-semibold leading-7 text-slate-100 lg:text-[15px]">
                     موقعنا <span className="font-black text-emerald-300">مجاني تماماً</span> وبدون إعلانات مزعجة أثناء البث..
                     استمرارنا يعتمد على دعمك بتصفح{" "}
                     <span className="rounded-full border border-emerald-300/25 bg-emerald-400/10 px-2 py-1 text-emerald-200">
@@ -1764,7 +1764,7 @@ export default function WatchPage() {
           </div>
 
           <aside className="flex flex-col gap-4">
-            <div className="rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur">
+            <div className="order-2 rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur lg:order-1">
               <div className="flex items-center gap-3">
                 {match.home_logo ? (
                   // eslint-disable-next-line @next/next/no-img-element
@@ -1784,7 +1784,7 @@ export default function WatchPage() {
               <div className="mt-4 text-sm text-slate-300">{formatKickoff(match.match_start)}</div>
             </div>
 
-            <div className="rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur">
+            <div className="order-1 rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur lg:order-2">
               <div className="text-sm font-medium text-slate-300">المصادر</div>
               <div className="mt-4 grid grid-cols-2 gap-3">
                 {PROVIDER_META.map((item) => {
@@ -1852,7 +1852,7 @@ export default function WatchPage() {
               </div>
             </div>
 
-            <div className="rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur">
+            <div className="order-3 rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur">
               <div className="flex items-center justify-between gap-3">
                 <div className="text-sm font-medium text-slate-300">حالة البث</div>
                 <div className={`rounded-full px-3 py-1 text-xs font-bold ${stateTone(activeStatus)}`}>{stateLabel(activeStatus)}</div>
