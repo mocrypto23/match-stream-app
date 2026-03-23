@@ -14,57 +14,14 @@ type HomePageClientProps = {
   initialLoadError?: string | null;
 };
 
-
-const ADSTERRA_BANNER_728_SRCDOC = String.raw`<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <style>
-      html, body {
-        margin: 0;
-        padding: 0;
-        width: 100%;
-        height: 100%;
-        overflow: hidden;
-        background: transparent;
-      }
-      body {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-      }
-      #ad-wrap {
-        width: 728px;
-        height: 90px;
-        overflow: hidden;
-      }
-    </style>
-  </head>
-  <body>
-    <div id="ad-wrap">
-      <script>
-        atOptions = {
-          key: "6a12e1a77f6425cf6359cb652cff80e3",
-          format: "iframe",
-          height: 90,
-          width: 728,
-          params: {}
-        };
-      </script>
-      <script async src="https://www.highperformanceformat.com/6a12e1a77f6425cf6359cb652cff80e3/invoke.js"></script>
-    </div>
-  </body>
-</html>`;
-
 function SafeAdsterraBanner728() {
   return (
     <iframe
       title="TwoFooty Sponsor"
-      srcDoc={ADSTERRA_BANNER_728_SRCDOC}
-      sandbox="allow-scripts allow-top-navigation-by-user-activation allow-popups allow-popups-to-escape-sandbox"
+      src="https://tf-player.site/ad-frame/728"
+      sandbox="allow-scripts allow-same-origin allow-top-navigation-by-user-activation allow-popups allow-popups-to-escape-sandbox"
       loading="lazy"
-      referrerPolicy="no-referrer"
+      referrerPolicy="strict-origin-when-cross-origin"
       className="mx-auto h-[90px] w-[728px] min-w-[728px] overflow-hidden rounded-md border-0 bg-transparent"
     />
   );
