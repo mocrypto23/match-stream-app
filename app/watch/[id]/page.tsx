@@ -116,6 +116,8 @@ const EDGE_SHADOW_LEASE_PREFIX = "tf-watch-edge-shadow-lease";
 const EDGE_SHADOW_LEASE_TTL_MS = 15_000;
 const EDGE_SHADOW_LEASE_HEARTBEAT_MS = 5_000;
 const EDGE_SHADOW_FOLLOWER_CHECK_MS = 6_000;
+const EDGE_SHADOW_STALE_MS = 20_000;
+const EDGE_SHADOW_SSE_FALLBACK_DELAY_MS = 4_000;
 const P2P_ANNOUNCE_TRACKERS = [
   "wss://tracker.novage.com.ua",
   "wss://tracker.webtorrent.dev",
@@ -384,6 +386,7 @@ export default function WatchPage() {
   const [loading, setLoading] = useState(true);
   const [isPageHidden, setIsPageHidden] = useState(false);
   const [watchEventsConnected, setWatchEventsConnected] = useState(false);
+  const [watchEdgePrimaryConnected, setWatchEdgePrimaryConnected] = useState(false);
   const [displayProgressByProvider, setDisplayProgressByProvider] = useState<DisplayProgressMap>(createDisplayProgressMap);
   const [retainedPlaylistUrls, setRetainedPlaylistUrls] = useState<Record<StreamProviderId, string>>({
     livekora: "",
@@ -402,6 +405,7 @@ export default function WatchPage() {
   const hlsRef = useRef<Hls | null>(null);
   const waitingOverlayTimerRef = useRef<number | null>(null);
   const watchStateRequestRef = useRef<Promise<void> | null>(null);
+  const watchEdgeSnapshotRequestRef = useRef<Promise<void> | null>(null);
   const watchStateVersionRef = useRef<string | null>(null);
   const watchEdgeShadowVersionRef = useRef<string | null>(null);
   const watchEdgeShadowLastMessageAtRef = useRef(0);
@@ -524,6 +528,7 @@ export default function WatchPage() {
   const activePreparationActive = useMemo(() => {
     return shouldAnimatePreparation(activeStatus, !!providerSourceUrl) || (pendingBootstraps[activeProvider] || 0) > 0;
   }, [activeProvider, activeStatus, pendingBootstraps, providerSourceUrl]);
+  const liveUpdatesConnected = watchEdgePrimaryConnected || watchEventsConnected;
   const p2pStatusLine = useMemo(() => {
     if (!p2pStats.enabled) return p2pStats.status;
     const base = `P2P: ${p2pStats.ratioPct}% | Saved: ${formatP2PBytes(p2pStats.p2pDownloadedBytes)} | Uploaded: ${formatP2PBytes(p2pStats.uploadedBytes)} | Peers: ${p2pStats.peers}`;
@@ -672,35 +677,91 @@ export default function WatchPage() {
     await refreshWatchState();
   }, [refreshWatchState]);
 
+  const applyEdgeSnapshot = useCallback(
+    (payload: WatchStatePayload | null | undefined) => {
+      if (!payload) return;
+      if (payload.version) {
+        watchEdgeShadowVersionRef.current = String(payload.version);
+      }
+      watchEdgeShadowLastMessageAtRef.current = Date.now();
+      setWatchEdgePrimaryConnected(true);
+      applyWatchState(payload);
+    },
+    [applyWatchState]
+  );
+
+  const refreshEdgeSnapshot = useCallback(async () => {
+    if (!Number.isFinite(matchId) || matchId <= 0) return;
+    if (watchEdgeSnapshotRequestRef.current) {
+      await watchEdgeSnapshotRequestRef.current;
+      return;
+    }
+    const request = (async () => {
+      try {
+        const response = await fetch(`/__edge-watch/snapshot/${matchId}`, {
+          headers: { accept: "application/json" },
+        });
+        const payload = (await response.json().catch(() => null)) as
+          | {
+              snapshot?: WatchStatePayload | null;
+              version?: string | null;
+            }
+          | null;
+        const snapshot = payload?.snapshot || null;
+        if (!response.ok || !snapshot || typeof snapshot !== "object") return;
+        applyEdgeSnapshot(snapshot);
+      } catch {}
+    })();
+    watchEdgeSnapshotRequestRef.current = request;
+    try {
+      await request;
+    } finally {
+      watchEdgeSnapshotRequestRef.current = null;
+    }
+  }, [applyEdgeSnapshot, matchId]);
+
   useEffect(() => {
     if (!matchId || Number.isNaN(matchId)) return;
+    if (watchEdgePrimaryConnected) {
+      setWatchEventsConnected(false);
+      return;
+    }
     if (typeof window === "undefined" || typeof EventSource === "undefined") {
       setWatchEventsConnected(false);
       return;
     }
 
-    const stream = new EventSource(`/api/livekora/events/stream/${matchId}`);
-    let closed = false;
+    const timer = window.setTimeout(() => {
+      const stream = new EventSource(`/api/livekora/events/stream/${matchId}`);
+      let closed = false;
 
-    stream.addEventListener("connected", () => {
-      setWatchEventsConnected(true);
-    });
+      stream.addEventListener("connected", () => {
+        setWatchEventsConnected(true);
+      });
 
-    stream.addEventListener("watch-state-change", () => {
-      void refreshAllStatuses();
-    });
+      stream.addEventListener("watch-state-change", () => {
+        void refreshAllStatuses();
+      });
 
-    stream.onerror = () => {
-      if (closed) return;
-      setWatchEventsConnected(false);
-    };
+      stream.onerror = () => {
+        if (closed) return;
+        setWatchEventsConnected(false);
+      };
+
+      cleanup = () => {
+        closed = true;
+        setWatchEventsConnected(false);
+        stream.close();
+      };
+    }, EDGE_SHADOW_SSE_FALLBACK_DELAY_MS);
+    let cleanup = () => {};
 
     return () => {
-      closed = true;
+      window.clearTimeout(timer);
+      cleanup();
       setWatchEventsConnected(false);
-      stream.close();
     };
-  }, [matchId, refreshAllStatuses]);
+  }, [matchId, refreshAllStatuses, watchEdgePrimaryConnected]);
 
   useEffect(() => {
     if (!matchId || Number.isNaN(matchId)) return;
@@ -786,11 +847,16 @@ export default function WatchPage() {
       }
     };
 
+    const markEdgeActive = () => {
+      watchEdgeShadowLastMessageAtRef.current = Date.now();
+      setWatchEdgePrimaryConnected(true);
+    };
+
     const applyShadowVersion = (version: string) => {
       const normalizedVersion = String(version || "").trim();
       if (!normalizedVersion) return;
       watchEdgeShadowVersionRef.current = normalizedVersion;
-      watchEdgeShadowLastMessageAtRef.current = Date.now();
+      markEdgeActive();
     };
 
     const startSocket = () => {
@@ -807,20 +873,36 @@ export default function WatchPage() {
       });
 
       socket.addEventListener("message", (event) => {
-        let payload: { type?: string; version?: string | null; payload?: { version?: string | null } | null } | null =
+        let payload:
+          | {
+              type?: string;
+              version?: string | null;
+              payload?: WatchStatePayload | null;
+            }
+          | null =
           null;
         try {
           payload = JSON.parse(String(event.data || "")) as {
             type?: string;
             version?: string | null;
-            payload?: { version?: string | null } | null;
+            payload?: WatchStatePayload | null;
           };
         } catch {
           return;
         }
         if (!payload) return;
         if (payload.type === "connected" || payload.type === "pong") {
-          watchEdgeShadowLastMessageAtRef.current = Date.now();
+          markEdgeActive();
+          return;
+        }
+        if (payload.type === "snapshot" && payload.payload) {
+          applyEdgeSnapshot(payload.payload);
+          postChannelMessage({
+            type: "shadow-version",
+            ownerId: tabId,
+            version: payload.payload.version || payload.version || null,
+            ts: Date.now(),
+          });
           return;
         }
         const version = String(payload.version || payload.payload?.version || "").trim();
@@ -832,6 +914,9 @@ export default function WatchPage() {
           version,
           ts: Date.now(),
         });
+        if (payload.type === "watch-state-diff") {
+          void refreshEdgeSnapshot();
+        }
       });
 
       const handleSocketClosed = () => {
@@ -940,7 +1025,14 @@ export default function WatchPage() {
         };
         if (!payload?.type) return;
         if (payload.type === "shadow-version") {
-          applyShadowVersion(String(payload.version || ""));
+          if (String(payload.ownerId || "").trim() === tabId) return;
+          const version = String(payload.version || "").trim();
+          if (!version) return;
+          const previousVersion = String(watchEdgeShadowVersionRef.current || "").trim();
+          applyShadowVersion(version);
+          if (version !== previousVersion) {
+            void refreshEdgeSnapshot();
+          }
           return;
         }
         if (payload.type === "leader-heartbeat") {
@@ -951,7 +1043,7 @@ export default function WatchPage() {
               stopLeading(false);
             }
           }
-          watchEdgeShadowLastMessageAtRef.current = Date.now();
+          markEdgeActive();
           return;
         }
         if (payload.type === "leader-release") {
@@ -973,8 +1065,19 @@ export default function WatchPage() {
       }
     }, EDGE_SHADOW_FOLLOWER_CHECK_MS);
 
+    const healthTimer = window.setInterval(() => {
+      if (closed) return;
+      const lastAt = watchEdgeShadowLastMessageAtRef.current || 0;
+      if (!lastAt) {
+        setWatchEdgePrimaryConnected(false);
+        return;
+      }
+      setWatchEdgePrimaryConnected(Date.now() - lastAt <= EDGE_SHADOW_STALE_MS);
+    }, 3_000);
+
     return () => {
       closed = true;
+      window.clearInterval(healthTimer);
       if (followerCheckTimer) {
         window.clearInterval(followerCheckTimer);
       }
@@ -1301,19 +1404,19 @@ export default function WatchPage() {
 
   useEffect(() => {
     if (!matchId || Number.isNaN(matchId)) return;
-    const pollMs = watchEventsConnected ? (isPageHidden ? 90_000 : 60_000) : isPageHidden ? HIDDEN_STATUS_POLL_MS : STATUS_POLL_MS;
+    const pollMs = liveUpdatesConnected ? (isPageHidden ? 90_000 : 60_000) : isPageHidden ? HIDDEN_STATUS_POLL_MS : STATUS_POLL_MS;
     const id = window.setInterval(() => {
       void refreshAllStatuses();
     }, pollMs);
     return () => window.clearInterval(id);
-  }, [isPageHidden, matchId, refreshAllStatuses, watchEventsConnected]);
+  }, [isPageHidden, liveUpdatesConnected, matchId, refreshAllStatuses]);
 
   useEffect(() => {
     if (!matchId || Number.isNaN(matchId)) return;
     if (!providerSourceUrl) return;
     if (!playbackRequested && activeStatus?.state !== "warming") return;
     if (activeStatus?.state === "ready") return;
-    const pollMs = watchEventsConnected
+    const pollMs = liveUpdatesConnected
       ? isPageHidden
         ? 20_000
         : 12_000
@@ -1324,7 +1427,7 @@ export default function WatchPage() {
       void refreshProviderStatus(activeProvider);
     }, pollMs);
     return () => window.clearInterval(id);
-  }, [activeProvider, activeStatus?.state, isPageHidden, matchId, playbackRequested, providerSourceUrl, refreshProviderStatus, watchEventsConnected]);
+  }, [activeProvider, activeStatus?.state, isPageHidden, liveUpdatesConnected, matchId, playbackRequested, providerSourceUrl, refreshProviderStatus]);
 
   useEffect(() => {
     if (!playbackRequested) {
