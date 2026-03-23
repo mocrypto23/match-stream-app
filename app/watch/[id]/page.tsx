@@ -150,18 +150,43 @@ const EMPTY_P2P_STATS: P2PStats = {
 };
 let p2pEngineModulePromise: Promise<P2PEngineModule> | null = null;
 
+const AD_IMPRESSIONS_PER_DAY_LIMIT = 3;
+const AD_IMPRESSIONS_STORAGE_KEY = "tf-player-ad-impressions";
+
+function cairoDateKey() {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Africa/Cairo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
 function WatchPageSponsorBanner() {
   return (
-    <div className="hidden overflow-x-auto md:block" dir="ltr">
-      <iframe
-        title="TF Player Sponsor"
-        src="/ad-frame/tf-player-728"
-        sandbox="allow-scripts allow-same-origin allow-top-navigation-by-user-activation"
-        loading="lazy"
-        referrerPolicy="strict-origin-when-cross-origin"
-        className="mx-auto h-[90px] w-[728px] min-w-[728px] overflow-hidden rounded-md border-0 bg-transparent"
-      />
-    </div>
+    <>
+      <div className="hidden overflow-x-auto md:block" dir="ltr">
+        <iframe
+          title="TF Player Sponsor"
+          src="/ad-frame/tf-player-728"
+          sandbox="allow-scripts allow-same-origin allow-top-navigation-by-user-activation"
+          loading="lazy"
+          referrerPolicy="strict-origin-when-cross-origin"
+          className="mx-auto h-[90px] w-[728px] min-w-[728px] overflow-hidden rounded-md border-0 bg-transparent"
+        />
+      </div>
+
+      <div className="overflow-x-auto md:hidden" dir="ltr">
+        <iframe
+          title="TF Player Mobile Sponsor"
+          src="/ad-frame/tf-player-320x50"
+          sandbox="allow-scripts allow-same-origin allow-top-navigation-by-user-activation"
+          loading="lazy"
+          referrerPolicy="strict-origin-when-cross-origin"
+          className="mx-auto h-[50px] w-[320px] min-w-[320px] overflow-hidden rounded-md border-0 bg-transparent"
+        />
+      </div>
+    </>
   );
 }
 
@@ -366,6 +391,7 @@ export default function WatchPage() {
   const [playbackStarted, setPlaybackStarted] = useState(false);
   const [playerSessionNonce, setPlayerSessionNonce] = useState(0);
   const [p2pStats, setP2pStats] = useState<P2PStats>(EMPTY_P2P_STATS);
+  const [shouldShowSponsorAd, setShouldShowSponsorAd] = useState(false);
   const p2pStatsStoreRef = useRef<Record<string, P2PStats>>({});
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
@@ -426,6 +452,7 @@ export default function WatchPage() {
     disable: () => {},
     scheduleEnable: () => {},
   });
+  const adImpressionClaimedRef = useRef(false);
 
   const sources = useMemo(
     () =>
@@ -496,6 +523,43 @@ export default function WatchPage() {
     if (p2pStats.peers > 0 || p2pStats.status === "P2P: متصلة") return base;
     return `${base} | ${p2pStats.status.replace(/^P2P:\s*/, "")}`;
   }, [p2pStats]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (adImpressionClaimedRef.current) return;
+
+    const todayKey = cairoDateKey();
+    let nextCount = 1;
+
+    try {
+      const raw = window.localStorage.getItem(AD_IMPRESSIONS_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as { dateKey?: string; count?: number };
+        if (parsed.dateKey === todayKey) {
+          const currentCount = Number(parsed.count || 0);
+          if (currentCount >= AD_IMPRESSIONS_PER_DAY_LIMIT) {
+            setShouldShowSponsorAd(false);
+            adImpressionClaimedRef.current = true;
+            return;
+          }
+          nextCount = currentCount + 1;
+        }
+      }
+
+      window.localStorage.setItem(
+        AD_IMPRESSIONS_STORAGE_KEY,
+        JSON.stringify({
+          dateKey: todayKey,
+          count: nextCount,
+        })
+      );
+      setShouldShowSponsorAd(true);
+      adImpressionClaimedRef.current = true;
+    } catch {
+      setShouldShowSponsorAd(true);
+      adImpressionClaimedRef.current = true;
+    }
+  }, []);
 
   const applyProviderStatus = useCallback((provider: StreamProviderId, status: StreamSourceStatus | null | undefined) => {
     if (!status) return;
@@ -1680,21 +1744,23 @@ export default function WatchPage() {
               </div>
             </div>
 
-            <div className="rounded-3xl border border-emerald-400/20 bg-[linear-gradient(135deg,rgba(16,185,129,0.08),rgba(15,23,42,0.68))] p-3 sm:p-4 backdrop-blur">
-              <div className="rounded-2xl border border-white/10 bg-black/15 px-3 py-3 text-center shadow-inner shadow-black/10 sm:px-4">
-                <div className="text-xs font-semibold leading-6 text-slate-100 sm:text-sm sm:leading-7">
-                  موقعنا <span className="font-black text-emerald-300">مجاني تماماً</span> وبدون إعلانات مزعجة أثناء البث..
-                  استمرارنا يعتمد على دعمك بتصفح{" "}
-                  <span className="rounded-full border border-emerald-300/25 bg-emerald-400/10 px-2 py-1 text-emerald-200">
-                    الإعلان الوحيد
-                  </span>{" "}
-                  <span className="text-slate-300">(إذا كنت مهتماً به)</span> ويحفزنا على التطوير لضمان أفضل جودة لك.
+            {shouldShowSponsorAd ? (
+              <div className="rounded-3xl border border-emerald-400/20 bg-[linear-gradient(135deg,rgba(16,185,129,0.08),rgba(15,23,42,0.68))] p-3 sm:p-4 backdrop-blur">
+                <div className="rounded-2xl border border-white/10 bg-black/15 px-3 py-3 text-center shadow-inner shadow-black/10 sm:px-4">
+                  <div className="text-xs font-semibold leading-6 text-slate-100 sm:text-sm sm:leading-7">
+                    موقعنا <span className="font-black text-emerald-300">مجاني تماماً</span> وبدون إعلانات مزعجة أثناء البث..
+                    استمرارنا يعتمد على دعمك بتصفح{" "}
+                    <span className="rounded-full border border-emerald-300/25 bg-emerald-400/10 px-2 py-1 text-emerald-200">
+                      الإعلان الوحيد
+                    </span>{" "}
+                    <span className="text-slate-300">(إذا كنت مهتماً به)</span> ويحفزنا على التطوير لضمان أفضل جودة لك.
+                  </div>
+                </div>
+                <div className="mt-3">
+                  <WatchPageSponsorBanner />
                 </div>
               </div>
-              <div className="mt-3 hidden md:block">
-                <WatchPageSponsorBanner />
-              </div>
-            </div>
+            ) : null}
           </div>
 
           <aside className="flex flex-col gap-4">
