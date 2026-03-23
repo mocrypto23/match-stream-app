@@ -80,6 +80,7 @@ pm2 restart tf-player --update-env || PORT=3000 NODE_ENV=production pm2 start np
 pm2 delete tf-repackager >/dev/null 2>&1 || true
 pm2 delete tf-repack-prewarm >/dev/null 2>&1 || true
 pm2 restart livekora-r2-agent --update-env || NODE_ENV=production pm2 start server/livekora-r2-agent/index.js --name livekora-r2-agent --cwd "$APP_DIR"
+pm2 restart watch-state-fanout --update-env || NODE_ENV=production pm2 start server/watch-state-fanout/index.js --name watch-state-fanout --cwd "$APP_DIR"
 pm2 save
 sync_nginx_config
 sudo systemctl start nginx || true

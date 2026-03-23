@@ -5,6 +5,7 @@ const http = require("http");
 const path = require("path");
 const { createHash } = require("crypto");
 const dotenv = require("dotenv");
+const { createClient } = require("redis");
 const {
   S3Client,
   PutObjectCommand,
@@ -59,6 +60,21 @@ function normalizeHeaderValue(raw) {
 
 function hashHex(value) {
   return createHash("sha1").update(String(value || "")).digest("hex");
+}
+
+function hasProviderMatch(status) {
+  return !!String(status?.sourceUrl || status?.currentSource || status?.playlistUrl || "").trim();
+}
+
+function buildWatchStateEventFingerprint(status) {
+  return [
+    status.provider,
+    status.state,
+    status.sourceUrl || "",
+    status.currentSource || "",
+    status.playlistUrl || "",
+    hasProviderMatch(status) ? "1" : "0",
+  ].join("::");
 }
 
 function resolveManifestUrl(raw, baseUrl) {
@@ -393,6 +409,7 @@ class LivekoraJob {
     this.assetsBySourceUrl = new Map();
     this.syncTimer = null;
     this.syncPromise = null;
+    this.lastPublishedEventFingerprint = "";
   }
 
   get playlistKey() {
@@ -411,6 +428,7 @@ class LivekoraJob {
     this.phase = String(phase || "").trim() || this.phase || "queued";
     this.progressPct = clampProgress(progressPct, this.progressPct);
     this.touch();
+    this.emitStatusEventIfChanged();
   }
 
   start() {
@@ -418,12 +436,14 @@ class LivekoraJob {
     this.state = "running";
     this.setProgress("queued", 5);
     this.scheduleNextSync(0);
+    this.emitStatusEventIfChanged();
   }
 
   async stop() {
     this.state = "stopped";
     if (this.syncTimer) clearTimeout(this.syncTimer);
     this.syncTimer = null;
+    this.emitStatusEventIfChanged();
     await this.manager.purgeRemotePrefix(this.remotePrefix, this.manager.config.purgeStopMaxKeys);
   }
 
@@ -437,6 +457,7 @@ class LivekoraJob {
       this.lastError = "";
       this.setProgress("queued", 5);
     }
+    this.emitStatusEventIfChanged();
   }
 
   scheduleNextSync(delayMs) {
@@ -495,6 +516,23 @@ class LivekoraJob {
       phase: isReady ? "ready" : isFailed ? "failed" : this.phase || "queued",
       progressPct: isReady ? 100 : isFailed ? clampProgress(this.progressPct, 0) : clampProgress(this.progressPct, 0),
     };
+  }
+
+  emitStatusEventIfChanged() {
+    const status = this.toStatus();
+    const fingerprint = buildWatchStateEventFingerprint(status);
+    if (fingerprint === this.lastPublishedEventFingerprint) return;
+    this.lastPublishedEventFingerprint = fingerprint;
+    this.manager.publishWatchStateEvent({
+      matchId: this.matchId,
+      provider: this.providerId,
+      state: status.state,
+      sourceUrl: status.sourceUrl,
+      currentSource: status.currentSource,
+      playlistUrl: status.playlistUrl,
+      providerHasMatch: hasProviderMatch(status),
+      updatedAt: status.updatedAt,
+    });
   }
 
   ensureAssetRecord(sourceUrl, kind) {
@@ -1016,6 +1054,8 @@ class LivekoraManager {
   constructor(config) {
     this.config = config;
     this.jobs = new Map();
+    this.redisPub = null;
+    this.redisPubReady = false;
     this.r2 = new S3Client({
       region: "auto",
       endpoint: config.r2Endpoint,
@@ -1025,6 +1065,49 @@ class LivekoraManager {
         secretAccessKey: config.r2SecretAccessKey,
       },
     });
+  }
+
+  async ensureRedisPublisher() {
+    if (!this.config.watchStateRedisUrl) return null;
+    if (this.redisPubReady && this.redisPub) return this.redisPub;
+    if (!this.redisPub) {
+      this.redisPub = createClient({ url: this.config.watchStateRedisUrl });
+      this.redisPub.on("error", (error) => {
+        this.redisPubReady = false;
+        this.log("warn", "watch-state redis publisher error", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+    if (!this.redisPubReady) {
+      await this.redisPub.connect();
+      this.redisPubReady = true;
+      this.log("info", "watch-state redis publisher connected", {
+        redisUrl: this.config.watchStateRedisUrl,
+      });
+    }
+    return this.redisPub;
+  }
+
+  publishWatchStateEvent(payload) {
+    if (!this.config.watchStateRedisUrl) return;
+    const matchId = Number.parseInt(String(payload?.matchId || "").trim(), 10);
+    if (!Number.isFinite(matchId) || matchId <= 0) return;
+    const channel = `watch-state:match:${matchId}`;
+    const body = JSON.stringify({
+      type: "watch-state-change",
+      ...payload,
+      ts: nowIso(),
+    });
+    void this.ensureRedisPublisher()
+      .then((client) => (client ? client.publish(channel, body) : null))
+      .catch((error) => {
+        this.redisPubReady = false;
+        this.log("warn", "watch-state event publish failed", {
+          channel,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
   }
 
   log(level, message, extra = {}) {
@@ -1213,6 +1296,8 @@ function loadConfig() {
     remoteRetentionMs: toInt(process.env.LIVEKORA_R2_REMOTE_RETENTION_MS, 45_000, 5000),
     maxConsecutiveFailures: toInt(process.env.LIVEKORA_R2_MAX_CONSECUTIVE_FAILURES, 6, 1),
     purgeStopMaxKeys: toInt(process.env.LIVEKORA_R2_PURGE_MAX_KEYS, 5000, 100),
+    watchStateRedisUrl:
+      String(process.env.WATCH_STATE_REDIS_URL || "redis://127.0.0.1:6379").trim() || "redis://127.0.0.1:6379",
   };
 }
 

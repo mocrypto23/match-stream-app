@@ -338,6 +338,7 @@ export default function WatchPage() {
   const [pageError, setPageError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [isPageHidden, setIsPageHidden] = useState(false);
+  const [watchEventsConnected, setWatchEventsConnected] = useState(false);
   const [displayProgressByProvider, setDisplayProgressByProvider] = useState<DisplayProgressMap>(createDisplayProgressMap);
   const [retainedPlaylistUrls, setRetainedPlaylistUrls] = useState<Record<StreamProviderId, string>>({
     livekora: "",
@@ -584,6 +585,36 @@ export default function WatchPage() {
   const refreshAllStatuses = useCallback(async () => {
     await refreshWatchState();
   }, [refreshWatchState]);
+
+  useEffect(() => {
+    if (!matchId || Number.isNaN(matchId)) return;
+    if (typeof window === "undefined" || typeof EventSource === "undefined") {
+      setWatchEventsConnected(false);
+      return;
+    }
+
+    const stream = new EventSource(`/api/livekora/events/stream/${matchId}`);
+    let closed = false;
+
+    stream.addEventListener("connected", () => {
+      setWatchEventsConnected(true);
+    });
+
+    stream.addEventListener("watch-state-change", () => {
+      void refreshAllStatuses();
+    });
+
+    stream.onerror = () => {
+      if (closed) return;
+      setWatchEventsConnected(false);
+    };
+
+    return () => {
+      closed = true;
+      setWatchEventsConnected(false);
+      stream.close();
+    };
+  }, [matchId, refreshAllStatuses]);
 
   const bootstrapProvider = useCallback(
     async (provider: StreamProviderId, opts?: { silent?: boolean }) => {
@@ -898,24 +929,30 @@ export default function WatchPage() {
 
   useEffect(() => {
     if (!matchId || Number.isNaN(matchId)) return;
-    const pollMs = isPageHidden ? HIDDEN_STATUS_POLL_MS : STATUS_POLL_MS;
+    const pollMs = watchEventsConnected ? (isPageHidden ? 90_000 : 60_000) : isPageHidden ? HIDDEN_STATUS_POLL_MS : STATUS_POLL_MS;
     const id = window.setInterval(() => {
       void refreshAllStatuses();
     }, pollMs);
     return () => window.clearInterval(id);
-  }, [isPageHidden, matchId, refreshAllStatuses]);
+  }, [isPageHidden, matchId, refreshAllStatuses, watchEventsConnected]);
 
   useEffect(() => {
     if (!matchId || Number.isNaN(matchId)) return;
     if (!providerSourceUrl) return;
     if (!playbackRequested && activeStatus?.state !== "warming") return;
     if (activeStatus?.state === "ready") return;
-    const pollMs = isPageHidden ? HIDDEN_ACTIVE_WARMING_POLL_MS : ACTIVE_WARMING_POLL_MS;
+    const pollMs = watchEventsConnected
+      ? isPageHidden
+        ? 20_000
+        : 12_000
+      : isPageHidden
+        ? HIDDEN_ACTIVE_WARMING_POLL_MS
+        : ACTIVE_WARMING_POLL_MS;
     const id = window.setInterval(() => {
       void refreshProviderStatus(activeProvider);
     }, pollMs);
     return () => window.clearInterval(id);
-  }, [activeProvider, activeStatus?.state, isPageHidden, matchId, playbackRequested, providerSourceUrl, refreshProviderStatus]);
+  }, [activeProvider, activeStatus?.state, isPageHidden, matchId, playbackRequested, providerSourceUrl, refreshProviderStatus, watchEventsConnected]);
 
   useEffect(() => {
     if (!playbackRequested) {
