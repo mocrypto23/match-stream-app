@@ -29,10 +29,11 @@ function buildWatchStateVersion(statuses: StreamSourceStatus[], sourceUrls: Sour
       [
         status.provider,
         status.state,
+        status.phase || "",
+        String(status.progressPct ?? ""),
         status.reason,
         status.currentSource || "",
         status.playlistUrl || "",
-        status.updatedAt || "",
         sourceUrls[status.provider] || "",
       ].join("::")
     )
