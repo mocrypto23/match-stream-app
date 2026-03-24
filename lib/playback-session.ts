@@ -134,6 +134,10 @@ function throttlePlaybackGuardLog(kind: string, fingerprint: string, details: Re
 }
 
 function readRequestHost(req: Request) {
+  const forwardedHost = String(req.headers.get("x-forwarded-host") || "").trim().toLowerCase();
+  if (forwardedHost) return forwardedHost.split(",")[0]?.trim().toLowerCase() || "";
+  const hostHeader = String(req.headers.get("host") || "").trim().toLowerCase();
+  if (hostHeader) return hostHeader;
   try {
     return new URL(req.url).host.toLowerCase();
   } catch {
