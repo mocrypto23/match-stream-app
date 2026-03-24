@@ -444,7 +444,9 @@ class LivekoraJob {
     if (this.syncTimer) clearTimeout(this.syncTimer);
     this.syncTimer = null;
     this.emitStatusEventIfChanged();
-    await this.manager.purgeRemotePrefix(this.remotePrefix, this.manager.config.purgeStopMaxKeys);
+    if (this.manager.config.purgeOnStop) {
+      await this.manager.purgeRemotePrefix(this.remotePrefix, this.manager.config.purgeStopMaxKeys);
+    }
   }
 
   updateSeed(input) {
@@ -1195,7 +1197,9 @@ class LivekoraManager {
         publicPathPrefix,
       });
       this.jobs.set(key, job);
-      await this.purgeRemotePrefix(job.remotePrefix, this.config.purgeStopMaxKeys);
+      if (this.config.purgeOnBootstrap) {
+        await this.purgeRemotePrefix(job.remotePrefix, this.config.purgeStopMaxKeys);
+      }
       job.start();
       this.log("info", "r2 mirror job started", {
         provider: providerId,
@@ -1287,15 +1291,17 @@ function loadConfig() {
     r2SecretAccessKey,
     publicBaseUrl,
     remoteRoot: String(process.env.LIVEKORA_R2_REMOTE_ROOT || "live").trim().replace(/^\/+|\/+$/g, "") || "live",
-    idleStopMs: toInt(process.env.LIVEKORA_R2_IDLE_STOP_MS, 10 * 60 * 1000, 60_000),
+    idleStopMs: toInt(process.env.LIVEKORA_R2_IDLE_STOP_MS, 30 * 60 * 1000, 60_000),
     uploadPollMs: toInt(process.env.LIVEKORA_R2_UPLOAD_POLL_MS, 2200, 400),
-    playlistPublishMinIntervalMs: toInt(process.env.LIVEKORA_R2_PLAYLIST_PUBLISH_MIN_INTERVAL_MS, 2500, 1000),
+    playlistPublishMinIntervalMs: toInt(process.env.LIVEKORA_R2_PLAYLIST_PUBLISH_MIN_INTERVAL_MS, 4000, 1000),
     manifestFetchTimeoutMs: toInt(process.env.LIVEKORA_R2_MANIFEST_FETCH_TIMEOUT_MS, 15_000, 2000),
     assetFetchTimeoutMs: toInt(process.env.LIVEKORA_R2_ASSET_FETCH_TIMEOUT_MS, 22_000, 3000),
     mirrorAssetConcurrency: toInt(process.env.LIVEKORA_R2_ASSET_CONCURRENCY, 6, 1),
     remoteRetentionMs: toInt(process.env.LIVEKORA_R2_REMOTE_RETENTION_MS, 45_000, 5000),
     maxConsecutiveFailures: toInt(process.env.LIVEKORA_R2_MAX_CONSECUTIVE_FAILURES, 6, 1),
     purgeStopMaxKeys: toInt(process.env.LIVEKORA_R2_PURGE_MAX_KEYS, 5000, 100),
+    purgeOnBootstrap: String(process.env.LIVEKORA_R2_PURGE_ON_BOOTSTRAP || "").trim() === "1",
+    purgeOnStop: String(process.env.LIVEKORA_R2_PURGE_ON_STOP || "").trim() === "1",
     watchStateRedisUrl:
       String(process.env.WATCH_STATE_REDIS_URL || "redis://127.0.0.1:6379").trim() || "redis://127.0.0.1:6379",
   };
