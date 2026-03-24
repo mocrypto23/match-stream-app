@@ -44,6 +44,13 @@ type StatusMap = Record<StreamProviderId, StreamSourceStatus | null>;
 type PendingBootstrapMap = Record<StreamProviderId, number>;
 type DisplayProgressMap = Record<StreamProviderId, number>;
 type DisplayProgressMetaMap = Record<StreamProviderId, { animating: boolean; startedAt: number }>;
+type PlaybackUrlMap = Record<StreamProviderId, string>;
+type PlaybackSessionResponse = {
+  ok?: boolean;
+  playUrl?: string | null;
+  expiresAt?: string | null;
+  error?: string | null;
+};
 type P2PEngineModule = {
   HlsJsP2PEngine: new (config?: {
     core?: {
@@ -213,6 +220,10 @@ function createDisplayProgressMetaMap(): DisplayProgressMetaMap {
     beinlive: { animating: false, startedAt: 0 },
     siiir: { animating: false, startedAt: 0 },
   };
+}
+
+function createPlaybackUrlMap(): PlaybackUrlMap {
+  return { livekora: "", beinlive: "", siiir: "" };
 }
 
 function loadP2PEngineModule() {
@@ -425,6 +436,7 @@ export default function WatchPage() {
     beinlive: "",
     siiir: "",
   });
+  const [playbackSessionUrls, setPlaybackSessionUrls] = useState<PlaybackUrlMap>(createPlaybackUrlMap);
   const [pendingBootstraps, setPendingBootstraps] = useState<PendingBootstrapMap>(createPendingBootstrapMap);
   const [playbackRequested, setPlaybackRequested] = useState(false);
   const [playbackStarting, setPlaybackStarting] = useState(false);
@@ -544,6 +556,10 @@ export default function WatchPage() {
     }
     return retained || fallbackPlaylistUrl;
   }, [activeProvider, activeStatus, fallbackPlaylistUrl, retainedPlaylistUrls]);
+  const playerStreamUrl = useMemo(() => {
+    if (!playbackRequested) return "";
+    return String(playbackSessionUrls[activeProvider] || "").trim();
+  }, [activeProvider, playbackRequested, playbackSessionUrls]);
 
   const directSourceUrl = useMemo(() => {
     return getMatchSourceUrl(match, activeProvider) || null;
@@ -708,6 +724,41 @@ export default function WatchPage() {
   const refreshAllStatuses = useCallback(async () => {
     await refreshWatchState();
   }, [refreshWatchState]);
+
+  const ensurePlaybackSession = useCallback(
+    async (provider: StreamProviderId) => {
+      try {
+        const response = await fetch("/api/playback/session", {
+          method: "POST",
+          cache: "no-store",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            matchId,
+            provider,
+          }),
+        });
+        const payload = (await response.json().catch(() => null)) as PlaybackSessionResponse | null;
+        const playUrl = String(payload?.playUrl || "").trim();
+        if (!response.ok || !playUrl) {
+          throw new Error(String(payload?.error || "playback-session-failed"));
+        }
+        setPlaybackSessionUrls((current) => {
+          if (current[provider] === playUrl) return current;
+          return {
+            ...current,
+            [provider]: playUrl,
+          };
+        });
+        return playUrl;
+      } catch (error) {
+        setPageError(error instanceof Error ? error.message : "playback-session-failed");
+        return "";
+      }
+    },
+    [matchId]
+  );
 
   const applyEdgeSnapshot = useCallback(
     (payload: WatchStatePayload | null | undefined) => {
@@ -1170,15 +1221,22 @@ export default function WatchPage() {
     [applyProviderStatus, matchId]
   );
 
-  const requestPlaybackStart = useCallback(() => {
+  const requestPlaybackStart = useCallback(async () => {
     setPageError(null);
-    setPlaybackRequested(true);
     setPlaybackStarting(true);
     if (!String(streamUrl || "").trim()) {
+      setPlaybackRequested(true);
       void refreshProviderStatus(activeProvider);
       void bootstrapProvider(activeProvider);
+      return;
     }
-  }, [activeProvider, bootstrapProvider, refreshProviderStatus, streamUrl]);
+    const playUrl = await ensurePlaybackSession(activeProvider);
+    if (!playUrl) {
+      setPlaybackStarting(false);
+      return;
+    }
+    setPlaybackRequested(true);
+  }, [activeProvider, bootstrapProvider, ensurePlaybackSession, refreshProviderStatus, streamUrl]);
 
   const clearWaitingOverlayTimer = useCallback(() => {
     if (waitingOverlayTimerRef.current !== null) {
@@ -1234,6 +1292,7 @@ export default function WatchPage() {
     setDisplayProgressByProvider(createDisplayProgressMap());
     displayProgressMetaRef.current = createDisplayProgressMetaMap();
     setRetainedPlaylistUrls({ livekora: "", beinlive: "", siiir: "" });
+    setPlaybackSessionUrls(createPlaybackUrlMap());
     setPendingBootstraps(createPendingBootstrapMap());
     p2pStatsStoreRef.current = {};
     setP2pStats(EMPTY_P2P_STATS);
@@ -1496,6 +1555,14 @@ export default function WatchPage() {
 
   useEffect(() => {
     if (!playbackRequested) return;
+    if (activeStatus?.state !== "ready") return;
+    if (!String(streamUrl || "").trim()) return;
+    if (String(playbackSessionUrls[activeProvider] || "").trim()) return;
+    void ensurePlaybackSession(activeProvider);
+  }, [activeProvider, activeStatus?.state, ensurePlaybackSession, playbackRequested, playbackSessionUrls, streamUrl]);
+
+  useEffect(() => {
+    if (!playbackRequested) return;
     if (!hasPlayedRef.current) return;
     if (!providerSourceUrl) return;
     if (activeStatus?.state !== "ready") return;
@@ -1504,7 +1571,7 @@ export default function WatchPage() {
     sourceRecoveryPendingRef.current[activeProvider] = false;
 
     const video = videoRef.current;
-    const stream = String(streamUrl || "").trim();
+    const stream = String(playerStreamUrl || "").trim();
     const now = Date.now();
     const watch = playbackWatchRef.current;
     const stalledForMs = now - watch.lastAdvanceAt;
@@ -1526,12 +1593,12 @@ export default function WatchPage() {
     activeProvider,
     activeStatus?.state,
     playbackRequested,
+    playerStreamUrl,
     providerSourceUrl,
-    streamUrl,
   ]);
 
   useEffect(() => {
-    const stream = String(streamUrl || "").trim();
+    const stream = String(playerStreamUrl || "").trim();
     const watch = playbackWatchRef.current;
     const now = Date.now();
     if (!playbackRequested || !stream) {
@@ -1551,7 +1618,7 @@ export default function WatchPage() {
         lastAdvanceAt: now,
       };
     }
-  }, [activeProvider, playbackRequested, streamUrl]);
+  }, [activeProvider, playbackRequested, playerStreamUrl]);
 
   useEffect(() => {
     if (!match) return;
@@ -1589,7 +1656,7 @@ export default function WatchPage() {
       const video = videoRef.current;
       if (!video) return;
 
-      const stream = String(streamUrl || "").trim();
+      const stream = String(playerStreamUrl || "").trim();
       const now = Date.now();
       const watch = playbackWatchRef.current;
       const currentTime = Number(video.currentTime || 0);
@@ -1691,12 +1758,12 @@ export default function WatchPage() {
     playbackStarting,
     activeStatus?.state,
     refreshProviderStatus,
-    streamUrl,
+    playerStreamUrl,
   ]);
 
   useEffect(() => {
     const video = videoRef.current;
-    const src = String(streamUrl || "").trim();
+    const src = String(playerStreamUrl || "").trim();
     const p2pStoreKey = `${matchId}:${activeProvider}`;
     const persistedP2PStats = p2pStatsStoreRef.current[p2pStoreKey];
 
@@ -2034,7 +2101,7 @@ export default function WatchPage() {
         scheduleEnable: () => {},
       };
     };
-  }, [activeProvider, clearWaitingOverlayTimer, matchId, playbackRequested, playerSessionNonce, streamUrl]);
+  }, [activeProvider, clearWaitingOverlayTimer, matchId, playbackRequested, playerSessionNonce, playerStreamUrl]);
 
   if (loading) {
     return (
@@ -2312,7 +2379,7 @@ export default function WatchPage() {
                 </div>
                 <div>
                   <div className="text-slate-400">رابط البث النهائي</div>
-                  <div className="break-all font-mono text-xs text-teal-200">{streamUrl || "غير متاح بعد"}</div>
+                  <div className="break-all font-mono text-xs text-teal-200">{playerStreamUrl || streamUrl || "غير متاح بعد"}</div>
                 </div>
                 <div>
                   <div className="text-slate-400">المصدر الحالي</div>

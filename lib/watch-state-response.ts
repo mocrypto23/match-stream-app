@@ -4,6 +4,7 @@ import { NextResponse } from "next/server";
 
 import { buildBeinliveStatus } from "@/lib/beinlive-agent";
 import { buildLivekoraStatus } from "@/lib/livekora-agent";
+import { protectClientStatus } from "@/lib/playback-session";
 import { readAllR2MirrorAgentStatuses } from "@/lib/r2-mirror-agent";
 import { buildSiiirStatus } from "@/lib/siiir-agent";
 import type { StreamProviderId, StreamSourceStatus } from "@/lib/stream-source-types";
@@ -109,14 +110,18 @@ export async function buildWatchStateResponse(req: Request, matchId: number) {
     return applyWatchStateHeaders(new NextResponse(null, { status: 304 }), etag);
   }
 
+  const protectedLivekoraStatus = protectClientStatus(livekoraStatus);
+  const protectedBeinliveStatus = protectClientStatus(beinliveStatus);
+  const protectedSiiirStatus = protectClientStatus(siiirStatus);
+
   const payload: HotWatchStatePayload = {
     matchId,
     stream_url: seed.sourceUrls.beinlive,
     stream_url_2: seed.sourceUrls.siiir,
     stream_url_4: seed.sourceUrls.livekora,
-    livekoraStatus,
-    beinliveStatus,
-    siiirStatus,
+    livekoraStatus: protectedLivekoraStatus,
+    beinliveStatus: protectedBeinliveStatus,
+    siiirStatus: protectedSiiirStatus,
     updatedAt,
     version,
   };

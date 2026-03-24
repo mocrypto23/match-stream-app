@@ -7,6 +7,7 @@ import { readAllR2MirrorAgentStatuses } from "@/lib/r2-mirror-agent";
 import { buildSiiirStatus } from "@/lib/siiir-agent";
 import { beinliveProvider } from "@/lib/beinlive-provider";
 import { livekoraProvider } from "@/lib/live-providers";
+import { buildClientPlaybackUrl, protectClientStatus } from "@/lib/playback-session";
 import { siiirProvider } from "@/lib/siiir-provider";
 import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
 import { seedHotWatchState } from "@/lib/watch-state-cache";
@@ -66,7 +67,12 @@ export async function GET(_req: Request, ctx: Ctx) {
       agentStatus: agentStatuses?.siiir || null,
     }),
   ]);
-  const streamSources = [livekoraStatus, beinliveStatus, siiirStatus].sort((left, right) => left.order - right.order);
+  const protectedLivekoraStatus = protectClientStatus(livekoraStatus);
+  const protectedBeinliveStatus = protectClientStatus(beinliveStatus);
+  const protectedSiiirStatus = protectClientStatus(siiirStatus);
+  const streamSources = [protectedLivekoraStatus, protectedBeinliveStatus, protectedSiiirStatus]
+    .filter(Boolean)
+    .sort((left, right) => Number(left?.order || 0) - Number(right?.order || 0));
 
   const response = NextResponse.json({
     id: data.id,
@@ -81,12 +87,12 @@ export async function GET(_req: Request, ctx: Ctx) {
     stream_url: beinliveSourceUrl,
     stream_url_2: siiirSourceUrl,
     stream_url_4: sourceUrl,
-    livekoraStatus,
-    livekoraPlaylistUrl: livekoraStatus.playlistUrl,
-    beinliveStatus,
-    beinlivePlaylistUrl: beinliveStatus.playlistUrl,
-    siiirStatus,
-    siiirPlaylistUrl: siiirStatus.playlistUrl,
+    livekoraStatus: protectedLivekoraStatus,
+    livekoraPlaylistUrl: buildClientPlaybackUrl("livekora", matchId, !!String(livekoraStatus.playlistUrl || "").trim()),
+    beinliveStatus: protectedBeinliveStatus,
+    beinlivePlaylistUrl: buildClientPlaybackUrl("beinlive", matchId, !!String(beinliveStatus.playlistUrl || "").trim()),
+    siiirStatus: protectedSiiirStatus,
+    siiirPlaylistUrl: buildClientPlaybackUrl("siiir", matchId, !!String(siiirStatus.playlistUrl || "").trim()),
     streamSources,
   });
   response.headers.set("Cache-Control", "public, s-maxage=6, stale-while-revalidate=20");

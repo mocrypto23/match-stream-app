@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { buildLivekoraStatus } from "@/lib/livekora-agent";
 import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
 import { pickLivekoraSourceUrl } from "@/lib/live-providers";
+import { protectClientStatus } from "@/lib/playback-session";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -28,5 +29,5 @@ export async function GET(req: Request) {
     row: data,
     sourceUrl,
   });
-  return NextResponse.json({ livekoraStatus: status }, { headers: { "Cache-Control": "no-store" } });
+  return NextResponse.json({ livekoraStatus: protectClientStatus(status) }, { headers: { "Cache-Control": "no-store" } });
 }

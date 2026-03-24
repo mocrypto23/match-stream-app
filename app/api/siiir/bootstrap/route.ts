@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { runBootstrapSingleflight } from "@/lib/bootstrap-singleflight";
 import { resolveInternalAppOrigin } from "@/lib/live-providers";
+import { protectClientStatus } from "@/lib/playback-session";
 import { buildSiiirStatus, bootstrapSiiirAgent } from "@/lib/siiir-agent";
 import { buildSiiirSessionManifestUrl, siiirProvider } from "@/lib/siiir-provider";
 import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
@@ -30,7 +31,7 @@ export async function POST(req: Request) {
     (row ? String(await resolveProviderSourceUrl(siiirProvider, row) || "").trim() : "");
   if (!sourceUrl) {
     const siiirStatus = await buildSiiirStatus({ matchId, row: null, sourceUrl: null });
-    return NextResponse.json({ accepted: false, siiirStatus }, { status: 409 });
+    return NextResponse.json({ accepted: false, siiirStatus: protectClientStatus(siiirStatus) }, { status: 409 });
   }
 
   const siiirStatusBefore = await buildSiiirStatus({
@@ -46,7 +47,7 @@ export async function POST(req: Request) {
       {
         accepted: true,
         reason: "already-bootstrapped",
-        siiirStatus: siiirStatusBefore,
+        siiirStatus: protectClientStatus(siiirStatusBefore),
       },
       { status: 200, headers: { "Cache-Control": "no-store" } }
     );
@@ -71,7 +72,7 @@ export async function POST(req: Request) {
     {
       accepted: bootstrapped.accepted,
       reason: bootstrapped.reason,
-      siiirStatus,
+      siiirStatus: protectClientStatus(siiirStatus),
     },
     { status: bootstrapped.ok ? 200 : 502, headers: { "Cache-Control": "no-store" } }
   );

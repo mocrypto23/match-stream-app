@@ -4,6 +4,7 @@ import { bootstrapBeinliveAgent, buildBeinliveStatus } from "@/lib/beinlive-agen
 import { runBootstrapSingleflight } from "@/lib/bootstrap-singleflight";
 import { beinliveProvider, buildBeinliveSessionManifestUrl } from "@/lib/beinlive-provider";
 import { resolveInternalAppOrigin } from "@/lib/live-providers";
+import { protectClientStatus } from "@/lib/playback-session";
 import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
 import { getOrLoadHotWatchStateSeed } from "@/lib/watch-state-cache";
 
@@ -30,7 +31,7 @@ export async function POST(req: Request) {
     (row ? String(await resolveProviderSourceUrl(beinliveProvider, row) || "").trim() : "");
   if (!sourceUrl) {
     const beinliveStatus = await buildBeinliveStatus({ matchId, row: null, sourceUrl: null });
-    return NextResponse.json({ accepted: false, beinliveStatus }, { status: 409 });
+    return NextResponse.json({ accepted: false, beinliveStatus: protectClientStatus(beinliveStatus) }, { status: 409 });
   }
 
   const beinliveStatusBefore = await buildBeinliveStatus({
@@ -46,7 +47,7 @@ export async function POST(req: Request) {
       {
         accepted: true,
         reason: "already-bootstrapped",
-        beinliveStatus: beinliveStatusBefore,
+        beinliveStatus: protectClientStatus(beinliveStatusBefore),
       },
       { status: 200, headers: { "Cache-Control": "no-store" } }
     );
@@ -71,7 +72,7 @@ export async function POST(req: Request) {
     {
       accepted: bootstrapped.accepted,
       reason: bootstrapped.reason,
-      beinliveStatus,
+      beinliveStatus: protectClientStatus(beinliveStatus),
     },
     { status: bootstrapped.ok ? 200 : 502, headers: { "Cache-Control": "no-store" } }
   );

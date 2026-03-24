@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { buildBeinliveStatus } from "@/lib/beinlive-agent";
 import { beinliveProvider } from "@/lib/beinlive-provider";
 import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
+import { protectClientStatus } from "@/lib/playback-session";
 import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
 
 export const runtime = "nodejs";
@@ -28,5 +29,5 @@ export async function GET(req: Request) {
     row: data,
     sourceUrl: await resolveProviderSourceUrl(beinliveProvider, data),
   });
-  return NextResponse.json({ beinliveStatus: status }, { headers: { "Cache-Control": "no-store" } });
+  return NextResponse.json({ beinliveStatus: protectClientStatus(status) }, { headers: { "Cache-Control": "no-store" } });
 }

@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
+import { protectClientStatus } from "@/lib/playback-session";
 import { buildSiiirStatus } from "@/lib/siiir-agent";
 import { siiirProvider } from "@/lib/siiir-provider";
 import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
@@ -28,5 +29,5 @@ export async function GET(req: Request) {
     row: data,
     sourceUrl: await resolveProviderSourceUrl(siiirProvider, data),
   });
-  return NextResponse.json({ siiirStatus: status }, { headers: { "Cache-Control": "no-store" } });
+  return NextResponse.json({ siiirStatus: protectClientStatus(status) }, { headers: { "Cache-Control": "no-store" } });
 }
