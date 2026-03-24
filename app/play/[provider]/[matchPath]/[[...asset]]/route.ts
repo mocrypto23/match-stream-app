@@ -2,7 +2,9 @@ import { NextResponse } from "next/server";
 
 import {
   buildUpstreamPlaybackManifestUrl,
+  guardPlaybackAssetRequest,
   isValidPlaybackProvider,
+  observePlaybackGatewayRequest,
   parsePlaybackMatchId,
   rewriteManifestForPlaybackGateway,
   verifyPlaybackSessionToken,
@@ -38,6 +40,13 @@ export async function GET(req: Request, ctx: Ctx) {
 
   const session = verifyPlaybackSessionToken({ req, matchId, provider });
   if (!session.ok) {
+    observePlaybackGatewayRequest({
+      req,
+      provider,
+      matchId,
+      assetPath: Array.isArray(asset) && asset.length ? asset.join("/") : "index.m3u8",
+      reason: session.reason,
+    });
     return NextResponse.json({ error: session.reason }, { status: 401 });
   }
 
@@ -47,15 +56,39 @@ export async function GET(req: Request, ctx: Ctx) {
   }
 
   const assetPath = Array.isArray(asset) && asset.length ? asset.join("/") : "index.m3u8";
-  if (assetPath !== "index.m3u8") {
+  observePlaybackGatewayRequest({
+    req,
+    provider,
+    matchId,
+    assetPath,
+  });
+  if (assetPath !== "index.m3u8" && !assetPath.toLowerCase().endsWith(".m3u8")) {
+    const guard = guardPlaybackAssetRequest({
+      req,
+      provider,
+      matchId,
+      claims: session.claims,
+      assetPath,
+    });
+    if (!guard.ok) {
+      return NextResponse.json({ error: guard.reason }, { status: 429 });
+    }
     const rawAssetUrl = buildRawAssetUrl(upstreamManifestUrl, assetPath);
     if (!rawAssetUrl) {
       return NextResponse.json({ error: "invalid-playback-asset" }, { status: 400 });
     }
-    return NextResponse.redirect(rawAssetUrl, { status: 307 });
+    const redirect = NextResponse.redirect(rawAssetUrl, { status: 307 });
+    redirect.headers.set("Cache-Control", "no-store");
+    redirect.headers.set("x-tf-playback-gateway", "1");
+    return redirect;
   }
 
-  const response = await fetch(upstreamManifestUrl, {
+  const manifestUrl = assetPath === "index.m3u8" ? upstreamManifestUrl : buildRawAssetUrl(upstreamManifestUrl, assetPath);
+  if (!manifestUrl) {
+    return NextResponse.json({ error: "invalid-manifest-asset" }, { status: 400 });
+  }
+
+  const response = await fetch(manifestUrl, {
     method: "GET",
     cache: "no-store",
     redirect: "follow",
@@ -70,7 +103,7 @@ export async function GET(req: Request, ctx: Ctx) {
   }
 
   const manifestText = await response.text().catch(() => "");
-  const rewritten = rewriteManifestForPlaybackGateway(manifestText, upstreamManifestUrl);
+  const rewritten = rewriteManifestForPlaybackGateway(manifestText, manifestUrl);
   const out = new NextResponse(rewritten, {
     status: 200,
     headers: {

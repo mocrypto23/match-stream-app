@@ -1,4 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { posix as pathPosix } from "node:path";
 
 import { NextResponse } from "next/server";
 
@@ -20,6 +21,29 @@ type PlaybackSessionClaims = {
   exp: number;
   ua: string;
 };
+
+type PlaybackAccessState = {
+  hits: number[];
+  ipBuckets: Map<string, number>;
+  lastSeenAt: number;
+};
+
+type PlaybackSessionIssueState = {
+  hits: number[];
+  lastSeenAt: number;
+};
+
+const playbackAccessBySession = new Map<string, PlaybackAccessState>();
+const playbackSessionIssueByKey = new Map<string, PlaybackSessionIssueState>();
+const playbackLogThrottle = new Map<string, number>();
+const PLAYBACK_RATE_WINDOW_MS = 10_000;
+const PLAYBACK_MAX_REQUESTS_PER_WINDOW = 600;
+const PLAYBACK_IP_BUCKET_WINDOW_MS = 10 * 60 * 1000;
+const PLAYBACK_MAX_IP_BUCKETS = 8;
+const PLAYBACK_ACCESS_IDLE_TTL_MS = 30 * 60 * 1000;
+const PLAYBACK_SESSION_WINDOW_MS = 60_000;
+const PLAYBACK_MAX_SESSION_ISSUES_PER_WINDOW = 30;
+const PLAYBACK_ISSUE_IDLE_TTL_MS = 15 * 60 * 1000;
 
 function toBase64Url(input: Buffer | string) {
   return Buffer.from(input)
@@ -100,6 +124,40 @@ export function createPlaybackSessionToken(input: {
   };
 }
 
+function throttlePlaybackGuardLog(kind: string, fingerprint: string, details: Record<string, unknown>) {
+  const key = `${kind}:${fingerprint}`;
+  const now = Date.now();
+  const lastLoggedAt = playbackLogThrottle.get(key) || 0;
+  if (now - lastLoggedAt < 30_000) return;
+  playbackLogThrottle.set(key, now);
+  console.warn("[playback-guard]", kind, details);
+}
+
+function readRequestHost(req: Request) {
+  try {
+    return new URL(req.url).host.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function hostLooksTrusted(host: string, expectedHost: string) {
+  const normalizedHost = String(host || "").trim().toLowerCase();
+  const normalizedExpected = String(expectedHost || "").trim().toLowerCase();
+  if (!normalizedHost || !normalizedExpected) return false;
+  return normalizedHost === normalizedExpected || normalizedHost.endsWith(`.${normalizedExpected}`);
+}
+
+function extractHeaderHost(rawValue: string) {
+  const value = String(rawValue || "").trim();
+  if (!value) return "";
+  try {
+    return new URL(value).host.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
 export function playbackSessionCookieName(provider: StreamProviderId, matchId: number) {
   return `tfps_${provider}_m${matchId}`;
 }
@@ -163,6 +221,149 @@ export function verifyPlaybackSessionToken(input: {
   return { ok: true as const, claims };
 }
 
+function getClientIpBucket(req: Request) {
+  const rawIp =
+    String(req.headers.get("cf-connecting-ip") || "").trim() ||
+    String(req.headers.get("x-forwarded-for") || "")
+      .split(",")[0]
+      .trim();
+  if (!rawIp) return "ip:unknown";
+  if (rawIp.includes(":")) {
+    return `ip6:${rawIp.split(":").slice(0, 4).join(":")}`;
+  }
+  const parts = rawIp.split(".");
+  if (parts.length === 4) {
+    return `ip4:${parts.slice(0, 3).join(".")}`;
+  }
+  return `ip:${rawIp}`;
+}
+
+function cleanupPlaybackAccessState(now: number) {
+  for (const [key, state] of playbackAccessBySession.entries()) {
+    if (now - state.lastSeenAt > PLAYBACK_ACCESS_IDLE_TTL_MS) {
+      playbackAccessBySession.delete(key);
+    }
+  }
+}
+
+function cleanupPlaybackSessionIssueState(now: number) {
+  for (const [key, state] of playbackSessionIssueByKey.entries()) {
+    if (now - state.lastSeenAt > PLAYBACK_ISSUE_IDLE_TTL_MS) {
+      playbackSessionIssueByKey.delete(key);
+    }
+  }
+}
+
+export function guardPlaybackSessionIssueRequest(input: {
+  req: Request;
+  provider: StreamProviderId;
+  matchId: number;
+}) {
+  const now = Date.now();
+  cleanupPlaybackSessionIssueState(now);
+  const issueKey = `${input.provider}:${input.matchId}:${getClientIpBucket(input.req)}`;
+  const issueState =
+    playbackSessionIssueByKey.get(issueKey) ||
+    ({
+      hits: [],
+      lastSeenAt: now,
+    } satisfies PlaybackSessionIssueState);
+  issueState.lastSeenAt = now;
+  issueState.hits = issueState.hits.filter((value) => now - value <= PLAYBACK_SESSION_WINDOW_MS);
+  issueState.hits.push(now);
+  playbackSessionIssueByKey.set(issueKey, issueState);
+  if (issueState.hits.length > PLAYBACK_MAX_SESSION_ISSUES_PER_WINDOW) {
+    throttlePlaybackGuardLog("session-rate-limit", issueKey, {
+      provider: input.provider,
+      matchId: input.matchId,
+      hits: issueState.hits.length,
+    });
+    return { ok: false as const, reason: "playback-session-rate-limit" };
+  }
+  return { ok: true as const };
+}
+
+export function guardPlaybackAssetRequest(input: {
+  req: Request;
+  provider: StreamProviderId;
+  matchId: number;
+  claims: PlaybackSessionClaims;
+  assetPath: string;
+}) {
+  const now = Date.now();
+  cleanupPlaybackAccessState(now);
+  const sessionKey = `${input.provider}:${input.matchId}:${input.claims.ua}:${input.claims.exp}`;
+  const accessState =
+    playbackAccessBySession.get(sessionKey) ||
+    ({
+      hits: [],
+      ipBuckets: new Map<string, number>(),
+      lastSeenAt: now,
+    } satisfies PlaybackAccessState);
+  accessState.lastSeenAt = now;
+  accessState.hits = accessState.hits.filter((value) => now - value <= PLAYBACK_RATE_WINDOW_MS);
+  accessState.hits.push(now);
+  if (accessState.hits.length > PLAYBACK_MAX_REQUESTS_PER_WINDOW) {
+    throttlePlaybackGuardLog("rate-limit", sessionKey, {
+      provider: input.provider,
+      matchId: input.matchId,
+      assetPath: input.assetPath,
+      hits: accessState.hits.length,
+    });
+    playbackAccessBySession.set(sessionKey, accessState);
+    return { ok: false as const, reason: "playback-rate-limit" };
+  }
+
+  const ipBucket = getClientIpBucket(input.req);
+  for (const [bucket, seenAt] of accessState.ipBuckets.entries()) {
+    if (now - seenAt > PLAYBACK_IP_BUCKET_WINDOW_MS) {
+      accessState.ipBuckets.delete(bucket);
+    }
+  }
+  accessState.ipBuckets.set(ipBucket, now);
+  if (accessState.ipBuckets.size > PLAYBACK_MAX_IP_BUCKETS) {
+    throttlePlaybackGuardLog("ip-bucket-limit", sessionKey, {
+      provider: input.provider,
+      matchId: input.matchId,
+      assetPath: input.assetPath,
+      ipBuckets: accessState.ipBuckets.size,
+    });
+    playbackAccessBySession.set(sessionKey, accessState);
+    return { ok: false as const, reason: "playback-ip-bucket-limit" };
+  }
+
+  playbackAccessBySession.set(sessionKey, accessState);
+  return { ok: true as const };
+}
+
+export function observePlaybackGatewayRequest(input: {
+  req: Request;
+  provider: StreamProviderId;
+  matchId: number;
+  assetPath: string;
+  reason?: string | null;
+}) {
+  const expectedHost = readRequestHost(input.req);
+  const originHost = extractHeaderHost(String(input.req.headers.get("origin") || ""));
+  const refererHost = extractHeaderHost(String(input.req.headers.get("referer") || ""));
+  const secFetchSite = String(input.req.headers.get("sec-fetch-site") || "").trim().toLowerCase();
+  const suspicious =
+    (!!originHost && !hostLooksTrusted(originHost, expectedHost)) ||
+    (!!refererHost && !hostLooksTrusted(refererHost, expectedHost)) ||
+    secFetchSite === "cross-site";
+  if (!suspicious && !input.reason) return;
+  const fingerprint = `${input.provider}:${input.matchId}:${input.assetPath}:${originHost || refererHost || secFetchSite || "unknown"}`;
+  throttlePlaybackGuardLog("gateway-observe", fingerprint, {
+    provider: input.provider,
+    matchId: input.matchId,
+    assetPath: input.assetPath,
+    reason: input.reason || null,
+    originHost: originHost || null,
+    refererHost: refererHost || null,
+    secFetchSite: secFetchSite || null,
+  });
+}
+
 export function attachPlaybackSessionCookie(
   response: NextResponse,
   input: {
@@ -192,6 +393,36 @@ function resolveManifestUrl(raw: string, baseUrl: string) {
   }
 }
 
+function buildGatewayRelativeAssetReference(raw: string, baseUrl: string) {
+  const value = String(raw || "").trim();
+  if (!value) return value;
+  if (/^(data:|skd:|urn:)/i.test(value)) return value;
+
+  let absolute: URL;
+  try {
+    absolute = new URL(value, baseUrl);
+  } catch {
+    return value;
+  }
+
+  let base: URL;
+  try {
+    base = new URL(baseUrl);
+  } catch {
+    return value;
+  }
+
+  const baseDir = pathPosix.dirname(base.pathname || "/");
+  const targetPath = absolute.pathname || "/";
+  let relativePath = pathPosix.relative(baseDir, targetPath).replace(/\\/g, "/");
+  if (!relativePath || relativePath === ".") {
+    relativePath = pathPosix.basename(targetPath) || value;
+  }
+  if (absolute.search) relativePath += absolute.search;
+  if (absolute.hash) relativePath += absolute.hash;
+  return relativePath;
+}
+
 export function rewriteManifestForPlaybackGateway(manifestText: string, upstreamManifestUrl: string) {
   const out = String(manifestText || "")
     .split(/\r?\n/)
@@ -199,9 +430,9 @@ export function rewriteManifestForPlaybackGateway(manifestText: string, upstream
       const trimmed = String(line || "").trim();
       if (!trimmed) return line;
       if (trimmed.startsWith("#")) {
-        return line.replace(/URI="([^"]+)"/gi, (_match, rawUri) => `URI="${resolveManifestUrl(rawUri, upstreamManifestUrl)}"`);
+        return line.replace(/URI="([^"]+)"/gi, (_match, rawUri) => `URI="${buildGatewayRelativeAssetReference(rawUri, upstreamManifestUrl)}"`);
       }
-      return resolveManifestUrl(trimmed, upstreamManifestUrl);
+      return buildGatewayRelativeAssetReference(trimmed, upstreamManifestUrl);
     })
     .join("\n");
   return out;
@@ -210,4 +441,3 @@ export function rewriteManifestForPlaybackGateway(manifestText: string, upstream
 export function buildUpstreamPlaybackManifestUrl(provider: StreamProviderId, matchId: number) {
   return buildProviderPublicPlaylistUrl(provider, matchId);
 }
-

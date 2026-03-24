@@ -4,7 +4,9 @@ import {
   attachPlaybackSessionCookie,
   buildPlaybackManifestPath,
   createPlaybackSessionToken,
+  guardPlaybackSessionIssueRequest,
   isValidPlaybackProvider,
+  observePlaybackGatewayRequest,
 } from "@/lib/playback-session";
 import { readAllR2MirrorAgentStatuses } from "@/lib/r2-mirror-agent";
 
@@ -25,6 +27,25 @@ export async function POST(req: Request) {
   if (!Number.isFinite(matchId) || matchId <= 0 || !isValidPlaybackProvider(provider)) {
     return NextResponse.json({ error: "invalid-playback-session-request" }, { status: 400 });
   }
+
+  const guard = guardPlaybackSessionIssueRequest({ req, provider, matchId });
+  if (!guard.ok) {
+    observePlaybackGatewayRequest({
+      req,
+      provider,
+      matchId,
+      assetPath: "session",
+      reason: guard.reason,
+    });
+    return NextResponse.json({ error: guard.reason }, { status: 429 });
+  }
+
+  observePlaybackGatewayRequest({
+    req,
+    provider,
+    matchId,
+    assetPath: "session",
+  });
 
   const statuses = await readAllR2MirrorAgentStatuses(matchId);
   const providerStatus =
@@ -53,4 +74,3 @@ export async function POST(req: Request) {
     expiresAt: session.expiresAt,
   });
 }
-

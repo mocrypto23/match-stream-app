@@ -45,6 +45,7 @@ type PendingBootstrapMap = Record<StreamProviderId, number>;
 type DisplayProgressMap = Record<StreamProviderId, number>;
 type DisplayProgressMetaMap = Record<StreamProviderId, { animating: boolean; startedAt: number }>;
 type PlaybackUrlMap = Record<StreamProviderId, string>;
+type PlaybackExpiryMap = Record<StreamProviderId, number>;
 type PlaybackSessionResponse = {
   ok?: boolean;
   playUrl?: string | null;
@@ -224,6 +225,15 @@ function createDisplayProgressMetaMap(): DisplayProgressMetaMap {
 
 function createPlaybackUrlMap(): PlaybackUrlMap {
   return { livekora: "", beinlive: "", siiir: "" };
+}
+
+function createPlaybackExpiryMap(): PlaybackExpiryMap {
+  return { livekora: 0, beinlive: 0, siiir: 0 };
+}
+
+function parsePlaybackExpiryMs(value: string | null | undefined) {
+  const millis = value ? Date.parse(String(value)) : NaN;
+  return Number.isFinite(millis) ? millis : 0;
 }
 
 function loadP2PEngineModule() {
@@ -437,6 +447,7 @@ export default function WatchPage() {
     siiir: "",
   });
   const [playbackSessionUrls, setPlaybackSessionUrls] = useState<PlaybackUrlMap>(createPlaybackUrlMap);
+  const [playbackSessionExpiries, setPlaybackSessionExpiries] = useState<PlaybackExpiryMap>(createPlaybackExpiryMap);
   const [pendingBootstraps, setPendingBootstraps] = useState<PendingBootstrapMap>(createPendingBootstrapMap);
   const [playbackRequested, setPlaybackRequested] = useState(false);
   const [playbackStarting, setPlaybackStarting] = useState(false);
@@ -448,6 +459,11 @@ export default function WatchPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   const waitingOverlayTimerRef = useRef<number | null>(null);
+  const playbackSessionRequestRef = useRef<Record<StreamProviderId, Promise<string> | null>>({
+    livekora: null,
+    beinlive: null,
+    siiir: null,
+  });
   const watchStateRequestRef = useRef<Promise<void> | null>(null);
   const watchEdgeSnapshotRequestRef = useRef<Promise<void> | null>(null);
   const watchStateVersionRef = useRef<string | null>(null);
@@ -726,38 +742,67 @@ export default function WatchPage() {
   }, [refreshWatchState]);
 
   const ensurePlaybackSession = useCallback(
-    async (provider: StreamProviderId) => {
-      try {
-        const response = await fetch("/api/playback/session", {
-          method: "POST",
-          cache: "no-store",
-          headers: {
-            "content-type": "application/json",
-          },
-          body: JSON.stringify({
-            matchId,
-            provider,
-          }),
-        });
-        const payload = (await response.json().catch(() => null)) as PlaybackSessionResponse | null;
-        const playUrl = String(payload?.playUrl || "").trim();
-        if (!response.ok || !playUrl) {
-          throw new Error(String(payload?.error || "playback-session-failed"));
-        }
-        setPlaybackSessionUrls((current) => {
-          if (current[provider] === playUrl) return current;
-          return {
-            ...current,
-            [provider]: playUrl,
-          };
-        });
-        return playUrl;
-      } catch (error) {
-        setPageError(error instanceof Error ? error.message : "playback-session-failed");
-        return "";
+    async (provider: StreamProviderId, options?: { force?: boolean; silent?: boolean }) => {
+      const currentPlayUrl = String(playbackSessionUrls[provider] || "").trim();
+      const currentExpiry = Number(playbackSessionExpiries[provider] || 0);
+      const now = Date.now();
+      if (!options?.force && currentPlayUrl && currentExpiry - now > 5 * 60 * 1000) {
+        return currentPlayUrl;
       }
+
+      const inFlight = playbackSessionRequestRef.current[provider];
+      if (inFlight) return inFlight;
+
+      const request = (async () => {
+        try {
+          const response = await fetch("/api/playback/session", {
+            method: "POST",
+            cache: "no-store",
+            headers: {
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              matchId,
+              provider,
+            }),
+          });
+          const payload = (await response.json().catch(() => null)) as PlaybackSessionResponse | null;
+          const playUrl = String(payload?.playUrl || "").trim();
+          const expiresAt = parsePlaybackExpiryMs(payload?.expiresAt || null);
+          if (!response.ok || !playUrl) {
+            throw new Error(String(payload?.error || "playback-session-failed"));
+          }
+          setPlaybackSessionUrls((current) => {
+            if (current[provider] === playUrl) return current;
+            return {
+              ...current,
+              [provider]: playUrl,
+            };
+          });
+          if (expiresAt > 0) {
+            setPlaybackSessionExpiries((current) => {
+              if (current[provider] === expiresAt) return current;
+              return {
+                ...current,
+                [provider]: expiresAt,
+              };
+            });
+          }
+          return playUrl;
+        } catch (error) {
+          if (!options?.silent) {
+            setPageError(error instanceof Error ? error.message : "playback-session-failed");
+          }
+          return "";
+        } finally {
+          playbackSessionRequestRef.current[provider] = null;
+        }
+      })();
+
+      playbackSessionRequestRef.current[provider] = request;
+      return request;
     },
-    [matchId]
+    [matchId, playbackSessionExpiries, playbackSessionUrls]
   );
 
   const applyEdgeSnapshot = useCallback(
@@ -1293,6 +1338,7 @@ export default function WatchPage() {
     displayProgressMetaRef.current = createDisplayProgressMetaMap();
     setRetainedPlaylistUrls({ livekora: "", beinlive: "", siiir: "" });
     setPlaybackSessionUrls(createPlaybackUrlMap());
+    setPlaybackSessionExpiries(createPlaybackExpiryMap());
     setPendingBootstraps(createPendingBootstrapMap());
     p2pStatsStoreRef.current = {};
     setP2pStats(EMPTY_P2P_STATS);
@@ -1560,6 +1606,21 @@ export default function WatchPage() {
     if (String(playbackSessionUrls[activeProvider] || "").trim()) return;
     void ensurePlaybackSession(activeProvider);
   }, [activeProvider, activeStatus?.state, ensurePlaybackSession, playbackRequested, playbackSessionUrls, streamUrl]);
+
+  useEffect(() => {
+    if (!playbackRequested) return;
+    const playUrl = String(playbackSessionUrls[activeProvider] || "").trim();
+    const expiresAt = Number(playbackSessionExpiries[activeProvider] || 0);
+    if (!playUrl || !expiresAt) return;
+    const now = Date.now();
+    const refreshLeadMs = 5 * 60 * 1000;
+    const remainingMs = expiresAt - now;
+    const refreshDelay = remainingMs <= refreshLeadMs ? 1_000 : Math.max(30_000, remainingMs - refreshLeadMs);
+    const timerId = window.setTimeout(() => {
+      void ensurePlaybackSession(activeProvider, { force: true, silent: true });
+    }, refreshDelay);
+    return () => window.clearTimeout(timerId);
+  }, [activeProvider, ensurePlaybackSession, playbackRequested, playbackSessionExpiries, playbackSessionUrls]);
 
   useEffect(() => {
     if (!playbackRequested) return;
