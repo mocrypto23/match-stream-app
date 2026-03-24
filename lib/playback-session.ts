@@ -351,6 +351,7 @@ export function observePlaybackGatewayRequest(input: {
   const originHost = extractHeaderHost(String(input.req.headers.get("origin") || ""));
   const refererHost = extractHeaderHost(String(input.req.headers.get("referer") || ""));
   const secFetchSite = String(input.req.headers.get("sec-fetch-site") || "").trim().toLowerCase();
+  if (!input.reason && secFetchSite === "same-origin") return;
   const suspicious =
     (!!originHost && !hostLooksTrusted(originHost, expectedHost)) ||
     (!!refererHost && !hostLooksTrusted(refererHost, expectedHost)) ||
