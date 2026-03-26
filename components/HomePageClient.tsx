@@ -6,6 +6,8 @@ import { cairoDayStringFromOffset, dayToOffset, type DayKey, type MatchRow } fro
 
 const MATCHES_REQUEST_TIMEOUT_MS = 12_000;
 const MATCHES_REQUEST_RETRIES = 2;
+const HOME_AD_IMPRESSIONS_PER_DAY_LIMIT = 3;
+const HOME_AD_IMPRESSIONS_STORAGE_KEY = "twofooty-home-ad-impressions";
 
 type HomePageClientProps = {
   initialDay: DayKey;
@@ -39,6 +41,15 @@ function HomePageSponsorBanner() {
       </div>
     </>
   );
+}
+
+function cairoDateKey() {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Africa/Cairo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
 }
 
 function isValidHttpUrl(raw: unknown): raw is string {
@@ -169,6 +180,8 @@ export default function HomePageClient({
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(initialLoadError);
   const [reloadNonce, setReloadNonce] = useState(0);
+  const [shouldShowSponsorAd, setShouldShowSponsorAd] = useState(false);
+  const adImpressionClaimedRef = useRef(false);
   const skipInitialFetchRef = useRef(true);
 
   const tabs = useMemo(
@@ -259,6 +272,43 @@ export default function HomePageClient({
     };
   }, [day, reloadNonce]);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (adImpressionClaimedRef.current) return;
+
+    const todayKey = cairoDateKey();
+    let nextCount = 1;
+
+    try {
+      const raw = window.localStorage.getItem(HOME_AD_IMPRESSIONS_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as { dateKey?: string; count?: number };
+        if (parsed.dateKey === todayKey) {
+          const currentCount = Number(parsed.count || 0);
+          if (currentCount >= HOME_AD_IMPRESSIONS_PER_DAY_LIMIT) {
+            setShouldShowSponsorAd(false);
+            adImpressionClaimedRef.current = true;
+            return;
+          }
+          nextCount = currentCount + 1;
+        }
+      }
+
+      window.localStorage.setItem(
+        HOME_AD_IMPRESSIONS_STORAGE_KEY,
+        JSON.stringify({
+          dateKey: todayKey,
+          count: nextCount,
+        })
+      );
+      setShouldShowSponsorAd(true);
+      adImpressionClaimedRef.current = true;
+    } catch {
+      setShouldShowSponsorAd(true);
+      adImpressionClaimedRef.current = true;
+    }
+  }, []);
+
   const sortedMatches = useMemo(() => {
     const arr = [...matches];
     const rank = (s: string) => (s === "live" ? 0 : s === "upcoming" ? 1 : 2);
@@ -304,7 +354,7 @@ export default function HomePageClient({
         </div>
       </header>
 
-      <div className="mx-auto mb-8 max-w-4xl">
+      {shouldShowSponsorAd ? <div className="mx-auto mb-8 max-w-4xl">
         <div className="rounded-3xl border border-blue-400/20 bg-[linear-gradient(135deg,rgba(59,130,246,0.1),rgba(15,23,42,0.76))] p-3 sm:p-4 backdrop-blur">
           <div className="rounded-2xl border border-white/10 bg-black/15 px-3 py-3 text-center shadow-inner shadow-black/10 sm:px-4">
             <div className="text-sm font-semibold leading-7 text-slate-100 lg:text-[15px]">
@@ -319,7 +369,7 @@ export default function HomePageClient({
             <HomePageSponsorBanner />
           </div>
         </div>
-      </div>
+      </div> : null}
 
       <div className="max-w-4xl mx-auto flex gap-2 mb-8">
         {tabs.map((t) => (
