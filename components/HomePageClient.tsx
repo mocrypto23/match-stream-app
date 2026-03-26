@@ -294,7 +294,7 @@ export default function HomePageClient({
         <img
           src="/twofooty-logo.png"
           alt="TwoFooty"
-          className="h-16 w-auto object-contain sm:h-20"
+          className="h-24 w-auto object-contain sm:h-32"
           loading="eager"
           decoding="async"
         />
