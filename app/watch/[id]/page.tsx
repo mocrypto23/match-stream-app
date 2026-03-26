@@ -111,14 +111,15 @@ const HIDDEN_STATUS_POLL_MS = 25_000;
 const HIDDEN_ACTIVE_WARMING_POLL_MS = 10_000;
 const AUTO_BOOTSTRAP_RETRY_MS = 12_000;
 const ACTIVE_RECOVERY_RETRY_MS = 3_500;
-const PLAYBACK_STALL_CHECK_MS = 2_000;
-const SOFT_PLAYBACK_STALL_RECOVERY_MS = 2_500;
-const HARD_PLAYBACK_STALL_RECOVERY_MS = 9_000;
-const WAITING_OVERLAY_DELAY_MS = 3_500;
+const PLAYBACK_STALL_CHECK_MS = 3_000;
+const SOFT_PLAYBACK_STALL_RECOVERY_MS = 10_000;
+const HARD_PLAYBACK_STALL_RECOVERY_MS = 30_000;
+const WAITING_OVERLAY_DELAY_MS = 8_000;
 const PREPARATION_PROGRESS_TICK_MS = 250;
 const PREPARATION_PROGRESS_CAP_PCT = 95;
 const P2P_STATS_UPDATE_MS = 300;
-const P2P_MIN_ENABLED_BEFORE_FALLBACK_MS = 1_500;
+const P2P_MIN_ENABLED_BEFORE_FALLBACK_MS = 8_000;
+const P2P_ENABLE_DELAY_MS = 4_000;
 const EDGE_SHADOW_CHANNEL_PREFIX = "tf-watch-edge-shadow";
 const EDGE_SHADOW_LEASE_PREFIX = "tf-watch-edge-shadow-lease";
 const EDGE_SHADOW_VIEWER_ID_STORAGE_KEY = "tf-watch-edge-viewer-id";
@@ -511,6 +512,7 @@ export default function WatchPage() {
   const p2pControlRef = useRef<{
     enabled: boolean;
     enabledAt: number;
+    autoReenableBlocked: boolean;
     provider: StreamProviderId | null;
     streamUrl: string;
     disable: (reason?: string) => void;
@@ -518,6 +520,7 @@ export default function WatchPage() {
   }>({
     enabled: false,
     enabledAt: 0,
+    autoReenableBlocked: false,
     provider: null,
     streamUrl: "",
     disable: () => {},
@@ -1811,6 +1814,10 @@ export default function WatchPage() {
       activeRecoveryAtRef.current[activeProvider] = now;
       selectedRecoveryPendingRef.current = true;
       setPlaybackStarting(true);
+      if (sourceStillReady) {
+        setPlayerSessionNonce((current) => current + 1);
+        return;
+      }
       void refreshProviderStatus(activeProvider);
       void bootstrapProvider(activeProvider, { silent: true });
       setPlayerSessionNonce((current) => current + 1);
@@ -1986,21 +1993,23 @@ export default function WatchPage() {
     };
     const scheduleEnableP2P = () => {
       clearP2PEnableTimer();
-      if (disposed || !p2pEngine || p2pControlRef.current.enabled) return;
+      if (disposed || !p2pEngine || p2pControlRef.current.enabled || p2pControlRef.current.autoReenableBlocked) return;
       updateP2PModeStatus();
       scheduleP2PStatsUpdate();
       p2pEnableTimer = window.setTimeout(() => {
-        if (disposed || !p2pEngine || p2pControlRef.current.enabled) return;
+        if (disposed || !p2pEngine || p2pControlRef.current.enabled || p2pControlRef.current.autoReenableBlocked) return;
         applyP2PMode(true);
-      }, 1_500);
+      }, P2P_ENABLE_DELAY_MS);
     };
     p2pControlRef.current = {
       enabled: false,
       enabledAt: 0,
+      autoReenableBlocked: false,
       provider: activeProvider,
       streamUrl: src,
       disable: (reason?: string) => {
         clearP2PEnableTimer();
+        p2pControlRef.current.autoReenableBlocked = true;
         applyP2PMode(false, reason);
       },
       scheduleEnable: scheduleEnableP2P,
@@ -2165,6 +2174,7 @@ export default function WatchPage() {
       p2pControlRef.current = {
         enabled: false,
         enabledAt: 0,
+        autoReenableBlocked: false,
         provider: null,
         streamUrl: "",
         disable: () => {},
