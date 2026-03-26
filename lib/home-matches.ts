@@ -4,6 +4,7 @@ import { unstable_cache } from "next/cache";
 
 import { supabaseAdmin } from "@/app/api/_supabase";
 import type { MatchRow } from "@/lib/home-page-shared";
+import { resolveProviderSourceUrl, streamProviders } from "@/lib/stream-provider-registry";
 
 type MatchApiRow = {
   id: number;
@@ -18,6 +19,10 @@ type MatchApiRow = {
   home_score?: number | null;
   away_score?: number | null;
   status_key?: string | null;
+  stream_url?: string | null;
+  stream_url_2?: string | null;
+  stream_url_3?: string | null;
+  stream_url_4?: string | null;
 };
 
 type HomeLogoLookupRow = {
@@ -304,7 +309,7 @@ async function fetchMatchesForDay(day: string) {
   const { data, error } = await supabaseAdmin
     .from(TABLE)
     .select(
-      "id,match_key,home_team,away_team,home_logo,away_logo,match_day,match_start,match_time,home_score,away_score,status_key"
+      "id,match_key,home_team,away_team,home_logo,away_logo,match_day,match_start,match_time,home_score,away_score,status_key,stream_url,stream_url_2,stream_url_3,stream_url_4"
     )
     .eq("match_day", day)
     .order("match_start", { ascending: true, nullsFirst: false })
@@ -316,10 +321,34 @@ async function fetchMatchesForDay(day: string) {
 
   const hydrated = await hydrateMissingLogos((data ?? []) as MatchApiRow[]);
   const deduped = dedupeLikelyDuplicateMatches(hydrated);
-  return deduped.map((row) => ({
+  const supportedOnly = await filterMatchesToBroadcastableProviders(deduped);
+  return supportedOnly.map((row) => ({
     ...row,
     match_time: sanitizeMatchTimeForClient(row.match_time),
   })) as MatchRow[];
+}
+
+async function filterMatchesToBroadcastableProviders(rows: MatchApiRow[]) {
+  if (!rows.length) return rows;
+
+  const decisions = await Promise.all(
+    rows.map(async (row) => {
+      const availability = await Promise.all(
+        streamProviders.map(async (provider) => {
+          try {
+            const sourceUrl = await resolveProviderSourceUrl(provider, row);
+            return !!String(sourceUrl || "").trim();
+          } catch {
+            return false;
+          }
+        })
+      );
+
+      return availability.some(Boolean);
+    })
+  );
+
+  return rows.filter((_row, index) => decisions[index]);
 }
 
 export function getCachedMatchesFetcher(day: string) {
