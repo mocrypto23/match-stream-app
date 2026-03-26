@@ -13,7 +13,7 @@ import {
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const MANIFEST_MICRO_CACHE_TTL_MS = 1500;
+const MANIFEST_MICRO_CACHE_TTL_MS = 500;
 const MANIFEST_MICRO_CACHE_MAX_ENTRIES = 256;
 
 type ManifestMicroCacheEntry = {
@@ -54,6 +54,10 @@ function cleanupManifestMicroCache(now: number) {
   for (const key of staleKeys) {
     manifestMicroCache.delete(key);
   }
+}
+
+function shouldMicroCacheManifest(assetPath: string) {
+  return String(assetPath || "").trim().toLowerCase() === "index.m3u8";
 }
 
 function readManifestMicroCache(key: string, now: number) {
@@ -134,8 +138,9 @@ export async function GET(req: Request, ctx: Ctx) {
     return NextResponse.json({ error: "invalid-manifest-asset" }, { status: 400 });
   }
 
-  const cachedManifest = readManifestMicroCache(manifestCacheKey, now);
-  if (cachedManifest) {
+  const allowManifestMicroCache = shouldMicroCacheManifest(assetPath);
+  const cachedManifest = allowManifestMicroCache ? readManifestMicroCache(manifestCacheKey, now) : null;
+  if (allowManifestMicroCache && cachedManifest) {
     return new NextResponse(cachedManifest, {
       status: 200,
       headers: {
@@ -162,7 +167,9 @@ export async function GET(req: Request, ctx: Ctx) {
 
   const manifestText = await response.text().catch(() => "");
   const rewritten = rewriteManifestForPlaybackGateway(manifestText, manifestUrl);
-  writeManifestMicroCache(manifestCacheKey, rewritten, Date.now());
+  if (allowManifestMicroCache) {
+    writeManifestMicroCache(manifestCacheKey, rewritten, Date.now());
+  }
   const out = new NextResponse(rewritten, {
     status: 200,
     headers: {

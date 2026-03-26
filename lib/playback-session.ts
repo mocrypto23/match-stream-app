@@ -428,6 +428,24 @@ function buildGatewayRelativeAssetReference(raw: string, baseUrl: string) {
   return relativePath;
 }
 
+function isManifestReference(raw: string, baseUrl: string) {
+  const value = String(raw || "").trim();
+  if (!value) return false;
+  const absoluteUrl = resolveManifestUrl(value, baseUrl);
+  try {
+    return new URL(absoluteUrl).pathname.toLowerCase().endsWith(".m3u8");
+  } catch {
+    return /\.m3u8(?:$|[?#])/i.test(value);
+  }
+}
+
+function rewriteManifestReference(raw: string, baseUrl: string) {
+  if (isManifestReference(raw, baseUrl)) {
+    return buildGatewayRelativeAssetReference(raw, baseUrl);
+  }
+  return resolveManifestUrl(raw, baseUrl);
+}
+
 export function rewriteManifestForPlaybackGateway(manifestText: string, upstreamManifestUrl: string) {
   const out = String(manifestText || "")
     .split(/\r?\n/)
@@ -435,9 +453,9 @@ export function rewriteManifestForPlaybackGateway(manifestText: string, upstream
       const trimmed = String(line || "").trim();
       if (!trimmed) return line;
       if (trimmed.startsWith("#")) {
-        return line.replace(/URI="([^"]+)"/gi, (_match, rawUri) => `URI="${buildGatewayRelativeAssetReference(rawUri, upstreamManifestUrl)}"`);
+        return line.replace(/URI="([^"]+)"/gi, (_match, rawUri) => `URI="${rewriteManifestReference(rawUri, upstreamManifestUrl)}"`);
       }
-      return buildGatewayRelativeAssetReference(trimmed, upstreamManifestUrl);
+      return rewriteManifestReference(trimmed, upstreamManifestUrl);
     })
     .join("\n");
   return out;
