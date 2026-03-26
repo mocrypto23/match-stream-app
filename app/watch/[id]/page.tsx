@@ -1270,6 +1270,13 @@ export default function WatchPage() {
   );
 
   const requestPlaybackStart = useCallback(async () => {
+    const video = videoRef.current;
+    if (playbackRequested && video && video.paused && String(playerStreamUrl || streamUrl || "").trim()) {
+      setPageError(null);
+      setPlaybackStarting(false);
+      void video.play().catch(() => {});
+      return;
+    }
     setPageError(null);
     setPlaybackStarting(true);
     if (!String(streamUrl || "").trim()) {
@@ -1284,7 +1291,7 @@ export default function WatchPage() {
       return;
     }
     setPlaybackRequested(true);
-  }, [activeProvider, bootstrapProvider, ensurePlaybackSession, refreshProviderStatus, streamUrl]);
+  }, [activeProvider, bootstrapProvider, ensurePlaybackSession, playbackRequested, playerStreamUrl, refreshProviderStatus, streamUrl]);
 
   const clearWaitingOverlayTimer = useCallback(() => {
     if (waitingOverlayTimerRef.current !== null) {
@@ -1315,8 +1322,7 @@ export default function WatchPage() {
     if (video) {
       video.pause();
     }
-    resetPlaybackState({ clearError: false });
-  }, [resetPlaybackState]);
+  }, []);
 
   useEffect(() => {
     if (providerHasMatchById[selectedProvider]) return;
@@ -1812,12 +1818,11 @@ export default function WatchPage() {
       if (now - lastRecoveryAt < hardRecoveryThresholdMs) return;
 
       activeRecoveryAtRef.current[activeProvider] = now;
-      selectedRecoveryPendingRef.current = true;
-      setPlaybackStarting(true);
       if (sourceStillReady) {
-        setPlayerSessionNonce((current) => current + 1);
         return;
       }
+      selectedRecoveryPendingRef.current = true;
+      setPlaybackStarting(true);
       void refreshProviderStatus(activeProvider);
       void bootstrapProvider(activeProvider, { silent: true });
       setPlayerSessionNonce((current) => current + 1);
@@ -2240,7 +2245,7 @@ export default function WatchPage() {
                     return;
                   }
                   if (video.paused) {
-                    requestPlaybackStart();
+                    void video.play().catch(() => {});
                     return;
                   }
                   stopPlaybackSession();
