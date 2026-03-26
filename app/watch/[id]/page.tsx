@@ -186,7 +186,7 @@ function WatchPageSponsorBanner() {
         <iframe
           title="TF Player Sponsor"
           src="/ad-frame/tf-player-728"
-          sandbox="allow-scripts allow-same-origin allow-top-navigation-by-user-activation"
+          sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
           loading="lazy"
           referrerPolicy="strict-origin-when-cross-origin"
           className="mx-auto h-[90px] w-[728px] min-w-[728px] overflow-hidden rounded-md border-0 bg-transparent"
@@ -197,7 +197,7 @@ function WatchPageSponsorBanner() {
         <iframe
           title="TF Player Mobile Sponsor"
           src="/ad-frame/tf-player-320x50"
-          sandbox="allow-scripts allow-same-origin allow-top-navigation-by-user-activation"
+          sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
           loading="lazy"
           referrerPolicy="strict-origin-when-cross-origin"
           className="mx-auto h-[50px] w-[320px] min-w-[320px] overflow-hidden rounded-md border-0 bg-transparent"
