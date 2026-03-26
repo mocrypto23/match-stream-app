@@ -1580,6 +1580,9 @@ export default function WatchPage() {
     const hasUsableStream = !!String(streamUrl || "").trim();
     const isReady = activeStatus?.state === "ready" && hasUsableStream;
     if (!isReady) {
+      if (isPageHidden && hasPlayedRef.current) {
+        return;
+      }
       if (!hasPlayedRef.current || !hasUsableStream) {
         selectedRecoveryPendingRef.current = true;
       }
@@ -1597,7 +1600,7 @@ export default function WatchPage() {
     setPageError(null);
     setPlaybackStarting(true);
     setPlayerSessionNonce((current) => current + 1);
-  }, [activeStatus?.state, playbackRequested, providerSourceUrl, streamUrl]);
+  }, [activeStatus?.state, isPageHidden, playbackRequested, providerSourceUrl, streamUrl]);
 
   useEffect(() => {
     if (!playbackRequested) return;
@@ -1624,6 +1627,7 @@ export default function WatchPage() {
 
   useEffect(() => {
     if (!playbackRequested) return;
+    if (isPageHidden) return;
     if (!hasPlayedRef.current) return;
     if (!providerSourceUrl) return;
     if (activeStatus?.state !== "ready") return;
@@ -1653,6 +1657,7 @@ export default function WatchPage() {
   }, [
     activeProvider,
     activeStatus?.state,
+    isPageHidden,
     playbackRequested,
     playerStreamUrl,
     providerSourceUrl,
@@ -1716,6 +1721,7 @@ export default function WatchPage() {
     const id = window.setInterval(() => {
       const video = videoRef.current;
       if (!video) return;
+      if (document.visibilityState === "hidden") return;
 
       const stream = String(playerStreamUrl || "").trim();
       const now = Date.now();
@@ -1873,6 +1879,9 @@ export default function WatchPage() {
 
     const onWaiting = () => {
       clearWaitingOverlayTimer();
+      if (document.visibilityState === "hidden") {
+        return;
+      }
       if (!hasPlayedRef.current) {
         setPlaybackStarting(true);
         return;
