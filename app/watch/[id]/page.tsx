@@ -1270,13 +1270,6 @@ export default function WatchPage() {
   );
 
   const requestPlaybackStart = useCallback(async () => {
-    const video = videoRef.current;
-    if (playbackRequested && video && video.paused && String(playerStreamUrl || streamUrl || "").trim()) {
-      setPageError(null);
-      setPlaybackStarting(false);
-      void video.play().catch(() => {});
-      return;
-    }
     setPageError(null);
     setPlaybackStarting(true);
     if (!String(streamUrl || "").trim()) {
@@ -1291,7 +1284,7 @@ export default function WatchPage() {
       return;
     }
     setPlaybackRequested(true);
-  }, [activeProvider, bootstrapProvider, ensurePlaybackSession, playbackRequested, playerStreamUrl, refreshProviderStatus, streamUrl]);
+  }, [activeProvider, bootstrapProvider, ensurePlaybackSession, refreshProviderStatus, streamUrl]);
 
   const clearWaitingOverlayTimer = useCallback(() => {
     if (waitingOverlayTimerRef.current !== null) {
@@ -1322,7 +1315,8 @@ export default function WatchPage() {
     if (video) {
       video.pause();
     }
-  }, []);
+    resetPlaybackState({ clearError: false });
+  }, [resetPlaybackState]);
 
   useEffect(() => {
     if (providerHasMatchById[selectedProvider]) return;
@@ -2245,7 +2239,7 @@ export default function WatchPage() {
                     return;
                   }
                   if (video.paused) {
-                    void video.play().catch(() => {});
+                    requestPlaybackStart();
                     return;
                   }
                   stopPlaybackSession();
