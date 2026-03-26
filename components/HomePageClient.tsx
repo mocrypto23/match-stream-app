@@ -15,16 +15,29 @@ type HomePageClientProps = {
 
 function HomePageSponsorBanner() {
   return (
-    <div className="hidden overflow-x-auto md:block" dir="ltr">
-      <iframe
-        title="TwoFooty Sponsor"
-        src="/ad-frame/twofooty-728"
-        sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
-        loading="lazy"
-        referrerPolicy="strict-origin-when-cross-origin"
-        className="mx-auto h-[90px] w-[728px] min-w-[728px] overflow-hidden rounded-md border-0 bg-transparent"
-      />
-    </div>
+    <>
+      <div className="hidden overflow-x-auto md:block" dir="ltr">
+        <iframe
+          title="TwoFooty Sponsor"
+          src="/ad-frame/twofooty-728"
+          sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+          loading="lazy"
+          referrerPolicy="strict-origin-when-cross-origin"
+          className="mx-auto h-[90px] w-[728px] min-w-[728px] overflow-hidden rounded-md border-0 bg-transparent"
+        />
+      </div>
+
+      <div className="overflow-x-auto md:hidden" dir="ltr">
+        <iframe
+          title="TwoFooty Mobile Sponsor"
+          src="/ad-frame/twofooty-320x50"
+          sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+          loading="lazy"
+          referrerPolicy="strict-origin-when-cross-origin"
+          className="mx-auto h-[50px] w-[320px] min-w-[320px] overflow-hidden rounded-md border-0 bg-transparent"
+        />
+      </div>
+    </>
   );
 }
 
@@ -287,7 +300,7 @@ export default function HomePageClient({
         </div>
       </header>
 
-      <div className="mx-auto mb-8 hidden max-w-4xl md:block">
+      <div className="mx-auto mb-8 max-w-4xl">
         <div className="rounded-3xl border border-blue-400/20 bg-[linear-gradient(135deg,rgba(59,130,246,0.1),rgba(15,23,42,0.76))] p-3 sm:p-4 backdrop-blur">
           <div className="rounded-2xl border border-white/10 bg-black/15 px-3 py-3 text-center shadow-inner shadow-black/10 sm:px-4">
             <div className="text-sm font-semibold leading-7 text-slate-100 lg:text-[15px]">
