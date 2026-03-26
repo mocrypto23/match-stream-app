@@ -1335,28 +1335,14 @@ function appendScheduleSeedRows(seedMap, rows, options = {}) {
 function buildScheduleSeedRows({
   primaryRows = [],
   siiirRows = [],
-  livehdRows = [],
   livekoraRows = [],
-  yallaliveRows = [],
-  tskoraRows = [],
-  onekoraRows = [],
 } = {}) {
   const seedMap = new Map();
   const stats = [];
 
   stats.push(appendScheduleSeedRows(seedMap, primaryRows, { sourceName: "bein" }));
   stats.push(appendScheduleSeedRows(seedMap, siiirRows, { sourceName: "siiir", matchUrlField: "match_page_url" }));
-  stats.push(appendScheduleSeedRows(seedMap, livehdRows, { sourceName: "livehd", dayKeyFallback: "today" }));
   stats.push(appendScheduleSeedRows(seedMap, livekoraRows, { sourceName: "livekora", dayKeyFallback: "today" }));
-  stats.push(appendScheduleSeedRows(seedMap, yallaliveRows, { sourceName: "yallalive" }));
-  stats.push(appendScheduleSeedRows(seedMap, tskoraRows, { sourceName: "tskora" }));
-  stats.push(
-    appendScheduleSeedRows(seedMap, onekoraRows, {
-      sourceName: "onekora",
-      dayKeyFallback: "today",
-      matchUrlField: "article_url",
-    })
-  );
 
   return {
     rows: Array.from(seedMap.values()),
@@ -6328,31 +6314,11 @@ async function startScraping() {
       if (!siiirMap.has(k)) siiirMap.set(k, r.siiir_stream_url);
     }
 
-    // 3) LIVEHD77 list (today only) + resolve stream url
-    const livehdListContext = await browser.newContext({
-      locale: "ar-EG",
-      timezoneId: TZ,
-      serviceWorkers: "block",
-      extraHTTPHeaders: { "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7" },
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-      viewport: { width: 1280, height: 720 },
-    });
-    const livehdListPage = await livehdListContext.newPage();
-    await applyAntiAds(livehdListContext, livehdListPage);
-
-    const livehdRows = await scrapeLivehdToday(livehdListPage);
-    await livehdListPage.close().catch(() => { });
-    await livehdListContext.close().catch(() => { });
-
-    const livehdEnriched = await enrichLivehdWithStreams(browser, livehdRows);
-
+    // 3) Disabled non-broadcast sources to avoid scraper work on providers we do not stream from.
+    const livehdRows = [];
+    const livehdEnriched = [];
     const livehdMap = new Map();
-    for (const r of livehdEnriched) {
-      if (!r.livehd_stream_url) continue;
-      const k = keyOfTeams(r.match_day, r.home_team, r.away_team);
-      if (!livehdMap.has(k)) livehdMap.set(k, r.livehd_stream_url);
-    }
+    console.log("⏭️ LIVEHD source disabled (not an active broadcast provider).");
 
     // 4) LIVEKORA lists + resolve stream url (Server 4)
     let yalaEnriched = [];
@@ -6431,106 +6397,21 @@ async function startScraping() {
       console.log("⏭️ LIVEKORA source disabled (Server 4).");
     }
 
-    // 5) YALLALIVE lists + resolve stream url (Server 5 primary)
-    const yallaliveContext = await browser.newContext({
-      locale: "ar-EG",
-      timezoneId: TZ,
-      serviceWorkers: "block",
-      extraHTTPHeaders: { "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7" },
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-      viewport: { width: 1280, height: 720 },
-    });
-    const yallalivePage = await yallaliveContext.newPage();
-    await applyAntiAds(yallaliveContext, yallalivePage);
-
+    // 5-7) Disabled non-broadcast sources to keep scraper aligned with active providers only.
     const yallaliveAll = [];
-    for (const d of ACTIVE_DAYS) {
-      try {
-        const rows = await scrapeYallaliveDay(yallalivePage, d.key);
-        yallaliveAll.push(...rows);
-      } catch (e) {
-        console.error(`⚠️ YALLALIVE list fail ${d.key}:`, e.message);
-        if (DIAG) diagWrite(`yallalive/errors_${d.key}.txt`, String(e?.stack || e?.message || e));
-      }
-    }
-    await yallalivePage.close().catch(() => { });
-    await yallaliveContext.close().catch(() => { });
-
-    const yallaliveEnriched = await enrichYallaliveWithStreams(browser, yallaliveAll);
+    const yallaliveEnriched = [];
     const yallaliveMap = new Map();
-    for (const r of yallaliveEnriched) {
-      if (!r.yallalive_stream_url) continue;
-      const k = keyOfTeams(r.match_day, r.home_team, r.away_team);
-      if (!yallaliveMap.has(k)) yallaliveMap.set(k, r.yallalive_stream_url);
-    }
-
-    // 6) TSKORA lists (Server 5 fallback)
-    const tskoraContext = await browser.newContext({
-      locale: "ar-EG",
-      timezoneId: TZ,
-      serviceWorkers: "block",
-      extraHTTPHeaders: { "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7" },
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-      viewport: { width: 1280, height: 720 },
-    });
-    const tskoraPage = await tskoraContext.newPage();
-    await applyAntiAds(tskoraContext, tskoraPage);
-
     const tskoraAll = [];
-    for (const d of ACTIVE_DAYS) {
-      try {
-        const rows = await scrapeTskoraDay(tskoraPage, d.key);
-        tskoraAll.push(...rows);
-      } catch (e) {
-        console.error(`⚠️ TSKORA list fail ${d.key}:`, e.message);
-        if (DIAG) diagWrite(`tskora/errors_${d.key}.txt`, String(e?.stack || e?.message || e));
-      }
-    }
-    await tskoraPage.close().catch(() => { });
-    await tskoraContext.close().catch(() => { });
-
-    const tskoraEnriched = await enrichTskoraWithStreams(browser, tskoraAll);
+    const tskoraEnriched = [];
     const tskoraMap = new Map();
-    for (const r of tskoraEnriched) {
-      if (!r.tskora_stream_url) continue;
-      const k = keyOfTeams(r.match_day, r.home_team, r.away_team);
-      if (!tskoraMap.has(k)) tskoraMap.set(k, r.tskora_stream_url);
-    }
-
-    // 7) 1KORA articles + resolve stream url (Server 6)
-    const oneKoraListContext = await browser.newContext({
-      locale: "ar-EG",
-      timezoneId: TZ,
-      serviceWorkers: "block",
-      extraHTTPHeaders: { "Accept-Language": "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7" },
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-      viewport: { width: 1280, height: 720 },
-    });
-    const oneKoraListPage = await oneKoraListContext.newPage();
-    await applyAntiAds(oneKoraListContext, oneKoraListPage);
-    const oneKoraArticles = await scrapeOneKoraArticleList(oneKoraListPage);
-    await oneKoraListPage.close().catch(() => { });
-    await oneKoraListContext.close().catch(() => { });
-
-    const oneKoraEnriched = await enrichOneKoraWithStreams(browser, oneKoraArticles);
+    const oneKoraEnriched = [];
     const oneKoraMap = new Map();
-    for (const r of oneKoraEnriched) {
-      if (!r.onekora_stream_url) continue;
-      const k = keyOfTeams(r.match_day, r.home_team, r.away_team);
-      if (!oneKoraMap.has(k)) oneKoraMap.set(k, r.onekora_stream_url);
-    }
+    console.log("⏭️ YALLALIVE / TSKORA / 1KORA sources disabled (not active broadcast providers).");
 
     const { rows: scheduleSeedRows, stats: scheduleSeedStats } = buildScheduleSeedRows({
       primaryRows: enriched,
       siiirRows: siiirAll,
-      livehdRows,
       livekoraRows: yalaAll,
-      yallaliveRows: yallaliveAll,
-      tskoraRows: tskoraAll,
-      onekoraRows: oneKoraEnriched,
     });
 
     if (!scheduleSeedRows.length) {
