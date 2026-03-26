@@ -473,10 +473,16 @@ class LivekoraJob {
   }
 
   derivePublicStatus(nowMs = Date.now()) {
+    const providerReadyGraceMs =
+      this.providerId === "livekora"
+        ? Math.max(this.manager.config.readyGraceMs, 120_000)
+        : this.providerId === "siiir"
+          ? Math.max(this.manager.config.readyGraceMs, 75_000)
+          : Math.max(this.manager.config.readyGraceMs, 45_000);
     const dynamicReadyGraceMs =
       Number.isFinite(this.lastObservedTargetDurationSec) && this.lastObservedTargetDurationSec > 0
-        ? Math.max(15_000, Math.round(this.lastObservedTargetDurationSec * 1000 * 4 + 4000))
-        : 25_000;
+        ? Math.max(providerReadyGraceMs, Math.round(this.lastObservedTargetDurationSec * 1000 * 4 + 4000))
+        : providerReadyGraceMs;
     if (this.state === "degraded") {
       return {
         state: "down",
@@ -620,9 +626,14 @@ class LivekoraJob {
       const defaultTimeoutMs = this.manager.config.manifestFetchTimeoutMs;
       if (!isSessionManifestUrl(rawUrl)) return defaultTimeoutMs;
       const isColdBootstrap = !this.lastPublishAt && !this.lastCurrentSource;
-      if (!isColdBootstrap) return defaultTimeoutMs;
+      if (this.providerId === "livekora") {
+        return Math.max(defaultTimeoutMs, isColdBootstrap ? 95_000 : 65_000);
+      }
       if (this.providerId === "siiir") {
-        return Math.max(defaultTimeoutMs, 40_000);
+        return Math.max(defaultTimeoutMs, isColdBootstrap ? 50_000 : 40_000);
+      }
+      if (this.providerId === "beinlive") {
+        return Math.max(defaultTimeoutMs, isColdBootstrap ? 35_000 : 25_000);
       }
       return defaultTimeoutMs;
     };
@@ -1295,6 +1306,7 @@ function loadConfig() {
     uploadPollMs: toInt(process.env.LIVEKORA_R2_UPLOAD_POLL_MS, 2200, 400),
     playlistPublishMinIntervalMs: toInt(process.env.LIVEKORA_R2_PLAYLIST_PUBLISH_MIN_INTERVAL_MS, 4000, 1000),
     manifestFetchTimeoutMs: toInt(process.env.LIVEKORA_R2_MANIFEST_FETCH_TIMEOUT_MS, 15_000, 2000),
+    readyGraceMs: toInt(process.env.LIVEKORA_R2_READY_GRACE_MS, 45_000, 10_000),
     assetFetchTimeoutMs: toInt(process.env.LIVEKORA_R2_ASSET_FETCH_TIMEOUT_MS, 22_000, 3000),
     mirrorAssetConcurrency: toInt(process.env.LIVEKORA_R2_ASSET_CONCURRENCY, 6, 1),
     remoteRetentionMs: toInt(process.env.LIVEKORA_R2_REMOTE_RETENTION_MS, 45_000, 5000),
