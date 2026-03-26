@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
 
 import { beinliveProvider } from "@/lib/beinlive-provider";
-import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
+import { sanitizeHeaderValue } from "@/lib/http-header-utils";
 import { resolveInternalAppOrigin } from "@/lib/live-providers";
-import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
+import { runSessionManifestSingleflight } from "@/lib/session-manifest-singleflight";
+import { getOrLoadHotWatchStateSeed } from "@/lib/watch-state-cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -19,33 +20,45 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok: false, error: "invalid-match-id" }, { status: 400 });
   }
 
-  const { data, error } = await fetchLivekoraMatchRow(matchId);
+  const { seed, error } = await getOrLoadHotWatchStateSeed(matchId);
   if (error) {
     return NextResponse.json({ ok: false, error: String(error.message || "db-error") }, { status: 500 });
   }
-  if (!data) {
+  if (!seed) {
     return NextResponse.json({ ok: false, error: "match-not-found" }, { status: 404 });
   }
 
-  const sourceUrl = await resolveProviderSourceUrl(beinliveProvider, data);
+  const sourceUrl = String(seed.sourceUrls.beinlive || "").trim();
   if (!sourceUrl) {
     return NextResponse.json({ ok: false, error: "missing-source" }, { status: 409 });
   }
 
   const internalOrigin = resolveInternalAppOrigin(req);
-  const resolved = await beinliveProvider.extractCurrentManifest(
-    {
-      matchId,
-      sourceUrl,
-      internalOrigin,
-    },
-    {
-      waitForMediaSequence: Number.isFinite(waitForMediaSequence) ? waitForMediaSequence : null,
-      waitTimeoutMs: Number.isFinite(waitTimeoutMs) ? waitTimeoutMs : null,
-      forceRefresh,
-      allowRotate,
-    }
-  );
+  const singleflightKey = [
+    "beinlive",
+    matchId,
+    sourceUrl,
+    Number.isFinite(waitForMediaSequence) ? waitForMediaSequence : "",
+    Number.isFinite(waitTimeoutMs) ? waitTimeoutMs : "",
+    forceRefresh ? "force" : "normal",
+    allowRotate ? "rotate" : "fixed",
+  ].join("::");
+  const resolved = await runSessionManifestSingleflight(singleflightKey, async () => {
+    return await beinliveProvider.extractCurrentManifest(
+      {
+        matchId,
+        sourceUrl,
+        internalOrigin,
+      },
+      {
+        waitForMediaSequence: Number.isFinite(waitForMediaSequence) ? waitForMediaSequence : null,
+        waitTimeoutMs: Number.isFinite(waitTimeoutMs) ? waitTimeoutMs : null,
+        forceRefresh,
+        allowRotate,
+      }
+    );
+  });
+  const timingHeader = sanitizeHeaderValue(resolved.timingSummary || "");
 
   if (!resolved.ok) {
     return NextResponse.json(
@@ -58,8 +71,8 @@ export async function GET(req: Request) {
       {
         status: 502,
         headers: {
-          "x-r2-discovery-timing": resolved.timingSummary || "",
-          "x-livekora-discovery-timing": resolved.timingSummary || "",
+          "x-r2-discovery-timing": timingHeader,
+          "x-livekora-discovery-timing": timingHeader,
         },
       }
     );
@@ -80,8 +93,8 @@ export async function GET(req: Request) {
       "x-r2-playback-url": resolved.playbackUrl || "",
       "x-r2-media-sequence": String(resolved.mediaSequence ?? ""),
       "x-r2-target-duration": String(resolved.targetDurationSec || 0),
-      "x-r2-discovery-timing": resolved.timingSummary || "",
-      "x-livekora-discovery-timing": resolved.timingSummary || "",
+      "x-r2-discovery-timing": timingHeader,
+      "x-livekora-discovery-timing": timingHeader,
     },
   });
 }

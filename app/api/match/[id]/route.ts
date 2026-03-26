@@ -5,12 +5,8 @@ import { buildLivekoraStatus } from "@/lib/livekora-agent";
 import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
 import { readAllR2MirrorAgentStatuses } from "@/lib/r2-mirror-agent";
 import { buildSiiirStatus } from "@/lib/siiir-agent";
-import { beinliveProvider } from "@/lib/beinlive-provider";
-import { livekoraProvider } from "@/lib/live-providers";
 import { buildClientPlaybackUrl, protectClientStatus } from "@/lib/playback-session";
-import { siiirProvider } from "@/lib/siiir-provider";
-import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
-import { seedHotWatchState } from "@/lib/watch-state-cache";
+import { getOrLoadHotWatchStateSeed } from "@/lib/watch-state-cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -24,26 +20,20 @@ export async function GET(_req: Request, ctx: Ctx) {
     return NextResponse.json({ error: "invalid-match-id" }, { status: 400 });
   }
 
-  const { data, error } = await fetchLivekoraMatchRow(matchId);
+  const { seed, row: seededRow, error } = await getOrLoadHotWatchStateSeed(matchId);
   if (error) {
     return NextResponse.json({ error: String(error.message || "db-error") }, { status: 500 });
   }
+  if (!seed) {
+    return NextResponse.json({ error: "match-not-found" }, { status: 404 });
+  }
+  const data = seededRow || (await fetchLivekoraMatchRow(matchId)).data;
   if (!data) {
     return NextResponse.json({ error: "match-not-found" }, { status: 404 });
   }
-
-  const [sourceUrl, beinliveSourceUrl, siiirSourceUrl] = await Promise.all([
-    resolveProviderSourceUrl(livekoraProvider, data),
-    resolveProviderSourceUrl(beinliveProvider, data),
-    resolveProviderSourceUrl(siiirProvider, data),
-  ]);
-
-  seedHotWatchState({
-    matchId,
-    livekoraSourceUrl: sourceUrl,
-    beinliveSourceUrl,
-    siiirSourceUrl,
-  });
+  const sourceUrl = seed.sourceUrls.livekora;
+  const beinliveSourceUrl = seed.sourceUrls.beinlive;
+  const siiirSourceUrl = seed.sourceUrls.siiir;
 
   const agentStatuses = await readAllR2MirrorAgentStatuses(matchId);
 

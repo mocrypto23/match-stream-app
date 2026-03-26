@@ -17,6 +17,7 @@ export type HotWatchStateSeed = {
 
 const HOT_WATCH_STATE_TTL_MS = 6 * 60 * 60 * 1000;
 const hotWatchStateSeedCache = new Map<number, HotWatchStateSeed>();
+const hotWatchStateSeedInflight = new Map<number, Promise<{ seed: HotWatchStateSeed | null; row: LivekoraMatchRow | null; error: Error | null }>>();
 
 function normalizeSourceUrl(value: string | null | undefined) {
   return String(value || "").trim() || null;
@@ -103,5 +104,15 @@ export async function loadAndSeedHotWatchState(matchId: number) {
 export async function getOrLoadHotWatchStateSeed(matchId: number) {
   const cached = getHotWatchStateSeed(matchId);
   if (cached) return { seed: cached, row: null as LivekoraMatchRow | null, error: null };
-  return await loadAndSeedHotWatchState(matchId);
+  const existing = hotWatchStateSeedInflight.get(matchId);
+  if (existing) return await existing;
+  const promise = loadAndSeedHotWatchState(matchId);
+  hotWatchStateSeedInflight.set(matchId, promise);
+  try {
+    return await promise;
+  } finally {
+    if (hotWatchStateSeedInflight.get(matchId) === promise) {
+      hotWatchStateSeedInflight.delete(matchId);
+    }
+  }
 }
