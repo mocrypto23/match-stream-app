@@ -291,9 +291,13 @@ export default function HomePageClient({
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-white p-4 sm:p-8 font-sans" dir="rtl">
       <header className="max-w-4xl mx-auto flex justify-between items-center mb-6 border-b border-gray-900 pb-6">
-        <h1 className="text-3xl font-black text-blue-500 tracking-tighter">
-          Two<span className="text-white">Footy</span>
-        </h1>
+        <img
+          src="/twofooty-logo.png"
+          alt="TwoFooty"
+          className="h-12 w-auto object-contain sm:h-14"
+          loading="eager"
+          decoding="async"
+        />
         <div className="flex items-center gap-2">
           <span className="w-2 h-2 bg-red-600 rounded-full animate-pulse" />
           <span className="text-sm text-gray-400 font-bold text-red-500">بث مباشر الآن</span>
