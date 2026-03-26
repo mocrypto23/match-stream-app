@@ -1,7 +1,7 @@
 const inFlightSessionManifestLoads = new Map<string, Promise<unknown>>();
 const MAX_PARALLEL_SESSION_MANIFEST_LOADS = Math.max(
   1,
-  Number.parseInt(String(process.env.SESSION_MANIFEST_MAX_PARALLEL || "3").trim(), 10) || 3
+  Number.parseInt(String(process.env.SESSION_MANIFEST_MAX_PARALLEL || "12").trim(), 10) || 12
 );
 
 let activeSessionManifestLoads = 0;
