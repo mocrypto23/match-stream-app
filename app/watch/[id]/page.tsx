@@ -116,7 +116,9 @@ const SOFT_PLAYBACK_STALL_RECOVERY_MS = 10_000;
 const HARD_PLAYBACK_STALL_RECOVERY_MS = 30_000;
 const WAITING_OVERLAY_DELAY_MS = 8_000;
 const PREPARATION_PROGRESS_TICK_MS = 250;
+const PREPARATION_PROGRESS_START_PCT = 10;
 const PREPARATION_PROGRESS_CAP_PCT = 95;
+const DEFAULT_PROVIDER_WARMUP_ESTIMATE_MS = 15_000;
 const P2P_STATS_UPDATE_MS = 300;
 const P2P_MIN_ENABLED_BEFORE_FALLBACK_MS = 8_000;
 const P2P_ENABLE_DELAY_MS = 4_000;
@@ -152,9 +154,9 @@ const PROVIDER_META: Array<{ provider: StreamProviderId; order: number; label: s
   { provider: "siiir", order: 3, label: "siiir.tv" },
 ];
 const PROVIDER_WARMUP_ESTIMATE_MS: Record<StreamProviderId, number> = {
-  livekora: 12_000,
-  beinlive: 2_500,
-  siiir: 10_000,
+  livekora: 18_000,
+  beinlive: 12_000,
+  siiir: 17_000,
 };
 const EMPTY_P2P_STATS: P2PStats = {
   enabled: false,
@@ -320,7 +322,9 @@ function progressPct(status: StreamSourceStatus | null) {
   if (!status) return 0;
   if (status.state === "ready") return 100;
   const value = Number(status.progressPct);
-  if (!Number.isFinite(value)) return status.reason === "not-bootstrapped" ? 0 : status.state === "warming" ? 8 : 0;
+  if (!Number.isFinite(value)) {
+    return status.reason === "not-bootstrapped" ? 0 : status.state === "warming" ? PREPARATION_PROGRESS_START_PCT : 0;
+  }
   return Math.max(0, Math.min(100, Math.round(value)));
 }
 
@@ -371,22 +375,32 @@ function buildStatusMap(payload: MatchPayload | null): StatusMap {
 function phaseProgressFloor(phase: StreamSourcePhase | null | undefined) {
   switch (phase) {
     case "queued":
-      return 6;
+      return PREPARATION_PROGRESS_START_PCT;
     case "resolving_source":
-      return 18;
+      return PREPARATION_PROGRESS_START_PCT;
     case "fetching_manifest":
-      return 32;
+      return PREPARATION_PROGRESS_START_PCT;
     case "resolving_variant":
-      return 52;
+      return 34;
     case "mirroring_assets":
-      return 74;
+      return 62;
     case "publishing_playlist":
-      return 88;
+      return 82;
     case "ready":
       return 100;
     default:
       return 0;
   }
+}
+
+function displayPreparationProgress(rawPct: number) {
+  const clamped = Math.max(0, Math.min(PREPARATION_PROGRESS_CAP_PCT, Number.isFinite(rawPct) ? rawPct : 0));
+  if (clamped <= 0) return 0;
+  const normalized = clamped / PREPARATION_PROGRESS_CAP_PCT;
+  const curved = Math.pow(normalized, 1.8);
+  return Math.round(
+    PREPARATION_PROGRESS_START_PCT + curved * (PREPARATION_PROGRESS_CAP_PCT - PREPARATION_PROGRESS_START_PCT)
+  );
 }
 
 function shouldAnimatePreparation(status: StreamSourceStatus | null, hasSource: boolean) {
@@ -1381,6 +1395,10 @@ export default function WatchPage() {
           const status = statusByProvider[provider];
           const hasSource = providerHasMatchById[provider];
           const rawPct = progressPct(status);
+          const displayRawPct =
+            rawPct > 0 && rawPct < 100
+              ? Math.min(PREPARATION_PROGRESS_CAP_PCT, displayPreparationProgress(rawPct))
+              : rawPct;
           const meta = displayProgressMetaRef.current[provider];
           const animating = shouldAnimatePreparation(status, hasSource);
 
@@ -1407,7 +1425,7 @@ export default function WatchPage() {
           if (animating) {
             const startFloor = Math.max(
               phaseProgressFloor(status?.phase),
-              rawPct > 0 && rawPct < 100 ? Math.min(rawPct, PREPARATION_PROGRESS_CAP_PCT) : 0
+              displayRawPct > 0 && displayRawPct < 100 ? Math.min(displayRawPct, PREPARATION_PROGRESS_CAP_PCT) : 0
             );
             if (!meta.animating) {
               meta.animating = true;
@@ -1419,13 +1437,16 @@ export default function WatchPage() {
             }
 
             const elapsedMs = Math.max(0, now - meta.startedAt);
-            const estimatedMs = Math.max(1_500, PROVIDER_WARMUP_ESTIMATE_MS[provider] || 6_000);
+            const estimatedMs = Math.max(4_500, PROVIDER_WARMUP_ESTIMATE_MS[provider] || DEFAULT_PROVIDER_WARMUP_ESTIMATE_MS);
             const elapsedPct = Math.min(
               PREPARATION_PROGRESS_CAP_PCT,
-              Math.round((elapsedMs / estimatedMs) * PREPARATION_PROGRESS_CAP_PCT)
+              Math.round(
+                PREPARATION_PROGRESS_START_PCT +
+                  (elapsedMs / estimatedMs) * (PREPARATION_PROGRESS_CAP_PCT - PREPARATION_PROGRESS_START_PCT)
+              )
             );
             const phaseFloor = phaseProgressFloor(status?.phase);
-            const targetPct = Math.max(startFloor, phaseFloor, elapsedPct);
+            const targetPct = Math.max(startFloor, phaseFloor, elapsedPct, displayRawPct);
             const nextValue = Math.max(next[provider], Math.min(PREPARATION_PROGRESS_CAP_PCT, targetPct));
             if (nextValue !== next[provider]) {
               next[provider] = nextValue;
@@ -1436,7 +1457,7 @@ export default function WatchPage() {
 
           meta.animating = false;
           meta.startedAt = 0;
-          const settledPct = rawPct > 0 ? rawPct : 0;
+          const settledPct = displayRawPct > 0 ? displayRawPct : 0;
           if (next[provider] !== settledPct) {
             next[provider] = settledPct;
             changed = true;
