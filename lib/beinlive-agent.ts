@@ -18,8 +18,6 @@ function isBeinlivePseudoSourceFailure(input: {
   const reason = String(agentStatus.reason || "").trim().toLowerCase();
   const currentSource = String(agentStatus.currentSource || "").trim();
 
-  if (String(agentStatus.state || "") !== "down") return false;
-  if (String(agentStatus.phase || "") !== "failed") return false;
   if (currentSource) return false;
 
   return (
