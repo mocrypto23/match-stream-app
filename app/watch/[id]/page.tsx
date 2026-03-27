@@ -2421,9 +2421,7 @@ export default function WatchPage() {
                   }
                   if (video.paused) {
                     requestPlaybackStart();
-                    return;
                   }
-                  stopPlaybackSession();
                 }}
               />
 
