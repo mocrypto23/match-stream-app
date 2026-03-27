@@ -21,7 +21,7 @@ const DEFAULT_USER_AGENT =
 const DEFAULT_MANIFEST_CACHE_CONTROL = "no-store, no-cache, must-revalidate, max-age=0";
 const DEFAULT_SEGMENT_CACHE_CONTROL = "public, max-age=3600, s-maxage=86400, immutable";
 const DEFAULT_KEY_CACHE_CONTROL = "public, max-age=60, s-maxage=300";
-const VALID_PROVIDER_IDS = new Set(["livekora", "beinlive", "siiir"]);
+const VALID_PROVIDER_IDS = new Set(["livekora", "beinlive", "siiir", "yallashoot"]);
 
 function nowIso() {
   return new Date().toISOString();
@@ -270,7 +270,14 @@ function normalizeProviderId(rawValue) {
 }
 
 function normalizePublicPathPrefix(rawValue, providerId) {
-  const fallback = providerId === "beinlive" ? "beinlive" : providerId === "siiir" ? "siiir" : "livekora";
+  const fallback =
+    providerId === "beinlive"
+      ? "beinlive"
+      : providerId === "siiir"
+      ? "siiir"
+      : providerId === "yallashoot"
+      ? "yallashoot"
+      : "livekora";
   const value = String(rawValue || fallback)
     .trim()
     .replace(/^\/+|\/+$/g, "");
@@ -478,7 +485,9 @@ class LivekoraJob {
         ? Math.max(this.manager.config.readyGraceMs, 120_000)
         : this.providerId === "siiir"
           ? Math.max(this.manager.config.readyGraceMs, 75_000)
-          : Math.max(this.manager.config.readyGraceMs, 45_000);
+          : this.providerId === "yallashoot"
+            ? Math.max(this.manager.config.readyGraceMs, 60_000)
+            : Math.max(this.manager.config.readyGraceMs, 45_000);
     const dynamicReadyGraceMs =
       Number.isFinite(this.lastObservedTargetDurationSec) && this.lastObservedTargetDurationSec > 0
         ? Math.max(providerReadyGraceMs, Math.round(this.lastObservedTargetDurationSec * 1000 * 4 + 4000))
@@ -1345,6 +1354,7 @@ async function main() {
           livekora: manager.status("livekora", matchId),
           beinlive: manager.status("beinlive", matchId),
           siiir: manager.status("siiir", matchId),
+          yallashoot: manager.status("yallashoot", matchId),
           updatedAt: nowIso(),
         });
       }

@@ -23,6 +23,7 @@ type MatchApiRow = {
   stream_url_2?: string | null;
   stream_url_3?: string | null;
   stream_url_4?: string | null;
+  stream_url_5?: string | null;
 };
 
 type HomeLogoLookupRow = {
@@ -309,7 +310,7 @@ async function fetchMatchesForDay(day: string) {
   const { data, error } = await supabaseAdmin
     .from(TABLE)
     .select(
-      "id,match_key,home_team,away_team,home_logo,away_logo,match_day,match_start,match_time,home_score,away_score,status_key,stream_url,stream_url_2,stream_url_3,stream_url_4"
+      "id,match_key,home_team,away_team,home_logo,away_logo,match_day,match_start,match_time,home_score,away_score,status_key,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5"
     )
     .eq("match_day", day)
     .order("match_start", { ascending: true, nullsFirst: false })

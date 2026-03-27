@@ -12,7 +12,7 @@ const PLAYBACK_SESSION_TTL_MS = Math.max(
   10 * 60 * 1000,
   Number.parseInt(String(process.env.PLAYBACK_SESSION_TTL_MS || "7200000"), 10) || 7_200_000
 );
-const VALID_PROVIDER_IDS = new Set<StreamProviderId>(["livekora", "beinlive", "siiir"]);
+const VALID_PROVIDER_IDS = new Set<StreamProviderId>(["livekora", "beinlive", "siiir", "yallashoot"]);
 
 type PlaybackSessionClaims = {
   v: 1;

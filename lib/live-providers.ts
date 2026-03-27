@@ -10,6 +10,7 @@ export type MatchRowLike = {
   stream_url_2?: string | null;
   stream_url_3?: string | null;
   stream_url_4?: string | null;
+  stream_url_5?: string | null;
   home_team?: string | null;
   away_team?: string | null;
   match_start?: string | null;
@@ -605,7 +606,9 @@ export function buildProviderPublicPlaylistUrl(providerId: StreamProviderId, mat
       .trim()
       .replace(/\/+$/, "");
   if (!base) return null;
-  return providerId === "siiir" ? `${base}/siiir/m${matchId}/index.m3u8` : `${base}/beinlive/m${matchId}/index.m3u8`;
+  if (providerId === "siiir") return `${base}/siiir/m${matchId}/index.m3u8`;
+  if (providerId === "yallashoot") return `${base}/yallashoot/m${matchId}/index.m3u8`;
+  return `${base}/beinlive/m${matchId}/index.m3u8`;
 }
 
 export function resolveInternalAppOrigin(req?: Request | null) {

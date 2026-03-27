@@ -5,6 +5,7 @@ import { buildLivekoraStatus } from "@/lib/livekora-agent";
 import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
 import { readAllR2MirrorAgentStatuses } from "@/lib/r2-mirror-agent";
 import { buildSiiirStatus } from "@/lib/siiir-agent";
+import { buildYallashootStatus } from "@/lib/yallashoot-agent";
 import { buildClientPlaybackUrl, protectClientStatus } from "@/lib/playback-session";
 import { getOrLoadHotWatchStateSeed } from "@/lib/watch-state-cache";
 
@@ -34,10 +35,11 @@ export async function GET(_req: Request, ctx: Ctx) {
   const sourceUrl = seed.sourceUrls.livekora;
   const beinliveSourceUrl = seed.sourceUrls.beinlive;
   const siiirSourceUrl = seed.sourceUrls.siiir;
+  const yallashootSourceUrl = seed.sourceUrls.yallashoot;
 
   const agentStatuses = await readAllR2MirrorAgentStatuses(matchId);
 
-  const [livekoraStatus, beinliveStatus, siiirStatus] = await Promise.all([
+  const [livekoraStatus, beinliveStatus, siiirStatus, yallashootStatus] = await Promise.all([
     buildLivekoraStatus({
       matchId,
       row: data,
@@ -56,11 +58,18 @@ export async function GET(_req: Request, ctx: Ctx) {
       sourceUrl: siiirSourceUrl,
       agentStatus: agentStatuses?.siiir || null,
     }),
+    buildYallashootStatus({
+      matchId,
+      row: data,
+      sourceUrl: yallashootSourceUrl,
+      agentStatus: agentStatuses?.yallashoot || null,
+    }),
   ]);
   const protectedLivekoraStatus = protectClientStatus(livekoraStatus);
   const protectedBeinliveStatus = protectClientStatus(beinliveStatus);
   const protectedSiiirStatus = protectClientStatus(siiirStatus);
-  const streamSources = [protectedLivekoraStatus, protectedBeinliveStatus, protectedSiiirStatus]
+  const protectedYallashootStatus = protectClientStatus(yallashootStatus);
+  const streamSources = [protectedLivekoraStatus, protectedBeinliveStatus, protectedSiiirStatus, protectedYallashootStatus]
     .filter(Boolean)
     .sort((left, right) => Number(left?.order || 0) - Number(right?.order || 0));
 
@@ -76,6 +85,7 @@ export async function GET(_req: Request, ctx: Ctx) {
     status_key: data.status_key || null,
     stream_url: beinliveSourceUrl,
     stream_url_2: siiirSourceUrl,
+    stream_url_5: yallashootSourceUrl,
     stream_url_4: sourceUrl,
     livekoraStatus: protectedLivekoraStatus,
     livekoraPlaylistUrl: buildClientPlaybackUrl("livekora", matchId, !!String(livekoraStatus.playlistUrl || "").trim()),
@@ -83,6 +93,12 @@ export async function GET(_req: Request, ctx: Ctx) {
     beinlivePlaylistUrl: buildClientPlaybackUrl("beinlive", matchId, !!String(beinliveStatus.playlistUrl || "").trim()),
     siiirStatus: protectedSiiirStatus,
     siiirPlaylistUrl: buildClientPlaybackUrl("siiir", matchId, !!String(siiirStatus.playlistUrl || "").trim()),
+    yallashootStatus: protectedYallashootStatus,
+    yallashootPlaylistUrl: buildClientPlaybackUrl(
+      "yallashoot",
+      matchId,
+      !!String(yallashootStatus.playlistUrl || "").trim()
+    ),
     streamSources,
   });
   response.headers.set("Cache-Control", "public, s-maxage=6, stale-while-revalidate=20");

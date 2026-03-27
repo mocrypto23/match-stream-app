@@ -49,7 +49,13 @@ export async function POST(req: Request) {
 
   const statuses = await readAllR2MirrorAgentStatuses(matchId);
   const providerStatus =
-    provider === "livekora" ? statuses?.livekora : provider === "beinlive" ? statuses?.beinlive : statuses?.siiir;
+    provider === "livekora"
+      ? statuses?.livekora
+      : provider === "beinlive"
+      ? statuses?.beinlive
+      : provider === "siiir"
+      ? statuses?.siiir
+      : statuses?.yallashoot;
 
   if (providerStatus?.state !== "ready" || !String(providerStatus.playlistUrl || "").trim()) {
     return NextResponse.json({ error: "playback-not-ready" }, { status: 409 });

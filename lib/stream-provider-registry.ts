@@ -2,8 +2,9 @@ import { beinliveProvider } from "@/lib/beinlive-provider";
 import { livekoraProvider, type LiveStreamProvider, type MatchRowLike } from "@/lib/live-providers";
 import { siiirProvider } from "@/lib/siiir-provider";
 import type { StreamProviderId } from "@/lib/stream-source-types";
+import { yallashootProvider } from "@/lib/yallashoot-provider";
 
-export const streamProviders = [livekoraProvider, beinliveProvider, siiirProvider] as const;
+export const streamProviders = [livekoraProvider, beinliveProvider, siiirProvider, yallashootProvider] as const;
 
 const SOURCE_URL_CACHE_TTL_MS = 2 * 60_000;
 const sourceUrlCache = new Map<string, { value: string | null; expiresAt: number }>();

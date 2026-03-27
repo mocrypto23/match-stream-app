@@ -18,6 +18,7 @@ type MatchPayload = {
   status_key?: string | null;
   stream_url?: string | null;
   stream_url_2?: string | null;
+  stream_url_5?: string | null;
   stream_url_4?: string | null;
   livekoraStatus?: StreamSourceStatus | null;
   livekoraPlaylistUrl?: string | null;
@@ -25,6 +26,8 @@ type MatchPayload = {
   beinlivePlaylistUrl?: string | null;
   siiirStatus?: StreamSourceStatus | null;
   siiirPlaylistUrl?: string | null;
+  yallashootStatus?: StreamSourceStatus | null;
+  yallashootPlaylistUrl?: string | null;
   streamSources?: StreamSourceStatus[] | null;
 };
 
@@ -32,10 +35,12 @@ type WatchStatePayload = {
   matchId: number;
   stream_url?: string | null;
   stream_url_2?: string | null;
+  stream_url_5?: string | null;
   stream_url_4?: string | null;
   livekoraStatus?: StreamSourceStatus | null;
   beinliveStatus?: StreamSourceStatus | null;
   siiirStatus?: StreamSourceStatus | null;
+  yallashootStatus?: StreamSourceStatus | null;
   updatedAt?: string | null;
   version?: string | null;
 };
@@ -152,11 +157,13 @@ const PROVIDER_META: Array<{ provider: StreamProviderId; order: number; label: s
   { provider: "livekora", order: 1, label: "livekora vip" },
   { provider: "beinlive", order: 2, label: "bein-live" },
   { provider: "siiir", order: 3, label: "siiir.tv" },
+  { provider: "yallashoot", order: 4, label: "yalla-shoot" },
 ];
 const PROVIDER_WARMUP_ESTIMATE_MS: Record<StreamProviderId, number> = {
   livekora: 18_000,
   beinlive: 12_000,
   siiir: 17_000,
+  yallashoot: 16_000,
 };
 const EMPTY_P2P_STATS: P2PStats = {
   enabled: false,
@@ -211,11 +218,11 @@ function WatchPageSponsorBanner() {
 }
 
 function createPendingBootstrapMap(): PendingBootstrapMap {
-  return { livekora: 0, beinlive: 0, siiir: 0 };
+  return { livekora: 0, beinlive: 0, siiir: 0, yallashoot: 0 };
 }
 
 function createDisplayProgressMap(): DisplayProgressMap {
-  return { livekora: 0, beinlive: 0, siiir: 0 };
+  return { livekora: 0, beinlive: 0, siiir: 0, yallashoot: 0 };
 }
 
 function createDisplayProgressMetaMap(): DisplayProgressMetaMap {
@@ -223,15 +230,16 @@ function createDisplayProgressMetaMap(): DisplayProgressMetaMap {
     livekora: { animating: false, startedAt: 0 },
     beinlive: { animating: false, startedAt: 0 },
     siiir: { animating: false, startedAt: 0 },
+    yallashoot: { animating: false, startedAt: 0 },
   };
 }
 
 function createPlaybackUrlMap(): PlaybackUrlMap {
-  return { livekora: "", beinlive: "", siiir: "" };
+  return { livekora: "", beinlive: "", siiir: "", yallashoot: "" };
 }
 
 function createPlaybackExpiryMap(): PlaybackExpiryMap {
-  return { livekora: 0, beinlive: 0, siiir: 0 };
+  return { livekora: 0, beinlive: 0, siiir: 0, yallashoot: 0 };
 }
 
 function parsePlaybackExpiryMs(value: string | null | undefined) {
@@ -369,6 +377,7 @@ function buildStatusMap(payload: MatchPayload | null): StatusMap {
     livekora: payload?.livekoraStatus || null,
     beinlive: payload?.beinliveStatus || null,
     siiir: payload?.siiirStatus || null,
+    yallashoot: payload?.yallashootStatus || null,
   };
 }
 
@@ -415,7 +424,8 @@ function shouldAnimatePreparation(status: StreamSourceStatus | null, hasSource: 
 function getMatchSourceUrl(payload: MatchPayload | null, provider: StreamProviderId) {
   if (provider === "livekora") return String(payload?.stream_url_4 || "").trim();
   if (provider === "beinlive") return String(payload?.stream_url || "").trim();
-  return String(payload?.stream_url_2 || "").trim();
+  if (provider === "siiir") return String(payload?.stream_url_2 || "").trim();
+  return String(payload?.stream_url_5 || "").trim();
 }
 
 function getProviderSourceCandidate(
@@ -448,7 +458,12 @@ export default function WatchPage() {
   const params = useParams<{ id?: string }>();
   const matchId = Number.parseInt(String(params?.id || "").trim(), 10);
   const [match, setMatch] = useState<MatchPayload | null>(null);
-  const [statusByProvider, setStatusByProvider] = useState<StatusMap>({ livekora: null, beinlive: null, siiir: null });
+  const [statusByProvider, setStatusByProvider] = useState<StatusMap>({
+    livekora: null,
+    beinlive: null,
+    siiir: null,
+    yallashoot: null,
+  });
   const [selectedProvider, setSelectedProvider] = useState<StreamProviderId>("livekora");
   const [pageError, setPageError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -460,6 +475,7 @@ export default function WatchPage() {
     livekora: "",
     beinlive: "",
     siiir: "",
+    yallashoot: "",
   });
   const [playbackSessionUrls, setPlaybackSessionUrls] = useState<PlaybackUrlMap>(createPlaybackUrlMap);
   const [playbackSessionExpiries, setPlaybackSessionExpiries] = useState<PlaybackExpiryMap>(createPlaybackExpiryMap);
@@ -478,6 +494,7 @@ export default function WatchPage() {
     livekora: null,
     beinlive: null,
     siiir: null,
+    yallashoot: null,
   });
   const watchStateRequestRef = useRef<Promise<void> | null>(null);
   const watchEdgeSnapshotRequestRef = useRef<Promise<void> | null>(null);
@@ -491,26 +508,31 @@ export default function WatchPage() {
     livekora: 0,
     beinlive: 0,
     siiir: 0,
+    yallashoot: 0,
   });
   const backgroundBootstrapAtRef = useRef<Record<StreamProviderId, number>>({
     livekora: 0,
     beinlive: 0,
     siiir: 0,
+    yallashoot: 0,
   });
   const activeRecoveryAtRef = useRef<Record<StreamProviderId, number>>({
     livekora: 0,
     beinlive: 0,
     siiir: 0,
+    yallashoot: 0,
   });
   const softRecoveryAtRef = useRef<Record<StreamProviderId, number>>({
     livekora: 0,
     beinlive: 0,
     siiir: 0,
+    yallashoot: 0,
   });
   const sourceRecoveryPendingRef = useRef<Record<StreamProviderId, boolean>>({
     livekora: false,
     beinlive: false,
     siiir: false,
+    yallashoot: false,
   });
   const playbackWatchRef = useRef<{
     provider: StreamProviderId | null;
@@ -555,6 +577,7 @@ export default function WatchPage() {
       livekora: providerHasMatch(match, statusByProvider, "livekora"),
       beinlive: providerHasMatch(match, statusByProvider, "beinlive"),
       siiir: providerHasMatch(match, statusByProvider, "siiir"),
+      yallashoot: providerHasMatch(match, statusByProvider, "yallashoot"),
     }),
     [match, statusByProvider]
   );
@@ -575,9 +598,19 @@ export default function WatchPage() {
       const fallback = String(match?.beinlivePlaylistUrl || "").trim();
       return fallback || null;
     }
-    const fallback = String(match?.siiirPlaylistUrl || "").trim();
+    if (activeProvider === "siiir") {
+      const fallback = String(match?.siiirPlaylistUrl || "").trim();
+      return fallback || null;
+    }
+    const fallback = String(match?.yallashootPlaylistUrl || "").trim();
     return fallback || null;
-  }, [activeProvider, match?.beinlivePlaylistUrl, match?.livekoraPlaylistUrl, match?.siiirPlaylistUrl]);
+  }, [
+    activeProvider,
+    match?.beinlivePlaylistUrl,
+    match?.livekoraPlaylistUrl,
+    match?.siiirPlaylistUrl,
+    match?.yallashootPlaylistUrl,
+  ]);
 
   const streamUrl = useMemo(() => {
     const retained = String(retainedPlaylistUrls[activeProvider] || "").trim();
@@ -668,15 +701,18 @@ export default function WatchPage() {
       livekora: payload.livekoraStatus || null,
       beinlive: payload.beinliveStatus || null,
       siiir: payload.siiirStatus || null,
+      yallashoot: payload.yallashootStatus || null,
     });
     setMatch((current) => {
       if (!current) return current;
       const nextStreamUrl = payload.stream_url ?? current.stream_url ?? null;
       const nextStreamUrl2 = payload.stream_url_2 ?? current.stream_url_2 ?? null;
+      const nextStreamUrl5 = payload.stream_url_5 ?? current.stream_url_5 ?? null;
       const nextStreamUrl4 = payload.stream_url_4 ?? current.stream_url_4 ?? null;
       if (
         nextStreamUrl === (current.stream_url ?? null) &&
         nextStreamUrl2 === (current.stream_url_2 ?? null) &&
+        nextStreamUrl5 === (current.stream_url_5 ?? null) &&
         nextStreamUrl4 === (current.stream_url_4 ?? null)
       ) {
         return current;
@@ -685,6 +721,7 @@ export default function WatchPage() {
         ...current,
         stream_url: nextStreamUrl,
         stream_url_2: nextStreamUrl2,
+        stream_url_5: nextStreamUrl5,
         stream_url_4: nextStreamUrl4,
       };
     });
@@ -1259,6 +1296,7 @@ export default function WatchPage() {
               livekoraStatus?: StreamSourceStatus | null;
               beinliveStatus?: StreamSourceStatus | null;
               siiirStatus?: StreamSourceStatus | null;
+              yallashootStatus?: StreamSourceStatus | null;
               reason?: string;
               error?: string;
             }
@@ -1266,6 +1304,7 @@ export default function WatchPage() {
         if (provider === "livekora") applyProviderStatus(provider, payload?.livekoraStatus);
         if (provider === "beinlive") applyProviderStatus(provider, payload?.beinliveStatus);
         if (provider === "siiir") applyProviderStatus(provider, payload?.siiirStatus);
+        if (provider === "yallashoot") applyProviderStatus(provider, payload?.yallashootStatus);
         if (!response.ok && !opts?.silent) {
           setPageError(String(payload?.reason || payload?.error || "bootstrap-failed"));
         }
@@ -1348,21 +1387,21 @@ export default function WatchPage() {
     resetPlaybackState({ clearError: false });
     watchStateRequestRef.current = null;
     watchStateVersionRef.current = null;
-    backgroundBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
-    lastAutoBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
-    setStatusByProvider({ livekora: null, beinlive: null, siiir: null });
+    backgroundBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0, yallashoot: 0 };
+    lastAutoBootstrapAtRef.current = { livekora: 0, beinlive: 0, siiir: 0, yallashoot: 0 };
+    setStatusByProvider({ livekora: null, beinlive: null, siiir: null, yallashoot: null });
     setDisplayProgressByProvider(createDisplayProgressMap());
     displayProgressMetaRef.current = createDisplayProgressMetaMap();
-    setRetainedPlaylistUrls({ livekora: "", beinlive: "", siiir: "" });
+    setRetainedPlaylistUrls({ livekora: "", beinlive: "", siiir: "", yallashoot: "" });
     setPlaybackSessionUrls(createPlaybackUrlMap());
     setPlaybackSessionExpiries(createPlaybackExpiryMap());
     setPendingBootstraps(createPendingBootstrapMap());
     p2pStatsStoreRef.current = {};
     setP2pStats(EMPTY_P2P_STATS);
     setSelectedProvider("livekora");
-    activeRecoveryAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
-    softRecoveryAtRef.current = { livekora: 0, beinlive: 0, siiir: 0 };
-    sourceRecoveryPendingRef.current = { livekora: false, beinlive: false, siiir: false };
+    activeRecoveryAtRef.current = { livekora: 0, beinlive: 0, siiir: 0, yallashoot: 0 };
+    softRecoveryAtRef.current = { livekora: 0, beinlive: 0, siiir: 0, yallashoot: 0 };
+    sourceRecoveryPendingRef.current = { livekora: false, beinlive: false, siiir: false, yallashoot: false };
     selectedRecoveryPendingRef.current = false;
     setPlayerSessionNonce(0);
   }, [matchId, resetPlaybackState]);
@@ -1371,7 +1410,7 @@ export default function WatchPage() {
     setRetainedPlaylistUrls((current) => {
       let changed = false;
       const next = { ...current };
-      for (const provider of ["livekora", "beinlive", "siiir"] as StreamProviderId[]) {
+      for (const provider of PROVIDER_META.map((item) => item.provider)) {
         const status = statusByProvider[provider];
         const playlistUrl = String(status?.playlistUrl || "").trim();
         if (status?.state === "ready" && playlistUrl && next[provider] !== playlistUrl) {

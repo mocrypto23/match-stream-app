@@ -1,15 +1,16 @@
-export type UiServerId = 1 | 2 | 3 | 4;
-export type SlotServerId = 1 | 2 | 3 | 4;
-export type SourceFamily = "bein" | "siiir" | "livehd" | "livekora";
+export type UiServerId = 1 | 2 | 3 | 4 | 5;
+export type SlotServerId = 1 | 2 | 3 | 4 | 5;
+export type SourceFamily = "bein" | "siiir" | "livehd" | "livekora" | "yallashoot";
 
-export const UI_SERVER_IDS = [1, 2, 3, 4] as const;
-export const SLOT_SERVER_IDS = [1, 2, 3, 4] as const;
+export const UI_SERVER_IDS = [1, 2, 3, 4, 5] as const;
+export const SLOT_SERVER_IDS = [1, 2, 3, 4, 5] as const;
 
 const SLOT_BY_UI: Record<UiServerId, SlotServerId> = {
   1: 4,
   2: 2,
   3: 3,
   4: 1,
+  5: 5,
 };
 
 const UI_BY_SLOT: Record<SlotServerId, UiServerId> = {
@@ -17,6 +18,7 @@ const UI_BY_SLOT: Record<SlotServerId, UiServerId> = {
   2: 2,
   3: 3,
   4: 1,
+  5: 5,
 };
 
 const SOURCE_FAMILY_BY_SLOT: Record<SlotServerId, SourceFamily> = {
@@ -24,6 +26,7 @@ const SOURCE_FAMILY_BY_SLOT: Record<SlotServerId, SourceFamily> = {
   2: "siiir",
   3: "livehd",
   4: "livekora",
+  5: "yallashoot",
 };
 
 const HOST_ALLOWLIST_BY_SLOT: Record<SlotServerId, string[]> = {
@@ -50,6 +53,12 @@ const HOST_ALLOWLIST_BY_SLOT: Record<SlotServerId, string[]> = {
     "sportsurges.cc",
     "sportsurges.online",
   ],
+  5: [
+    "yalla-shoot.mov",
+    "smartagro.mov",
+    "sports-flash.space",
+    "sport-arab.space",
+  ],
 };
 
 type StreamRowFields = {
@@ -57,6 +66,7 @@ type StreamRowFields = {
   stream_url_2?: string | null;
   stream_url_3?: string | null;
   stream_url_4?: string | null;
+  stream_url_5?: string | null;
 };
 
 function normalizeHost(host: string) {
@@ -243,7 +253,8 @@ export function getSlotSourceUrlFromRow(row: StreamRowFields, slotServerId: Slot
   if (slotServerId === 1) return String(row.stream_url || "").trim() || null;
   if (slotServerId === 2) return String(row.stream_url_2 || "").trim() || null;
   if (slotServerId === 3) return String(row.stream_url_3 || "").trim() || null;
-  return String(row.stream_url_4 || "").trim() || null;
+  if (slotServerId === 4) return String(row.stream_url_4 || "").trim() || null;
+  return String(row.stream_url_5 || "").trim() || null;
 }
 
 export function buildR2PlaylistUrlForSlot(baseUrl: string, matchId: number, slotServerId: SlotServerId) {

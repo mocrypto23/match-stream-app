@@ -14,6 +14,7 @@ export type LivekoraMatchRow = {
   stream_url_2?: string | null;
   stream_url_3?: string | null;
   stream_url_4?: string | null;
+  stream_url_5?: string | null;
 };
 
 function normalizeTeamNameForCompare(value: unknown) {
@@ -77,7 +78,8 @@ function extractDayKeyFromRow(row: LivekoraMatchRow) {
 }
 
 function countPresentStreams(row: LivekoraMatchRow) {
-  return [row.stream_url, row.stream_url_2, row.stream_url_3, row.stream_url_4].filter((value) => String(value || "").trim()).length;
+  return [row.stream_url, row.stream_url_2, row.stream_url_3, row.stream_url_4, row.stream_url_5]
+    .filter((value) => String(value || "").trim()).length;
 }
 
 async function fetchRowsByDayKey(dayKey: string) {
@@ -85,7 +87,7 @@ async function fetchRowsByDayKey(dayKey: string) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(safeDayKey)) return [] as LivekoraMatchRow[];
   const { data, error } = await supabaseAdmin
     .from("match-stream-app")
-    .select("id,match_key,home_team,away_team,home_logo,away_logo,match_start,match_day,status_key,stream_url,stream_url_2,stream_url_3,stream_url_4")
+    .select("id,match_key,home_team,away_team,home_logo,away_logo,match_start,match_day,status_key,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5")
     .like("match_key", `${safeDayKey}||%`)
     .limit(300);
   if (error || !Array.isArray(data)) return [] as LivekoraMatchRow[];
@@ -120,13 +122,16 @@ async function enrichWithDuplicateSiblingStream(row: LivekoraMatchRow) {
     return Number(b.id || 0) - Number(a.id || 0);
   })[0];
 
-  if (!donor?.stream_url && !donor?.stream_url_2 && !donor?.stream_url_3 && !donor?.stream_url_4) return row;
+  if (!donor?.stream_url && !donor?.stream_url_2 && !donor?.stream_url_3 && !donor?.stream_url_4 && !donor?.stream_url_5) {
+    return row;
+  }
   return {
     ...row,
     stream_url: row.stream_url || donor.stream_url,
     stream_url_2: row.stream_url_2 || donor.stream_url_2,
     stream_url_3: row.stream_url_3 || donor.stream_url_3,
     stream_url_4: row.stream_url_4 || donor.stream_url_4,
+    stream_url_5: row.stream_url_5 || donor.stream_url_5,
     match_start: row.match_start || donor.match_start,
     match_day: row.match_day || donor.match_day,
     status_key: row.status_key || donor.status_key,
@@ -136,7 +141,7 @@ async function enrichWithDuplicateSiblingStream(row: LivekoraMatchRow) {
 export async function fetchLivekoraMatchRow(matchId: number) {
   const { data, error } = await supabaseAdmin
     .from("match-stream-app")
-    .select("id,match_key,home_team,away_team,home_logo,away_logo,match_start,match_day,status_key,stream_url,stream_url_2,stream_url_3,stream_url_4")
+    .select("id,match_key,home_team,away_team,home_logo,away_logo,match_start,match_day,status_key,stream_url,stream_url_2,stream_url_3,stream_url_4,stream_url_5")
     .eq("id", matchId)
     .maybeSingle();
 

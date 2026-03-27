@@ -4,7 +4,7 @@
  * + SIIIR.TV (Server 2) extractor
  * + LIVEHD77 (Server 3) extractor
  * + LIVEKORA (Server 4) extractor
- * + YALLALIVE (Server 5) extractor
+ * + YALLA-SHOOT (Server 5) extractor
  * + 1KORA (Server 6) extractor
  *
  * Adds:
@@ -27,6 +27,7 @@ const { chromium } = require("playwright");
 const { createClient } = require("@supabase/supabase-js");
 const fs = require("fs");
 const path = require("path");
+const { randomUUID } = require("crypto");
 require("dotenv").config({ path: ".env.local" });
 const { PlaywrightBlocker } = require("@ghostery/adblocker-playwright");
 const fetch = require("cross-fetch");
@@ -133,7 +134,26 @@ const YALA = {
   },
   siteHost: "livekora.vip",
 };
-// YALLALIVE source (Server 5 primary)
+// YALLA-SHOOT source (Server 5)
+const YALLASHOOT = {
+  matchesApiBase: "https://ws.kora-api.space/api/matches",
+  redirectBase: "https://xyzyalla-shootx-space.smartagro.mov/",
+  siteHosts: [
+    "yalla-shoot.mov",
+    "smartagro.mov",
+    "sports-flash.space",
+    "sport-arab.space",
+    "sports-lights.space",
+    "sports-burst.space",
+    "sports-echo.space",
+    "sports-mania.space",
+    "sports-wave.space",
+    "sports-edge.space",
+    "sports-nova.space",
+    "sports-center.space",
+  ],
+};
+// Legacy Server 5 constants retained only for old helper functions that are no longer active in the main flow.
 const YALLALIVE = {
   dayUrl: {
     yesterday: "https://anewssport.fun/yesterday-matches/",
@@ -194,14 +214,18 @@ const SERVER_SLOT_DOMAIN_WHITELIST = Object.freeze({
     "sportsurges.online",
   ],
   5: [
-    "dvalna.ru",
-    "anewssport.fun",
-    "yallalive.sx",
-    "zxxxeeplay.fun",
-    "codepcplay.fun",
-    "playerai.site",
-    "soyspace.cyou",
-    "coopnnn.fun",
+    "yalla-shoot.mov",
+    "smartagro.mov",
+    "sports-flash.space",
+    "sport-arab.space",
+    "sports-lights.space",
+    "sports-burst.space",
+    "sports-echo.space",
+    "sports-mania.space",
+    "sports-wave.space",
+    "sports-edge.space",
+    "sports-nova.space",
+    "sports-center.space",
   ],
   6: ["1kora.com", "ahlamontada.com"],
 });
@@ -3318,7 +3342,80 @@ function findYalaFallbackUrl(rows, { matchDay, homeTeam, awayTeam }) {
   return null;
 }
 
-function findServer5FallbackUrl(rows, { matchDay, homeTeam, awayTeam, fieldName = "yallalive_stream_url" } = {}) {
+function buildYallashootArticleUrl(matchId) {
+  const normalizedMatchId = Number.parseInt(String(matchId || "").trim(), 10);
+  if (!Number.isFinite(normalizedMatchId) || normalizedMatchId <= 0) return null;
+  return `${YALLASHOOT.redirectBase}?m=${encodeURIComponent(String(normalizedMatchId))}&lang=ar`;
+}
+
+function isServer5SourceLikeUrl(url) {
+  const normalized = normalizeUrl(url, url);
+  if (!normalized || isClearlyNonStreamUrl(normalized)) return false;
+
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    if (!hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[5])) return false;
+    if (host.endsWith("smartagro.mov")) return /^\d+$/.test(String(parsed.searchParams.get("m") || "").trim());
+    return /\/article\//i.test(parsed.pathname) || /^\d+$/.test(String(parsed.searchParams.get("m") || "").trim());
+  } catch {
+    return false;
+  }
+}
+
+async function fetchYallashootDay(dayKey) {
+  const matchDay = matchDayFromKey(dayKey);
+  if (!matchDay) return [];
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+    const resp = await fetch(`${YALLASHOOT.matchesApiBase}/${encodeURIComponent(matchDay)}/1`, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        ...DEFAULT_HTTP_HEADERS,
+        accept: "application/json,text/plain,*/*",
+        Referer: "https://yalla-shoot.mov/",
+      },
+    });
+    clearTimeout(timeoutId);
+    if (!resp.ok) return [];
+
+    const payload = await resp.json().catch(() => null);
+    const matches = Array.isArray(payload?.matches) ? payload.matches : [];
+    const deduped = new Map();
+
+    for (const item of matches) {
+      const matchId = Number.parseInt(String(item?.id || "").trim(), 10);
+      const homeTeam = normalizeSpaces(String(item?.home || "").trim());
+      const awayTeam = normalizeSpaces(String(item?.away || "").trim());
+      const hasChannels = String(item?.has_channels || "").trim() === "1";
+      if (!Number.isFinite(matchId) || matchId <= 0 || !homeTeam || !awayTeam || !hasChannels) continue;
+
+      const streamUrl = buildYallashootArticleUrl(matchId);
+      if (!streamUrl || !isServer5SourceLikeUrl(streamUrl)) continue;
+
+      const matchKey = keyOfTeams(matchDay, homeTeam, awayTeam);
+      if (!matchKey || deduped.has(matchKey)) continue;
+      deduped.set(matchKey, {
+        match_key: matchKey,
+        home_team: homeTeam,
+        away_team: awayTeam,
+        match_day: matchDay,
+        yallashoot_stream_url: streamUrl,
+        yallashoot_match_id: matchId,
+      });
+    }
+
+    return Array.from(deduped.values());
+  } catch {
+    return [];
+  }
+}
+
+function findServer5FallbackUrl(rows, { matchDay, homeTeam, awayTeam, fieldName = "yallashoot_stream_url" } = {}) {
   if (!Array.isArray(rows) || !rows.length || !matchDay || !homeTeam || !awayTeam) return null;
 
   let best = null;
@@ -3552,9 +3649,9 @@ function validateServerUrlBySlot(slot, url, { stats = null, reason = "", matchKe
       }
       case 5: {
         const hostAllowed = hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[5]);
-        const isServer5Landing = hostMatchesAnyHint(host, YALLALIVE.siteHosts);
+        const isSourceLike = isServer5SourceLikeUrl(normalized);
         const isPlayerLike = isServer5PlayerLikeUrl(normalized);
-        allowed = hostAllowed && !isClearlyNonStreamUrl(normalized) && (isServer5Landing || isPlayerLike);
+        allowed = hostAllowed && !isClearlyNonStreamUrl(normalized) && (isSourceLike || isPlayerLike);
         if (!allowed) rejectReason = reason || "server5_requires_known_domain";
         break;
       }
@@ -6222,7 +6319,7 @@ async function enrichOneKoraWithStreams(browser, articleUrls) {
 // ===================== Main =====================
 async function startScraping() {
   console.log(
-    "🚀 بدء السكرابر (bein-live) + Server2 (SIIIR) + Server3 (LIVEHD77) + Server4 (LIVEKORA) + Server5 (YALLALIVE only) + Server6 (1KORA) ..."
+    "🚀 بدء السكرابر (bein-live) + Server2 (SIIIR) + Server3 (LIVEHD77) + Server4 (LIVEKORA) + Server5 (YALLA-SHOOT) ..."
   );
   console.log(`⚙️ day scope: ${SCRAPE_DAY_SCOPE_RAW} => [${ACTIVE_DAY_KEYS.join(", ")}]`);
 
@@ -6397,16 +6494,23 @@ async function startScraping() {
       console.log("⏭️ LIVEKORA source disabled (Server 4).");
     }
 
-    // 5-7) Disabled non-broadcast sources to keep scraper aligned with active providers only.
-    const yallaliveAll = [];
-    const yallaliveEnriched = [];
-    const yallaliveMap = new Map();
-    const tskoraAll = [];
-    const tskoraEnriched = [];
-    const tskoraMap = new Map();
+    // 5-7) Keep scraper aligned strictly with active broadcast providers only.
+    const yallashootAll = [];
+    for (const day of ACTIVE_DAYS) {
+      const rows = await fetchYallashootDay(day.key);
+      yallashootAll.push(...rows);
+      console.log(`YALLA-SHOOT ${day.key}: ${rows.length} items`);
+    }
+    const yallashootEnriched = yallashootAll.filter((row) => isServer5SourceLikeUrl(row?.yallashoot_stream_url));
+    const yallashootMap = new Map();
+    for (const row of yallashootEnriched) {
+      const matchKey = keyOfTeams(row.match_day, row.home_team, row.away_team);
+      if (!matchKey || !row.yallashoot_stream_url) continue;
+      if (!yallashootMap.has(matchKey)) yallashootMap.set(matchKey, row.yallashoot_stream_url);
+    }
     const oneKoraEnriched = [];
     const oneKoraMap = new Map();
-    console.log("⏭️ YALLALIVE / TSKORA / 1KORA sources disabled (not active broadcast providers).");
+    console.log("⏭️ Active Server 5 source is YALLA-SHOOT only. 1KORA remains disabled.");
 
     const { rows: scheduleSeedRows, stats: scheduleSeedStats } = buildScheduleSeedRows({
       primaryRows: enriched,
@@ -6544,7 +6648,7 @@ async function startScraping() {
         stage: "extract",
       });
 
-      // Server 4 (LIVEKORA), Server 5 (YALLALIVE only), Server 6 (1KORA), Server 7 (reserved)
+      // Server 4 (LIVEKORA), Server 5 (YALLA-SHOOT), Server 6 (1KORA), Server 7 (reserved)
       let server4 = yalaMap.get(match_key) || yalaDirectMap.get(match_key) || null;
       if (!server4) {
         server4 =
@@ -6569,14 +6673,14 @@ async function startScraping() {
         stage: "extract",
       });
 
-      let server5 = yallaliveMap.get(match_key) || null;
+      let server5 = yallashootMap.get(match_key) || null;
       if (!server5) {
         server5 =
-          findServer5FallbackUrl(yallaliveEnriched, {
+          findServer5FallbackUrl(yallashootEnriched, {
             matchDay: match_day,
             homeTeam: m.home_team,
             awayTeam: m.away_team,
-            fieldName: "yallalive_stream_url",
+            fieldName: "yallashoot_stream_url",
           }) || null;
       }
       server5 = validateServerUrlBySlot(5, server5, {
@@ -6724,7 +6828,7 @@ async function startScraping() {
             siiir_count: siiirEnriched.length,
             livehd_count: livehdEnriched.length,
             yala_count: yalaEnriched.length,
-            tskora_count: tskoraEnriched.length,
+            yallashoot_count: yallashootEnriched.length,
             onekora_count: oneKoraEnriched.length,
             isolation_reject_server2: isolationStats.isolation_reject_server2,
             isolation_reject_server3: isolationStats.isolation_reject_server3,

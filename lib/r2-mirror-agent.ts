@@ -2,6 +2,7 @@ import type { StreamAgentStatus, StreamProviderId } from "@/lib/stream-source-ty
 import type { BeinliveAgentStatus } from "@/lib/beinlive-types";
 import type { LivekoraAgentStatus } from "@/lib/livekora-types";
 import type { SiiirAgentStatus } from "@/lib/siiir-types";
+import type { YallashootAgentStatus } from "@/lib/yallashoot-types";
 
 const R2_AGENT_BIND = String(process.env.LIVEKORA_R2_AGENT_BIND || "127.0.0.1").trim() || "127.0.0.1";
 const R2_AGENT_PORT = Number.parseInt(String(process.env.LIVEKORA_R2_AGENT_PORT || "3500"), 10) || 3500;
@@ -48,6 +49,7 @@ export async function readAllR2MirrorAgentStatuses(matchId: number) {
           livekora: LivekoraAgentStatus | null;
           beinlive: BeinliveAgentStatus | null;
           siiir: SiiirAgentStatus | null;
+          yallashoot: YallashootAgentStatus | null;
           updatedAt?: string;
         }
       | null;

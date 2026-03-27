@@ -64,6 +64,7 @@ function buildSnapshotDiff(previous, next) {
     { provider: "livekora", field: "stream_url_4" },
     { provider: "beinlive", field: "stream_url" },
     { provider: "siiir", field: "stream_url_2" },
+    { provider: "yallashoot", field: "stream_url_5" },
   ];
 
   for (const item of topLevelMap) {
@@ -73,7 +74,7 @@ function buildSnapshotDiff(previous, next) {
   }
 
   const providerStatusFields = ["state", "playlistUrl", "currentSource", "reason", "phase", "progressPct", "sourceUrl"];
-  for (const provider of ["livekora", "beinlive", "siiir"]) {
+  for (const provider of ["livekora", "beinlive", "siiir", "yallashoot"]) {
     const statusKey = `${provider}Status`;
     const changedFields = listChangedFields(previous?.[statusKey], next?.[statusKey], providerStatusFields);
     if (changedFields.length) {
@@ -338,12 +339,17 @@ export class MatchHub {
               updatedAt: payload?.updatedAt ? String(payload.updatedAt) : new Date().toISOString(),
               stream_url: payload?.stream_url ? String(payload.stream_url) : null,
               stream_url_2: payload?.stream_url_2 ? String(payload.stream_url_2) : null,
+              stream_url_5: payload?.stream_url_5 ? String(payload.stream_url_5) : null,
               stream_url_4: payload?.stream_url_4 ? String(payload.stream_url_4) : null,
               livekoraStatus:
                 payload?.livekoraStatus && typeof payload.livekoraStatus === "object" ? payload.livekoraStatus : null,
               beinliveStatus:
                 payload?.beinliveStatus && typeof payload.beinliveStatus === "object" ? payload.beinliveStatus : null,
               siiirStatus: payload?.siiirStatus && typeof payload.siiirStatus === "object" ? payload.siiirStatus : null,
+              yallashootStatus:
+                payload?.yallashootStatus && typeof payload.yallashootStatus === "object"
+                  ? payload.yallashootStatus
+                  : null,
             }
           : null;
       if (!normalizedSnapshot) {

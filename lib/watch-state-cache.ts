@@ -5,6 +5,7 @@ import { livekoraProvider } from "@/lib/live-providers";
 import { siiirProvider } from "@/lib/siiir-provider";
 import type { StreamProviderId } from "@/lib/stream-source-types";
 import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
+import { yallashootProvider } from "@/lib/yallashoot-provider";
 
 type SourceUrlMap = Record<StreamProviderId, string | null>;
 
@@ -23,11 +24,17 @@ function normalizeSourceUrl(value: string | null | undefined) {
   return String(value || "").trim() || null;
 }
 
-function sourceUrlMapFromResolved(input: { livekora: string | null; beinlive: string | null; siiir: string | null }): SourceUrlMap {
+function sourceUrlMapFromResolved(input: {
+  livekora: string | null;
+  beinlive: string | null;
+  siiir: string | null;
+  yallashoot: string | null;
+}): SourceUrlMap {
   return {
     livekora: normalizeSourceUrl(input.livekora),
     beinlive: normalizeSourceUrl(input.beinlive),
     siiir: normalizeSourceUrl(input.siiir),
+    yallashoot: normalizeSourceUrl(input.yallashoot),
   };
 }
 
@@ -44,6 +51,7 @@ export function seedHotWatchState(input: {
   livekoraSourceUrl?: string | null;
   beinliveSourceUrl?: string | null;
   siiirSourceUrl?: string | null;
+  yallashootSourceUrl?: string | null;
 }) {
   const now = Date.now();
   pruneExpiredSeeds(now);
@@ -52,6 +60,7 @@ export function seedHotWatchState(input: {
     livekora: input.livekoraSourceUrl ?? current?.sourceUrls.livekora ?? null,
     beinlive: input.beinliveSourceUrl ?? current?.sourceUrls.beinlive ?? null,
     siiir: input.siiirSourceUrl ?? current?.sourceUrls.siiir ?? null,
+    yallashoot: input.yallashootSourceUrl ?? current?.sourceUrls.yallashoot ?? null,
   });
   const next: HotWatchStateSeed = {
     matchId: input.matchId,
@@ -75,15 +84,17 @@ export function getHotWatchStateSeed(matchId: number) {
 }
 
 async function resolveSourceUrls(row: LivekoraMatchRow) {
-  const [livekoraSourceUrl, beinliveSourceUrl, siiirSourceUrl] = await Promise.all([
+  const [livekoraSourceUrl, beinliveSourceUrl, siiirSourceUrl, yallashootSourceUrl] = await Promise.all([
     resolveProviderSourceUrl(livekoraProvider, row),
     resolveProviderSourceUrl(beinliveProvider, row),
     resolveProviderSourceUrl(siiirProvider, row),
+    resolveProviderSourceUrl(yallashootProvider, row),
   ]);
   return sourceUrlMapFromResolved({
     livekora: livekoraSourceUrl,
     beinlive: beinliveSourceUrl,
     siiir: siiirSourceUrl,
+    yallashoot: yallashootSourceUrl,
   });
 }
 
@@ -97,6 +108,7 @@ export async function loadAndSeedHotWatchState(matchId: number) {
     livekoraSourceUrl: sourceUrls.livekora,
     beinliveSourceUrl: sourceUrls.beinlive,
     siiirSourceUrl: sourceUrls.siiir,
+    yallashootSourceUrl: sourceUrls.yallashoot,
   });
   return { seed, row: data, error: null };
 }

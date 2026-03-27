@@ -7,6 +7,7 @@ import { buildLivekoraStatus } from "@/lib/livekora-agent";
 import { protectClientStatus } from "@/lib/playback-session";
 import { readAllR2MirrorAgentStatuses } from "@/lib/r2-mirror-agent";
 import { buildSiiirStatus } from "@/lib/siiir-agent";
+import { buildYallashootStatus } from "@/lib/yallashoot-agent";
 import type { StreamProviderId, StreamSourceStatus } from "@/lib/stream-source-types";
 import { getOrLoadHotWatchStateSeed } from "@/lib/watch-state-cache";
 
@@ -16,10 +17,12 @@ export type HotWatchStatePayload = {
   matchId: number;
   stream_url?: string | null;
   stream_url_2?: string | null;
+  stream_url_5?: string | null;
   stream_url_4?: string | null;
   livekoraStatus?: StreamSourceStatus | null;
   beinliveStatus?: StreamSourceStatus | null;
   siiirStatus?: StreamSourceStatus | null;
+  yallashootStatus?: StreamSourceStatus | null;
   updatedAt?: string | null;
   version?: string | null;
 };
@@ -80,7 +83,7 @@ export async function buildWatchStateResponse(req: Request, matchId: number) {
 
   const agentStatuses = await readAllR2MirrorAgentStatuses(matchId);
   const safeRow = row || null;
-  const [livekoraStatus, beinliveStatus, siiirStatus] = await Promise.all([
+  const [livekoraStatus, beinliveStatus, siiirStatus, yallashootStatus] = await Promise.all([
     buildLivekoraStatus({
       matchId,
       row: safeRow,
@@ -99,9 +102,17 @@ export async function buildWatchStateResponse(req: Request, matchId: number) {
       sourceUrl: seed.sourceUrls.siiir,
       agentStatus: agentStatuses?.siiir || null,
     }),
+    buildYallashootStatus({
+      matchId,
+      row: safeRow,
+      sourceUrl: seed.sourceUrls.yallashoot,
+      agentStatus: agentStatuses?.yallashoot || null,
+    }),
   ]);
 
-  const statuses = [livekoraStatus, beinliveStatus, siiirStatus].sort((left, right) => left.order - right.order);
+  const statuses = [livekoraStatus, beinliveStatus, siiirStatus, yallashootStatus].sort(
+    (left, right) => left.order - right.order
+  );
   const updatedAt = latestUpdatedAt(statuses, seed.updatedAt);
   const version = buildWatchStateVersion(statuses, seed.sourceUrls);
   const etag = createWatchStateEtag(version);
@@ -113,15 +124,18 @@ export async function buildWatchStateResponse(req: Request, matchId: number) {
   const protectedLivekoraStatus = protectClientStatus(livekoraStatus);
   const protectedBeinliveStatus = protectClientStatus(beinliveStatus);
   const protectedSiiirStatus = protectClientStatus(siiirStatus);
+  const protectedYallashootStatus = protectClientStatus(yallashootStatus);
 
   const payload: HotWatchStatePayload = {
     matchId,
     stream_url: seed.sourceUrls.beinlive,
     stream_url_2: seed.sourceUrls.siiir,
+    stream_url_5: seed.sourceUrls.yallashoot,
     stream_url_4: seed.sourceUrls.livekora,
     livekoraStatus: protectedLivekoraStatus,
     beinliveStatus: protectedBeinliveStatus,
     siiirStatus: protectedSiiirStatus,
+    yallashootStatus: protectedYallashootStatus,
     updatedAt,
     version,
   };

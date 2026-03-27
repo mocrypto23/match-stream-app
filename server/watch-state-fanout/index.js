@@ -58,10 +58,12 @@ function compactWatchState(payload) {
     updatedAt: payload.updatedAt ? String(payload.updatedAt) : nowIso(),
     stream_url: payload.stream_url ? String(payload.stream_url) : null,
     stream_url_2: payload.stream_url_2 ? String(payload.stream_url_2) : null,
+    stream_url_5: payload.stream_url_5 ? String(payload.stream_url_5) : null,
     stream_url_4: payload.stream_url_4 ? String(payload.stream_url_4) : null,
     livekoraStatus: payload.livekoraStatus && typeof payload.livekoraStatus === "object" ? payload.livekoraStatus : null,
     beinliveStatus: payload.beinliveStatus && typeof payload.beinliveStatus === "object" ? payload.beinliveStatus : null,
     siiirStatus: payload.siiirStatus && typeof payload.siiirStatus === "object" ? payload.siiirStatus : null,
+    yallashootStatus: payload.yallashootStatus && typeof payload.yallashootStatus === "object" ? payload.yallashootStatus : null,
   };
 }
 
