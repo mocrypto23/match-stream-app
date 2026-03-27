@@ -45,7 +45,9 @@ type CachedDayPage = {
   matches: Array<{
     matchId: number;
     homeTeam: string;
+    homeTeamEn: string;
     awayTeam: string;
+    awayTeamEn: string;
     href: string;
   }>;
 };
@@ -114,6 +116,25 @@ function unorderedPairKey(home: unknown, away: unknown) {
   const right = normalizeTeamName(away);
   if (!left || !right) return "";
   return [left, right].sort().join("|");
+}
+
+function parseMatchSlugCandidates(rawUrl: unknown) {
+  const normalized = normalizeHttpUrl(String(rawUrl || "").trim());
+  if (!normalized) return [];
+  try {
+    const parsed = new URL(normalized);
+    const slugMatch = parsed.pathname.match(/\/matches\/([^/?#]+)/i);
+    const slug = String(slugMatch?.[1] || "").trim().toLowerCase();
+    if (!slug || !slug.includes("-vs-")) return [];
+    const [homeSlug, awaySlug] = slug.split("-vs-").map((part) => part.replace(/[^a-z0-9-]+/g, " ").trim());
+    if (!homeSlug || !awaySlug) return [];
+    return [
+      unorderedPairKey(homeSlug, awaySlug),
+      unorderedPairKey(homeSlug.replace(/-/g, " "), awaySlug.replace(/-/g, " ")),
+    ].filter(Boolean);
+  } catch {
+    return [];
+  }
 }
 
 function hostMatchesAnySuffix(host: string, suffixes: readonly string[]) {
@@ -319,13 +340,17 @@ async function fetchDayMatches(dayKey: string) {
         .map((item) => {
           const matchId = Number.parseInt(String(item?.id || "").trim(), 10);
           const homeTeam = String(item?.home || "").trim();
+          const homeTeamEn = String(item?.home_en || "").trim();
           const awayTeam = String(item?.away || "").trim();
+          const awayTeamEn = String(item?.away_en || "").trim();
           const hasChannels = String(item?.has_channels || "").trim() === "1";
           if (!Number.isFinite(matchId) || matchId <= 0 || !homeTeam || !awayTeam || !hasChannels) return null;
           return {
             matchId,
             homeTeam,
+            homeTeamEn,
             awayTeam,
+            awayTeamEn,
             href: buildArticleUrl(matchId),
           };
         })
@@ -701,10 +726,19 @@ export async function pickYallashootSourceUrl(row: MatchRowLike) {
   if (isAllowedYallashootSource(direct)) return direct;
 
   const pairKey = unorderedPairKey(row?.home_team, row?.away_team);
-  if (!pairKey) return null;
+  const slugKeys = parseMatchSlugCandidates(row?.stream_url);
+  if (!pairKey && !slugKeys.length) return null;
   const dayKey = String(row?.match_day || "").trim() || new Date().toISOString().slice(0, 10);
   const matches = await fetchDayMatches(dayKey).catch(() => [] as CachedDayPage["matches"]);
-  const found = matches.find((candidate) => unorderedPairKey(candidate.homeTeam, candidate.awayTeam) === pairKey);
+  const found = matches.find((candidate) => {
+    const candidateKeys = [
+      unorderedPairKey(candidate.homeTeam, candidate.awayTeam),
+      unorderedPairKey(candidate.homeTeamEn, candidate.awayTeamEn),
+    ].filter(Boolean);
+    if (pairKey && candidateKeys.includes(pairKey)) return true;
+    if (!slugKeys.length) return false;
+    return slugKeys.some((key) => candidateKeys.includes(key));
+  });
   return found?.href || null;
 }
 

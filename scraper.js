@@ -3348,6 +3348,25 @@ function buildYallashootArticleUrl(matchId) {
   return `${YALLASHOOT.redirectBase}?m=${encodeURIComponent(String(normalizedMatchId))}&lang=ar`;
 }
 
+function parseMatchSlugPairKeys(rawUrl) {
+  const normalized = normalizeUrl(rawUrl, rawUrl);
+  if (!normalized) return [];
+  try {
+    const parsed = new URL(normalized);
+    const slugMatch = parsed.pathname.match(/\/matches\/([^/?#]+)/i);
+    const slug = String(slugMatch?.[1] || "").trim().toLowerCase();
+    if (!slug || !slug.includes("-vs-")) return [];
+    const [homeSlug, awaySlug] = slug.split("-vs-").map((part) => part.replace(/[^a-z0-9-]+/g, " ").trim());
+    if (!homeSlug || !awaySlug) return [];
+    return [
+      keyOfTeams("slug", homeSlug, awaySlug).replace(/^slug\|\|/, ""),
+      keyOfTeams("slug", homeSlug.replace(/-/g, " "), awaySlug.replace(/-/g, " ")).replace(/^slug\|\|/, ""),
+    ].filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 function isServer5SourceLikeUrl(url) {
   const normalized = normalizeUrl(url, url);
   if (!normalized || isClearlyNonStreamUrl(normalized)) return false;
@@ -3390,7 +3409,9 @@ async function fetchYallashootDay(dayKey) {
     for (const item of matches) {
       const matchId = Number.parseInt(String(item?.id || "").trim(), 10);
       const homeTeam = normalizeSpaces(String(item?.home || "").trim());
+      const homeTeamEn = normalizeSpaces(String(item?.home_en || "").trim());
       const awayTeam = normalizeSpaces(String(item?.away || "").trim());
+      const awayTeamEn = normalizeSpaces(String(item?.away_en || "").trim());
       const hasChannels = String(item?.has_channels || "").trim() === "1";
       if (!Number.isFinite(matchId) || matchId <= 0 || !homeTeam || !awayTeam || !hasChannels) continue;
 
@@ -3402,7 +3423,9 @@ async function fetchYallashootDay(dayKey) {
       deduped.set(matchKey, {
         match_key: matchKey,
         home_team: homeTeam,
+        home_team_en: homeTeamEn,
         away_team: awayTeam,
+        away_team_en: awayTeamEn,
         match_day: matchDay,
         yallashoot_stream_url: streamUrl,
         yallashoot_match_id: matchId,
@@ -3415,8 +3438,10 @@ async function fetchYallashootDay(dayKey) {
   }
 }
 
-function findServer5FallbackUrl(rows, { matchDay, homeTeam, awayTeam, fieldName = "yallashoot_stream_url" } = {}) {
+function findServer5FallbackUrl(rows, { matchDay, homeTeam, awayTeam, matchUrl = "", fieldName = "yallashoot_stream_url" } = {}) {
   if (!Array.isArray(rows) || !rows.length || !matchDay || !homeTeam || !awayTeam) return null;
+
+  const slugPairKeys = parseMatchSlugPairKeys(matchUrl);
 
   let best = null;
   let bestScore = 0;
@@ -3430,7 +3455,19 @@ function findServer5FallbackUrl(rows, { matchDay, homeTeam, awayTeam, fieldName 
       teamSoftMatchScore(homeTeam, r.home_team) + teamSoftMatchScore(awayTeam, r.away_team);
     const swapped =
       teamSoftMatchScore(homeTeam, r.away_team) + teamSoftMatchScore(awayTeam, r.home_team);
-    const score = Math.max(direct, swapped);
+    const directEn =
+      teamSoftMatchScore(homeTeam, r.home_team_en) + teamSoftMatchScore(awayTeam, r.away_team_en);
+    const swappedEn =
+      teamSoftMatchScore(homeTeam, r.away_team_en) + teamSoftMatchScore(awayTeam, r.home_team_en);
+    let score = Math.max(direct, swapped, directEn, swappedEn);
+
+    if (slugPairKeys.length) {
+      const candidateSlugKeys = [
+        keyOfTeams("slug", r.home_team_en, r.away_team_en).replace(/^slug\|\|/, ""),
+        keyOfTeams("slug", r.home_team, r.away_team).replace(/^slug\|\|/, ""),
+      ].filter(Boolean);
+      if (slugPairKeys.some((key) => candidateSlugKeys.includes(key))) score += 4;
+    }
     if (score > bestScore) {
       bestScore = score;
       best = candidate;
@@ -6680,6 +6717,7 @@ async function startScraping() {
             matchDay: match_day,
             homeTeam: m.home_team,
             awayTeam: m.away_team,
+            matchUrl: m.match_url,
             fieldName: "yallashoot_stream_url",
           }) || null;
       }
