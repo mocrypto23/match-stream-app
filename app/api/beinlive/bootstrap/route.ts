@@ -39,6 +39,16 @@ export async function POST(req: Request) {
     row: null,
     sourceUrl,
   });
+  if (beinliveStatusBefore.reason === "missing-source") {
+    return NextResponse.json(
+      {
+        accepted: false,
+        reason: "missing-source",
+        beinliveStatus: protectClientStatus(beinliveStatusBefore),
+      },
+      { status: 409, headers: { "Cache-Control": "no-store" } }
+    );
+  }
   if (
     String(beinliveStatusBefore.sourceUrl || "").trim() === sourceUrl &&
     (beinliveStatusBefore.state === "ready" || beinliveStatusBefore.state === "warming")

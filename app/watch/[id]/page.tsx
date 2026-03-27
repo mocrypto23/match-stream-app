@@ -452,6 +452,10 @@ function getProviderSourceCandidate(
 }
 
 function providerHasMatch(payload: MatchPayload | null, statuses: StatusMap, provider: StreamProviderId) {
+  const status = statuses[provider];
+  if (status?.reason === "missing-source" && status.phase === "failed") {
+    return false;
+  }
   return !!getProviderSourceCandidate(payload, statuses, provider);
 }
 
