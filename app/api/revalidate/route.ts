@@ -11,6 +11,13 @@ type RevalidateBody = {
   paths?: string[];
 };
 
+type PrewarmResult = {
+  ok: boolean;
+  status?: number;
+  url?: string;
+  error?: string;
+};
+
 function getProvidedSecret(req: NextRequest) {
   const auth = req.headers.get("authorization");
   if (auth?.startsWith("Bearer ")) {
@@ -27,6 +34,60 @@ function normalizePaths(paths: unknown) {
   if (!valid.length) return ["/", "/watch/[id]"];
 
   return [...new Set(valid)];
+}
+
+function resolveRequestOrigin(req: NextRequest) {
+  const explicitOrigin =
+    (process.env.NEXT_PUBLIC_SITE_URL ?? "").trim() ||
+    (process.env.SITE_URL ?? "").trim();
+  if (explicitOrigin) {
+    return explicitOrigin.replace(/\/+$/, "");
+  }
+
+  const forwardedProto = (req.headers.get("x-forwarded-proto") ?? "").trim();
+  const forwardedHost = (req.headers.get("x-forwarded-host") ?? "").trim();
+  const host = forwardedHost || (req.headers.get("host") ?? "").trim();
+  if (host) {
+    const proto = forwardedProto || req.nextUrl.protocol.replace(/:$/, "") || "https";
+    return `${proto}://${host}`;
+  }
+
+  return req.nextUrl.origin.replace(/\/+$/, "");
+}
+
+async function prewarmHomeHtml(req: NextRequest): Promise<PrewarmResult> {
+  const url = `${resolveRequestOrigin(req)}/`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      cache: "no-store",
+      signal: controller.signal,
+      headers: {
+        "user-agent": "twofooty-revalidate-prewarm/1.0",
+        "x-twofooty-prewarm": "1",
+      },
+    });
+
+    await response.text();
+
+    return {
+      ok: response.ok,
+      status: response.status,
+      url,
+      error: response.ok ? undefined : `HTTP ${response.status}`,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      url,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -70,11 +131,17 @@ export async function POST(req: NextRequest) {
     } catch {}
   }
 
+  let prewarmedHome: PrewarmResult | null = null;
+  if (paths.includes("/")) {
+    prewarmedHome = await prewarmHomeHtml(req);
+  }
+
   return NextResponse.json({
     ok: true,
     revalidated: paths,
     revalidatedTags: ["matches-list"],
     prewarmedDays,
+    prewarmedHome,
     at: new Date().toISOString(),
   });
 }
