@@ -13,16 +13,6 @@ import {
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const MANIFEST_MICRO_CACHE_TTL_MS = 500;
-const MANIFEST_MICRO_CACHE_MAX_ENTRIES = 256;
-
-type ManifestMicroCacheEntry = {
-  body: string;
-  expiresAt: number;
-};
-
-const manifestMicroCache = new Map<string, ManifestMicroCacheEntry>();
-
 type Ctx = {
   params: Promise<{
     provider?: string;
@@ -38,44 +28,6 @@ function buildRawAssetUrl(manifestUrl: string, assetPath: string) {
   } catch {
     return null;
   }
-}
-
-function cleanupManifestMicroCache(now: number) {
-  for (const [key, entry] of manifestMicroCache.entries()) {
-    if (entry.expiresAt <= now) {
-      manifestMicroCache.delete(key);
-    }
-  }
-  if (manifestMicroCache.size <= MANIFEST_MICRO_CACHE_MAX_ENTRIES) return;
-  const staleKeys = Array.from(manifestMicroCache.keys()).slice(
-    0,
-    manifestMicroCache.size - MANIFEST_MICRO_CACHE_MAX_ENTRIES
-  );
-  for (const key of staleKeys) {
-    manifestMicroCache.delete(key);
-  }
-}
-
-function shouldMicroCacheManifest(assetPath: string) {
-  return String(assetPath || "").trim().toLowerCase() === "index.m3u8";
-}
-
-function readManifestMicroCache(key: string, now: number) {
-  const entry = manifestMicroCache.get(key);
-  if (!entry) return null;
-  if (entry.expiresAt <= now) {
-    manifestMicroCache.delete(key);
-    return null;
-  }
-  return entry.body;
-}
-
-function writeManifestMicroCache(key: string, body: string, now: number) {
-  cleanupManifestMicroCache(now);
-  manifestMicroCache.set(key, {
-    body,
-    expiresAt: now + MANIFEST_MICRO_CACHE_TTL_MS,
-  });
 }
 
 export async function GET(req: Request, ctx: Ctx) {
@@ -104,8 +56,6 @@ export async function GET(req: Request, ctx: Ctx) {
   }
 
   const assetPath = Array.isArray(asset) && asset.length ? asset.join("/") : "index.m3u8";
-  const now = Date.now();
-  const manifestCacheKey = `${provider}:${matchId}:${assetPath}`;
   observePlaybackGatewayRequest({
     req,
     provider,
@@ -138,19 +88,6 @@ export async function GET(req: Request, ctx: Ctx) {
     return NextResponse.json({ error: "invalid-manifest-asset" }, { status: 400 });
   }
 
-  const allowManifestMicroCache = shouldMicroCacheManifest(assetPath);
-  const cachedManifest = allowManifestMicroCache ? readManifestMicroCache(manifestCacheKey, now) : null;
-  if (allowManifestMicroCache && cachedManifest) {
-    return new NextResponse(cachedManifest, {
-      status: 200,
-      headers: {
-        "content-type": "application/vnd.apple.mpegurl; charset=utf-8",
-        "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
-        "x-tf-playback-gateway": "1",
-      },
-    });
-  }
-
   const response = await fetch(manifestUrl, {
     method: "GET",
     cache: "no-store",
@@ -167,9 +104,6 @@ export async function GET(req: Request, ctx: Ctx) {
 
   const manifestText = await response.text().catch(() => "");
   const rewritten = rewriteManifestForPlaybackGateway(manifestText, manifestUrl);
-  if (allowManifestMicroCache) {
-    writeManifestMicroCache(manifestCacheKey, rewritten, Date.now());
-  }
   const out = new NextResponse(rewritten, {
     status: 200,
     headers: {

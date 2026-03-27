@@ -2059,8 +2059,22 @@ export default function WatchPage() {
       nextHls.attachMedia(video);
     };
 
+    const shouldUseP2P = !src.startsWith("/play/");
+
     void (async () => {
       try {
+        if (!shouldUseP2P) {
+          const nextStats = {
+            ...EMPTY_P2P_STATS,
+            supported: true,
+            status: "P2P: معطلة مؤقتًا للاستقرار",
+          };
+          p2pStatsStoreRef.current[p2pStoreKey] = nextStats;
+          setP2pStats(nextStats);
+          attachHls(new Hls(hlsConfig));
+          return;
+        }
+
         const { HlsJsP2PEngine } = await loadP2PEngineModule();
         if (disposed) return;
 
