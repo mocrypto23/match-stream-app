@@ -697,12 +697,20 @@ export default function WatchPage() {
 
   const applyWatchState = useCallback((payload: WatchStatePayload | null | undefined) => {
     if (!payload) return;
-    setStatusByProvider({
-      livekora: payload.livekoraStatus || null,
-      beinlive: payload.beinliveStatus || null,
-      siiir: payload.siiirStatus || null,
-      yallashoot: payload.yallashootStatus || null,
-    });
+    setStatusByProvider((current) => ({
+      livekora: Object.prototype.hasOwnProperty.call(payload, "livekoraStatus")
+        ? payload.livekoraStatus || null
+        : current.livekora,
+      beinlive: Object.prototype.hasOwnProperty.call(payload, "beinliveStatus")
+        ? payload.beinliveStatus || null
+        : current.beinlive,
+      siiir: Object.prototype.hasOwnProperty.call(payload, "siiirStatus")
+        ? payload.siiirStatus || null
+        : current.siiir,
+      yallashoot: Object.prototype.hasOwnProperty.call(payload, "yallashootStatus")
+        ? payload.yallashootStatus || null
+        : current.yallashoot,
+    }));
     setMatch((current) => {
       if (!current) return current;
       const nextStreamUrl = payload.stream_url ?? current.stream_url ?? null;
