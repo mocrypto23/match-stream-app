@@ -1609,15 +1609,19 @@ export default function WatchPage() {
   }, [isBeforeStreamWindow]);
 
   useEffect(() => {
+    if (isBeforeStreamWindow) {
+      streamWindowOpenedRef.current = true;
+      return;
+    }
     if (!streamAutoOpenEnabled) {
       streamWindowOpenedRef.current = false;
       return;
     }
-    if (streamWindowOpenedRef.current) return;
-    streamWindowOpenedRef.current = true;
+    if (!streamWindowOpenedRef.current) return;
+    streamWindowOpenedRef.current = false;
     void loadMatch();
     void refreshAllStatuses();
-  }, [loadMatch, refreshAllStatuses, streamAutoOpenEnabled]);
+  }, [isBeforeStreamWindow, loadMatch, refreshAllStatuses, streamAutoOpenEnabled]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
