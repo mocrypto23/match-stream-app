@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { bootstrapLivekoraAgent, buildLivekoraStatus } from "@/lib/livekora-agent";
+import { getMatchStreamWindowFromSeed } from "@/lib/match-stream-window";
 import { runBootstrapSingleflight } from "@/lib/bootstrap-singleflight";
 import { buildLivekoraSessionManifestUrl, resolveInternalAppOrigin } from "@/lib/live-providers";
 import { protectClientStatus } from "@/lib/playback-session";
@@ -22,6 +23,19 @@ export async function POST(req: Request) {
   }
   if (!seed) {
     return NextResponse.json({ accepted: false, error: "match-not-found" }, { status: 404 });
+  }
+
+  const streamWindow = getMatchStreamWindowFromSeed(seed);
+  if (!streamWindow.canOpen) {
+    return NextResponse.json(
+      {
+        accepted: false,
+        reason: "scheduled-not-open",
+        opensAt: streamWindow.opensAtMs ? new Date(streamWindow.opensAtMs).toISOString() : null,
+        msUntilOpen: streamWindow.msUntilOpen,
+      },
+      { status: 409, headers: { "Cache-Control": "no-store" } },
+    );
   }
 
   const sourceUrl = String(seed.sourceUrls.livekora || "").trim() || null;

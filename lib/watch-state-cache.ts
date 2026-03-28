@@ -12,6 +12,8 @@ type SourceUrlMap = Record<StreamProviderId, string | null>;
 export type HotWatchStateSeed = {
   matchId: number;
   sourceUrls: SourceUrlMap;
+  matchStart: string | null;
+  statusKey: string | null;
   seededAt: number;
   updatedAt: string;
 };
@@ -52,6 +54,8 @@ export function seedHotWatchState(input: {
   beinliveSourceUrl?: string | null;
   siiirSourceUrl?: string | null;
   yallashootSourceUrl?: string | null;
+  matchStart?: string | null;
+  statusKey?: string | null;
 }) {
   const now = Date.now();
   pruneExpiredSeeds(now);
@@ -65,6 +69,8 @@ export function seedHotWatchState(input: {
   const next: HotWatchStateSeed = {
     matchId: input.matchId,
     sourceUrls,
+    matchStart: input.matchStart ?? current?.matchStart ?? null,
+    statusKey: input.statusKey ?? current?.statusKey ?? null,
     seededAt: now,
     updatedAt: new Date(now).toISOString(),
   };
@@ -109,6 +115,8 @@ export async function loadAndSeedHotWatchState(matchId: number) {
     beinliveSourceUrl: sourceUrls.beinlive,
     siiirSourceUrl: sourceUrls.siiir,
     yallashootSourceUrl: sourceUrls.yallashoot,
+    matchStart: data.match_start || null,
+    statusKey: data.status_key || null,
   });
   return { seed, row: data, error: null };
 }

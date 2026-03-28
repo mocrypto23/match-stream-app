@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { runBootstrapSingleflight } from "@/lib/bootstrap-singleflight";
 import { resolveInternalAppOrigin } from "@/lib/live-providers";
+import { getMatchStreamWindowFromSeed } from "@/lib/match-stream-window";
 import { protectClientStatus } from "@/lib/playback-session";
 import { buildSiiirStatus, bootstrapSiiirAgent } from "@/lib/siiir-agent";
 import { buildSiiirSessionManifestUrl, siiirProvider } from "@/lib/siiir-provider";
@@ -24,6 +25,19 @@ export async function POST(req: Request) {
   }
   if (!seed) {
     return NextResponse.json({ accepted: false, error: "match-not-found" }, { status: 404 });
+  }
+
+  const streamWindow = getMatchStreamWindowFromSeed(seed);
+  if (!streamWindow.canOpen) {
+    return NextResponse.json(
+      {
+        accepted: false,
+        reason: "scheduled-not-open",
+        opensAt: streamWindow.opensAtMs ? new Date(streamWindow.opensAtMs).toISOString() : null,
+        msUntilOpen: streamWindow.msUntilOpen,
+      },
+      { status: 409, headers: { "Cache-Control": "no-store" } },
+    );
   }
 
   const sourceUrl =

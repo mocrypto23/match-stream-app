@@ -5,6 +5,7 @@ import { useParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import VideoPlayerControls from "@/components/VideoPlayerControls";
+import { getMatchStreamWindow } from "@/lib/match-stream-window";
 import type { StreamProviderId, StreamSourcePhase, StreamSourceStatus } from "@/lib/stream-source-types";
 
 type MatchPayload = {
@@ -185,7 +186,7 @@ const EMPTY_P2P_STATS: P2PStats = {
   p2pDownloadedBytes: 0,
   uploadedBytes: 0,
   ratioPct: 0,
-  status: "P2P: غير مفعلة",
+  status: "P2P: ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€šÃ‚ÂÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â©",
 };
 let p2pEngineModulePromise: Promise<P2PEngineModule> | null = null;
 
@@ -305,9 +306,9 @@ function formatP2PBytes(bytes: number) {
 }
 
 function formatKickoff(value: string | null | undefined) {
-  if (!value) return "موعد المباراة غير متوفر";
+  if (!value) return "ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€šÃ‚ÂÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±";
   const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) return "موعد المباراة غير متوفر";
+  if (!Number.isFinite(date.getTime())) return "ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€šÃ‚ÂÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±";
   return new Intl.DateTimeFormat("ar-EG", {
     weekday: "short",
     hour: "numeric",
@@ -318,14 +319,31 @@ function formatKickoff(value: string | null | undefined) {
   }).format(date);
 }
 
-function stateLabel(status: StreamSourceStatus | null) {
-  if (!status) return "جاري التحميل";
-  if (status.state === "ready") return "البث جاهز";
-  if (String(status.sourceUrl || "").trim() && (status.state === "warming" || status.reason === "not-bootstrapped" || status.phase === "queued")) {
-    return "جاري تجهيز البث";
+function formatTimeUntilStreamOpen(ms: number) {
+  const safeMs = Math.max(0, Math.round(ms));
+  const totalMinutes = Math.ceil(safeMs / 60_000);
+  if (totalMinutes <= 1) return "ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â£ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â  ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â©";
+
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+
+  if (hours > 0 && minutes > 0) {
+    return `${hours} ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â³ ${minutes} ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯`;
   }
-  if (status.state === "warming") return "جاري تجهيز البث";
-  return "البث غير جاهز";
+  if (hours > 0) {
+    return `${hours} ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â³`;
+  }
+  return `${minutes} ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯`;
+}
+
+function stateLabel(status: StreamSourceStatus | null) {
+  if (!status) return "ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â  ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾";
+  if (status.state === "ready") return "ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â« ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â²";
+  if (String(status.sourceUrl || "").trim() && (status.state === "warming" || status.reason === "not-bootstrapped" || status.phase === "queued")) {
+    return "ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â  ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â² ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«";
+  }
+  if (status.state === "warming") return "ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â  ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â² ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«";
+  return "ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â« ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â²";
 }
 
 function stateTone(status: StreamSourceStatus | null) {
@@ -483,6 +501,7 @@ export default function WatchPage() {
   const [selectedProvider, setSelectedProvider] = useState<StreamProviderId>("livekora");
   const [pageError, setPageError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [streamClockMs, setStreamClockMs] = useState(() => Date.now());
   const [isPageHidden, setIsPageHidden] = useState(false);
   const [watchEventsConnected, setWatchEventsConnected] = useState(false);
   const [watchEdgePrimaryConnected, setWatchEdgePrimaryConnected] = useState(false);
@@ -581,6 +600,7 @@ export default function WatchPage() {
     scheduleEnable: () => {},
   });
   const adImpressionClaimedRef = useRef(false);
+  const streamWindowOpenedRef = useRef(false);
 
   const sources = useMemo(
     () =>
@@ -607,6 +627,17 @@ export default function WatchPage() {
   const activeProvider = activeStatus?.provider || selectedProvider;
   const activeProgressPct = progressPct(activeStatus);
   const activePhaseLabel = phaseLabel(activeStatus);
+  const streamOpenWindow = useMemo(
+    () => getMatchStreamWindow(match?.match_start, match?.status_key, streamClockMs),
+    [match?.match_start, match?.status_key, streamClockMs]
+  );
+  const streamAutoOpenEnabled = streamOpenWindow.canOpen;
+  const streamPreOpenMessage = useMemo(() => {
+    if (streamAutoOpenEnabled || !streamOpenWindow.hasKnownKickoff) return "";
+    const remaining = formatTimeUntilStreamOpen(streamOpenWindow.msUntilOpen);
+    return `\u0639\u0632\u064a\u0632\u064a \u0627\u0644\u0645\u0634\u0627\u0647\u062f\u060c \u0633\u064a\u062a\u0645 \u0641\u062a\u062d \u0627\u0644\u0628\u062b \u0642\u0628\u0644 \u0627\u0644\u0645\u0628\u0627\u0631\u0627\u0629 \u0628\u0646\u0635\u0641 \u0633\u0627\u0639\u0629. \u064a\u0628\u062f\u0623 \u062a\u062c\u0647\u064a\u0632 \u0627\u0644\u0645\u0635\u0627\u062f\u0631 \u062a\u0644\u0642\u0627\u0626\u064a\u064b\u0627 \u0628\u0639\u062f ${remaining}.`;
+  }, [streamAutoOpenEnabled, streamOpenWindow.hasKnownKickoff, streamOpenWindow.msUntilOpen]);
+  const isBeforeStreamWindow = !streamAutoOpenEnabled && streamOpenWindow.hasKnownKickoff;
   const fallbackPlaylistUrl = useMemo(() => {
     if (activeProvider === "livekora") {
       const fallback = String(match?.livekoraPlaylistUrl || "").trim();
@@ -664,7 +695,7 @@ export default function WatchPage() {
   const p2pStatusLine = useMemo(() => {
     if (!p2pStats.enabled) return p2pStats.status;
     const base = `P2P: ${p2pStats.ratioPct}% | Saved: ${formatP2PBytes(p2pStats.p2pDownloadedBytes)} | Uploaded: ${formatP2PBytes(p2pStats.uploadedBytes)} | Peers: ${p2pStats.peers}`;
-    if (p2pStats.peers > 0 || p2pStats.status === "P2P: متصلة") return base;
+    if (p2pStats.peers > 0 || p2pStats.status === "P2P: ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂµÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â©") return base;
     return `${base} | ${p2pStats.status.replace(/^P2P:\s*/, "")}`;
   }, [p2pStats]);
 
@@ -755,7 +786,7 @@ export default function WatchPage() {
 
   const loadMatch = useCallback(async () => {
     if (!Number.isFinite(matchId) || matchId <= 0) {
-      setPageError("رقم المباراة غير صالح.");
+      setPageError("ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂµÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­.");
       setLoading(false);
       return;
     }
@@ -776,7 +807,7 @@ export default function WatchPage() {
         return pickInitialProvider(payload);
       });
     } catch (error) {
-      setPageError(error instanceof Error ? error.message : "تعذر تحميل المباراة.");
+      setPageError(error instanceof Error ? error.message : "ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â°ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â©.");
     } finally {
       setLoading(false);
     }
@@ -1305,6 +1336,7 @@ export default function WatchPage() {
   const bootstrapProvider = useCallback(
     async (provider: StreamProviderId, opts?: { silent?: boolean }) => {
       if (!Number.isFinite(matchId) || matchId <= 0) return;
+      if (!streamAutoOpenEnabled) return;
       setPendingBootstraps((current) => ({
         ...current,
         [provider]: (current[provider] || 0) + 1,
@@ -1331,7 +1363,7 @@ export default function WatchPage() {
         if (provider === "beinlive") applyProviderStatus(provider, payload?.beinliveStatus);
         if (provider === "siiir") applyProviderStatus(provider, payload?.siiirStatus);
         if (provider === "yallashoot") applyProviderStatus(provider, payload?.yallashootStatus);
-        if (!response.ok && !opts?.silent) {
+        if (!response.ok && !opts?.silent && payload?.reason !== "scheduled-not-open") {
           setPageError(String(payload?.reason || payload?.error || "bootstrap-failed"));
         }
       } catch (error) {
@@ -1345,11 +1377,16 @@ export default function WatchPage() {
         }));
       }
     },
-    [applyProviderStatus, matchId]
+    [applyProviderStatus, matchId, streamAutoOpenEnabled]
   );
 
   const requestPlaybackStart = useCallback(async () => {
     setPageError(null);
+    if (!streamAutoOpenEnabled) {
+      setPlaybackRequested(false);
+      setPlaybackStarting(false);
+      return;
+    }
     setPlaybackStarting(true);
     if (!String(streamUrl || "").trim()) {
       setPlaybackRequested(true);
@@ -1363,7 +1400,7 @@ export default function WatchPage() {
       return;
     }
     setPlaybackRequested(true);
-  }, [activeProvider, bootstrapProvider, ensurePlaybackSession, refreshProviderStatus, streamUrl]);
+  }, [activeProvider, bootstrapProvider, ensurePlaybackSession, refreshProviderStatus, streamAutoOpenEnabled, streamUrl]);
 
   const clearWaitingOverlayTimer = useCallback(() => {
     if (waitingOverlayTimerRef.current !== null) {
@@ -1408,6 +1445,30 @@ export default function WatchPage() {
   useEffect(() => {
     void loadMatch();
   }, [loadMatch]);
+
+  useEffect(() => {
+    if (streamAutoOpenEnabled || !streamOpenWindow.hasKnownKickoff) return;
+    const id = window.setInterval(() => {
+      setStreamClockMs(Date.now());
+    }, 1_000);
+    return () => window.clearInterval(id);
+  }, [streamAutoOpenEnabled, streamOpenWindow.hasKnownKickoff]);
+
+  useEffect(() => {
+    if (!match) return;
+    setStreamClockMs(Date.now());
+  }, [match?.match_start, match?.status_key, match?.id]);
+
+  useEffect(() => {
+    if (!streamAutoOpenEnabled) {
+      streamWindowOpenedRef.current = false;
+      return;
+    }
+    if (streamWindowOpenedRef.current) return;
+    streamWindowOpenedRef.current = true;
+    void loadMatch();
+    void refreshAllStatuses();
+  }, [loadMatch, refreshAllStatuses, streamAutoOpenEnabled]);
 
   useEffect(() => {
     resetPlaybackState({ clearError: false });
@@ -1569,12 +1630,14 @@ export default function WatchPage() {
 
   useEffect(() => {
     if (!matchId || Number.isNaN(matchId)) return;
+    if (!streamAutoOpenEnabled) return;
     if (!providerSourceUrl) return;
     void bootstrapProvider(activeProvider, { silent: true });
-  }, [activeProvider, bootstrapProvider, matchId, providerSourceUrl]);
+  }, [activeProvider, bootstrapProvider, matchId, providerSourceUrl, streamAutoOpenEnabled]);
 
   useEffect(() => {
     if (!matchId || Number.isNaN(matchId)) return;
+    if (!streamAutoOpenEnabled) return;
 
     let cancelled = false;
     void (async () => {
@@ -1608,10 +1671,11 @@ export default function WatchPage() {
     return () => {
       cancelled = true;
     };
-  }, [activeProvider, bootstrapProvider, matchId, pendingBootstraps, providerHasMatchById, statusByProvider]);
+  }, [activeProvider, bootstrapProvider, matchId, pendingBootstraps, providerHasMatchById, statusByProvider, streamAutoOpenEnabled]);
 
   useEffect(() => {
     if (!matchId || Number.isNaN(matchId)) return;
+    if (!streamAutoOpenEnabled) return;
     if (!providerSourceUrl) return;
     if (activeStatus?.reason !== "not-bootstrapped") return;
     if ((pendingBootstraps[activeProvider] || 0) > 0) return;
@@ -1629,19 +1693,22 @@ export default function WatchPage() {
     matchId,
     pendingBootstraps,
     providerSourceUrl,
+    streamAutoOpenEnabled,
   ]);
 
   useEffect(() => {
     if (!matchId || Number.isNaN(matchId)) return;
+    if (!streamAutoOpenEnabled) return;
     const pollMs = liveUpdatesConnected ? (isPageHidden ? 90_000 : 60_000) : isPageHidden ? HIDDEN_STATUS_POLL_MS : STATUS_POLL_MS;
     const id = window.setInterval(() => {
       void refreshAllStatuses();
     }, pollMs);
     return () => window.clearInterval(id);
-  }, [isPageHidden, liveUpdatesConnected, matchId, refreshAllStatuses]);
+  }, [isPageHidden, liveUpdatesConnected, matchId, refreshAllStatuses, streamAutoOpenEnabled]);
 
   useEffect(() => {
     if (!matchId || Number.isNaN(matchId)) return;
+    if (!streamAutoOpenEnabled) return;
     if (!providerSourceUrl) return;
     if (!playbackRequested && activeStatus?.state !== "warming") return;
     if (activeStatus?.state === "ready") return;
@@ -1656,7 +1723,7 @@ export default function WatchPage() {
       void refreshProviderStatus(activeProvider);
     }, pollMs);
     return () => window.clearInterval(id);
-  }, [activeProvider, activeStatus?.state, isPageHidden, liveUpdatesConnected, matchId, playbackRequested, providerSourceUrl, refreshProviderStatus]);
+  }, [activeProvider, activeStatus?.state, isPageHidden, liveUpdatesConnected, matchId, playbackRequested, providerSourceUrl, refreshProviderStatus, streamAutoOpenEnabled]);
 
   useEffect(() => {
     if (!playbackRequested) {
@@ -1992,7 +2059,7 @@ export default function WatchPage() {
       if (video.canPlayType("application/vnd.apple.mpegurl")) {
         setP2pStats({
           ...EMPTY_P2P_STATS,
-          status: "P2P: غير مدعومة على هذا المتصفح",
+          status: "P2P: ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â° ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â°ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂµÃƒÆ’Ã¢â€žÂ¢Ãƒâ€šÃ‚ÂÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­",
         });
         video.src = src;
         video.addEventListener("playing", onPlaying);
@@ -2008,7 +2075,7 @@ export default function WatchPage() {
         };
       }
       setPlaybackStarting(false);
-      setPageError("المتصفح لا يدعم HLS.");
+      setPageError("ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂµÃƒÆ’Ã¢â€žÂ¢Ãƒâ€šÃ‚ÂÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ HLS.");
       return;
     }
 
@@ -2032,7 +2099,7 @@ export default function WatchPage() {
           p2pDownloadedBytes: 0,
           uploadedBytes: 0,
           ratioPct: 0,
-          status: "P2P: انتظار استقرار التشغيل",
+          status: "P2P: ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â³ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â´ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾",
         };
     const clearP2PEnableTimer = () => {
       if (p2pEnableTimer !== null) {
@@ -2061,19 +2128,19 @@ export default function WatchPage() {
     const updateP2PModeStatus = (fallbackReason?: string) => {
       if (disposed || !p2pSnapshot.supported) return;
       if (p2pControlRef.current.enabled) {
-        p2pSnapshot.status = p2pSnapshot.peers > 0 ? "P2P: متصلة" : "P2P: جاري البحث عن peers";
+        p2pSnapshot.status = p2pSnapshot.peers > 0 ? "P2P: ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂµÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â©" : "P2P: ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â  ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â« ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â  peers";
         return;
       }
       if (fallbackReason) {
         p2pSnapshot.status = fallbackReason;
         return;
       }
-      p2pSnapshot.status = "P2P: انتظار استقرار التشغيل";
+      p2pSnapshot.status = "P2P: ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â³ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â´ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾";
     };
     const syncP2PModeStatus = (fallbackReason?: string) => {
       if (disposed || !p2pSnapshot.supported) return;
       if (p2pControlRef.current.enabled) {
-        p2pSnapshot.status = p2pSnapshot.peers > 0 ? "P2P: متصلة" : "P2P: HTTP-first / جاري البحث عن peers";
+        p2pSnapshot.status = p2pSnapshot.peers > 0 ? "P2P: ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂµÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â©" : "P2P: HTTP-first / ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â  ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â« ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â  peers";
         return;
       }
       if (fallbackReason) {
@@ -2081,10 +2148,10 @@ export default function WatchPage() {
         return;
       }
       if (Date.now() < p2pControlRef.current.cooldownUntil) {
-        p2pSnapshot.status = "P2P: تهدئة مؤقتة بعد تقطيع";
+        p2pSnapshot.status = "P2P: ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¤ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â·ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹";
         return;
       }
-      p2pSnapshot.status = "P2P: مؤجلة حتى يثبت البث";
+      p2pSnapshot.status = "P2P: ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¤ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â° ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Âª ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«";
     };
     const updateP2PStats = () => {
       if (disposed) return;
@@ -2236,7 +2303,7 @@ export default function WatchPage() {
           const nextStats = {
             ...EMPTY_P2P_STATS,
             supported: true,
-            status: "P2P: معطلة مؤقتًا للاستقرار",
+            status: "P2P: ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â·ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¤ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â³ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±",
           };
           p2pStatsStoreRef.current[p2pStoreKey] = nextStats;
           setP2pStats(nextStats);
@@ -2327,7 +2394,7 @@ export default function WatchPage() {
         if (disposed) return;
         setP2pStats({
           ...EMPTY_P2P_STATS,
-          status: "P2P: فشل التهيئة",
+          status: "P2P: ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€šÃ‚ÂÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â´ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â©",
         });
         console.error("P2P init failed", error);
         attachHls(new Hls(hlsConfig));
@@ -2371,8 +2438,8 @@ export default function WatchPage() {
     return (
       <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6">
         <div className="text-center">
-          <div className="text-xl font-bold">جاري تحميل المباراة</div>
-          <div className="text-sm text-slate-300 mt-2">يتم تجهيز المصادر المتاحة الآن.</div>
+          <div className="text-xl font-bold">ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â  ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â©</div>
+          <div className="text-sm text-slate-300 mt-2">ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â² ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂµÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â .</div>
         </div>
       </main>
     );
@@ -2382,18 +2449,27 @@ export default function WatchPage() {
     return (
       <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6">
         <div className="text-center max-w-xl">
-          <div className="text-xl font-bold">تعذر فتح المباراة</div>
-          <div className="text-sm text-slate-300 mt-2">{pageError || "لم يتم العثور على بيانات المباراة."}</div>
+          <div className="text-xl font-bold">ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â°ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€šÃ‚ÂÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â©</div>
+          <div className="text-sm text-slate-300 mt-2">{pageError || "ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â° ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Âª ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â©."}</div>
         </div>
       </main>
     );
   }
 
-  const title = [match.home_team || "الفريق الأول", match.away_team || "الفريق الثاني"].join(" × ");
+  const title = [match.home_team || "ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€šÃ‚ÂÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â£ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾", match.away_team || "ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€šÃ‚ÂÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â "].join(" ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â ");
   const isBootstrapPending = (pendingBootstraps[activeProvider] || 0) > 0;
-  const showPreparationProgress = !streamUrl && !!providerSourceUrl && (activePreparationActive || activeDisplayProgressPct > 0);
+  const showPreparationProgress =
+    !isBeforeStreamWindow && !streamUrl && !!providerSourceUrl && (activePreparationActive || activeDisplayProgressPct > 0);
   const startupProgressPct = streamUrl && activeStatus?.state === "ready" ? 100 : activeDisplayProgressPct;
-  const startupProgressLabel = streamUrl && activeStatus?.state === "ready" ? "تم تجهيز الرابط" : activePhaseLabel;
+  const startupProgressLabel = streamUrl && activeStatus?.state === "ready" ? "ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â² ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â·" : activePhaseLabel;
+  const activeStateDisplayLabel = isBeforeStreamWindow ? "\u0641\u064a \u0627\u0646\u062a\u0638\u0627\u0631 \u0641\u062a\u062d \u0627\u0644\u0628\u062b" : stateLabel(activeStatus);
+  const activeStateDisplayTone = isBeforeStreamWindow ? "bg-sky-600" : stateTone(activeStatus);
+  const activePhaseDisplayLabel = isBeforeStreamWindow ? "\u0633\u064a\u0628\u062f\u0623 \u062a\u062c\u0647\u064a\u0632 \u0627\u0644\u0645\u0635\u0627\u062f\u0631 \u062a\u0644\u0642\u0627\u0626\u064a\u064b\u0627" : activePhaseLabel;
+  const activeReasonDisplay = isBeforeStreamWindow ? streamPreOpenMessage : activeStatus?.reason || pageError || "n/a";
+  const activePlaybackUrlDisplay = isBeforeStreamWindow ? "\u0633\u064a\u062a\u0648\u0641\u0631 \u0631\u0627\u0628\u0637 \u0627\u0644\u0628\u062b \u0642\u0628\u0644 \u0627\u0644\u0645\u0628\u0627\u0631\u0627\u0629 \u0628\u0646\u0635\u0641 \u0633\u0627\u0639\u0629" : playerStreamUrl || streamUrl || "\u063a\u064a\u0631 \u0645\u062a\u0627\u062d \u0628\u0639\u062f";
+  const activeCurrentSourceDisplay = isBeforeStreamWindow
+    ? "\u0633\u064a\u062a\u0645 \u062a\u062d\u062f\u064a\u062f \u0627\u0644\u0631\u0627\u0628\u0637 \u062a\u0644\u0642\u0627\u0626\u064a\u064b\u0627 \u0639\u0646\u062f \u0628\u062f\u0621 \u0627\u0644\u062a\u062c\u0647\u064a\u0632"
+    : activeStatus?.currentSource || directSourceUrl || "\u063a\u064a\u0631 \u0645\u062a\u0627\u062d";
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(15,118,110,0.28),_transparent_35%),linear-gradient(180deg,_#020617_0%,_#07111f_55%,_#020617_100%)] text-white">
@@ -2431,37 +2507,48 @@ export default function WatchPage() {
 
               {streamUrl && !playbackRequested ? (
                 <div className="absolute inset-0 z-[60] flex flex-col items-center justify-center gap-4 bg-black/80 px-6 text-center">
-                  <div className="text-3xl font-bold text-white">اضغط لبدء البث</div>
+                  <div className="text-3xl font-bold text-white">ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¶ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂºÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â· ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¡ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«</div>
                   <button
                     type="button"
                     onClick={requestPlaybackStart}
                     className="rounded-2xl bg-teal-500 px-6 py-3 text-base font-bold text-slate-950 transition hover:bg-teal-400"
                   >
-                    اضغط لبدء البث
+                    ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¶ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂºÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â· ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¡ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«
                   </button>
                 </div>
               ) : null}
 
               {!streamUrl ? (
                 <div className="absolute inset-0 z-[55] flex flex-col items-center justify-center gap-3 bg-black/70 px-6 text-center">
-                  {showPreparationProgress ? (
+                  {isBeforeStreamWindow ? (
+                    <div className="w-full max-w-2xl rounded-3xl border border-sky-400/20 bg-slate-950/70 px-5 py-6 shadow-2xl shadow-black/30">
+                      <div className="text-xs font-semibold tracking-[0.2em] text-sky-300/80">STREAM WINDOW</div>
+                      <div className="mt-3 text-2xl font-bold text-white sm:text-3xl">{"\u0633\u064a\u0641\u062a\u062d \u0627\u0644\u0628\u062b \u0642\u0628\u0644 \u0627\u0644\u0645\u0628\u0627\u0631\u0627\u0629 \u0628\u0646\u0635\u0641 \u0633\u0627\u0639\u0629"}</div>
+                      <div className="mt-3 text-sm leading-7 text-slate-200 sm:text-base">{streamPreOpenMessage}</div>
+                      <div className="mt-5 inline-flex rounded-full border border-sky-300/20 bg-sky-400/10 px-4 py-2 text-sm font-semibold text-sky-200">
+                        {streamOpenWindow.msUntilOpen > 0
+                          ? `\u0627\u0644\u0648\u0642\u062a \u0627\u0644\u0645\u062a\u0628\u0642\u064a: ${formatTimeUntilStreamOpen(streamOpenWindow.msUntilOpen)}`
+                          : "\u0633\u064a\u0628\u062f\u0623 \u062a\u062c\u0647\u064a\u0632 \u0627\u0644\u0628\u062b \u062a\u0644\u0642\u0627\u0626\u064a\u064b\u0627 \u0627\u0644\u0622\u0646"}
+                      </div>
+                    </div>
+                  ) : showPreparationProgress ? (
                     <div className="w-full max-w-md">
                       <div className="flex items-center justify-between text-xs text-slate-300">
-                        <span>{activePhaseLabel}</span>
+                        <span>{activePhaseDisplayLabel}</span>
                         <span>{activeDisplayProgressPct}%</span>
                       </div>
                       <div className="mt-2 h-2.5 overflow-hidden rounded-full bg-white/10">
                         <div
                           className={`h-full rounded-full transition-[width] duration-500 ${progressTone(activeStatus)}`}
-                          style={{ width: `${activeDisplayProgressPct}%` }}
+                      style={{ width: `${isBeforeStreamWindow ? 0 : activeDisplayProgressPct}%` }}
                         />
                       </div>
                     </div>
                   ) : (
                     <>
-                      <div className="text-2xl font-bold">{stateLabel(activeStatus)}</div>
+                      <div className="text-2xl font-bold">{activeStateDisplayLabel}</div>
                       <div className="text-sm text-slate-300">
-                        {activeStatus?.reason || pageError || "waiting-for-playlist"}
+                        {activeReasonDisplay}
                       </div>
                     </>
                   )}
@@ -2471,10 +2558,10 @@ export default function WatchPage() {
               {playbackRequested && playbackStarting && (hasPlayedRef.current || !!streamUrl) ? (
                 <div className="pointer-events-none absolute inset-0 z-[56] flex flex-col items-center justify-center gap-3 bg-black/35 px-6 text-center">
                   <div className="text-2xl font-bold text-white">
-                    {hasPlayedRef.current ? "جاري استعادة البث" : "جاري بدء البث"}
+                    {hasPlayedRef.current ? "ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â  ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â³ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«" : "ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â  ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¡ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«"}
                   </div>
                   <div className="text-sm text-slate-200">
-                    {hasPlayedRef.current ? "قد يتأخر لثوانٍ بسيطة ثم يكمل." : "انتظر لحظة حتى يبدأ البث."}
+                    {hasPlayedRef.current ? "ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â£ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â®ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€šÃ‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â³ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â·ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾." : "ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¸ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â° ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â£ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«."}
                   </div>
                   {!hasPlayedRef.current ? (
                     <div className="w-full max-w-sm">
@@ -2508,12 +2595,12 @@ export default function WatchPage() {
               <div className="rounded-3xl border border-emerald-400/20 bg-[linear-gradient(135deg,rgba(16,185,129,0.08),rgba(15,23,42,0.68))] p-3 sm:p-4 backdrop-blur">
                 <div className="rounded-2xl border border-white/10 bg-black/15 px-3 py-3 text-center shadow-inner shadow-black/10 sm:px-4">
                   <div className="text-sm font-semibold leading-7 text-slate-100 lg:text-[15px]">
-                    موقعنا <span className="font-black text-emerald-300">مجاني تماماً</span> وبدون إعلانات مزعجة أثناء البث..
-                    استمرارنا يعتمد على دعمك بتصفح{" "}
+                    ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ <span className="font-black text-emerald-300">ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â  ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹</span> ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â  ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¥ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Âª ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â²ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â£ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¡ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«..
+                    ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â³ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â° ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€ Ã¢â‚¬â„¢ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂµÃƒÆ’Ã¢â€žÂ¢Ãƒâ€šÃ‚ÂÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­{" "}
                     <span className="rounded-full border border-emerald-300/25 bg-emerald-400/10 px-2 py-1 text-emerald-200">
-                      الإعلان الوحيد
+                      ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¥ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â  ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯
                     </span>{" "}
-                    <span className="text-slate-300">(إذا كنت مهتماً به)</span> ويحفزنا على التطوير لضمان أفضل جودة لك.
+                    <span className="text-slate-300">(ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¥ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â°ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Âª ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡)</span> ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€šÃ‚ÂÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â²ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â° ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â·ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¶ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â  ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â£ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€šÃ‚ÂÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¶ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€ Ã¢â‚¬â„¢.
                   </div>
                 </div>
                 <div className="mt-3">
@@ -2532,7 +2619,7 @@ export default function WatchPage() {
                 ) : (
                   <div className="h-14 w-14 rounded-full bg-white/10" />
                 )}
-                <div className="flex-1 text-center text-xl font-bold">{match.home_team || "الفريق الأول"}</div>
+                <div className="flex-1 text-center text-xl font-bold">{match.home_team || "ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€šÃ‚ÂÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â£ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¹Ã¢â‚¬Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾"}</div>
                 {match.away_logo ? (
                   // eslint-disable-next-line @next/next/no-img-element
                   <img src={match.away_logo} alt={match.away_team || "away"} className="h-14 w-14 rounded-full bg-white/90 object-contain p-1" />
@@ -2540,17 +2627,37 @@ export default function WatchPage() {
                   <div className="h-14 w-14 rounded-full bg-white/10" />
                 )}
               </div>
-              <div className="mt-3 text-center text-lg font-semibold text-teal-200">{match.away_team || "الفريق الثاني"}</div>
+              <div className="mt-3 text-center text-lg font-semibold text-teal-200">{match.away_team || "ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€šÃ‚ÂÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â "}</div>
               <div className="mt-4 text-sm text-slate-300">{formatKickoff(match.match_start)}</div>
             </div>
 
             <div className="order-1 rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur lg:order-2">
-              <div className="text-sm font-medium text-slate-300">المصادر</div>
+              <div className="text-sm font-medium text-slate-300">ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂµÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±</div>
               <div className="mt-4 grid grid-cols-2 gap-3">
                 {PROVIDER_META.map((item) => {
                   const status = statusByProvider[item.provider];
                   const providerUnavailable = !providerHasMatchById[item.provider];
                   const isActive = activeProvider === item.provider;
+                  const cardDisplayLabel = providerUnavailable
+                    ? "\u0627\u0644\u0645\u0635\u062f\u0631 \u0644\u0627 \u064a\u0639\u0631\u0636 \u0627\u0644\u0645\u0628\u0627\u0631\u0627\u0629"
+                    : isBeforeStreamWindow
+                      ? "\u0633\u064a\u0641\u062a\u062d \u0642\u0628\u0644 \u0627\u0644\u0645\u0628\u0627\u0631\u0627\u0629"
+                      : stateLabel(status);
+                  const cardDisplayPhase = providerUnavailable
+                    ? "\u0627\u0644\u0645\u0635\u062f\u0631 \u0644\u0627 \u064a\u0639\u0631\u0636 \u0627\u0644\u0645\u0628\u0627\u0631\u0627\u0629"
+                    : isBeforeStreamWindow
+                      ? "\u0633\u064a\u0628\u062f\u0623 \u0627\u0644\u062a\u062c\u0647\u064a\u0632 \u062a\u0644\u0642\u0627\u0626\u064a\u064b\u0627"
+                      : status?.state === "warming"
+                        ? phaseLabel(status)
+                        : stateLabel(status);
+                  const cardDisplayProgress = providerUnavailable
+                    ? 0
+                    : isBeforeStreamWindow
+                      ? 0
+                      : status?.state === "ready"
+                        ? 100
+                        : Math.round(displayProgressByProvider[item.provider] ?? progressPct(status));
+                  const cardProgressTone = providerUnavailable ? "bg-rose-500" : isBeforeStreamWindow ? "bg-sky-500" : progressTone(status);
                   return (
                     <button
                       key={item.provider}
@@ -2573,34 +2680,22 @@ export default function WatchPage() {
                       }`}
                       disabled={providerUnavailable}
                     >
-                      <div className="text-xs text-slate-400">مصدر {item.order}</div>
+                      <div className="text-xs text-slate-400">{"\u0645\u0635\u062f\u0631"} {item.order}</div>
                       <div className="mt-1 font-semibold text-white">{status?.label || item.label}</div>
                       <div className={`mt-2 text-xs ${providerUnavailable ? "text-rose-200" : "text-slate-300"}`}>
-                        {providerUnavailable ? "المصدر لا يعرض المباراة" : stateLabel(status)}
+                        {cardDisplayLabel}
                       </div>
-                      {status || providerUnavailable ? (
+                      {status || providerUnavailable || isBeforeStreamWindow ? (
                         <div className="mt-3">
                           <div className="flex items-center justify-between text-[11px] text-slate-400">
-                            <span>
-                              {providerUnavailable
-                                ? "المصدر لا يعرض المباراة"
-                                : status?.state === "warming"
-                                  ? phaseLabel(status)
-                                  : stateLabel(status)}
-                            </span>
-                            <span>
-                              {providerUnavailable
-                                ? "0%"
-                                : `${status?.state === "ready" ? 100 : Math.round(displayProgressByProvider[item.provider] ?? progressPct(status))}%`}
-                            </span>
+                            <span>{cardDisplayPhase}</span>
+                            <span>{`${cardDisplayProgress}%`}</span>
                           </div>
                           <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-white/8">
                             <div
-                              className={`h-full rounded-full transition-[width] duration-500 ${
-                                providerUnavailable ? "bg-rose-500" : progressTone(status)
-                              }`}
+                              className={`h-full rounded-full transition-[width] duration-500 ${cardProgressTone}`}
                               style={{
-                                width: `${providerUnavailable ? 100 : status?.state === "ready" ? 100 : Math.round(displayProgressByProvider[item.provider] ?? progressPct(status))}%`,
+                                width: `${providerUnavailable ? 100 : cardDisplayProgress}%`,
                               }}
                             />
                           </div>
@@ -2614,38 +2709,38 @@ export default function WatchPage() {
 
             <div className="order-3 rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur">
               <div className="flex items-center justify-between gap-3">
-                <div className="text-sm font-medium text-slate-300">حالة البث</div>
-                <div className={`rounded-full px-3 py-1 text-xs font-bold ${stateTone(activeStatus)}`}>{stateLabel(activeStatus)}</div>
+                <div className="text-sm font-medium text-slate-300">ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â«</div>
+                <div className={`rounded-full px-3 py-1 text-xs font-bold ${activeStateDisplayTone}`}>{activeStateDisplayLabel}</div>
               </div>
               <div className="mt-4 space-y-3 text-sm text-slate-200">
                 <div>
                   <div className="flex items-center justify-between text-slate-400">
-                    <span>نسبة التجهيز</span>
-                    <span className="font-mono text-xs">{activeDisplayProgressPct}%</span>
+                    <span>ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â³ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â© ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â²</span>
+                    <span className="font-mono text-xs">{isBeforeStreamWindow ? "0%" : `${activeDisplayProgressPct}%`}</span>
                   </div>
                   <div className="mt-2 h-2 overflow-hidden rounded-full bg-white/10">
                     <div
                       className={`h-full rounded-full transition-[width] duration-500 ${progressTone(activeStatus)}`}
-                      style={{ width: `${activeDisplayProgressPct}%` }}
+                      style={{ width: `${isBeforeStreamWindow ? 0 : activeDisplayProgressPct}%` }}
                     />
                   </div>
-                  <div className="mt-2 text-xs text-slate-300">{activePhaseLabel}</div>
+                  <div className="mt-2 text-xs text-slate-300">{activePhaseDisplayLabel}</div>
                 </div>
                 <div>
-                  <div className="text-slate-400">المصدر المختار</div>
+                  <div className="text-slate-400">ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂµÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â®ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±</div>
                   <div className="font-semibold">{activeStatus?.label || PROVIDER_META.find((item) => item.provider === activeProvider)?.label || activeProvider}</div>
                 </div>
                 <div>
-                  <div className="text-slate-400">سبب الحالة</div>
-                  <div className="break-all font-mono text-xs">{activeStatus?.reason || pageError || "n/a"}</div>
+                  <div className="text-slate-400">ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â³ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â©</div>
+                  <div className="break-all font-mono text-xs">{activeReasonDisplay}</div>
                 </div>
                 <div>
-                  <div className="text-slate-400">رابط البث النهائي</div>
-                  <div className="break-all font-mono text-xs text-teal-200">{playerStreamUrl || streamUrl || "غير متاح بعد"}</div>
+                  <div className="text-slate-400">ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â±ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â· ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â« ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â </div>
+                  <div className="break-all font-mono text-xs text-teal-200">{activePlaybackUrlDisplay}</div>
                 </div>
                 <div>
-                  <div className="text-slate-400">المصدر الحالي</div>
-                  <div className="break-all font-mono text-xs">{activeStatus?.currentSource || directSourceUrl || "غير متاح"}</div>
+                  <div className="text-slate-400">ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂµÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â± ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â </div>
+                  <div className="break-all font-mono text-xs">{activeCurrentSourceDisplay}</div>
                 </div>
               </div>
                 <div>
@@ -2656,13 +2751,14 @@ export default function WatchPage() {
                 <button
                   type="button"
                   onClick={() => {
+                    if (isBeforeStreamWindow) return;
                     setPageError(null);
                     void bootstrapProvider(activeProvider);
                   }}
                   className="rounded-2xl bg-teal-500 px-4 py-2 text-sm font-bold text-slate-950 transition hover:bg-teal-400 disabled:cursor-not-allowed disabled:opacity-60"
-                  disabled={isBootstrapPending}
+                  disabled={isBootstrapPending || isBeforeStreamWindow}
                 >
-                  {isBootstrapPending ? "جاري التجهيز..." : "إعادة التجهيز"}
+                  {isBeforeStreamWindow ? "\u064a\u0641\u062a\u062d \u062a\u0644\u0642\u0627\u0626\u064a\u064b\u0627 \u0642\u0628\u0644 \u0627\u0644\u0645\u0628\u0627\u0631\u0627\u0629" : isBootstrapPending ? "\u062c\u0627\u0631\u064a \u0627\u0644\u062a\u062c\u0647\u064a\u0632..." : "\u0625\u0639\u0627\u062f\u0629 \u0627\u0644\u062a\u062c\u0647\u064a\u0632"}
                 </button>
                 <button
                   type="button"
@@ -2673,7 +2769,7 @@ export default function WatchPage() {
                   }}
                   className="rounded-2xl border border-white/15 px-4 py-2 text-sm font-medium text-white transition hover:bg-white/10"
                 >
-                  تحديث الحالة
+                  ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â¯ÃƒÆ’Ã¢â€žÂ¢Ãƒâ€¦Ã‚Â ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â« ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â­ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â§ÃƒÆ’Ã¢â€žÂ¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ÃƒÆ’Ã‹Å“Ãƒâ€šÃ‚Â©
                 </button>
               </div>
             </div>

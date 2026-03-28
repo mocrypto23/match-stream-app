@@ -4,6 +4,7 @@ import { bootstrapBeinliveAgent, buildBeinliveStatus } from "@/lib/beinlive-agen
 import { runBootstrapSingleflight } from "@/lib/bootstrap-singleflight";
 import { beinliveProvider, buildBeinliveSessionManifestUrl } from "@/lib/beinlive-provider";
 import { resolveInternalAppOrigin } from "@/lib/live-providers";
+import { getMatchStreamWindowFromSeed } from "@/lib/match-stream-window";
 import { protectClientStatus } from "@/lib/playback-session";
 import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
 import { getOrLoadHotWatchStateSeed } from "@/lib/watch-state-cache";
@@ -24,6 +25,19 @@ export async function POST(req: Request) {
   }
   if (!seed) {
     return NextResponse.json({ accepted: false, error: "match-not-found" }, { status: 404 });
+  }
+
+  const streamWindow = getMatchStreamWindowFromSeed(seed);
+  if (!streamWindow.canOpen) {
+    return NextResponse.json(
+      {
+        accepted: false,
+        reason: "scheduled-not-open",
+        opensAt: streamWindow.opensAtMs ? new Date(streamWindow.opensAtMs).toISOString() : null,
+        msUntilOpen: streamWindow.msUntilOpen,
+      },
+      { status: 409, headers: { "Cache-Control": "no-store" } },
+    );
   }
 
   const sourceUrl =
