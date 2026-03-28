@@ -627,8 +627,8 @@ export default function WatchPage() {
     match?.status_key,
     streamClockMs,
   ]);
-  const streamAutoOpenEnabled = streamOpenWindow.canOpen;
-  const isBeforeStreamWindow = !streamAutoOpenEnabled && streamOpenWindow.hasKnownKickoff;
+  const streamAutoOpenEnabled = !!match && streamOpenWindow.canOpen;
+  const isBeforeStreamWindow = !!match && !streamOpenWindow.canOpen && streamOpenWindow.hasKnownKickoff;
   const streamPreOpenMessage = useMemo(() => {
     if (!isBeforeStreamWindow) return "";
     return `عزيزي المشاهد، سيتم فتح البث قبل المباراة بنصف ساعة. يبدأ تجهيز المصادر تلقائيًا بعد ${formatTimeUntilStreamOpen(streamOpenWindow.msUntilOpen)}.`;
@@ -1331,6 +1331,7 @@ export default function WatchPage() {
   const bootstrapProvider = useCallback(
     async (provider: StreamProviderId, opts?: { silent?: boolean }) => {
       if (!Number.isFinite(matchId) || matchId <= 0) return;
+      if (!match) return;
       if (!streamAutoOpenEnabled) return;
       setPendingBootstraps((current) => ({
         ...current,
@@ -1373,10 +1374,11 @@ export default function WatchPage() {
         }));
       }
     },
-    [applyProviderStatus, matchId, streamAutoOpenEnabled]
+    [applyProviderStatus, match, matchId, streamAutoOpenEnabled]
   );
 
   const requestPlaybackStart = useCallback(async () => {
+    if (!match) return;
     if (!streamAutoOpenEnabled) {
       setPlaybackRequested(false);
       setPlaybackStarting(false);
@@ -1397,7 +1399,7 @@ export default function WatchPage() {
       return;
     }
     setPlaybackRequested(true);
-  }, [activeProvider, bootstrapProvider, ensurePlaybackSession, refreshProviderStatus, streamAutoOpenEnabled, streamUrl]);
+  }, [activeProvider, bootstrapProvider, ensurePlaybackSession, match, refreshProviderStatus, streamAutoOpenEnabled, streamUrl]);
 
   const clearWaitingOverlayTimer = useCallback(() => {
     if (waitingOverlayTimerRef.current !== null) {
