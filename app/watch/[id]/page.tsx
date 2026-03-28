@@ -392,8 +392,24 @@ function phaseLabel(status: StreamSourceStatus | null) {
 
 function progressTone(status: StreamSourceStatus | null) {
   if (!status) return "bg-slate-500";
+  const pct = progressPct(status);
+  const hasSource = !!String(status.sourceUrl || "").trim();
   if (status.state === "ready") return "bg-emerald-500";
-  if (status.state === "warming") return "bg-teal-400";
+  if (status.phase === "failed" || status.reason === "missing-source") return "bg-rose-500";
+  if (
+    hasSource &&
+    (status.state === "warming" ||
+      status.reason === "not-bootstrapped" ||
+      status.phase === "queued" ||
+      status.phase === "resolving_source" ||
+      status.phase === "fetching_manifest" ||
+      status.phase === "resolving_variant" ||
+      status.phase === "mirroring_assets" ||
+      status.phase === "publishing_playlist" ||
+      pct >= 80)
+  ) {
+    return pct >= 85 ? "bg-emerald-400" : "bg-teal-400";
+  }
   return "bg-rose-500";
 }
 
