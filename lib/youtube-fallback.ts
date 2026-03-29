@@ -2,8 +2,15 @@ import axios from "axios";
 
 import type { StreamProviderId, StreamSourceStatus } from "@/lib/stream-source-types";
 
-const DEFAULT_USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+const REQUEST_HEADER_PROFILES = [
+  {
+    "user-agent": "Mozilla/5.0",
+  },
+  {
+    "user-agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+  },
+] as const;
 const YOUTUBE_POSITIVE_CACHE_TTL_MS = 10 * 60_000;
 const YOUTUBE_NEGATIVE_CACHE_TTL_MS = 60_000;
 const YOUTUBE_FETCH_TIMEOUT_MS = 3_500;
@@ -301,24 +308,25 @@ function extractPlayervRuntimeUrl(text: string, baseUrl: string) {
 }
 
 async function fetchText(url: string, referrerUrl: string) {
-  try {
-    const response = await axios.get<string>(url, {
-      responseType: "text",
-      timeout: YOUTUBE_FETCH_TIMEOUT_MS,
-      maxRedirects: 4,
-      validateStatus: () => true,
-      headers: {
-        "user-agent": DEFAULT_USER_AGENT,
-        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,text/javascript,application/javascript,*/*;q=0.8",
-        "accept-language": "ar,en;q=0.9",
-        referer: referrerUrl || url,
-      },
-    });
-    if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) return "";
-    return String(response.data || "");
-  } catch {
-    return "";
+  for (const headerProfile of REQUEST_HEADER_PROFILES) {
+    try {
+      const response = await axios.get<string>(url, {
+        responseType: "text",
+        timeout: YOUTUBE_FETCH_TIMEOUT_MS,
+        maxRedirects: 4,
+        validateStatus: () => true,
+        headers: {
+          ...headerProfile,
+          "accept-language": "ar,en;q=0.9",
+          referer: referrerUrl || url,
+        },
+      });
+      if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) continue;
+      const text = String(response.data || "");
+      if (text) return text;
+    } catch {}
   }
+  return "";
 }
 
 async function resolvePlayervYouTubeFallback(sourceUrl: string) {
