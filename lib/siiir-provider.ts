@@ -124,6 +124,29 @@ function isSiiirUsableSource(rawUrl: string) {
   }
 }
 
+function scoreSiiirSource(rawUrl: string) {
+  const normalized = normalizeHttpUrl(rawUrl);
+  if (!normalized) return -1;
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    const pathname = String(parsed.pathname || "").toLowerCase();
+    if (hostMatchesAnySuffix(host, ["yallashot.us"])) {
+      if (pathname.includes("/hard/")) return 300;
+      if (/\/playerv\d+\.php/i.test(pathname)) return 280;
+      return 120;
+    }
+    if (hostMatchesAnySuffix(host, ["siiir.tv"])) {
+      if (/\/playerv\d+\.php/i.test(pathname)) return 260;
+      if (!isSiiirGenericPage(normalized)) return 150;
+      return 20;
+    }
+    return 0;
+  } catch {
+    return -1;
+  }
+}
+
 function runtimeCacheKey(sourceUrl: string) {
   return normalizeHttpUrl(sourceUrl).toLowerCase();
 }
@@ -504,13 +527,17 @@ export function isAllowedSiiirSource(rawUrl: string) {
 
 export async function pickSiiirSourceUrl(row: MatchRowLike) {
   const canonicalTodayMatch = await findTodayMatchSource(row);
-  if (canonicalTodayMatch?.href && isSiiirUsableSource(canonicalTodayMatch.href)) {
-    return canonicalTodayMatch.href;
-  }
-
   const direct = String(row?.stream_url_2 || "").trim();
-  if (isSiiirUsableSource(direct)) return direct;
-  return canonicalTodayMatch?.href || null;
+  const directUsable = isSiiirUsableSource(direct) ? direct : "";
+  const canonical = String(canonicalTodayMatch?.href || "").trim();
+  const canonicalUsable = isSiiirUsableSource(canonical) ? canonical : "";
+
+  if (directUsable && canonicalUsable) {
+    return scoreSiiirSource(directUsable) >= scoreSiiirSource(canonicalUsable) ? directUsable : canonicalUsable;
+  }
+  if (directUsable) return directUsable;
+  if (canonicalUsable) return canonicalUsable;
+  return canonical || null;
 }
 
 export function buildSiiirSessionManifestUrl(matchId: number, internalOrigin: string) {
