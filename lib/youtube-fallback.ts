@@ -60,6 +60,33 @@ function decodeLooseHtml(text: string) {
     .replace(/\\\//g, "/");
 }
 
+function resolveMatchParamValue(baseUrl: string) {
+  try {
+    const parsed = new URL(baseUrl);
+    return (
+      String(parsed.searchParams.get("match") || "").trim() ||
+      String(parsed.searchParams.get("m") || "").trim() ||
+      String(parsed.searchParams.get("id") || "").trim()
+    );
+  } catch {
+    return "";
+  }
+}
+
+function interpolateTemplateUrl(rawUrl: string, baseUrl: string) {
+  const rawValue = decodeLooseHtml(String(rawUrl || "").trim());
+  if (!rawValue.includes("${")) return rawValue;
+  const matchValue = resolveMatchParamValue(baseUrl);
+  const encodedMatchValue = encodeURIComponent(matchValue);
+  return rawValue
+    .replace(/\$\{\s*encodeURIComponent\s*\(\s*matchId\s*\)\s*\}/gi, encodedMatchValue)
+    .replace(/\$\{\s*matchId\s*\}/gi, matchValue)
+    .replace(/\$\{\s*encodeURIComponent\s*\(\s*urlParams\.get\(['"]match['"]\)\s*\)\s*\}/gi, encodedMatchValue)
+    .replace(/\$\{\s*urlParams\.get\(['"]match['"]\)\s*\}/gi, matchValue)
+    .replace(/\$\{\s*encodeURIComponent\s*\(\s*params\.get\(['"]match['"]\)\s*\)\s*\}/gi, encodedMatchValue)
+    .replace(/\$\{\s*params\.get\(['"]match['"]\)\s*\}/gi, matchValue);
+}
+
 function buildVideoEmbedUrl(videoId: string) {
   const safeId = String(videoId || "").trim();
   if (!/^[A-Za-z0-9_-]{11}$/.test(safeId)) return "";
@@ -189,7 +216,7 @@ function extractYouTubeFromText(text: string) {
 }
 
 function resolveFollowUrl(rawUrl: string, baseUrl: string) {
-  const value = decodeLooseHtml(String(rawUrl || "").trim());
+  const value = interpolateTemplateUrl(rawUrl, baseUrl);
   if (!value) return "";
   try {
     const absolute = new URL(value.startsWith("//") ? `https:${value}` : value, baseUrl).toString();
@@ -255,6 +282,24 @@ function extractFollowUrls(text: string, baseUrl: string) {
   return out;
 }
 
+function extractPlayervRuntimeUrl(text: string, baseUrl: string) {
+  const decoded = decodeLooseHtml(text);
+  const patterns = [
+    /playerUrl\s*=\s*`([^`]*\/playerv\d+\.php\?[^`]+)`/gi,
+    /https?:\/\/[^"'`\s<>]+\/playerv\d+\.php\?[^"'`\s<>]+/gi,
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of decoded.matchAll(pattern)) {
+      const candidate = String(match[1] || match[0] || "").trim();
+      const resolved = resolveFollowUrl(candidate, baseUrl);
+      if (resolved) return resolved;
+    }
+  }
+
+  return "";
+}
+
 async function fetchText(url: string, referrerUrl: string) {
   try {
     const response = await axios.get<string>(url, {
@@ -274,6 +319,33 @@ async function fetchText(url: string, referrerUrl: string) {
   } catch {
     return "";
   }
+}
+
+async function resolvePlayervYouTubeFallback(sourceUrl: string) {
+  const normalizedSourceUrl = normalizeHttpUrl(sourceUrl);
+  if (!normalizedSourceUrl) return null;
+  if (!/\/hard\/|\/playerv\d+\.php/i.test(normalizedSourceUrl)) return null;
+
+  const sourcePageText = await fetchText(normalizedSourceUrl, normalizedSourceUrl);
+  if (!sourcePageText) return null;
+
+  const playervRuntimeUrl =
+    /\/playerv\d+\.php/i.test(normalizedSourceUrl)
+      ? normalizedSourceUrl
+      : extractPlayervRuntimeUrl(sourcePageText, normalizedSourceUrl);
+  if (!playervRuntimeUrl) return null;
+
+  const playervText = await fetchText(playervRuntimeUrl, normalizedSourceUrl);
+  if (!playervText) return null;
+
+  const extracted = extractYouTubeFromText(playervText);
+  if (!extracted?.embedUrl) return null;
+
+  return {
+    ...extracted,
+    via: "playerv-html",
+    detectedAt: Date.now(),
+  } satisfies YouTubeFallback;
 }
 
 function readCache(sourceUrl: string): YouTubeFallback | null | undefined {
@@ -314,6 +386,11 @@ export async function resolveYouTubeFallback(sourceUrl: string) {
     });
   }
 
+  const playervFallback = await resolvePlayervYouTubeFallback(normalizedSourceUrl);
+  if (playervFallback?.embedUrl) {
+    return writeCache(normalizedSourceUrl, playervFallback);
+  }
+
   const visited = new Set<string>();
   const queue: Array<{ url: string; referrerUrl: string; depth: number }> = [
     { url: normalizedSourceUrl, referrerUrl: normalizedSourceUrl, depth: 0 },
@@ -338,6 +415,18 @@ export async function resolveYouTubeFallback(sourceUrl: string) {
         via: next.depth === 0 ? "page-html" : "nested-html",
         detectedAt: Date.now(),
       });
+    }
+
+    const playervRuntimeUrl = extractPlayervRuntimeUrl(text, next.url);
+    if (playervRuntimeUrl) {
+      const playervKey = canonicalizeUrl(playervRuntimeUrl);
+      if (playervKey && !visited.has(playervKey)) {
+        queue.unshift({
+          url: playervRuntimeUrl,
+          referrerUrl: next.url,
+          depth: next.depth + 1,
+        });
+      }
     }
 
     if (next.depth >= YOUTUBE_MAX_CRAWL_DEPTH) continue;
