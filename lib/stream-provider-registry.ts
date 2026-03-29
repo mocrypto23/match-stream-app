@@ -7,6 +7,7 @@ import { yallashootProvider } from "@/lib/yallashoot-provider";
 export const streamProviders = [livekoraProvider, beinliveProvider, siiirProvider, yallashootProvider] as const;
 
 const SOURCE_URL_CACHE_TTL_MS = 2 * 60_000;
+const NULL_SOURCE_URL_CACHE_TTL_MS = 20_000;
 const sourceUrlCache = new Map<string, { value: string | null; expiresAt: number }>();
 const sourceUrlInflight = new Map<string, Promise<string | null>>();
 
@@ -39,7 +40,7 @@ export async function resolveProviderSourceUrl(provider: LiveStreamProvider, row
     const value = String(resolved || "").trim() || null;
     sourceUrlCache.set(cacheKey, {
       value,
-      expiresAt: Date.now() + SOURCE_URL_CACHE_TTL_MS,
+      expiresAt: Date.now() + (value ? SOURCE_URL_CACHE_TTL_MS : NULL_SOURCE_URL_CACHE_TTL_MS),
     });
     return value;
   })();

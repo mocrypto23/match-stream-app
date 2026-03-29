@@ -73,6 +73,11 @@ function normalizeHost(host: string) {
   return String(host || "").trim().toLowerCase().replace(/\.$/, "");
 }
 
+function isDynamicYallashootRedirectHost(host: string) {
+  const normalized = normalizeHost(host);
+  return !!normalized && normalized.endsWith(".mov") && normalized.includes("yalla-shootx-space");
+}
+
 function safeDecodeURIComponent(value: string) {
   try {
     return decodeURIComponent(String(value || ""));
@@ -93,6 +98,7 @@ function extractHost(rawUrl: string) {
 function findSlotServerByHost(hostname: string): SlotServerId | null {
   const host = normalizeHost(hostname);
   if (!host) return null;
+  if (isDynamicYallashootRedirectHost(host)) return 5;
   for (const slotServerId of SLOT_SERVER_IDS) {
     if (hostMatchesAnySuffix(host, getSlotHostAllowlist(slotServerId))) return slotServerId;
   }
@@ -192,7 +198,11 @@ export function hostMatchesAnySuffix(hostname: string, suffixes: string[]) {
 export function isAllowedSourceForSlotServer(slotServerId: SlotServerId, rawUrl: string) {
   if (!isValidHttpUrl(rawUrl)) return false;
   try {
-    const host = new URL(rawUrl).hostname;
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname;
+    if (slotServerId === 5 && isDynamicYallashootRedirectHost(host)) {
+      return /^\d+$/.test(String(parsed.searchParams.get("m") || "").trim());
+    }
     return hostMatchesAnySuffix(host, getSlotHostAllowlist(slotServerId));
   } catch {
     return false;
@@ -232,11 +242,11 @@ export function isIngestCandidateAlignedWithSlotServer(input: {
   ].filter((value) => isValidHttpUrl(value));
   const ownReferrers = referrerPool.filter((refUrl) => {
     const refHost = extractHost(refUrl);
-    return !!refHost && hostMatchesAnySuffix(refHost, allowlist);
+    return !!refHost && (hostMatchesAnySuffix(refHost, allowlist) || (slotServerId === 5 && isDynamicYallashootRedirectHost(refHost)));
   });
   if (!ownReferrers.length) return false;
 
-  if (hostMatchesAnySuffix(targetHost, allowlist)) return true;
+  if (hostMatchesAnySuffix(targetHost, allowlist) || (slotServerId === 5 && isDynamicYallashootRedirectHost(targetHost))) return true;
 
   // Some upstream pages legitimately embed their player chain on a foreign
   // host. If the chain started from an allowed source page for this slot and

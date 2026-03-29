@@ -19,6 +19,7 @@ export type HotWatchStateSeed = {
 };
 
 const HOT_WATCH_STATE_TTL_MS = 6 * 60 * 60 * 1000;
+const PARTIAL_HOT_WATCH_STATE_REFRESH_MS = 60_000;
 const hotWatchStateSeedCache = new Map<number, HotWatchStateSeed>();
 const hotWatchStateSeedInflight = new Map<number, Promise<{ seed: HotWatchStateSeed | null; row: LivekoraMatchRow | null; error: Error | null }>>();
 
@@ -46,6 +47,10 @@ function pruneExpiredSeeds(now: number) {
       hotWatchStateSeedCache.delete(matchId);
     }
   }
+}
+
+function isPartialSeed(seed: HotWatchStateSeed) {
+  return Object.values(seed.sourceUrls).some((value) => !String(value || "").trim());
 }
 
 export function seedHotWatchState(input: {
@@ -123,7 +128,12 @@ export async function loadAndSeedHotWatchState(matchId: number) {
 
 export async function getOrLoadHotWatchStateSeed(matchId: number) {
   const cached = getHotWatchStateSeed(matchId);
-  if (cached) return { seed: cached, row: null as LivekoraMatchRow | null, error: null };
+  if (cached) {
+    const seedAgeMs = Date.now() - cached.seededAt;
+    if (!(isPartialSeed(cached) && seedAgeMs >= PARTIAL_HOT_WATCH_STATE_REFRESH_MS)) {
+      return { seed: cached, row: null as LivekoraMatchRow | null, error: null };
+    }
+  }
   const existing = hotWatchStateSeedInflight.get(matchId);
   if (existing) return await existing;
   const promise = loadAndSeedHotWatchState(matchId);

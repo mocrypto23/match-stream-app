@@ -143,6 +143,11 @@ function hostMatchesAnySuffix(host: string, suffixes: readonly string[]) {
   return suffixes.some((suffix) => normalized === suffix || normalized.endsWith(`.${suffix}`));
 }
 
+function isDynamicYallashootRedirectHost(host: string) {
+  const normalized = String(host || "").trim().toLowerCase().replace(/\.$/, "");
+  return !!normalized && normalized.endsWith(".mov") && normalized.includes("yalla-shootx-space");
+}
+
 function buildSourceStateKey(sourceUrl: string) {
   return normalizeHttpUrl(sourceUrl).toLowerCase();
 }
@@ -715,7 +720,11 @@ export function isAllowedYallashootSource(rawUrl: string) {
   const normalized = normalizeHttpUrl(rawUrl);
   if (!normalized) return false;
   try {
-    return hostMatchesAnySuffix(new URL(normalized).hostname, YALLASHOOT_ALLOWED_HOST_SUFFIXES);
+    const parsed = new URL(normalized);
+    const host = parsed.hostname;
+    const matchId = String(parsed.searchParams.get("m") || "").trim();
+    if (hostMatchesAnySuffix(host, YALLASHOOT_ALLOWED_HOST_SUFFIXES)) return true;
+    return isDynamicYallashootRedirectHost(host) && /^\d+$/.test(matchId);
   } catch {
     return false;
   }

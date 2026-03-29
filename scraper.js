@@ -3348,6 +3348,11 @@ function buildYallashootArticleUrl(matchId) {
   return `${YALLASHOOT.redirectBase}?m=${encodeURIComponent(String(normalizedMatchId))}&lang=ar`;
 }
 
+function isDynamicYallashootRedirectHost(host) {
+  const normalized = String(host || "").trim().toLowerCase().replace(/\.$/, "");
+  return !!normalized && normalized.endsWith(".mov") && normalized.includes("yalla-shootx-space");
+}
+
 function parseMatchSlugPairKeys(rawUrl) {
   const normalized = normalizeUrl(rawUrl, rawUrl);
   if (!normalized) return [];
@@ -3374,8 +3379,10 @@ function isServer5SourceLikeUrl(url) {
   try {
     const parsed = new URL(normalized);
     const host = parsed.hostname.toLowerCase();
+    const matchId = String(parsed.searchParams.get("m") || "").trim();
+    if (isDynamicYallashootRedirectHost(host)) return /^\d+$/.test(matchId);
     if (!hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[5])) return false;
-    if (host.endsWith("smartagro.mov")) return /^\d+$/.test(String(parsed.searchParams.get("m") || "").trim());
+    if (host.endsWith("smartagro.mov")) return /^\d+$/.test(matchId);
     return /\/article\//i.test(parsed.pathname) || /^\d+$/.test(String(parsed.searchParams.get("m") || "").trim());
   } catch {
     return false;
@@ -3685,7 +3692,7 @@ function validateServerUrlBySlot(slot, url, { stats = null, reason = "", matchKe
         break;
       }
       case 5: {
-        const hostAllowed = hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[5]);
+        const hostAllowed = hostMatchesAnyHint(host, SERVER_SLOT_DOMAIN_WHITELIST[5]) || isDynamicYallashootRedirectHost(host);
         const isSourceLike = isServer5SourceLikeUrl(normalized);
         const isPlayerLike = isServer5PlayerLikeUrl(normalized);
         allowed = hostAllowed && !isClearlyNonStreamUrl(normalized) && (isSourceLike || isPlayerLike);
