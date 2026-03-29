@@ -1,6 +1,7 @@
 import { bootstrapR2MirrorAgent, readR2MirrorAgentStatus } from "@/lib/r2-mirror-agent";
 import type { LivekoraMatchRow } from "@/lib/livekora-match";
 import type { YallashootAgentStatus, YallashootStatus } from "@/lib/yallashoot-types";
+import { maybeBuildYouTubeFallbackStatus } from "@/lib/youtube-fallback";
 
 function nowIso() {
   return new Date().toISOString();
@@ -62,6 +63,18 @@ export async function buildYallashootStatus(input: {
   const agentStatus =
     input.agentStatus === undefined ? await readYallashootAgentStatus(input.matchId) : input.agentStatus;
   if (!agentStatus) {
+    const youtubeFallback = await maybeBuildYouTubeFallbackStatus({
+      provider: "yallashoot",
+      label: "yalla-shoot",
+      order: 4,
+      matchId: input.matchId,
+      sourceUrl,
+      reason: "agent-unreachable",
+      updatedAt: nowIso(),
+    });
+    if (youtubeFallback) {
+      return youtubeFallback satisfies YallashootStatus;
+    }
     return {
       provider: "yallashoot",
       mode: "r2",
@@ -77,6 +90,22 @@ export async function buildYallashootStatus(input: {
       phase: "failed",
       progressPct: 0,
     } satisfies YallashootStatus;
+  }
+
+  if (agentStatus.state !== "ready") {
+    const youtubeFallback = await maybeBuildYouTubeFallbackStatus({
+      provider: "yallashoot",
+      label: "yalla-shoot",
+      order: 4,
+      matchId: input.matchId,
+      sourceUrl,
+      currentSource: agentStatus.currentSource || null,
+      reason: agentStatus.reason || null,
+      updatedAt: agentStatus.updatedAt || nowIso(),
+    });
+    if (youtubeFallback) {
+      return youtubeFallback satisfies YallashootStatus;
+    }
   }
 
   const playlistUrl =

@@ -32,12 +32,14 @@ function buildWatchStateVersion(statuses: StreamSourceStatus[], sourceUrls: Sour
     .map((status) =>
       [
         status.provider,
+        status.mode,
         status.state,
         status.phase || "",
         String(status.progressPct ?? ""),
         status.reason,
         status.currentSource || "",
         status.playlistUrl || "",
+        status.youtubeEmbedUrl || "",
         sourceUrls[status.provider] || "",
       ].join("::")
     )

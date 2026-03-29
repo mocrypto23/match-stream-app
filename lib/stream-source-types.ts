@@ -1,6 +1,7 @@
 export type StreamProviderId = "livekora" | "beinlive" | "siiir" | "yallashoot";
 
 export type StreamSourceState = "ready" | "warming" | "down";
+export type StreamSourceMode = "r2" | "youtube";
 
 export type StreamSourcePhase =
   | "queued"
@@ -14,13 +15,14 @@ export type StreamSourcePhase =
 
 export type StreamSourceStatus = {
   provider: StreamProviderId;
-  mode: "r2";
+  mode: StreamSourceMode;
   matchId: number;
   sourceUrl: string | null;
   state: StreamSourceState;
   playlistUrl: string | null;
   reason: string;
   currentSource: string | null;
+  youtubeEmbedUrl?: string | null;
   updatedAt: string;
   label: string;
   order: number;

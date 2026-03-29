@@ -95,6 +95,13 @@ export function buildClientPlaybackUrl(provider: StreamProviderId, matchId: numb
 
 export function protectClientStatus(status: StreamSourceStatus | null | undefined) {
   if (!status) return null;
+  if (status.mode === "youtube") {
+    return {
+      ...status,
+      playlistUrl: String(status.youtubeEmbedUrl || status.playlistUrl || "").trim() || null,
+      youtubeEmbedUrl: String(status.youtubeEmbedUrl || status.playlistUrl || "").trim() || null,
+    } satisfies StreamSourceStatus;
+  }
   const hasPlaylistUrl = !!String(status.playlistUrl || "").trim();
   return {
     ...status,

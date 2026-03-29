@@ -682,10 +682,19 @@ export default function WatchPage() {
     }
     return retained || fallbackPlaylistUrl;
   }, [activeProvider, activeStatus, fallbackPlaylistUrl, retainedPlaylistUrls]);
+  const activeYouTubeEmbedUrl = useMemo(() => {
+    if (activeStatus?.mode !== "youtube") return "";
+    return String(activeStatus.youtubeEmbedUrl || activeStatus.playlistUrl || fallbackPlaylistUrl || "").trim();
+  }, [activeStatus?.mode, activeStatus?.playlistUrl, activeStatus?.youtubeEmbedUrl, fallbackPlaylistUrl]);
   const playerStreamUrl = useMemo(() => {
     if (!playbackRequested) return "";
+    if (activeStatus?.mode === "youtube") {
+      return activeYouTubeEmbedUrl;
+    }
     return String(playbackSessionUrls[activeProvider] || "").trim();
-  }, [activeProvider, playbackRequested, playbackSessionUrls]);
+  }, [activeProvider, activeStatus?.mode, activeYouTubeEmbedUrl, playbackRequested, playbackSessionUrls]);
+  const isActiveYouTubeProvider = activeStatus?.mode === "youtube";
+  const isYouTubePlayback = playbackRequested && isActiveYouTubeProvider && !!playerStreamUrl;
 
   const directSourceUrl = useMemo(() => {
     return getMatchSourceUrl(match, activeProvider) || null;
@@ -1409,13 +1418,28 @@ export default function WatchPage() {
       void bootstrapProvider(activeProvider);
       return;
     }
+    if (activeStatus?.mode === "youtube") {
+      setPlaybackRequested(true);
+      setPlaybackStarting(false);
+      setPlaybackStarted(false);
+      return;
+    }
     const playUrl = await ensurePlaybackSession(activeProvider);
     if (!playUrl) {
       setPlaybackStarting(false);
       return;
     }
     setPlaybackRequested(true);
-  }, [activeProvider, bootstrapProvider, ensurePlaybackSession, match, refreshProviderStatus, streamAutoOpenEnabled, streamUrl]);
+  }, [
+    activeProvider,
+    activeStatus?.mode,
+    bootstrapProvider,
+    ensurePlaybackSession,
+    match,
+    refreshProviderStatus,
+    streamAutoOpenEnabled,
+    streamUrl,
+  ]);
 
   const clearWaitingOverlayTimer = useCallback(() => {
     if (waitingOverlayTimerRef.current !== null) {
@@ -1778,14 +1802,16 @@ export default function WatchPage() {
 
   useEffect(() => {
     if (!playbackRequested) return;
+    if (activeStatus?.mode === "youtube") return;
     if (activeStatus?.state !== "ready") return;
     if (!String(streamUrl || "").trim()) return;
     if (String(playbackSessionUrls[activeProvider] || "").trim()) return;
     void ensurePlaybackSession(activeProvider);
-  }, [activeProvider, activeStatus?.state, ensurePlaybackSession, playbackRequested, playbackSessionUrls, streamUrl]);
+  }, [activeProvider, activeStatus?.mode, activeStatus?.state, ensurePlaybackSession, playbackRequested, playbackSessionUrls, streamUrl]);
 
   useEffect(() => {
     if (!playbackRequested) return;
+    if (activeStatus?.mode === "youtube") return;
     const playUrl = String(playbackSessionUrls[activeProvider] || "").trim();
     const expiresAt = Number(playbackSessionExpiries[activeProvider] || 0);
     if (!playUrl || !expiresAt) return;
@@ -1797,7 +1823,7 @@ export default function WatchPage() {
       void ensurePlaybackSession(activeProvider, { force: true, silent: true });
     }, refreshDelay);
     return () => window.clearTimeout(timerId);
-  }, [activeProvider, ensurePlaybackSession, playbackRequested, playbackSessionExpiries, playbackSessionUrls]);
+  }, [activeProvider, activeStatus?.mode, ensurePlaybackSession, playbackRequested, playbackSessionExpiries, playbackSessionUrls]);
 
   useEffect(() => {
     if (!playbackRequested) return;
@@ -1890,6 +1916,7 @@ export default function WatchPage() {
   ]);
 
   useEffect(() => {
+    if (activeStatus?.mode === "youtube") return;
     if (!playbackRequested) return;
 
     const id = window.setInterval(() => {
@@ -1996,6 +2023,7 @@ export default function WatchPage() {
     return () => window.clearInterval(id);
   }, [
     activeProvider,
+    activeStatus?.mode,
     activeStatus?.state,
     bootstrapProvider,
     playbackRequested,
@@ -2016,11 +2044,23 @@ export default function WatchPage() {
       hlsRef.current.destroy();
       hlsRef.current = null;
     }
+    if (video) {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    }
+    if (isActiveYouTubeProvider) {
+      setP2pStats({
+        ...EMPTY_P2P_STATS,
+        supported: false,
+        status: "P2P: غير متاحة مع YouTube",
+      });
+      setPlaybackStarting(false);
+      hasPlayedRef.current = false;
+      return;
+    }
     if (!video) return;
 
-    video.pause();
-    video.removeAttribute("src");
-    video.load();
     if (persistedP2PStats?.enabled) {
       setP2pStats(persistedP2PStats);
     } else {
@@ -2450,7 +2490,7 @@ export default function WatchPage() {
         scheduleEnable: () => {},
       };
     };
-  }, [activeProvider, clearWaitingOverlayTimer, matchId, playbackRequested, playerSessionNonce, playerStreamUrl]);
+  }, [activeProvider, clearWaitingOverlayTimer, isActiveYouTubeProvider, matchId, playbackRequested, playerSessionNonce, playerStreamUrl]);
 
   if (loading) {
     return (
@@ -2496,24 +2536,36 @@ export default function WatchPage() {
           <div className="flex flex-col gap-4">
             <div className="overflow-hidden rounded-3xl border border-white/10 bg-black/40 shadow-2xl shadow-black/40">
               <div className="relative aspect-video bg-black">
-              <video
-                ref={videoRef}
-                className="h-full w-full"
-                controls={false}
-                playsInline
-                preload="none"
-                onClick={() => {
-                  const video = videoRef.current;
-                  if (!video) return;
-                  if (!playbackRequested) {
-                    requestPlaybackStart();
-                    return;
-                  }
-                  if (video.paused) {
-                    requestPlaybackStart();
-                  }
-                }}
-              />
+              {isYouTubePlayback ? (
+                <iframe
+                  key={playerStreamUrl}
+                  src={playerStreamUrl}
+                  title={title}
+                  className="h-full w-full"
+                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                  allowFullScreen
+                  referrerPolicy="strict-origin-when-cross-origin"
+                />
+              ) : (
+                <video
+                  ref={videoRef}
+                  className="h-full w-full"
+                  controls={false}
+                  playsInline
+                  preload="none"
+                  onClick={() => {
+                    const video = videoRef.current;
+                    if (!video) return;
+                    if (!playbackRequested) {
+                      requestPlaybackStart();
+                      return;
+                    }
+                    if (video.paused) {
+                      requestPlaybackStart();
+                    }
+                  }}
+                />
+              )}
 
               {streamUrl && !playbackRequested ? (
                 <div className="absolute inset-0 z-[60] flex flex-col items-center justify-center gap-4 bg-black/80 px-6 text-center">
@@ -2585,14 +2637,16 @@ export default function WatchPage() {
                 </div>
               ) : null}
 
-              <VideoPlayerControls
-                videoRef={videoRef}
-                hls={hlsRef.current}
-                title={title}
-                isLive
-                onPlayRequest={requestPlaybackStart}
-                onPauseRequest={stopPlaybackSession}
-              />
+              {!isYouTubePlayback ? (
+                <VideoPlayerControls
+                  videoRef={videoRef}
+                  hls={hlsRef.current}
+                  title={title}
+                  isLive
+                  onPlayRequest={requestPlaybackStart}
+                  onPauseRequest={stopPlaybackSession}
+                />
+              ) : null}
               </div>
             </div>
 

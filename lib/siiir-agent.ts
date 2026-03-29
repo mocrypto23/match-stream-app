@@ -1,6 +1,7 @@
 import { bootstrapR2MirrorAgent, readR2MirrorAgentStatus } from "@/lib/r2-mirror-agent";
 import type { LivekoraMatchRow } from "@/lib/livekora-match";
 import type { SiiirAgentStatus, SiiirStatus } from "@/lib/siiir-types";
+import { maybeBuildYouTubeFallbackStatus } from "@/lib/youtube-fallback";
 
 function nowIso() {
   return new Date().toISOString();
@@ -61,6 +62,18 @@ export async function buildSiiirStatus(input: {
 
   const agentStatus = input.agentStatus === undefined ? await readSiiirAgentStatus(input.matchId) : input.agentStatus;
   if (!agentStatus) {
+    const youtubeFallback = await maybeBuildYouTubeFallbackStatus({
+      provider: "siiir",
+      label: "siiir.tv",
+      order: 3,
+      matchId: input.matchId,
+      sourceUrl,
+      reason: "agent-unreachable",
+      updatedAt: nowIso(),
+    });
+    if (youtubeFallback) {
+      return youtubeFallback satisfies SiiirStatus;
+    }
     return {
       provider: "siiir",
       mode: "r2",
@@ -76,6 +89,22 @@ export async function buildSiiirStatus(input: {
       phase: "failed",
       progressPct: 0,
     } satisfies SiiirStatus;
+  }
+
+  if (agentStatus.state !== "ready") {
+    const youtubeFallback = await maybeBuildYouTubeFallbackStatus({
+      provider: "siiir",
+      label: "siiir.tv",
+      order: 3,
+      matchId: input.matchId,
+      sourceUrl,
+      currentSource: agentStatus.currentSource || null,
+      reason: agentStatus.reason || null,
+      updatedAt: agentStatus.updatedAt || nowIso(),
+    });
+    if (youtubeFallback) {
+      return youtubeFallback satisfies SiiirStatus;
+    }
   }
 
   const playlistUrl =

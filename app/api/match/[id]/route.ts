@@ -14,6 +14,13 @@ export const dynamic = "force-dynamic";
 
 type Ctx = { params: Promise<{ id?: string }> };
 
+function clientFacingPlaylistUrl(status: { provider: "livekora" | "beinlive" | "siiir" | "yallashoot"; matchId: number; mode: string; playlistUrl: string | null; youtubeEmbedUrl?: string | null }) {
+  if (status.mode === "youtube") {
+    return String(status.youtubeEmbedUrl || status.playlistUrl || "").trim() || null;
+  }
+  return buildClientPlaybackUrl(status.provider, status.matchId, !!String(status.playlistUrl || "").trim());
+}
+
 export async function GET(_req: Request, ctx: Ctx) {
   const { id: rawId } = await ctx.params;
   const matchId = Number.parseInt(String(rawId || "").trim(), 10);
@@ -88,17 +95,13 @@ export async function GET(_req: Request, ctx: Ctx) {
     stream_url_5: yallashootSourceUrl,
     stream_url_4: sourceUrl,
     livekoraStatus: protectedLivekoraStatus,
-    livekoraPlaylistUrl: buildClientPlaybackUrl("livekora", matchId, !!String(livekoraStatus.playlistUrl || "").trim()),
+    livekoraPlaylistUrl: clientFacingPlaylistUrl(livekoraStatus),
     beinliveStatus: protectedBeinliveStatus,
-    beinlivePlaylistUrl: buildClientPlaybackUrl("beinlive", matchId, !!String(beinliveStatus.playlistUrl || "").trim()),
+    beinlivePlaylistUrl: clientFacingPlaylistUrl(beinliveStatus),
     siiirStatus: protectedSiiirStatus,
-    siiirPlaylistUrl: buildClientPlaybackUrl("siiir", matchId, !!String(siiirStatus.playlistUrl || "").trim()),
+    siiirPlaylistUrl: clientFacingPlaylistUrl(siiirStatus),
     yallashootStatus: protectedYallashootStatus,
-    yallashootPlaylistUrl: buildClientPlaybackUrl(
-      "yallashoot",
-      matchId,
-      !!String(yallashootStatus.playlistUrl || "").trim()
-    ),
+    yallashootPlaylistUrl: clientFacingPlaylistUrl(yallashootStatus),
     streamSources,
   });
   response.headers.set("Cache-Control", "public, s-maxage=6, stale-while-revalidate=20");

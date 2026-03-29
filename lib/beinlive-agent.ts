@@ -2,6 +2,7 @@ import { buildBeinlivePublicPlaylistUrl } from "@/lib/beinlive-provider";
 import { bootstrapR2MirrorAgent, readR2MirrorAgentStatus } from "@/lib/r2-mirror-agent";
 import type { BeinliveAgentStatus, BeinliveStatus } from "@/lib/beinlive-types";
 import type { LivekoraMatchRow } from "@/lib/livekora-match";
+import { maybeBuildYouTubeFallbackStatus } from "@/lib/youtube-fallback";
 
 function nowIso() {
   return new Date().toISOString();
@@ -74,6 +75,18 @@ export async function buildBeinliveStatus(input: {
 
   const agentStatus = input.agentStatus === undefined ? await readBeinliveAgentStatus(input.matchId) : input.agentStatus;
   if (!agentStatus) {
+    const youtubeFallback = await maybeBuildYouTubeFallbackStatus({
+      provider: "beinlive",
+      label: "bein-live",
+      order: 2,
+      matchId: input.matchId,
+      sourceUrl,
+      reason: "agent-unreachable",
+      updatedAt: nowIso(),
+    });
+    if (youtubeFallback) {
+      return youtubeFallback satisfies BeinliveStatus;
+    }
     return {
       provider: "beinlive",
       mode: "r2",
@@ -89,6 +102,22 @@ export async function buildBeinliveStatus(input: {
       phase: "failed",
       progressPct: 0,
     } satisfies BeinliveStatus;
+  }
+
+  if (agentStatus.state !== "ready") {
+    const youtubeFallback = await maybeBuildYouTubeFallbackStatus({
+      provider: "beinlive",
+      label: "bein-live",
+      order: 2,
+      matchId: input.matchId,
+      sourceUrl,
+      currentSource: agentStatus.currentSource || null,
+      reason: agentStatus.reason || null,
+      updatedAt: agentStatus.updatedAt || nowIso(),
+    });
+    if (youtubeFallback) {
+      return youtubeFallback satisfies BeinliveStatus;
+    }
   }
 
   if (isBeinlivePseudoSourceFailure({ sourceUrl, agentStatus })) {

@@ -2,6 +2,7 @@ import { buildLivekoraPublicPlaylistUrl } from "@/lib/live-providers";
 import { bootstrapR2MirrorAgent, readR2MirrorAgentStatus } from "@/lib/r2-mirror-agent";
 import type { LivekoraAgentStatus, LivekoraStatus } from "@/lib/livekora-types";
 import type { LivekoraMatchRow } from "@/lib/livekora-match";
+import { maybeBuildYouTubeFallbackStatus } from "@/lib/youtube-fallback";
 
 function nowIso() {
   return new Date().toISOString();
@@ -52,6 +53,18 @@ export async function buildLivekoraStatus(input: {
 
   const agentStatus = input.agentStatus === undefined ? await readLivekoraAgentStatus(input.matchId) : input.agentStatus;
   if (!agentStatus) {
+    const youtubeFallback = await maybeBuildYouTubeFallbackStatus({
+      provider: "livekora",
+      label: "livekora vip",
+      order: 1,
+      matchId: input.matchId,
+      sourceUrl,
+      reason: "agent-unreachable",
+      updatedAt: nowIso(),
+    });
+    if (youtubeFallback) {
+      return youtubeFallback satisfies LivekoraStatus;
+    }
     return {
       provider: "livekora",
       mode: "r2",
@@ -67,6 +80,22 @@ export async function buildLivekoraStatus(input: {
       phase: "failed",
       progressPct: 0,
     } satisfies LivekoraStatus;
+  }
+
+  if (agentStatus.state !== "ready") {
+    const youtubeFallback = await maybeBuildYouTubeFallbackStatus({
+      provider: "livekora",
+      label: "livekora vip",
+      order: 1,
+      matchId: input.matchId,
+      sourceUrl,
+      currentSource: agentStatus.currentSource || null,
+      reason: agentStatus.reason || null,
+      updatedAt: agentStatus.updatedAt || nowIso(),
+    });
+    if (youtubeFallback) {
+      return youtubeFallback satisfies LivekoraStatus;
+    }
   }
 
   const playlistUrl =
