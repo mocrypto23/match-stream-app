@@ -111,14 +111,14 @@ const CLEANUP_OLD_FINISHED = String(process.env.CLEANUP_OLD_FINISHED ?? "0") !==
 // SIIIR source (Server 2)
 const SIIIR = {
   dayUrl: {
-    yesterday: "https://w5.siiir.tv/yesterday-matches/",
-    today: "https://w5.siiir.tv/today-matches/",
-    tomorrow: "https://w5.siiir.tv/tomorrow-matches/",
+    yesterday: "https://w7.siiir.tv/yesterday-matches/",
+    today: "https://w7.siiir.tv/today-matches/",
+    tomorrow: "https://w7.siiir.tv/tomorrow-matches/",
   },
 
 };
 const PRIMARY_FALLBACK_SIIIR_DAY_URL = {
-  today: "https://w5.siiir.tv/today-matches/",
+  today: "https://w6.siiir.tv/today-matches/",
 };
 // LIVEHD77 source (Server 3 - today only)
 const LIVEHD = {
@@ -1360,6 +1360,7 @@ function buildScheduleSeedRows({
   primaryRows = [],
   siiirRows = [],
   livekoraRows = [],
+  yallashootRows = [],
 } = {}) {
   const seedMap = new Map();
   const stats = [];
@@ -1367,6 +1368,12 @@ function buildScheduleSeedRows({
   stats.push(appendScheduleSeedRows(seedMap, primaryRows, { sourceName: "bein" }));
   stats.push(appendScheduleSeedRows(seedMap, siiirRows, { sourceName: "siiir", matchUrlField: "match_page_url" }));
   stats.push(appendScheduleSeedRows(seedMap, livekoraRows, { sourceName: "livekora", dayKeyFallback: "today" }));
+  stats.push(
+    appendScheduleSeedRows(seedMap, yallashootRows, {
+      sourceName: "yallashoot",
+      matchUrlField: "yallashoot_stream_url",
+    })
+  );
 
   return {
     rows: Array.from(seedMap.values()),
@@ -3420,7 +3427,8 @@ async function fetchYallashootDay(dayKey) {
       const awayTeam = normalizeSpaces(String(item?.away || "").trim());
       const awayTeamEn = normalizeSpaces(String(item?.away_en || "").trim());
       const hasChannels = String(item?.has_channels || "").trim() === "1";
-      if (!Number.isFinite(matchId) || matchId <= 0 || !homeTeam || !awayTeam || !hasChannels) continue;
+      const isActive = String(item?.active || "").trim() === "1";
+      if (!Number.isFinite(matchId) || matchId <= 0 || !homeTeam || !awayTeam || (!hasChannels && !isActive)) continue;
 
       const streamUrl = buildYallashootArticleUrl(matchId);
       if (!streamUrl || !isServer5SourceLikeUrl(streamUrl)) continue;
@@ -6560,6 +6568,7 @@ async function startScraping() {
       primaryRows: enriched,
       siiirRows: siiirAll,
       livekoraRows: yalaAll,
+      yallashootRows: yallashootEnriched,
     });
 
     if (!scheduleSeedRows.length) {

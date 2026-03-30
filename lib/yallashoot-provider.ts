@@ -349,7 +349,10 @@ async function fetchDayMatches(dayKey: string) {
           const awayTeam = String(item?.away || "").trim();
           const awayTeamEn = String(item?.away_en || "").trim();
           const hasChannels = String(item?.has_channels || "").trim() === "1";
-          if (!Number.isFinite(matchId) || matchId <= 0 || !homeTeam || !awayTeam || !hasChannels) return null;
+          const isActive = String(item?.active || "").trim() === "1";
+          if (!Number.isFinite(matchId) || matchId <= 0 || !homeTeam || !awayTeam || (!hasChannels && !isActive)) {
+            return null;
+          }
           return {
             matchId,
             homeTeam,

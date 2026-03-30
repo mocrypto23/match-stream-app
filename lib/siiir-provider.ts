@@ -21,7 +21,11 @@ import {
   rewriteManifestForSessionMirror,
 } from "@/lib/repack-runtime-adapters/shared";
 
-const SIIIR_DAY_PAGE_URL = "https://w6.siiir.tv/today-matches/";
+const SIIIR_DAY_PAGE_URLS = [
+  "https://w7.siiir.tv/today-matches/",
+  "https://w6.siiir.tv/today-matches/",
+  "https://w5.siiir.tv/today-matches/",
+] as const;
 const SIIIR_HOST_SUFFIXES = ["siiir.tv", "yallashot.us"] as const;
 const DAY_PAGE_CACHE_TTL_MS = 90_000;
 const RUNTIME_SOURCE_TTL_MS = 90_000;
@@ -229,19 +233,26 @@ async function fetchTodayMatches() {
     return cachedDayPage.matches;
   }
 
-  const response = await axios.get<string>(SIIIR_DAY_PAGE_URL, {
-    responseType: "text",
-    timeout: 14_000,
-    maxRedirects: 5,
-    validateStatus: () => true,
-    headers: {
-      "user-agent": DEFAULT_USER_AGENT,
-      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "accept-language": "ar,en;q=0.9",
-    },
-  });
-  const html = String(response.data || "");
-  const matches = Number(response.status || 0) >= 200 && Number(response.status || 0) < 300 ? parseTodayMatches(html) : [];
+  let matches: CachedDayPage["matches"] = [];
+  for (const dayPageUrl of SIIIR_DAY_PAGE_URLS) {
+    try {
+      const response = await axios.get<string>(dayPageUrl, {
+        responseType: "text",
+        timeout: 14_000,
+        maxRedirects: 5,
+        validateStatus: () => true,
+        headers: {
+          "user-agent": DEFAULT_USER_AGENT,
+          accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "accept-language": "ar,en;q=0.9",
+        },
+      });
+      const html = String(response.data || "");
+      if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) continue;
+      matches = parseTodayMatches(html);
+      if (matches.length) break;
+    } catch {}
+  }
   cachedDayPage = {
     fetchedAt: Date.now(),
     matches,
