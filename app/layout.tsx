@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "TwoFooty",
-  description: "Free Matches By Mohammed Ayman",
+  description: "بث مباشر بدون اعلانات",
   manifest: "/site.webmanifest",
 };
 
