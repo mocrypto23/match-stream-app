@@ -67,3 +67,7 @@ pscp.exe
 /.vscode/
 /remote-diag.cmd
 /tmp-*
+/.tmp-*
+/.tmp_*
+/tmp_*
+/notes/
