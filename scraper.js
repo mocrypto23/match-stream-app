@@ -111,14 +111,14 @@ const CLEANUP_OLD_FINISHED = String(process.env.CLEANUP_OLD_FINISHED ?? "0") !==
 // SIIIR source (Server 2)
 const SIIIR = {
   dayUrl: {
-    yesterday: "https://w7.siiir.tv/yesterday-matches/",
-    today: "https://w7.siiir.tv/today-matches/",
-    tomorrow: "https://w7.siiir.tv/tomorrow-matches/",
+    yesterday: "https://siiir.tv/yesterday-matches/",
+    today: "https://siiir.tv/today-matches/",
+    tomorrow: "https://siiir.tv/tomorrow-matches/",
   },
 
 };
 const PRIMARY_FALLBACK_SIIIR_DAY_URL = {
-  today: "https://w6.siiir.tv/today-matches/",
+  today: "https://w7.siiir.tv/today-matches/",
 };
 // LIVEHD77 source (Server 3 - today only)
 const LIVEHD = {

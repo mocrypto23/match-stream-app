@@ -1,6 +1,6 @@
 import { beinliveProvider } from "@/lib/beinlive-provider";
 import { livekoraProvider, type LiveStreamProvider, type MatchRowLike } from "@/lib/live-providers";
-import { siiirProvider } from "@/lib/siiir-provider";
+import { isSiiirDegradedSourceUrl, siiirProvider } from "@/lib/siiir-provider";
 import type { StreamProviderId } from "@/lib/stream-source-types";
 import { yallashootProvider } from "@/lib/yallashoot-provider";
 
@@ -38,9 +38,16 @@ export async function resolveProviderSourceUrl(provider: LiveStreamProvider, row
   const promise = (async () => {
     const resolved = await provider.sourceSelector(row);
     const value = String(resolved || "").trim() || null;
+    const isDegradedSiiirValue = provider.id === "siiir" && isSiiirDegradedSourceUrl(value || "");
     sourceUrlCache.set(cacheKey, {
       value,
-      expiresAt: Date.now() + (value ? SOURCE_URL_CACHE_TTL_MS : NULL_SOURCE_URL_CACHE_TTL_MS),
+      expiresAt:
+        Date.now() +
+        (value
+          ? isDegradedSiiirValue
+            ? NULL_SOURCE_URL_CACHE_TTL_MS
+            : SOURCE_URL_CACHE_TTL_MS
+          : NULL_SOURCE_URL_CACHE_TTL_MS),
     });
     return value;
   })();

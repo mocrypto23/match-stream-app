@@ -2,7 +2,7 @@ import type { LivekoraMatchRow } from "@/lib/livekora-match";
 import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
 import { beinliveProvider } from "@/lib/beinlive-provider";
 import { livekoraProvider } from "@/lib/live-providers";
-import { siiirProvider } from "@/lib/siiir-provider";
+import { isSiiirDegradedSourceUrl, siiirProvider } from "@/lib/siiir-provider";
 import type { StreamProviderId } from "@/lib/stream-source-types";
 import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
 import { yallashootProvider } from "@/lib/yallashoot-provider";
@@ -50,7 +50,10 @@ function pruneExpiredSeeds(now: number) {
 }
 
 function isPartialSeed(seed: HotWatchStateSeed) {
-  return Object.values(seed.sourceUrls).some((value) => !String(value || "").trim());
+  return (
+    Object.values(seed.sourceUrls).some((value) => !String(value || "").trim()) ||
+    isSiiirDegradedSourceUrl(seed.sourceUrls.siiir || "")
+  );
 }
 
 export function seedHotWatchState(input: {

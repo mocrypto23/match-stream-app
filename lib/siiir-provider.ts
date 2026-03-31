@@ -22,6 +22,8 @@ import {
 } from "@/lib/repack-runtime-adapters/shared";
 
 const SIIIR_DAY_PAGE_URLS = [
+  "https://siiir.tv/today-matches/",
+  "https://www.siiir.tv/today-matches/",
   "https://w7.siiir.tv/today-matches/",
   "https://w6.siiir.tv/today-matches/",
   "https://w5.siiir.tv/today-matches/",
@@ -109,6 +111,25 @@ function isSiiirGenericPage(rawUrl: string) {
   }
 }
 
+export function isSiiirWeakLandingSource(rawUrl: string) {
+  const normalized = normalizeHttpUrl(rawUrl);
+  if (!normalized) return false;
+  try {
+    const parsed = new URL(normalized);
+    if (!hostMatchesAnySuffix(parsed.hostname, ["siiir.tv"])) return false;
+    const pathname = String(parsed.pathname || "").toLowerCase();
+    return /^\/matches\/watch(?:-|\/|$)/i.test(pathname);
+  } catch {
+    return false;
+  }
+}
+
+export function isSiiirDegradedSourceUrl(rawUrl: string) {
+  const normalized = normalizeHttpUrl(rawUrl);
+  if (!normalized) return false;
+  return isSiiirGenericPage(normalized) || isSiiirWeakLandingSource(normalized);
+}
+
 function isSiiirUsableSource(rawUrl: string) {
   const normalized = normalizeHttpUrl(rawUrl);
   if (!normalized) return false;
@@ -142,6 +163,7 @@ function scoreSiiirSource(rawUrl: string) {
     }
     if (hostMatchesAnySuffix(host, ["siiir.tv"])) {
       if (/\/playerv\d+\.php/i.test(pathname)) return 260;
+      if (isSiiirWeakLandingSource(normalized)) return 90;
       if (!isSiiirGenericPage(normalized)) return 150;
       return 20;
     }
@@ -542,13 +564,21 @@ export async function pickSiiirSourceUrl(row: MatchRowLike) {
   const directUsable = isSiiirUsableSource(direct) ? direct : "";
   const canonical = String(canonicalTodayMatch?.href || "").trim();
   const canonicalUsable = isSiiirUsableSource(canonical) ? canonical : "";
+  const directStrong = directUsable && !isSiiirDegradedSourceUrl(directUsable) ? directUsable : "";
+  const canonicalStrong = canonicalUsable && !isSiiirDegradedSourceUrl(canonicalUsable) ? canonicalUsable : "";
+
+  if (directStrong && canonicalStrong) {
+    return scoreSiiirSource(directStrong) >= scoreSiiirSource(canonicalStrong) ? directStrong : canonicalStrong;
+  }
+  if (directStrong) return directStrong;
+  if (canonicalStrong) return canonicalStrong;
 
   if (directUsable && canonicalUsable) {
     return scoreSiiirSource(directUsable) >= scoreSiiirSource(canonicalUsable) ? directUsable : canonicalUsable;
   }
   if (directUsable) return directUsable;
   if (canonicalUsable) return canonicalUsable;
-  return canonical || null;
+  return null;
 }
 
 export function buildSiiirSessionManifestUrl(matchId: number, internalOrigin: string) {
