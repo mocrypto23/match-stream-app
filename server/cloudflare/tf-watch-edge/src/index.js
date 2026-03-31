@@ -2,7 +2,7 @@ const BASE_PATH = "/__edge-watch";
 const WS_PATH_RE = /^\/__edge-watch\/ws\/(\d+)$/;
 const SNAPSHOT_PATH_RE = /^\/__edge-watch\/snapshot\/(\d+)$/;
 const PUBLISH_PATH_RE = /^\/__edge-watch\/publish\/(\d+)$/;
-const DEFAULT_SHARD_COUNT = 32;
+const DEFAULT_SHARD_COUNT = 4;
 
 function jsonResponse(payload, init = {}) {
   const headers = new Headers(init.headers || {});
