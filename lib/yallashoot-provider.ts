@@ -35,7 +35,7 @@ const YALLASHOOT_FRAME_HOSTS = [
   "https://vip.kora-top.zip",
 ] as const;
 const DAY_PAGE_CACHE_TTL_MS = 90_000;
-const SOURCE_STATE_TTL_MS = 10 * 60_000;
+const SOURCE_STATE_TTL_MS = 30 * 60_000;
 const WAIT_RETRY_INTERVAL_MS = 700;
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";

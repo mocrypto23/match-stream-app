@@ -486,7 +486,7 @@ class LivekoraJob {
         : this.providerId === "siiir"
           ? Math.max(this.manager.config.readyGraceMs, 75_000)
           : this.providerId === "yallashoot"
-            ? Math.max(this.manager.config.readyGraceMs, 60_000)
+            ? Math.max(this.manager.config.readyGraceMs, 180_000)
             : Math.max(this.manager.config.readyGraceMs, 45_000);
     const dynamicReadyGraceMs =
       Number.isFinite(this.lastObservedTargetDurationSec) && this.lastObservedTargetDurationSec > 0
@@ -643,6 +643,9 @@ class LivekoraJob {
       }
       if (this.providerId === "beinlive") {
         return Math.max(defaultTimeoutMs, isColdBootstrap ? 35_000 : 25_000);
+      }
+      if (this.providerId === "yallashoot") {
+        return Math.max(defaultTimeoutMs, isColdBootstrap ? 45_000 : 30_000);
       }
       return defaultTimeoutMs;
     };

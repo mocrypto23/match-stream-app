@@ -166,6 +166,15 @@ function normalizeSnapshotPayload(matchId, payload) {
   };
 }
 
+function snapshotNeedsRootResync(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return true;
+  for (const key of ["livekoraStatus", "beinliveStatus", "siiirStatus", "yallashootStatus"]) {
+    const state = String(snapshot?.[key]?.state || "").trim().toLowerCase();
+    if (state === "warming") return true;
+  }
+  return false;
+}
+
 function isInternalRequest(request) {
   return String(request.headers.get(INTERNAL_AUTH_HEADER) || "").trim() === "1";
 }
@@ -331,16 +340,17 @@ export class MatchHub {
     if (request.method === "GET" && url.pathname === "/snapshot") {
       const matchId = toMatchId(url.searchParams.get("matchId"));
       let snapshot = await this.readSnapshot();
-      if (!snapshot && matchId) {
+      const shardCount = toShardCount(url.searchParams.get("shards"), DEFAULT_SHARD_COUNT);
+      if (matchId && snapshotNeedsRootResync(snapshot)) {
         snapshot = await this.syncSnapshotFromRoot(
           matchId,
-          toShardCount(url.searchParams.get("shards"), DEFAULT_SHARD_COUNT)
+          shardCount
         );
       }
       return jsonResponse({
         ok: true,
         matchId: snapshot?.matchId || matchId,
-        shard: toShardIndex(url.searchParams.get("shard"), toShardCount(url.searchParams.get("shards"), DEFAULT_SHARD_COUNT)),
+        shard: toShardIndex(url.searchParams.get("shard"), shardCount),
         version: snapshot?.version || null,
         updatedAt: snapshot?.updatedAt || null,
         snapshot,
@@ -655,6 +665,33 @@ export class MatchHub {
           attachment.shardCount || DEFAULT_SHARD_COUNT,
           this.state.getWebSockets().length
         ).catch(() => {});
+        this.readSnapshot()
+          .then((localSnapshot) => {
+            if (!snapshotNeedsRootResync(localSnapshot)) return null;
+            return this.syncSnapshotFromRoot(attachment.matchId, attachment.shardCount || DEFAULT_SHARD_COUNT).then(
+              (rootSnapshot) => {
+                if (!rootSnapshot) return null;
+                const hasChanged =
+                  !localSnapshot ||
+                  localSnapshot.version !== rootSnapshot.version ||
+                  localSnapshot.updatedAt !== rootSnapshot.updatedAt;
+                if (!hasChanged) return null;
+                try {
+                  ws.send(
+                    JSON.stringify({
+                      type: "snapshot",
+                      matchId: rootSnapshot.matchId || attachment.matchId,
+                      version: rootSnapshot.version || null,
+                      updatedAt: rootSnapshot.updatedAt || null,
+                      payload: rootSnapshot,
+                    })
+                  );
+                } catch {}
+                return null;
+              }
+            );
+          })
+          .catch(() => {});
       }
       return;
     }
