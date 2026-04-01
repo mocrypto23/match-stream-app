@@ -22,7 +22,6 @@ type ManifestOptions = {
   waitTimeoutMs?: number | null;
   forceRefresh?: boolean;
   allowRotate?: boolean;
-  preferredCurrentSource?: string | null;
 };
 
 export type ProviderTimingSummary = string;

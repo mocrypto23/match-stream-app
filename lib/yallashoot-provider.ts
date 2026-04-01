@@ -316,32 +316,6 @@ function clearSourceState(sourceUrl: string) {
   yallashootSourceState.delete(key);
 }
 
-function buildDirectCandidateState(sourceUrl: string, manifestUrl: string) {
-  const normalizedSourceUrl = normalizeHttpUrl(sourceUrl);
-  const normalizedManifestUrl = normalizeHttpUrl(manifestUrl);
-  if (!normalizedSourceUrl || !normalizedManifestUrl) return null;
-  return writeSourceState({
-    sourceUrl: normalizedSourceUrl,
-    matchId: extractMatchIdFromSourceUrl(normalizedSourceUrl),
-    articleUrl: normalizedSourceUrl,
-    updatedAt: Date.now(),
-    activeIndex: 0,
-    lastMediaSequence: null,
-    candidates: [
-      {
-        channelKey: "preferred-current-source",
-        manifestUrl: normalizedManifestUrl,
-        referrerUrl: normalizedSourceUrl,
-        playbackUrl: normalizedSourceUrl,
-        updatedAt: Date.now(),
-        lastMediaSequence: null,
-        lastError: "",
-        failureCount: 0,
-      },
-    ],
-  });
-}
-
 function buildArticleUrl(matchId: number) {
   return `${YALLASHOOT_REDIRECT_BASE}?m=${encodeURIComponent(String(matchId))}&lang=ar`;
 }
@@ -810,22 +784,14 @@ export const yallashootProvider: LiveStreamProvider = {
         ? Date.now() + Math.max(1_000, Math.min(12_000, Number(options?.waitTimeoutMs || 5_000)))
         : 0;
     const allowRotate = options?.allowRotate !== false;
-    const preferredCurrentSource = normalizeHttpUrl(String(options?.preferredCurrentSource || "").trim());
-    const cachedState = options?.forceRefresh ? null : readSourceState(input.sourceUrl);
-    const cachedCurrentSource = normalizeHttpUrl(
-      String(cachedState?.candidates?.[cachedState?.activeIndex || 0]?.manifestUrl || "").trim()
-    );
-    const shouldPrimeDirectState = !!preferredCurrentSource && (!cachedState || cachedCurrentSource !== preferredCurrentSource);
-    let state =
-      (shouldPrimeDirectState ? buildDirectCandidateState(input.sourceUrl, preferredCurrentSource) : null) ||
-      cachedState ||
-      (!options?.forceRefresh && preferredCurrentSource ? buildDirectCandidateState(input.sourceUrl, preferredCurrentSource) : null);
+
+    let state = options?.forceRefresh ? null : readSourceState(input.sourceUrl);
     let preservedState = state;
     let attempts = 0;
     let candidatesTried = 0;
     let lastError = "yallashoot-manifest-unavailable";
     let rotated = false;
-    let refreshed = !!options?.forceRefresh || shouldPrimeDirectState;
+    let refreshed = !!options?.forceRefresh;
     let discoveryMs = 0;
     let candidateResolveMs = 0;
 

@@ -4,7 +4,6 @@ import { resolveInternalAppOrigin } from "@/lib/live-providers";
 import { sanitizeHeaderValue } from "@/lib/http-header-utils";
 import { runSessionManifestSingleflight } from "@/lib/session-manifest-singleflight";
 import { getOrLoadHotWatchStateSeed } from "@/lib/watch-state-cache";
-import { readYallashootAgentStatus } from "@/lib/yallashoot-agent";
 import { yallashootProvider } from "@/lib/yallashoot-provider";
 
 export const runtime = "nodejs";
@@ -35,12 +34,10 @@ export async function GET(req: Request) {
   }
 
   const internalOrigin = resolveInternalAppOrigin(req);
-  const agentStatus = await readYallashootAgentStatus(matchId);
   const singleflightKey = [
     "yallashoot",
     matchId,
     sourceUrl,
-    String(agentStatus?.currentSource || "").trim(),
     Number.isFinite(waitForMediaSequence) ? waitForMediaSequence : "",
     Number.isFinite(waitTimeoutMs) ? waitTimeoutMs : "",
     forceRefresh ? "force" : "normal",
@@ -58,7 +55,6 @@ export async function GET(req: Request) {
         waitTimeoutMs: Number.isFinite(waitTimeoutMs) ? waitTimeoutMs : null,
         forceRefresh,
         allowRotate,
-        preferredCurrentSource: String(agentStatus?.currentSource || "").trim() || null,
       }
     );
   });
