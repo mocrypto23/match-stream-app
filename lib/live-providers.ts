@@ -153,6 +153,12 @@ const LIVEKORA_HOST_SUFFIXES = [
   "koooralive.click",
   "kooraxx.com",
 ] as const;
+
+function isDynamicLivekoraHost(host: string) {
+  const normalized = String(host || "").trim().toLowerCase().replace(/\.$/, "");
+  if (!normalized) return false;
+  return /^([a-z0-9-]+\.)?koralive\d+\.[a-z.]+$/i.test(normalized);
+}
 const LIVEKORA_DAY_PAGE_URLS = ["https://www.livekora.vip/today-matches/", "https://www.livekora.vip/"] as const;
 const LIVEKORA_DAY_PAGE_CACHE_TTL_MS = 90_000;
 const DIRECT_EXTRACT_TIMEOUT_MS = 22_000;
@@ -534,7 +540,8 @@ export function isAllowedLivekoraSource(rawUrl: string) {
   const normalized = normalizeHttpUrl(rawUrl);
   if (!normalized) return false;
   try {
-    return hostMatchesAnySuffix(new URL(normalized).hostname, LIVEKORA_HOST_SUFFIXES);
+    const host = new URL(normalized).hostname;
+    return hostMatchesAnySuffix(host, LIVEKORA_HOST_SUFFIXES) || isDynamicLivekoraHost(host);
   } catch {
     return false;
   }

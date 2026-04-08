@@ -36,6 +36,7 @@ const YALLASHOOT_FRAME_HOSTS = [
 ] as const;
 const DAY_PAGE_CACHE_TTL_MS = 90_000;
 const SOURCE_STATE_TTL_MS = 30 * 60_000;
+const TOKENIZED_MANIFEST_REFRESH_WINDOW_MS = 90_000;
 const WAIT_RETRY_INTERVAL_MS = 700;
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
@@ -150,6 +151,36 @@ function isDynamicYallashootRedirectHost(host: string) {
 
 function buildSourceStateKey(sourceUrl: string) {
   return normalizeHttpUrl(sourceUrl).toLowerCase();
+}
+
+function parseManifestExpiresAt(manifestUrl: string) {
+  const normalized = normalizeHttpUrl(manifestUrl);
+  if (!normalized) return 0;
+  try {
+    const raw = String(new URL(normalized).searchParams.get("expires") || "").trim();
+    if (!raw) return 0;
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+    return raw.length >= 13 ? parsed : parsed * 1000;
+  } catch {
+    return 0;
+  }
+}
+
+function isManifestExpiringSoon(manifestUrl: string, windowMs = TOKENIZED_MANIFEST_REFRESH_WINDOW_MS) {
+  const expiresAt = parseManifestExpiresAt(manifestUrl);
+  return expiresAt > 0 && expiresAt - Date.now() <= Math.max(15_000, windowMs);
+}
+
+function shouldRefreshState(state: CachedSourceState) {
+  if (!state.candidates.length) return true;
+  const activeCandidate = state.candidates[state.activeIndex] || state.candidates[0];
+  if (activeCandidate?.manifestUrl && isManifestExpiringSoon(activeCandidate.manifestUrl)) {
+    return true;
+  }
+  const tokenizedCandidates = state.candidates.filter((candidate) => parseManifestExpiresAt(candidate.manifestUrl) > 0);
+  if (!tokenizedCandidates.length) return false;
+  return tokenizedCandidates.every((candidate) => isManifestExpiringSoon(candidate.manifestUrl));
 }
 
 function parseMediaSequence(manifestText: string) {
@@ -295,6 +326,10 @@ function readSourceState(sourceUrl: string) {
     return null;
   }
   if (cached.updatedAt + SOURCE_STATE_TTL_MS <= Date.now()) {
+    yallashootSourceState.delete(key);
+    return null;
+  }
+  if (shouldRefreshState(cached)) {
     yallashootSourceState.delete(key);
     return null;
   }

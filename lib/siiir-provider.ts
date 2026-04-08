@@ -362,6 +362,40 @@ function isDirectSiiirKoooraCandidate(candidate: string) {
   return value.includes("/kooora/") && value.includes("token=") && (value.includes("sid=") || value.includes("session_id="));
 }
 
+function isDirectSiiirHlsCandidate(candidate: string) {
+  const normalized = normalizeHttpUrl(candidate);
+  if (!normalized || normalized.includes("/api/embed-proxy")) return false;
+  try {
+    const parsed = new URL(normalized);
+    return /\.m3u8(?:$|[?#])/i.test(`${parsed.pathname}${parsed.search}`);
+  } catch {
+    return false;
+  }
+}
+
+function scoreDirectSiiirCandidate(candidate: string) {
+  if (isDirectSiiirHlsCandidate(candidate)) return 300;
+  if (isDirectSiiirKoooraCandidate(candidate)) return 200;
+  const value = String(candidate || "").trim().toLowerCase();
+  if (!value || value.includes("/api/embed-proxy")) return 0;
+  if (value.includes("token=") || value.includes("sid=") || value.includes("session_id=")) return 100;
+  return 0;
+}
+
+function selectDirectSiiirCandidates(candidates: string[]) {
+  const deduped = new Map<string, string>();
+  for (const candidate of candidates) {
+    const normalized = normalizeHttpUrl(candidate);
+    if (!normalized || deduped.has(normalized)) continue;
+    const score = scoreDirectSiiirCandidate(normalized);
+    if (score <= 0) continue;
+    deduped.set(normalized, normalized);
+  }
+  return Array.from(deduped.values())
+    .sort((left, right) => scoreDirectSiiirCandidate(right) - scoreDirectSiiirCandidate(left))
+    .slice(0, 6);
+}
+
 async function tryDirectSiiirKoooraManifest(
   input: ProviderContext,
   runtimeSource: { runtimeSourceUrl: string; playbackUrl: string }
@@ -406,11 +440,11 @@ async function tryDirectSiiirKoooraManifest(
   }
 
   const candidateBuildStartedAt = Date.now();
-  const candidates = (
-    await buildPlayerv2Candidates(playervContextUrl, playervBody, 5_500, input.internalOrigin).catch(() => [] as string[])
-  )
-    .filter((candidate) => isDirectSiiirKoooraCandidate(candidate))
-    .slice(0, 4);
+  const candidates = selectDirectSiiirCandidates(
+    await buildPlayerv2Candidates(playervContextUrl, playervBody, 5_500, input.internalOrigin).catch(
+      () => [] as string[]
+    )
+  );
   const candidateBuildMs = Date.now() - candidateBuildStartedAt;
   if (!candidates.length) {
     return {
@@ -469,7 +503,7 @@ async function tryDirectSiiirKoooraManifest(
         fetchUrl: candidate,
         referrerUrl: playervContextUrl,
         playbackUrl: normalizedPlaybackUrl,
-        currentSource: candidate,
+        currentSource: resolved.finalUrl,
         mediaSequence: parseMediaSequence(resolved.body),
         targetDurationSec: parseTargetDurationSec(resolved.body),
         refreshed: false,

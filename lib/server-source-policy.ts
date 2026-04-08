@@ -78,6 +78,11 @@ function isDynamicYallashootRedirectHost(host: string) {
   return !!normalized && normalized.endsWith(".mov") && normalized.includes("yalla-shootx-space");
 }
 
+function isDynamicLivekoraHost(host: string) {
+  const normalized = normalizeHost(host);
+  return !!normalized && /^([a-z0-9-]+\.)?koralive\d+\.[a-z.]+$/i.test(normalized);
+}
+
 function safeDecodeURIComponent(value: string) {
   try {
     return decodeURIComponent(String(value || ""));
@@ -99,6 +104,7 @@ function findSlotServerByHost(hostname: string): SlotServerId | null {
   const host = normalizeHost(hostname);
   if (!host) return null;
   if (isDynamicYallashootRedirectHost(host)) return 5;
+  if (isDynamicLivekoraHost(host)) return 4;
   for (const slotServerId of SLOT_SERVER_IDS) {
     if (hostMatchesAnySuffix(host, getSlotHostAllowlist(slotServerId))) return slotServerId;
   }
@@ -202,6 +208,9 @@ export function isAllowedSourceForSlotServer(slotServerId: SlotServerId, rawUrl:
     const host = parsed.hostname;
     if (slotServerId === 5 && isDynamicYallashootRedirectHost(host)) {
       return /^\d+$/.test(String(parsed.searchParams.get("m") || "").trim());
+    }
+    if (slotServerId === 4 && isDynamicLivekoraHost(host)) {
+      return true;
     }
     return hostMatchesAnySuffix(host, getSlotHostAllowlist(slotServerId));
   } catch {
