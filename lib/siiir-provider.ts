@@ -384,16 +384,30 @@ function scoreDirectSiiirCandidate(candidate: string) {
 
 function selectDirectSiiirCandidates(candidates: string[]) {
   const deduped = new Map<string, string>();
+  const koooraCandidates: string[] = [];
+  const hlsFallbackCandidates: string[] = [];
   for (const candidate of candidates) {
     const normalized = normalizeHttpUrl(candidate);
     if (!normalized || deduped.has(normalized)) continue;
     const score = scoreDirectSiiirCandidate(normalized);
     if (score <= 0) continue;
     deduped.set(normalized, normalized);
+    if (isDirectSiiirKoooraCandidate(normalized)) {
+      koooraCandidates.push(normalized);
+      continue;
+    }
+    if (isDirectSiiirHlsCandidate(normalized)) {
+      hlsFallbackCandidates.push(normalized);
+    }
   }
-  return Array.from(deduped.values())
+  if (koooraCandidates.length) {
+    return koooraCandidates
+      .sort((left, right) => scoreDirectSiiirCandidate(right) - scoreDirectSiiirCandidate(left))
+      .slice(0, 4);
+  }
+  return hlsFallbackCandidates
     .sort((left, right) => scoreDirectSiiirCandidate(right) - scoreDirectSiiirCandidate(left))
-    .slice(0, 6);
+    .slice(0, 2);
 }
 
 async function tryDirectSiiirKoooraManifest(
@@ -504,7 +518,7 @@ async function tryDirectSiiirKoooraManifest(
         fetchUrl: candidate,
         referrerUrl: playervContextUrl,
         playbackUrl: normalizedPlaybackUrl,
-        currentSource: resolved.finalUrl,
+        currentSource: candidate,
         mediaSequence: parseMediaSequence(resolved.body),
         targetDurationSec: parseTargetDurationSec(resolved.body),
         refreshed: false,
