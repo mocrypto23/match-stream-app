@@ -159,6 +159,12 @@ function isDynamicLivekoraHost(host: string) {
   if (!normalized) return false;
   return /^([a-z0-9-]+\.)?koralive\d+\.[a-z.]+$/i.test(normalized);
 }
+
+function isDynamicLivekoraBridgeHost(host: string) {
+  const normalized = String(host || "").trim().toLowerCase().replace(/\.$/, "");
+  if (!normalized) return false;
+  return normalized.includes("softstream");
+}
 const LIVEKORA_DAY_PAGE_URLS = ["https://www.livekora.vip/today-matches/", "https://www.livekora.vip/"] as const;
 const LIVEKORA_DAY_PAGE_CACHE_TTL_MS = 90_000;
 const DIRECT_EXTRACT_TIMEOUT_MS = 22_000;
@@ -261,16 +267,35 @@ function decodeHtmlEntities(value: string) {
 
 function parseLivekoraTodayMatches(html: string) {
   const out: CachedLivekoraDayPage["matches"] = [];
+  const seen = new Set<string>();
+  const pushMatch = (href: string, homeTeam: string, awayTeam: string) => {
+    const normalizedHref = normalizeHttpUrl(String(href || "").trim());
+    const normalizedHome = decodeHtmlEntities(String(homeTeam || "").trim());
+    const normalizedAway = decodeHtmlEntities(String(awayTeam || "").trim());
+    if (!normalizedHref || !normalizedHome || !normalizedAway) return;
+    const key = `${normalizedHref}::${unorderedPairKey(normalizedHome, normalizedAway)}`;
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push({ href: normalizedHref, homeTeam: normalizedHome, awayTeam: normalizedAway });
+  };
+
+  const titleAnchorRe = /<a[^>]+href=["']([^"'?#]+)["'][^>]+title=["']([^"']+?)["'][^>]*>/gi;
+  let titleMatch: RegExpExecArray | null = null;
+  while ((titleMatch = titleAnchorRe.exec(html))) {
+    const href = String(titleMatch[1] || "").trim();
+    const title = decodeHtmlEntities(String(titleMatch[2] || "").trim());
+    if (!title || !/\bvs\b|ضد/i.test(title)) continue;
+    const parts = title.split(/\s+(?:vs|ضد)\s+/i).map((value) => String(value || "").trim());
+    if (parts.length < 2) continue;
+    pushMatch(href, parts[0], parts[1]);
+  }
+
   const cardRe =
     /<a[^>]+href=["']([^"'?#]+)["'][^>]*>[\s\S]*?<div[^>]+class=["'][^"']*\bteam-name\b[^"']*["'][^>]*>\s*([^<]+?)\s*<\/div>[\s\S]*?<div[^>]+class=["'][^"']*\bteam-name\b[^"']*["'][^>]*>\s*([^<]+?)\s*<\/div>/gi;
 
   let match: RegExpExecArray | null = null;
   while ((match = cardRe.exec(html))) {
-    const href = normalizeHttpUrl(String(match[1] || "").trim());
-    const homeTeam = decodeHtmlEntities(String(match[2] || "").trim());
-    const awayTeam = decodeHtmlEntities(String(match[3] || "").trim());
-    if (!href || !homeTeam || !awayTeam) continue;
-    out.push({ homeTeam, awayTeam, href });
+    pushMatch(String(match[1] || "").trim(), String(match[2] || "").trim(), String(match[3] || "").trim());
   }
   return out;
 }
@@ -541,7 +566,7 @@ export function isAllowedLivekoraSource(rawUrl: string) {
   if (!normalized) return false;
   try {
     const host = new URL(normalized).hostname;
-    return hostMatchesAnySuffix(host, LIVEKORA_HOST_SUFFIXES) || isDynamicLivekoraHost(host);
+    return hostMatchesAnySuffix(host, LIVEKORA_HOST_SUFFIXES) || isDynamicLivekoraHost(host) || isDynamicLivekoraBridgeHost(host);
   } catch {
     return false;
   }
@@ -598,12 +623,12 @@ export async function pickLivekoraSourceUrl(row: MatchRowLike) {
   }
 
   const pairKey = unorderedPairKey(row?.home_team, row?.away_team);
-  if (!pairKey) return isAllowedLivekoraSource(raw) ? raw : null;
+  if (!pairKey) return rawIsWeak ? null : isAllowedLivekoraSource(raw) ? raw : null;
 
   const matches = await fetchLivekoraTodayMatches().catch(() => [] as CachedLivekoraDayPage["matches"]);
   const found = matches.find((candidate) => unorderedPairKey(candidate.homeTeam, candidate.awayTeam) === pairKey);
   if (found?.href) return found.href;
-  return isAllowedLivekoraSource(raw) ? raw : null;
+  return rawIsWeak ? null : isAllowedLivekoraSource(raw) ? raw : null;
 }
 
 export function buildLivekoraPublicPlaylistUrl(matchId: number, publicBaseUrl?: string) {
