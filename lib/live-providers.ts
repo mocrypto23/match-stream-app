@@ -585,14 +585,25 @@ async function fetchLivekoraTodayMatches() {
 
 export async function pickLivekoraSourceUrl(row: MatchRowLike) {
   const raw = String(row?.stream_url_4 || "").trim();
-  if (isAllowedLivekoraSource(raw)) return raw;
+  let rawIsWeak = false;
+  if (isAllowedLivekoraSource(raw)) {
+    try {
+      const parsed = new URL(raw);
+      const pathname = String(parsed.pathname || "").trim().toLowerCase().replace(/\/+$/, "") || "/";
+      rawIsWeak = pathname === "/" || pathname === "/today-matches";
+      if (!rawIsWeak) return raw;
+    } catch {
+      return raw;
+    }
+  }
 
   const pairKey = unorderedPairKey(row?.home_team, row?.away_team);
-  if (!pairKey) return null;
+  if (!pairKey) return isAllowedLivekoraSource(raw) ? raw : null;
 
   const matches = await fetchLivekoraTodayMatches().catch(() => [] as CachedLivekoraDayPage["matches"]);
   const found = matches.find((candidate) => unorderedPairKey(candidate.homeTeam, candidate.awayTeam) === pairKey);
-  return found?.href || null;
+  if (found?.href) return found.href;
+  return isAllowedLivekoraSource(raw) ? raw : null;
 }
 
 export function buildLivekoraPublicPlaylistUrl(matchId: number, publicBaseUrl?: string) {

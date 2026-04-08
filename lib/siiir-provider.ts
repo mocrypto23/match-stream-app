@@ -496,7 +496,8 @@ async function tryDirectSiiirKoooraManifest(
           resolved.finalUrl,
           input.internalOrigin,
           normalizedRuntimeSourceUrl,
-          2
+          2,
+          playervContextUrl
         ),
         finalUrl: resolved.finalUrl,
         targetUrl: candidate,

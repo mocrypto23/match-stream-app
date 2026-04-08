@@ -451,10 +451,14 @@ export function rewriteManifestForSessionMirror(
   baseUrl: string,
   internalOrigin: string,
   sourceUrl: string,
-  slotServer: SlotServerId
+  slotServer: SlotServerId,
+  assetReferrerUrlOverride?: string
 ) {
   const lines = String(manifest || "").split(/\r?\n/);
   const out: string[] = [];
+  const assetReferrerUrl = isValidHttpUrl(String(assetReferrerUrlOverride || "").trim())
+    ? String(assetReferrerUrlOverride || "").trim()
+    : baseUrl;
   const rewriteAssetUrl = (raw: string) => {
     const absolute = resolveManifestUrl(raw, baseUrl);
     if (!absolute) return raw;
@@ -466,7 +470,7 @@ export function rewriteManifestForSessionMirror(
       slotServer,
       sourceUrl,
       assetUrl: unwrapped,
-      referrerUrl: baseUrl,
+      referrerUrl: assetReferrerUrl,
     });
   };
 
