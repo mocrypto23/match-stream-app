@@ -165,6 +165,21 @@ function isDynamicLivekoraBridgeHost(host: string) {
   if (!normalized) return false;
   return normalized.includes("softstream");
 }
+
+function isDynamicLivekoraBridgeUrl(rawUrl: string) {
+  const normalized = normalizeHttpUrl(rawUrl);
+  if (!normalized) return false;
+  try {
+    const parsed = new URL(normalized);
+    const pathname = String(parsed.pathname || "").toLowerCase();
+    if (pathname.includes("/albaplayer/")) return true;
+    if (/\/live\d+\.(?:html?|php)$/i.test(pathname)) return true;
+    if (/\/(?:watch|player|stream)\d+\.(?:html?|php)$/i.test(pathname)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
 const LIVEKORA_DAY_PAGE_URLS = ["https://www.livekora.vip/today-matches/", "https://www.livekora.vip/"] as const;
 const LIVEKORA_DAY_PAGE_CACHE_TTL_MS = 90_000;
 const DIRECT_EXTRACT_TIMEOUT_MS = 22_000;
@@ -566,7 +581,12 @@ export function isAllowedLivekoraSource(rawUrl: string) {
   if (!normalized) return false;
   try {
     const host = new URL(normalized).hostname;
-    return hostMatchesAnySuffix(host, LIVEKORA_HOST_SUFFIXES) || isDynamicLivekoraHost(host) || isDynamicLivekoraBridgeHost(host);
+    return (
+      hostMatchesAnySuffix(host, LIVEKORA_HOST_SUFFIXES) ||
+      isDynamicLivekoraHost(host) ||
+      isDynamicLivekoraBridgeHost(host) ||
+      isDynamicLivekoraBridgeUrl(normalized)
+    );
   } catch {
     return false;
   }

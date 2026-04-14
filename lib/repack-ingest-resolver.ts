@@ -136,6 +136,19 @@ function safeOrigin(value: string) {
   }
 }
 
+function isDynamicSiiirKoooraUrl(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    const u = new URL(rawUrl);
+    const pathname = String(u.pathname || "").toLowerCase();
+    const search = String(u.search || "").toLowerCase();
+    if (!pathname.includes("/kooora/")) return false;
+    return search.includes("token=") || search.includes("sid=") || search.includes("session_id=") || search.includes("nonce=");
+  } catch {
+    return false;
+  }
+}
+
 function normalizeCandidate(raw: unknown, baseUrl: string) {
   const initial = String(raw || "").trim();
   if (!initial) return "";
@@ -1465,9 +1478,7 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
     const pathname = String(u.pathname || "").toLowerCase();
     const search = String(u.search || "").toLowerCase();
     const combined = `${pathname}${search}`;
-    const isYallashotKoooraDirect =
-      (u.hostname.toLowerCase().endsWith(".yallashot.us") || u.hostname.toLowerCase() === "yallashot.us") &&
-      pathname.includes("/kooora/");
+    const isYallashotKoooraDirect = isDynamicSiiirKoooraUrl(rawUrl);
 
     if (looksLikeNonStreamAssetPath(pathname)) return Number.NEGATIVE_INFINITY;
     if (combined.includes(".mpd")) return Number.NEGATIVE_INFINITY;
@@ -1490,7 +1501,7 @@ function scoreCandidate(rawUrl: string, sourceHost: string) {
           const tu = new URL(target);
           const tPath = String(tu.pathname || "").toLowerCase();
           const tHost = tu.hostname.toLowerCase();
-          if ((tHost.endsWith(".yallashot.us") || tHost === "yallashot.us") && tPath.includes("/kooora/")) {
+          if (isDynamicSiiirKoooraUrl(target)) {
             score += 420;
           }
           if ((tHost === "showchop.net" || tHost.endsWith(".showchop.net")) && tPath.includes("/embed/")) score += 180;
@@ -2181,8 +2192,7 @@ export async function resolveRepackIngestUrl(input: ResolveRepackIngestInput): P
       const candidateUrl = new URL(candidate);
       const host = candidateUrl.hostname.toLowerCase();
       const pathname = String(candidateUrl.pathname || "").toLowerCase();
-      const isYallashotKooora =
-        (host.endsWith(".yallashot.us") || host === "yallashot.us") && pathname.includes("/kooora/");
+      const isYallashotKooora = isDynamicSiiirKoooraUrl(candidate);
       if (!isYallashotKooora) continue;
       const proxyWrapped = buildInternalEmbedProxyUrl({
         sourceUrl: candidate,

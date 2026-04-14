@@ -387,15 +387,9 @@ function inheritYallashotManifestAuth(rawChildAbsoluteUrl: string, baseUrl: stri
   try {
     const child = new URL(rawChildAbsoluteUrl);
     const parent = new URL(baseUrl);
-    const childHost = child.hostname.toLowerCase();
-    const parentHost = parent.hostname.toLowerCase();
     const childPath = String(child.pathname || "").toLowerCase();
     const parentPath = String(parent.pathname || "").toLowerCase();
-    const isYallashotPair =
-      (childHost === "yallashot.us" || childHost.endsWith(".yallashot.us")) &&
-      (parentHost === "yallashot.us" || parentHost.endsWith(".yallashot.us")) &&
-      (childPath.includes("/kooora/") || parentPath.includes("/kooora/"));
-    if (!isYallashotPair) return rawChildAbsoluteUrl;
+    if (!childPath.includes("/kooora/") && !parentPath.includes("/kooora/")) return rawChildAbsoluteUrl;
 
     const token = String(parent.searchParams.get("token") || "").trim();
     const parentSid = String(parent.searchParams.get("sid") || "").trim();

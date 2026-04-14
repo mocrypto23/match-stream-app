@@ -21,14 +21,8 @@ import {
   rewriteManifestForSessionMirror,
 } from "@/lib/repack-runtime-adapters/shared";
 
-const SIIIR_DAY_PAGE_URLS = [
-  "https://siiir.tv/today-matches/",
-  "https://www.siiir.tv/today-matches/",
-  "https://w7.siiir.tv/today-matches/",
-  "https://w6.siiir.tv/today-matches/",
-  "https://w5.siiir.tv/today-matches/",
-] as const;
-const SIIIR_HOST_SUFFIXES = ["siiir.tv", "yallashot.us"] as const;
+const SIIIR_DAY_PAGE_URLS = ["https://siiir.tv/", "https://www.siiir.tv/"] as const;
+const SIIIR_HOST_SUFFIXES = ["siiir.tv"] as const;
 const DAY_PAGE_CACHE_TTL_MS = 90_000;
 const RUNTIME_SOURCE_TTL_MS = 90_000;
 const DEFAULT_USER_AGENT =
@@ -84,6 +78,22 @@ function hostMatchesAnySuffix(host: string, suffixes: readonly string[]) {
   return suffixes.some((suffix) => normalized === suffix || normalized.endsWith(`.${suffix}`));
 }
 
+function isDynamicSiiirRuntimeUrl(rawUrl: string) {
+  const normalized = normalizeHttpUrl(rawUrl);
+  if (!normalized) return false;
+  try {
+    const parsed = new URL(normalized);
+    const pathname = String(parsed.pathname || "").toLowerCase();
+    const search = String(parsed.search || "").toLowerCase();
+    if (/\/playerv\d+\.php/i.test(pathname)) return true;
+    if (pathname.includes("/hard/") && search.includes("match=")) return true;
+    if (!pathname.includes("/kooora/")) return false;
+    return search.includes("token=") || search.includes("sid=") || search.includes("session_id=") || search.includes("nonce=");
+  } catch {
+    return false;
+  }
+}
+
 function parseMediaSequence(manifestText: string) {
   const match = String(manifestText || "").match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/i);
   return match ? Number.parseInt(match[1], 10) : null;
@@ -133,13 +143,10 @@ export function isSiiirDegradedSourceUrl(rawUrl: string) {
 function isSiiirUsableSource(rawUrl: string) {
   const normalized = normalizeHttpUrl(rawUrl);
   if (!normalized) return false;
+  if (isDynamicSiiirRuntimeUrl(normalized)) return true;
   try {
     const parsed = new URL(normalized);
     const host = parsed.hostname.toLowerCase();
-    const pathname = String(parsed.pathname || "").toLowerCase();
-    if (hostMatchesAnySuffix(host, ["yallashot.us"])) {
-      return pathname.includes("/hard/") || /\/playerv\d+\.php/i.test(pathname);
-    }
     if (hostMatchesAnySuffix(host, ["siiir.tv"])) {
       return !isSiiirGenericPage(normalized);
     }
@@ -152,15 +159,19 @@ function isSiiirUsableSource(rawUrl: string) {
 function scoreSiiirSource(rawUrl: string) {
   const normalized = normalizeHttpUrl(rawUrl);
   if (!normalized) return -1;
+  if (isDynamicSiiirRuntimeUrl(normalized)) {
+    try {
+      const pathname = String(new URL(normalized).pathname || "").toLowerCase();
+      if (pathname.includes("/hard/")) return 340;
+      if (/\/playerv\d+\.php/i.test(pathname)) return 320;
+      if (pathname.includes("/kooora/")) return 240;
+    } catch {}
+    return 260;
+  }
   try {
     const parsed = new URL(normalized);
     const host = parsed.hostname.toLowerCase();
     const pathname = String(parsed.pathname || "").toLowerCase();
-    if (hostMatchesAnySuffix(host, ["yallashot.us"])) {
-      if (pathname.includes("/hard/")) return 300;
-      if (/\/playerv\d+\.php/i.test(pathname)) return 280;
-      return 120;
-    }
     if (hostMatchesAnySuffix(host, ["siiir.tv"])) {
       if (/\/playerv\d+\.php/i.test(pathname)) return 260;
       if (isSiiirWeakLandingSource(normalized)) return 90;
@@ -236,16 +247,31 @@ function decodeHtmlEntities(value: string) {
 
 function parseTodayMatches(html: string) {
   const out: CachedDayPage["matches"] = [];
+  const seen = new Set<string>();
+  const pushMatch = (href: string, homeTeam: string, awayTeam: string) => {
+    const normalizedHref = normalizeHttpUrl(String(href || "").trim());
+    const normalizedHome = decodeHtmlEntities(String(homeTeam || "").trim());
+    const normalizedAway = decodeHtmlEntities(String(awayTeam || "").trim());
+    if (!normalizedHref || !normalizedHome || !normalizedAway) return;
+    const key = `${normalizedHref}::${unorderedPairKey(normalizedHome, normalizedAway)}`;
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push({ homeTeam: normalizedHome, awayTeam: normalizedAway, href: normalizedHref });
+  };
+
+  const rootCardRe =
+    /<a[^>]+class=["'][^"']*\bmatch\b[^"']*\bhas-live\b[^"']*["'][^>]+href=["']([^"']+)["'][\s\S]*?<div class="team home">[\s\S]*?<span class="name">\s*([^<]+?)\s*<\/span>[\s\S]*?<div class="team away">[\s\S]*?<span class="name">\s*([^<]+?)\s*<\/span>/gi;
+  let rootMatch: RegExpExecArray | null = null;
+  while ((rootMatch = rootCardRe.exec(html))) {
+    pushMatch(String(rootMatch[1] || ""), String(rootMatch[2] || ""), String(rootMatch[3] || ""));
+  }
+
   const cardRe =
     /<div[^>]+class=['"][^'"]*\bAY_Match\b[^'"]*['"][\s\S]*?<div[^>]+class=['"][^'"]*\bTM_Name\b[^'"]*['"][^>]*>\s*([^<]+?)\s*<\/div>[\s\S]*?<div[^>]+class=['"][^'"]*\bTM_Name\b[^'"]*['"][^>]*>\s*([^<]+?)\s*<\/div>[\s\S]*?<a[^>]+href=["']([^"'#]+(?:\?[^"'#]*)?)["']/gi;
 
   let match: RegExpExecArray | null = null;
   while ((match = cardRe.exec(html))) {
-    const homeTeam = decodeHtmlEntities(String(match[1] || "").trim());
-    const awayTeam = decodeHtmlEntities(String(match[2] || "").trim());
-    const href = normalizeHttpUrl(String(match[3] || "").trim());
-    if (!homeTeam || !awayTeam || !href) continue;
-    out.push({ homeTeam, awayTeam, href });
+    pushMatch(String(match[3] || ""), String(match[1] || ""), String(match[2] || ""));
   }
   return out;
 }
@@ -270,7 +296,6 @@ async function fetchTodayMatches() {
         },
       });
       const html = String(response.data || "");
-      if (Number(response.status || 0) < 200 || Number(response.status || 0) >= 300) continue;
       matches = parseTodayMatches(html);
       if (matches.length) break;
     } catch {}
@@ -600,6 +625,7 @@ function mapAssetResult(result: Awaited<ReturnType<typeof playerv2RuntimeAdapter
 export function isAllowedSiiirSource(rawUrl: string) {
   const normalized = normalizeHttpUrl(rawUrl);
   if (!normalized) return false;
+  if (isDynamicSiiirRuntimeUrl(normalized)) return true;
   try {
     return hostMatchesAnySuffix(new URL(normalized).hostname, SIIIR_HOST_SUFFIXES);
   } catch {

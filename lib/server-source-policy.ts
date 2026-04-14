@@ -88,6 +88,35 @@ function isDynamicLivekoraBridgeHost(host: string) {
   return !!normalized && normalized.includes("softstream");
 }
 
+function isDynamicLivekoraBridgeUrl(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    const pathname = String(parsed.pathname || "").toLowerCase();
+    if (pathname.includes("/albaplayer/")) return true;
+    if (/\/live\d+\.(?:html?|php)$/i.test(pathname)) return true;
+    if (/\/(?:watch|player|stream)\d+\.(?:html?|php)$/i.test(pathname)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function isDynamicSiiirRuntimeUrl(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    const pathname = String(parsed.pathname || "").toLowerCase();
+    const search = String(parsed.search || "").toLowerCase();
+    if (/\/playerv\d+\.php/i.test(pathname)) return true;
+    if (pathname.includes("/hard/") && search.includes("match=")) return true;
+    if (!pathname.includes("/kooora/")) return false;
+    return search.includes("token=") || search.includes("sid=") || search.includes("session_id=") || search.includes("nonce=");
+  } catch {
+    return false;
+  }
+}
+
 function safeDecodeURIComponent(value: string) {
   try {
     return decodeURIComponent(String(value || ""));
@@ -219,6 +248,12 @@ export function isAllowedSourceForSlotServer(slotServerId: SlotServerId, rawUrl:
       return true;
     }
     if (slotServerId === 4 && isDynamicLivekoraBridgeHost(host)) {
+      return true;
+    }
+    if (slotServerId === 4 && isDynamicLivekoraBridgeUrl(rawUrl)) {
+      return true;
+    }
+    if (slotServerId === 2 && isDynamicSiiirRuntimeUrl(rawUrl)) {
       return true;
     }
     return hostMatchesAnySuffix(host, getSlotHostAllowlist(slotServerId));

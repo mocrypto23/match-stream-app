@@ -266,14 +266,26 @@ function hostMatchesAnySuffix(hostname: string, suffixes: string[]) {
   return suffixes.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
 }
 
-function isSiiirBrowserSensitivePage(rawUrl: string) {
+function isDynamicSiiirRuntimeUrl(rawUrl: string) {
   if (!isValidHttpUrl(rawUrl)) return false;
   try {
     const parsed = new URL(rawUrl);
-    const host = parsed.hostname.toLowerCase();
     const pathname = String(parsed.pathname || "").toLowerCase();
-    if (!(host === "yallashot.us" || host.endsWith(".yallashot.us"))) return false;
-    return pathname.includes("/playerv2.php") || pathname.includes("/hard/");
+    const search = String(parsed.search || "").toLowerCase();
+    if (/\/playerv\d+\.php/i.test(pathname)) return true;
+    if (pathname.includes("/hard/") && search.includes("match=")) return true;
+    if (!pathname.includes("/kooora/")) return false;
+    return search.includes("token=") || search.includes("sid=") || search.includes("session_id=") || search.includes("nonce=");
+  } catch {
+    return false;
+  }
+}
+
+function isSiiirBrowserSensitivePage(rawUrl: string) {
+  if (!isValidHttpUrl(rawUrl)) return false;
+  try {
+    const pathname = String(new URL(rawUrl).pathname || "").toLowerCase();
+    return /\/playerv\d+\.php/i.test(pathname) || pathname.includes("/hard/");
   } catch {
     return false;
   }
@@ -444,8 +456,7 @@ function looksLikeNavigableStreamPage(rawUrl: string) {
       host === "sportsurges.online" ||
       host.endsWith(".yallashoot2026.com") ||
       host === "yallashoot2026.com" ||
-      host.endsWith(".yallashot.us") ||
-      host === "yallashot.us"
+      isDynamicSiiirRuntimeUrl(rawUrl)
     );
   } catch {
     return false;
@@ -703,7 +714,7 @@ function scoreCandidate(input: {
     const u = new URL(targetUrl);
     const host = u.hostname.toLowerCase();
     const search = String(u.search || "").toLowerCase();
-    if (host.endsWith(".yallashot.us") || host === "yallashot.us") score += 220;
+    if (isDynamicSiiirRuntimeUrl(targetUrl)) score += 220;
     if (host.endsWith(".bein-live.com") || host === "bein-live.com") score += 160;
     if (host.endsWith(".livehd77.pro") || host === "livehd77.pro") score += 140;
     if (host.endsWith(".pandalive.live") || host === "pandalive.live") score += 120;

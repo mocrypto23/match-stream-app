@@ -621,11 +621,8 @@ function rewriteM3u8Manifest(
     let resolved = referrerForChildren || baseUrl;
     try {
       const base = new URL(baseUrl);
-      const host = normalizeHost(base.hostname);
       const pathname = String(base.pathname || "").toLowerCase();
-      const isYallashotKooora =
-        (host === "yallashot.us" || host.endsWith(".yallashot.us")) && pathname.includes("/kooora/");
-      if (isYallashotKooora) {
+      if (pathname.includes("/kooora/")) {
         // Some tokenized yallashot streams require referer chaining per-level manifest.
         resolved = baseUrl;
       }
@@ -667,15 +664,9 @@ function rewriteM3u8Manifest(
     try {
       const child = new URL(rawChildAbsoluteUrl);
       const parent = new URL(baseUrl);
-      const childHost = normalizeHost(child.hostname);
-      const parentHost = normalizeHost(parent.hostname);
       const childPath = String(child.pathname || "").toLowerCase();
       const parentPath = String(parent.pathname || "").toLowerCase();
-      const isYallashotPair =
-        (childHost === "yallashot.us" || childHost.endsWith(".yallashot.us")) &&
-        (parentHost === "yallashot.us" || parentHost.endsWith(".yallashot.us")) &&
-        (childPath.includes("/kooora/") || parentPath.includes("/kooora/"));
-      if (!isYallashotPair) return rawChildAbsoluteUrl;
+      if (!childPath.includes("/kooora/") && !parentPath.includes("/kooora/")) return rawChildAbsoluteUrl;
 
       const token = String(parent.searchParams.get("token") || "").trim();
       const parentSid = String(parent.searchParams.get("sid") || "").trim();
@@ -1395,8 +1386,8 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number, s
   out = out.replace(/DisableDevtool\s*\([\s\S]*?\)\s*;?/gi, "");
   out = out.replace(/consoleban\.init\s*\([\s\S]*?\)\s*;?/gi, "");
 
-  // yallashot player requires this POST endpoint to generate stream tokens.
-  if (host.endsWith("yallashot.us")) {
+  // Some playerv pages require this POST endpoint to generate stream tokens.
+  if (/\/playerv\d+\.php/i.test(String(target.pathname || "").toLowerCase())) {
     const tokenEndpoint = `${target.origin}/playerv2.php?action=generate_token`;
     const proxiedTokenEndpoint = buildProxyUrl(tokenEndpoint, nextDepth, target.toString());
     out = out.replace(
