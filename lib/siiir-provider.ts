@@ -322,12 +322,30 @@ function extractPlayerv2UrlFromHardPage(pageUrl: string, html: string) {
       : "";
   if (directUrl) return directUrl;
 
+  const sourceMatchId = String(new URL(pageUrl).searchParams.get("match") || "").trim();
+  if (sourceMatchId && directMatch) {
+    const resolvedDirectTemplate = normalizeHttpUrl(
+      directMatch
+        .replace(/\$\{encodeURIComponent\(matchId\)\}/gi, encodeURIComponent(sourceMatchId))
+        .replace(/\$\{matchId\}/gi, encodeURIComponent(sourceMatchId))
+    );
+    if (resolvedDirectTemplate) return resolvedDirectTemplate;
+  }
+
   const playerTemplateMatch = html.match(
     /playerUrl\s*=\s*`(https?:\/\/[^`]+?\/playerv\d+\.php\?match=match)\$\{encodeURIComponent\(matchId\)\}(&key=[^`]+)`/i
   );
-  const sourceMatchId = String(new URL(pageUrl).searchParams.get("match") || "").trim();
   if (playerTemplateMatch?.[1] && playerTemplateMatch?.[2] && sourceMatchId) {
     return normalizeHttpUrl(`${playerTemplateMatch[1]}${encodeURIComponent(sourceMatchId)}${playerTemplateMatch[2]}`);
+  }
+
+  const playerSrcTemplateMatch = html.match(
+    /playerElement\.src\s*=\s*`(https?:\/\/[^`]+?\/playerv\d+\.php\?match=)\$\{encodeURIComponent\(matchId\)\}([^`]*)`/i
+  );
+  if (playerSrcTemplateMatch?.[1] && sourceMatchId) {
+    return normalizeHttpUrl(
+      `${playerSrcTemplateMatch[1]}${encodeURIComponent(sourceMatchId)}${String(playerSrcTemplateMatch[2] || "").trim()}`
+    );
   }
   return "";
 }
