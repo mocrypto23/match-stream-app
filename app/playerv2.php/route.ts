@@ -12,7 +12,10 @@ function resolveUpstreamFromReferer(req: Request) {
     const proxiedTarget = refUrl.searchParams.get("url");
     if (proxiedTarget) {
       const decoded = new URL(proxiedTarget);
-      return `${decoded.origin}/playerv2.php?action=generate_token`;
+      const pathname = String(decoded.pathname || "");
+      const match = pathname.match(/\/(playerv\d+)\.php/i);
+      const scriptName = match?.[1] ? `${match[1]}.php` : "playerv2.php";
+      return `${decoded.origin}/${scriptName}?action=generate_token`;
     }
   } catch {}
 

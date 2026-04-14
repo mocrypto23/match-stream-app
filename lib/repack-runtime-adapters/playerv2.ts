@@ -11,14 +11,25 @@ import { getSourceFamilyForSlotServer } from "@/lib/server-source-policy";
 import {
   PLAYERV2_RUNTIME_MANIFEST_MAX_AGE_MS,
   buildSessionOwnedRuntimeAdapter,
-  primeRuntimeHint,
+  clearActiveRuntimeHint,
   type RuntimeAdapter,
   type RuntimeAdapterInput,
+  primeRuntimeHint,
   type RuntimeHintCandidate,
 } from "./shared";
+import { dropLiveEmbedSessionRuntime } from "@/lib/repack-embed-session";
 
 const DEFAULT_PLAYERV2_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+
+function dropCurrentRuntimeSession(input: RuntimeAdapterInput) {
+  return dropLiveEmbedSessionRuntime({
+    sourceUrl: input.sourceUrl,
+    requestOrigin: input.internalOrigin,
+    slotServerId: input.slotServer,
+  });
+}
+
 function looksLikePlayerv2Source(rawUrl: string) {
   try {
     const parsed = new URL(String(rawUrl || "").trim());
@@ -125,6 +136,8 @@ export const playerv2RuntimeAdapter: RuntimeAdapter = {
   currentManifest: async (input, queryOptions) => {
     const peek = playerv2BaseAdapter.peekStatus(input);
     if (queryOptions?.forceRefresh) {
+      clearActiveRuntimeHint(input);
+      await dropCurrentRuntimeSession(input).catch(() => null);
       await playerv2BaseAdapter.refresh(input, "playerv2_forced_manifest_refresh").catch(() => null);
     }
     if (peek.state !== "ready" && !peek.currentSource) {
@@ -165,6 +178,19 @@ export const playerv2RuntimeAdapter: RuntimeAdapter = {
         });
         if (resolved.ok) break;
       }
+    }
+    if (
+      !resolved.ok &&
+      /(?:altname|hostname\/ip does not match certificate|tls|certificate)/i.test(String(resolved.error || ""))
+    ) {
+      clearActiveRuntimeHint(input);
+      await dropCurrentRuntimeSession(input).catch(() => null);
+      await playerv2BaseAdapter.refresh(input, "playerv2_tls_hint_reset").catch(() => null);
+      resolved = await playerv2BaseAdapter.currentManifest(input, {
+        ...queryOptions,
+        forceRefresh: true,
+        allowRotate: false,
+      });
     }
     return resolved;
   },

@@ -3024,6 +3024,25 @@ export async function rotateLiveEmbedRuntime(input: {
   };
 }
 
+export async function dropLiveEmbedSessionRuntime(input: {
+  sourceUrl: string;
+  requestOrigin: string;
+  slotServerId?: SlotServerId;
+}) {
+  cleanupIdleSessions();
+  const sourceUrl = normalizeHttpUrl(input.sourceUrl);
+  const requestOrigin = normalizeHttpUrl(input.requestOrigin);
+  const key = `${canonicalizeUrl(sourceUrl)}|${canonicalizeUrl(requestOrigin)}|${String(input.slotServerId || "")}`;
+  const session = sessions.get(key);
+  if (!session) return false;
+  sessions.delete(key);
+  await session.close().catch(() => null);
+  if (!sessions.size) {
+    void closeBrowser();
+  }
+  return true;
+}
+
 export function peekLiveEmbedSessionState(input: {
   sourceUrl: string;
   requestOrigin: string;

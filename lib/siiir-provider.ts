@@ -428,7 +428,6 @@ function scoreDirectSiiirCandidate(candidate: string) {
 function selectDirectSiiirCandidates(candidates: string[]) {
   const deduped = new Map<string, string>();
   const koooraCandidates: string[] = [];
-  const hlsFallbackCandidates: string[] = [];
   for (const candidate of candidates) {
     const normalized = normalizeHttpUrl(candidate);
     if (!normalized || deduped.has(normalized)) continue;
@@ -437,20 +436,11 @@ function selectDirectSiiirCandidates(candidates: string[]) {
     deduped.set(normalized, normalized);
     if (isDirectSiiirKoooraCandidate(normalized)) {
       koooraCandidates.push(normalized);
-      continue;
-    }
-    if (isDirectSiiirHlsCandidate(normalized)) {
-      hlsFallbackCandidates.push(normalized);
     }
   }
-  if (koooraCandidates.length) {
-    return koooraCandidates
-      .sort((left, right) => scoreDirectSiiirCandidate(right) - scoreDirectSiiirCandidate(left))
-      .slice(0, 4);
-  }
-  return hlsFallbackCandidates
+  return koooraCandidates
     .sort((left, right) => scoreDirectSiiirCandidate(right) - scoreDirectSiiirCandidate(left))
-    .slice(0, 2);
+    .slice(0, 4);
 }
 
 async function tryDirectSiiirKoooraManifest(
@@ -527,7 +517,10 @@ async function tryDirectSiiirKoooraManifest(
       fetchUrl: candidate,
       referrerUrl: playervContextUrl,
       timeoutMs: 9_000,
-    });
+    }).catch((error: unknown) => ({
+      ok: false as const,
+      error: error instanceof Error ? error.message : "direct-kooora-manifest-exception",
+    }));
     if (!resolved.ok) continue;
 
     const manifestProbeMs = Date.now() - manifestProbeStartedAt;
@@ -759,7 +752,19 @@ export const siiirProvider: LiveStreamProvider = {
         internalOrigin: input.internalOrigin,
       },
       options
-    );
+    ).catch((error: unknown) => ({
+      ok: false as const,
+      error: error instanceof Error ? error.message : "playerv2-runtime-exception",
+      playbackUrl: runtimeSource.playbackUrl,
+      currentSource: "",
+      mediaSequence: null,
+      targetDurationSec: 0,
+      refreshed: false,
+      rotated: false,
+      adapterKind: "playerv2" as const,
+      candidatesFound: 0,
+      candidatesTried: 0,
+    }));
     manifestAttemptMs = Date.now() - manifestStartedAt;
 
     if (!resolved.ok) {
@@ -779,7 +784,19 @@ export const siiirProvider: LiveStreamProvider = {
             ...options,
             forceRefresh: true,
           }
-        );
+        ).catch((error: unknown) => ({
+          ok: false as const,
+          error: error instanceof Error ? error.message : "playerv2-runtime-refresh-exception",
+          playbackUrl: runtimeSource.playbackUrl,
+          currentSource: "",
+          mediaSequence: null,
+          targetDurationSec: 0,
+          refreshed: true,
+          rotated: false,
+          adapterKind: "playerv2" as const,
+          candidatesFound: 0,
+          candidatesTried: 0,
+        }));
         refreshManifestMs = Date.now() - refreshManifestStartedAt;
       }
     }

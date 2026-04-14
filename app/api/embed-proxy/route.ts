@@ -1388,10 +1388,12 @@ function rewriteKnownInlineEndpoints(html: string, target: URL, depth: number, s
 
   // Some playerv pages require this POST endpoint to generate stream tokens.
   if (/\/playerv\d+\.php/i.test(String(target.pathname || "").toLowerCase())) {
-    const tokenEndpoint = `${target.origin}/playerv2.php?action=generate_token`;
+    const match = String(target.pathname || "").match(/\/(playerv\d+)\.php/i);
+    const scriptName = match?.[1] ? `${match[1]}.php` : "playerv2.php";
+    const tokenEndpoint = `${target.origin}/${scriptName}?action=generate_token`;
     const proxiedTokenEndpoint = buildProxyUrl(tokenEndpoint, nextDepth, target.toString());
     out = out.replace(
-      /(['"])(?:\/)?playerv2\.php\?action=generate_token([^"']*)\1/gi,
+      /(['"])(?:\/)?playerv\d+\.php\?action=generate_token([^"']*)\1/gi,
       (_full, quote: string, suffix: string) => `${quote}${proxiedTokenEndpoint}${suffix || ""}${quote}`
     );
 

@@ -213,6 +213,10 @@ function writeActiveHint(input: RuntimeAdapterInput, resolved: { targetUrl: stri
   });
 }
 
+export function clearActiveRuntimeHint(input: RuntimeAdapterInput) {
+  activeRuntimeHints.delete(buildRuntimeKey(input));
+}
+
 export function primeRuntimeHint(input: RuntimeAdapterInput, resolved: RuntimeHintCandidate) {
   const targetUrl = String(resolved.targetUrl || "").trim();
   const referrerUrl = String(resolved.referrerUrl || input.sourceUrl).trim() || input.sourceUrl;
