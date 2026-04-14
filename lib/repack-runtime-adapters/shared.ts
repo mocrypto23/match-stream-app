@@ -40,6 +40,7 @@ type RuntimeResolutionOptions = {
   candidateMaxAgeMs: number;
   maxCandidatesToTry: number;
   forceFreshManifest?: boolean;
+  candidateFilter?: (input: RuntimeAdapterInput, candidate: SessionCandidate) => boolean;
   preferUrlIncludes?: string[];
   preferReferrerIncludes?: string[];
   preferManifestIncludes?: string[];
@@ -709,7 +710,8 @@ function buildCandidateQueue(
           ingestUrl: targetUrl,
           probeReferrerUrl: referrerUrl,
           probePlaylistUrl: targetUrl,
-        })
+        }) &&
+        (typeof options.candidateFilter !== "function" || options.candidateFilter(input, candidate))
       );
     })
     .map((candidate) => ({

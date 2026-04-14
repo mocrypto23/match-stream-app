@@ -185,7 +185,7 @@ function looksLikeEmbeddedPlayerOrStreamTarget(rawUrl: string) {
     return (
       combined.includes(".m3u8") ||
       pathname.includes("/albaplayer/") ||
-      pathname.includes("/playerv2.php") ||
+      /\/playerv\d+\.php/i.test(pathname) ||
       pathname.includes("/embed") ||
       pathname.includes("/player") ||
       pathname.includes("/hls/") ||

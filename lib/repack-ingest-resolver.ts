@@ -89,10 +89,6 @@ const MAX_ALBA_EXPAND_PAGES = 12;
 const MAX_ALBA_EXPAND_DEPTH = 2;
 const DEFAULT_RESOLVER_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
-const PLAYERV2_FALLBACK_DOMAINS = [
-  "https://1rxolmirvosixpyfy.yallashot.us/",
-  "https://jqyjghfms1mu8zc.yallashot.us/",
-];
 const PLAYERV2_ALLOW_SESSION_ID_ONLY =
   String(process.env.REPACK_PLAYERV2_ALLOW_SESSION_ID_ONLY || "0").trim() === "1";
 const PLAYERV_PAGE_PATH_RE = /\/playerv\d+\.php/i;
@@ -780,20 +776,11 @@ function extractPlayerv2ConfigFromHtml(html: string, pageUrl: string): Playerv2C
     } catch {}
   }
 
-  let pageHost = "";
   try {
     const u = new URL(pageUrl);
-    pageHost = String(u.hostname || "").toLowerCase();
     const origin = ensureTrailingSlash(u.origin);
     if (origin) domains.add(origin);
   } catch {}
-
-  if (pageHost.endsWith("yallashot.us")) {
-    for (const fallback of PLAYERV2_FALLBACK_DOMAINS) {
-      const normalized = ensureTrailingSlash(fallback);
-      if (normalized) domains.add(normalized);
-    }
-  }
 
   for (const candidate of randomCandidates) {
     try {

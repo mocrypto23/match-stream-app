@@ -39,6 +39,42 @@ function looksLikePlayerv2Source(rawUrl: string) {
   }
 }
 
+function unwrapProxyTarget(rawUrl: string) {
+  let current = String(rawUrl || "").trim();
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!current) return "";
+    try {
+      const parsed = new URL(current);
+      if (!String(parsed.pathname || "").toLowerCase().includes("/api/embed-proxy")) return parsed.toString();
+      const next = String(parsed.searchParams.get("url") || "").trim();
+      if (!next) return "";
+      current = decodeURIComponent(next);
+    } catch {
+      return "";
+    }
+  }
+  return current;
+}
+
+function isDirectSiiirKoooraUrl(rawUrl: string) {
+  try {
+    const parsed = new URL(String(rawUrl || "").trim());
+    const pathname = String(parsed.pathname || "").toLowerCase();
+    const search = String(parsed.search || "").toLowerCase();
+    if (!pathname.includes("/kooora/")) return false;
+    return search.includes("token=") && (search.includes("sid=") || search.includes("session_id="));
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedSiiirRuntimeCandidate(rawUrl: string) {
+  const direct = String(rawUrl || "").trim();
+  if (isDirectSiiirKoooraUrl(direct)) return true;
+  const unwrapped = unwrapProxyTarget(direct);
+  return !!unwrapped && isDirectSiiirKoooraUrl(unwrapped);
+}
+
 function uniqHints(candidates: RuntimeHintCandidate[]) {
   const out: RuntimeHintCandidate[] = [];
   const seen = new Set<string>();
@@ -101,7 +137,7 @@ async function derivePlayerv2HintCandidates(input: RuntimeAdapterInput) {
   const candidates = await buildPlayerv2Candidates(contextUrl, body, 5_500, input.internalOrigin).catch(() => []);
   return uniqHints(
     candidates
-      .filter((candidate) => candidate && !candidate.includes("/api/embed-proxy"))
+      .filter((candidate) => candidate && isAllowedSiiirRuntimeCandidate(candidate))
       .slice(0, 8)
       .map((candidate) => ({
         targetUrl: candidate,
@@ -125,8 +161,12 @@ const playerv2BaseAdapter = buildSessionOwnedRuntimeAdapter(
     warmingProgressMaxAgeMs: 12_000,
     runtimeWatchdogReadyStates: ["healthy", "refreshing"],
     runtimeWatchdogWarmingStates: ["recovering", "stalled", "refreshing"],
+    candidateFilter: (input, candidate) => {
+      if (input.slotServer !== 2) return true;
+      return isAllowedSiiirRuntimeCandidate(String(candidate?.targetUrl || ""));
+    },
     preferUrlIncludes: ["/kooora/", "token=", "sid=", "nonce=", ".m3u8"],
-    preferReferrerIncludes: ["/playerv", "siiir", "yallashot"],
+    preferReferrerIncludes: ["/playerv", "/hard/", "siiir"],
     preferManifestIncludes: ["/kooora/", "#extm3u"],
   }
 );
