@@ -22,6 +22,26 @@ function isHttpUrl(raw: string) {
   }
 }
 
+function decodeRequestHeadersToken(raw: string) {
+  const value = String(raw || "").trim();
+  if (!value) return null;
+  try {
+    const text = Buffer.from(value, "base64url").toString("utf8");
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const out: Record<string, string> = {};
+    for (const [key, val] of Object.entries(parsed)) {
+      const normalizedKey = String(key || "").trim().toLowerCase();
+      const normalizedValue = String(val || "").trim();
+      if (!normalizedKey || !normalizedValue) continue;
+      out[normalizedKey] = normalizedValue;
+    }
+    return Object.keys(out).length ? out : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const providerId = String(url.searchParams.get("provider") || "").trim().toLowerCase();
@@ -29,6 +49,7 @@ export async function GET(req: Request) {
   const sourceUrl = String(url.searchParams.get("sourceUrl") || "").trim();
   const assetUrl = String(url.searchParams.get("assetUrl") || "").trim();
   const referrerUrl = String(url.searchParams.get("referrerUrl") || "").trim();
+  const requestHeaders = decodeRequestHeadersToken(String(url.searchParams.get("requestHeaders") || "").trim());
   const provider =
     providerId === "yallashoot" || slotServer === 5 || yallashootProvider.isAllowedSource(sourceUrl)
       ? yallashootProvider
@@ -51,6 +72,7 @@ export async function GET(req: Request) {
     internalOrigin: resolveInternalAppOrigin(req),
     assetUrl,
     referrerUrl: isHttpUrl(referrerUrl) ? referrerUrl : undefined,
+    requestHeaders,
     timeoutMs: DEFAULT_SESSION_ASSET_TIMEOUT_MS,
   });
 

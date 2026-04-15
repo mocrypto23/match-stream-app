@@ -1,9 +1,11 @@
 import { NextResponse } from "next/server";
 
+import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
+import { resolveProviderSourceUrl } from "@/lib/stream-provider-registry";
 import { resolveInternalAppOrigin } from "@/lib/live-providers";
 import { runSessionManifestSingleflight } from "@/lib/session-manifest-singleflight";
 import { siiirProvider } from "@/lib/siiir-provider";
-import { getOrLoadHotWatchStateSeed } from "@/lib/watch-state-cache";
+import { getOrLoadHotWatchStateSeed, seedHotWatchState } from "@/lib/watch-state-cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -19,7 +21,7 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok: false, error: "invalid-match-id" }, { status: 400 });
   }
 
-  const { seed, error } = await getOrLoadHotWatchStateSeed(matchId);
+  const { seed, row, error } = await getOrLoadHotWatchStateSeed(matchId);
   if (error) {
     return NextResponse.json({ ok: false, error: String(error.message || "db-error") }, { status: 500 });
   }
@@ -27,7 +29,20 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok: false, error: "match-not-found" }, { status: 404 });
   }
 
-  const sourceUrl = String(seed.sourceUrls.siiir || "").trim();
+  const effectiveRow = row || (await fetchLivekoraMatchRow(matchId)).data || null;
+  const freshSourceUrl = effectiveRow ? await resolveProviderSourceUrl(siiirProvider, effectiveRow) : null;
+  if (freshSourceUrl && freshSourceUrl !== seed.sourceUrls.siiir) {
+    seedHotWatchState({
+      matchId,
+      livekoraSourceUrl: seed.sourceUrls.livekora,
+      beinliveSourceUrl: seed.sourceUrls.beinlive,
+      siiirSourceUrl: freshSourceUrl,
+      yallashootSourceUrl: seed.sourceUrls.yallashoot,
+      matchStart: effectiveRow?.match_start || seed.matchStart || null,
+      statusKey: effectiveRow?.status_key || seed.statusKey || null,
+    });
+  }
+  const sourceUrl = String(freshSourceUrl || seed.sourceUrls.siiir || "").trim();
   if (!sourceUrl) {
     return NextResponse.json({ ok: false, error: "missing-source" }, { status: 409 });
   }

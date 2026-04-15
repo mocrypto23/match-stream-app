@@ -95,6 +95,7 @@ export type LiveStreamProvider = {
     input: ProviderContext & {
       assetUrl: string;
       referrerUrl?: string | null;
+      requestHeaders?: Record<string, string> | null;
       timeoutMs?: number;
     }
   ) => Promise<ProviderAssetResult>;
@@ -175,6 +176,7 @@ function isDynamicLivekoraBridgeUrl(rawUrl: string) {
     if (pathname.includes("/albaplayer/")) return true;
     if (/\/live\d+\.(?:html?|php)$/i.test(pathname)) return true;
     if (/\/(?:watch|player|stream)\d+\.(?:html?|php)$/i.test(pathname)) return true;
+    if (/\/(?:[a-z]{1,6}|ch)\d+\.(?:html?|php)$/i.test(pathname)) return true;
     return false;
   } catch {
     return false;
@@ -378,6 +380,7 @@ function buildSessionAssetUrl(input: {
   sourceUrl: string;
   assetUrl: string;
   referrerUrl: string;
+  requestHeaders?: Record<string, string> | null;
 }) {
   const internalOrigin = normalizeHttpUrl(input.internalOrigin);
   const sourceUrl = normalizeHttpUrl(input.sourceUrl);
@@ -388,6 +391,10 @@ function buildSessionAssetUrl(input: {
   params.set("sourceUrl", sourceUrl);
   params.set("assetUrl", assetUrl);
   if (referrerUrl) params.set("referrerUrl", referrerUrl);
+  const requestHeaders = normalizeHeaderMap(input.requestHeaders);
+  if (Object.keys(requestHeaders).length > 0) {
+    params.set("requestHeaders", Buffer.from(JSON.stringify(requestHeaders), "utf8").toString("base64url"));
+  }
   return `${internalOrigin.replace(/\/+$/, "")}/api/livekora/session-asset?${params.toString()}`;
 }
 
@@ -397,6 +404,7 @@ function rewriteManifestForSession(input: {
   internalOrigin: string;
   sourceUrl: string;
   referrerUrl: string;
+  requestHeaders?: Record<string, string> | null;
 }) {
   const lines = String(input.manifest || "").split(/\r?\n/);
   const out: string[] = [];
@@ -409,6 +417,7 @@ function rewriteManifestForSession(input: {
         sourceUrl: input.sourceUrl,
         assetUrl: absolute,
         referrerUrl: input.referrerUrl,
+        requestHeaders: input.requestHeaders,
       }) || raw
     );
   };
@@ -972,6 +981,7 @@ async function extractLivekoraDirectManifest(input: ProviderContext, options?: M
         internalOrigin: input.internalOrigin,
         sourceUrl: input.sourceUrl,
         referrerUrl: state.referrerUrl,
+        requestHeaders: state.requestHeaders,
       }),
       finalUrl: resolved.finalUrl,
       targetUrl: resolved.finalUrl,
@@ -1069,12 +1079,13 @@ export const livekoraProvider: LiveStreamProvider = {
   },
   async fetchAsset(input) {
     const state = readSourceState(input.sourceUrl);
+    const requestHeaders = normalizeHeaderMap(input.requestHeaders || state?.requestHeaders);
     const referrerUrl =
       normalizeHttpUrl(String(input.referrerUrl || "").trim()) || state?.referrerUrl || input.sourceUrl;
-    if (state) {
+    if (Object.keys(requestHeaders).length > 0) {
       const directAsset = await fetchBinaryWithHeaders({
         url: input.assetUrl,
-        requestHeaders: state.requestHeaders,
+        requestHeaders,
         referrerUrl,
         timeoutMs: input.timeoutMs,
       });

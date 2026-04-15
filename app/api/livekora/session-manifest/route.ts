@@ -1,8 +1,9 @@
 import { NextResponse } from "next/server";
 
+import { fetchLivekoraMatchRow } from "@/lib/livekora-match";
 import { livekoraProvider, pickLivekoraSourceUrl, resolveInternalAppOrigin } from "@/lib/live-providers";
 import { runSessionManifestSingleflight } from "@/lib/session-manifest-singleflight";
-import { getOrLoadHotWatchStateSeed } from "@/lib/watch-state-cache";
+import { getOrLoadHotWatchStateSeed, seedHotWatchState } from "@/lib/watch-state-cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -26,7 +27,20 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok: false, error: "match-not-found" }, { status: 404 });
   }
 
-  const sourceUrl = String(seed.sourceUrls.livekora || "").trim() || (row ? await pickLivekoraSourceUrl(row) : null);
+  const effectiveRow = row || (await fetchLivekoraMatchRow(matchId)).data || null;
+  const freshSourceUrl = effectiveRow ? await pickLivekoraSourceUrl(effectiveRow) : null;
+  if (freshSourceUrl && freshSourceUrl !== seed.sourceUrls.livekora) {
+    seedHotWatchState({
+      matchId,
+      livekoraSourceUrl: freshSourceUrl,
+      beinliveSourceUrl: seed.sourceUrls.beinlive,
+      siiirSourceUrl: seed.sourceUrls.siiir,
+      yallashootSourceUrl: seed.sourceUrls.yallashoot,
+      matchStart: effectiveRow?.match_start || seed.matchStart || null,
+      statusKey: effectiveRow?.status_key || seed.statusKey || null,
+    });
+  }
+  const sourceUrl = String(freshSourceUrl || seed.sourceUrls.livekora || "").trim() || null;
   if (!sourceUrl) {
     return NextResponse.json({ ok: false, error: "missing-source" }, { status: 409 });
   }
