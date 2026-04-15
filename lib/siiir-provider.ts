@@ -399,6 +399,29 @@ async function resolveSiiirRuntimeSource(sourceUrl: string, options?: { forceRef
   };
 }
 
+function pickSiiirSessionEntryUrl(
+  runtimeSource: { runtimeSourceUrl: string; playbackUrl: string } | null,
+  fallbackSourceUrl: string
+) {
+  const normalizedPlaybackUrl = normalizeHttpUrl(String(runtimeSource?.playbackUrl || "").trim());
+  const normalizedRuntimeSourceUrl = normalizeHttpUrl(String(runtimeSource?.runtimeSourceUrl || "").trim());
+  const normalizedFallbackSourceUrl = normalizeHttpUrl(String(fallbackSourceUrl || "").trim());
+
+  const hardCandidate = [normalizedPlaybackUrl, normalizedFallbackSourceUrl].find((candidate) => {
+    if (!candidate) return false;
+    try {
+      const pathname = String(new URL(candidate).pathname || "").toLowerCase();
+      return pathname.includes("/hard/");
+    } catch {
+      return false;
+    }
+  });
+  if (hardCandidate) return hardCandidate;
+  if (normalizedRuntimeSourceUrl) return normalizedRuntimeSourceUrl;
+  if (normalizedPlaybackUrl) return normalizedPlaybackUrl;
+  return normalizedFallbackSourceUrl;
+}
+
 function isDirectSiiirKoooraCandidate(candidate: string) {
   const value = String(candidate || "").trim();
   if (!value || value.includes("/api/embed-proxy")) return false;
@@ -445,9 +468,11 @@ function selectDirectSiiirCandidates(candidates: string[]) {
 
 async function tryDirectSiiirKoooraManifest(
   input: ProviderContext,
-  runtimeSource: { runtimeSourceUrl: string; playbackUrl: string }
+  runtimeSource: { runtimeSourceUrl: string; playbackUrl: string },
+  sessionSourceUrl?: string
 ): Promise<DirectSiiirAttempt> {
-  const normalizedRuntimeSourceUrl = normalizeHttpUrl(runtimeSource.runtimeSourceUrl);
+  const normalizedRuntimeSourceUrl =
+    normalizeHttpUrl(String(sessionSourceUrl || "").trim()) || normalizeHttpUrl(runtimeSource.runtimeSourceUrl);
   if (!normalizedRuntimeSourceUrl || !looksLikePlayerv2PageUrl(normalizedRuntimeSourceUrl)) {
     return {
       ok: false,
@@ -719,8 +744,9 @@ export const siiirProvider: LiveStreamProvider = {
     const canTryDirectKoooraPath =
       !options?.forceRefresh &&
       (normalizedWaitForMediaSequence === null || normalizedWaitForMediaSequence <= 0);
+    let sessionSourceUrl = pickSiiirSessionEntryUrl(runtimeSource, input.sourceUrl);
     if (canTryDirectKoooraPath) {
-      const directResult = await tryDirectSiiirKoooraManifest(input, runtimeSource);
+      const directResult = await tryDirectSiiirKoooraManifest(input, runtimeSource, sessionSourceUrl);
       directPlayervFetchMs = directResult.playervFetchMs;
       directCandidateBuildMs = directResult.candidateBuildMs;
       directManifestProbeMs = directResult.manifestProbeMs;
@@ -747,7 +773,7 @@ export const siiirProvider: LiveStreamProvider = {
     let manifestStartedAt = Date.now();
     let resolved = await playerv2RuntimeAdapter.currentManifest(
       {
-        sourceUrl: runtimeSource.runtimeSourceUrl,
+        sourceUrl: sessionSourceUrl,
         slotServer: 2,
         internalOrigin: input.internalOrigin,
       },
@@ -773,10 +799,11 @@ export const siiirProvider: LiveStreamProvider = {
       refreshResolveMs = Date.now() - refreshResolveStartedAt;
       if (refreshedRuntimeSource?.runtimeSourceUrl) {
         runtimeSource = refreshedRuntimeSource;
+        sessionSourceUrl = pickSiiirSessionEntryUrl(runtimeSource, input.sourceUrl);
         const refreshManifestStartedAt = Date.now();
         resolved = await playerv2RuntimeAdapter.currentManifest(
           {
-            sourceUrl: runtimeSource.runtimeSourceUrl,
+            sourceUrl: sessionSourceUrl,
             slotServer: 2,
             internalOrigin: input.internalOrigin,
           },
@@ -824,7 +851,7 @@ export const siiirProvider: LiveStreamProvider = {
   },
   async fetchAsset(input) {
     const initialRuntimeSource = await resolveSiiirRuntimeSource(input.sourceUrl);
-    let effectiveSourceUrl = initialRuntimeSource?.runtimeSourceUrl || input.sourceUrl;
+    let effectiveSourceUrl = pickSiiirSessionEntryUrl(initialRuntimeSource, input.sourceUrl);
     let assetResult = await playerv2RuntimeAdapter.fetchAsset({
       sourceUrl: effectiveSourceUrl,
       slotServer: 2,
@@ -843,8 +870,9 @@ export const siiirProvider: LiveStreamProvider = {
 
     if (shouldRetryWithFreshRuntimeSource) {
       const refreshedRuntimeSource = await resolveSiiirRuntimeSource(input.sourceUrl, { forceRefresh: true });
-      if (refreshedRuntimeSource?.runtimeSourceUrl && refreshedRuntimeSource.runtimeSourceUrl !== effectiveSourceUrl) {
-        effectiveSourceUrl = refreshedRuntimeSource.runtimeSourceUrl;
+      const refreshedSessionSourceUrl = pickSiiirSessionEntryUrl(refreshedRuntimeSource, input.sourceUrl);
+      if (refreshedSessionSourceUrl && refreshedSessionSourceUrl !== effectiveSourceUrl) {
+        effectiveSourceUrl = refreshedSessionSourceUrl;
         assetResult = await playerv2RuntimeAdapter.fetchAsset({
           sourceUrl: effectiveSourceUrl,
           slotServer: 2,

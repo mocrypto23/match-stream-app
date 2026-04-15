@@ -96,6 +96,7 @@ function isDynamicLivekoraBridgeUrl(rawUrl: string) {
     if (pathname.includes("/albaplayer/")) return true;
     if (/\/live\d+\.(?:html?|php)$/i.test(pathname)) return true;
     if (/\/(?:watch|player|stream)\d+\.(?:html?|php)$/i.test(pathname)) return true;
+    if (/\/(?:[a-z]{1,6}|ch)\d+\.(?:html?|php)$/i.test(pathname)) return true;
     return false;
   } catch {
     return false;
