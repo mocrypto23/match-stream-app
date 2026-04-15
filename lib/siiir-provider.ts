@@ -450,20 +450,16 @@ function scoreDirectSiiirCandidate(candidate: string) {
 
 function selectDirectSiiirCandidates(candidates: string[]) {
   const deduped = new Map<string, string>();
-  const koooraCandidates: string[] = [];
   for (const candidate of candidates) {
     const normalized = normalizeHttpUrl(candidate);
     if (!normalized || deduped.has(normalized)) continue;
     const score = scoreDirectSiiirCandidate(normalized);
     if (score <= 0) continue;
     deduped.set(normalized, normalized);
-    if (isDirectSiiirKoooraCandidate(normalized)) {
-      koooraCandidates.push(normalized);
-    }
   }
-  return koooraCandidates
+  return Array.from(deduped.values())
     .sort((left, right) => scoreDirectSiiirCandidate(right) - scoreDirectSiiirCandidate(left))
-    .slice(0, 4);
+    .slice(0, 6);
 }
 
 async function tryDirectSiiirKoooraManifest(
@@ -608,6 +604,79 @@ async function tryDirectSiiirKoooraManifest(
   };
 }
 
+async function tryDirectSiiirVariantManifest(
+  input: ProviderContext,
+  runtimeSource: { runtimeSourceUrl: string; playbackUrl: string },
+  sessionSourceUrl: string,
+  currentSource: string,
+  meta?: {
+    refreshed?: boolean;
+    rotated?: boolean;
+    candidatesFound?: number;
+    candidatesTried?: number;
+  }
+): Promise<ProviderManifestResult | null> {
+  const normalizedCurrentSource = normalizeHttpUrl(currentSource);
+  if (!isDirectSiiirHlsCandidate(normalizedCurrentSource)) return null;
+
+  const normalizedSessionSourceUrl =
+    normalizeHttpUrl(String(sessionSourceUrl || "").trim()) || normalizeHttpUrl(runtimeSource.runtimeSourceUrl);
+  if (!normalizedSessionSourceUrl) return null;
+
+  const normalizedPlaybackUrl = normalizeHttpUrl(runtimeSource.playbackUrl) || input.sourceUrl;
+  const runtimeReferrerUrl =
+    normalizeHttpUrl(runtimeSource.runtimeSourceUrl) || normalizedPlaybackUrl || normalizedCurrentSource;
+  const resolved = await resolveSessionCandidateMediaManifest({
+    sourceUrl: normalizedSessionSourceUrl,
+    slotServer: 2,
+    internalOrigin: input.internalOrigin,
+    targetUrl: normalizedCurrentSource,
+    fetchUrl: normalizedCurrentSource,
+    referrerUrl: runtimeReferrerUrl,
+    timeoutMs: 12_000,
+  }).catch(() => null);
+  if (!resolved?.ok) return null;
+
+  primeRuntimeHint(
+    {
+      sourceUrl: normalizedSessionSourceUrl,
+      slotServer: 2,
+      internalOrigin: input.internalOrigin,
+    },
+    {
+      targetUrl: normalizedCurrentSource,
+      fetchUrl: normalizedCurrentSource,
+      referrerUrl: runtimeReferrerUrl,
+    }
+  );
+
+  return {
+    ok: true,
+    manifestBody: rewriteManifestForSessionMirror(
+      resolved.body,
+      resolved.finalUrl,
+      input.internalOrigin,
+      normalizedSessionSourceUrl,
+      2,
+      runtimeReferrerUrl
+    ),
+    finalUrl: resolved.finalUrl,
+    targetUrl: normalizedCurrentSource,
+    fetchUrl: normalizedCurrentSource,
+    referrerUrl: runtimeReferrerUrl,
+    playbackUrl: normalizedPlaybackUrl,
+    currentSource: normalizedCurrentSource,
+    mediaSequence: parseMediaSequence(resolved.body),
+    targetDurationSec: parseTargetDurationSec(resolved.body),
+    refreshed: !!meta?.refreshed,
+    rotated: !!meta?.rotated,
+    adapterKind: "playerv2",
+    candidatesFound: Number.isFinite(Number(meta?.candidatesFound)) ? Number(meta?.candidatesFound) : 1,
+    candidatesTried: Number.isFinite(Number(meta?.candidatesTried)) ? Number(meta?.candidatesTried) : 1,
+    sessionOwned: true,
+  };
+}
+
 function mapManifestResult(
   result: Awaited<ReturnType<typeof playerv2RuntimeAdapter.currentManifest>>,
   playbackUrl: string
@@ -715,6 +784,7 @@ export const siiirProvider: LiveStreamProvider = {
     let directCandidatesFound = 0;
     let directCandidatesTried = 0;
     let directError = "";
+    let directVariantProbeMs = 0;
     const initialRuntimeSource = await resolveSiiirRuntimeSource(input.sourceUrl, { forceRefresh: !!options?.forceRefresh });
     runtimeResolveMs = Date.now() - startedAt;
     if (!initialRuntimeSource?.runtimeSourceUrl) {
@@ -828,6 +898,43 @@ export const siiirProvider: LiveStreamProvider = {
       }
     }
 
+    if (!resolved.ok && /embed-session-empty/i.test(String(resolved.error || "").trim())) {
+      const directVariantStartedAt = Date.now();
+      const directVariantResult = await tryDirectSiiirVariantManifest(
+        input,
+        runtimeSource,
+        sessionSourceUrl,
+        String(resolved.currentSource || "").trim(),
+        {
+          refreshed: resolved.refreshed,
+          rotated: resolved.rotated,
+          candidatesFound: resolved.candidatesFound,
+          candidatesTried: resolved.candidatesTried,
+        }
+      );
+      directVariantProbeMs = Date.now() - directVariantStartedAt;
+      if (directVariantResult?.ok) {
+        return {
+          ...directVariantResult,
+          timingSummary: createTimingSummary("direct_hls_variant", {
+            total: Date.now() - startedAt,
+            resolveRuntimeSource: runtimeResolveMs,
+            directPlayervFetch: directPlayervFetchMs,
+            directCandidateBuild: directCandidateBuildMs,
+            directManifestProbe: directManifestProbeMs,
+            manifest: manifestAttemptMs,
+            refreshResolveRuntimeSource: refreshResolveMs,
+            refreshManifest: refreshManifestMs,
+            directVariantProbe: directVariantProbeMs,
+          }, {
+            directCandidatesFound,
+            directCandidatesTried,
+            directError,
+          }),
+        };
+      }
+    }
+
     const mapped = mapManifestResult(resolved, runtimeSource.playbackUrl);
     const totalMs = Date.now() - startedAt;
     const timingSummary = createTimingSummary(mapped.ok ? "resolved" : "resolved_failed", {
@@ -839,6 +946,7 @@ export const siiirProvider: LiveStreamProvider = {
       manifest: manifestAttemptMs,
       refreshResolveRuntimeSource: refreshResolveMs,
       refreshManifest: refreshManifestMs,
+      directVariantProbe: directVariantProbeMs,
     }, {
       directCandidatesFound,
       directCandidatesTried,
