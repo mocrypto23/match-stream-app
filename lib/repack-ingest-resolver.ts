@@ -79,6 +79,7 @@ type Playerv2Config = {
   paths: string[];
   domains: string[];
   randomCandidates: string[];
+  embeddedCandidates: string[];
 };
 
 const DEFAULT_TIMEOUT_MS = 5200;
@@ -733,11 +734,29 @@ function normalizeDomainPrefix(rawDomain: string, baseUrl: string) {
   return normalized.replace(/\/+$/, "");
 }
 
+function decodeObfuscatedPlayerv2Bootstrap(html: string) {
+  const text = String(html || "");
+  const encoded = text.match(/window\._0x\s*=\s*"([^"]+)"\s*;/i)?.[1] || "";
+  const key = text.match(/window\._0k\s*=\s*"([^"]+)"\s*;/i)?.[1] || "";
+  if (!encoded || !key) return null;
+  try {
+    const decoded = Buffer.from(encoded, "base64").toString("utf8");
+    let out = "";
+    for (let idx = 0; idx < decoded.length; idx += 1) {
+      out += String.fromCharCode(decoded.charCodeAt(idx) ^ key.charCodeAt(idx % key.length));
+    }
+    return JSON.parse(out) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 function extractPlayerv2ConfigFromHtml(html: string, pageUrl: string): Playerv2Config {
   const text = normalizeHtmlForScan(html);
   const paths = new Set<string>();
   const domains = new Set<string>();
   const randomCandidates = new Set<string>();
+  const embeddedCandidates = new Set<string>();
 
   const bootstrap = extractPlayerv2Bootstrap(text);
   if (bootstrap) {
@@ -749,6 +768,10 @@ function extractPlayerv2ConfigFromHtml(html: string, pageUrl: string): Playerv2C
     for (const candidate of bootstrap.randomCandidates) {
       const normalized = normalizeCandidate(candidate, pageUrl);
       if (normalized) randomCandidates.add(normalized);
+    }
+    for (const candidate of bootstrap.embeddedCandidates) {
+      const normalized = normalizeCandidate(candidate, pageUrl);
+      if (normalized) embeddedCandidates.add(normalized);
     }
   }
 
@@ -796,6 +819,7 @@ function extractPlayerv2ConfigFromHtml(html: string, pageUrl: string): Playerv2C
     paths: Array.from(paths).map((item) => normalizePlayerv2Path(item)).filter(Boolean),
     domains: Array.from(domains),
     randomCandidates: Array.from(randomCandidates),
+    embeddedCandidates: Array.from(embeddedCandidates),
   };
 }
 
@@ -992,25 +1016,88 @@ export async function fetchBeinAjaxResolvedCandidates(sourceUrl: string, sourceH
 function extractPlayerv2Bootstrap(html: string) {
   const text = String(html || "");
   const match = text.match(/window\.tabsConfig\s*=\s*(\{[\s\S]*?\})\s*;/i);
-  if (!match?.[1]) return null as { paths: string[]; activeDomains: string[]; randomCandidates: string[] } | null;
+  const decodedBootstrap = match?.[1]
+    ? (() => {
+        try {
+          const raw = String(match[1] || "").replace(/\\\//g, "/");
+          return JSON.parse(raw) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      })()
+    : decodeObfuscatedPlayerv2Bootstrap(text);
+  if (!decodedBootstrap) {
+    return null as {
+      paths: string[];
+      activeDomains: string[];
+      randomCandidates: string[];
+      embeddedCandidates: string[];
+    } | null;
+  }
   try {
-    const raw = String(match[1] || "").replace(/\\\//g, "/");
-    const parsed = JSON.parse(raw) as {
+    const parsed = decodedBootstrap as {
       tabs?: Array<{ path?: string; mobile_path?: string }>;
       activeDomains?: string[];
       random_links?: string[];
       random_pools?: Record<string, string[]>;
+      _sid?: string;
+      _tts?: number;
     };
     const paths = new Set<string>();
     const tabs = Array.isArray(parsed?.tabs) ? parsed.tabs : [];
+    const embeddedCandidates = new Set<string>();
+    const bootstrapDomains = new Set<string>();
+    const nonceCandidates = buildPlayerv2NonceCandidates();
+    const tokenizedEntries: Array<{ path: string; token: string; sessionId: string; ts: string }> = [];
     for (const tab of tabs) {
-      const path = String(tab?.path || tab?.mobile_path || "").trim();
-      if (!path) continue;
-      paths.add(path.replace(/^\/+/, ""));
+      const tabRecord = tab as {
+        path?: string;
+        mobile_path?: string;
+        _tp?: string;
+        _mtp?: string;
+        _t?: string | number;
+        _mt?: string | number;
+        _s?: string;
+        _ts?: string | number;
+      };
+      for (const rawPath of [tabRecord?.path, tabRecord?.mobile_path, tabRecord?._tp, tabRecord?._mtp]) {
+        const path = String(rawPath || "").trim();
+        if (!path) continue;
+        paths.add(path.replace(/^\/+/, ""));
+      }
+      const sessionId = String(tabRecord?._s || parsed?._sid || "").trim();
+      const tabTokenizedEntries = [
+        { path: String(tabRecord?._tp || "").trim(), token: String(tabRecord?._t || "").trim(), ts: String(tabRecord?._ts || parsed?._tts || "").trim() },
+        { path: String(tabRecord?._mtp || "").trim(), token: String(tabRecord?._mt || "").trim(), ts: String(tabRecord?._ts || parsed?._tts || "").trim() },
+      ];
+      for (const entry of tabTokenizedEntries) {
+        if (!entry.path || !entry.token || !sessionId || !entry.ts) continue;
+        tokenizedEntries.push({ ...entry, sessionId });
+      }
     }
     const activeDomains = Array.isArray(parsed?.activeDomains)
       ? parsed.activeDomains.map((item) => String(item || "").trim()).filter(Boolean)
       : [];
+    for (const item of activeDomains) {
+      const normalized = ensureTrailingSlash(item);
+      if (normalized) bootstrapDomains.add(normalized);
+    }
+    for (const entry of tokenizedEntries) {
+      const pathValue = entry.path.replace(/^\/+/, "");
+      for (const domain of bootstrapDomains) {
+        const base = normalizeDomainPrefix(domain, "https://example.com/");
+        if (!base) continue;
+        for (const nonce of nonceCandidates.slice(0, 2)) {
+          embeddedCandidates.add(
+            `${ensureTrailingSlash(base)}${pathValue}?ts=${encodeURIComponent(entry.ts)}&nonce=${encodeURIComponent(
+              nonce
+            )}&token=${encodeURIComponent(entry.token)}&sid=${encodeURIComponent(entry.sessionId)}&session_id=${encodeURIComponent(
+              entry.sessionId
+            )}`
+          );
+        }
+      }
+    }
     const randomCandidates = new Set<string>();
     const randomLinks = Array.isArray(parsed?.random_links) ? parsed.random_links : [];
     for (const item of randomLinks) {
@@ -1030,6 +1117,7 @@ function extractPlayerv2Bootstrap(html: string) {
       paths: Array.from(paths),
       activeDomains,
       randomCandidates: Array.from(randomCandidates),
+      embeddedCandidates: Array.from(embeddedCandidates),
     };
   } catch {
     return null;
@@ -1086,7 +1174,11 @@ export async function buildPlayerv2Candidates(sourceUrl: string, html: string, t
   const config = extractPlayerv2ConfigFromHtml(html, sourceUrl);
   if (!config.paths.length || !config.domains.length) {
     const fallbackOnly = buildPlayerv2ChannelFallbackCandidates(sourceUrl).filter((candidate) => isValidHttpUrl(candidate));
-    const seeded = [...fallbackOnly, ...config.randomCandidates.filter((candidate) => isValidHttpUrl(candidate))];
+    const seeded = [
+      ...config.embeddedCandidates.filter((candidate) => isValidHttpUrl(candidate)),
+      ...fallbackOnly,
+      ...config.randomCandidates.filter((candidate) => isValidHttpUrl(candidate)),
+    ];
     return Array.from(new Set(seeded));
   }
 
@@ -1097,6 +1189,7 @@ export async function buildPlayerv2Candidates(sourceUrl: string, html: string, t
   };
 
   const deferredRandomCandidates = [...config.randomCandidates];
+  const deferredEmbeddedCandidates = [...config.embeddedCandidates];
   const deferredFallbackCandidates = buildPlayerv2ChannelFallbackCandidates(sourceUrl);
 
   const maxPaths = Math.min(4, config.paths.length);
@@ -1157,6 +1250,18 @@ export async function buildPlayerv2Candidates(sourceUrl: string, html: string, t
           }
         }
       }
+    }
+  }
+
+  for (const embeddedCandidate of deferredEmbeddedCandidates) {
+    pushCandidate(embeddedCandidate);
+    if (requestOrigin) {
+      const proxied = buildInternalEmbedProxyUrl({
+        sourceUrl: embeddedCandidate,
+        requestOrigin,
+        referrerUrl: sourceUrl,
+      });
+      if (proxied) pushCandidate(proxied);
     }
   }
 
