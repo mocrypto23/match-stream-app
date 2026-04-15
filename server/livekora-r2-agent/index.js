@@ -484,7 +484,7 @@ class LivekoraJob {
       this.providerId === "livekora"
         ? Math.max(this.manager.config.readyGraceMs, 120_000)
         : this.providerId === "siiir"
-          ? Math.max(this.manager.config.readyGraceMs, 75_000)
+          ? Math.max(this.manager.config.readyGraceMs, 180_000)
           : this.providerId === "yallashoot"
             ? Math.max(this.manager.config.readyGraceMs, 180_000)
             : Math.max(this.manager.config.readyGraceMs, 45_000);
@@ -653,7 +653,12 @@ class LivekoraJob {
       if (!isSessionManifestUrl(rawUrl)) return rawUrl;
       try {
         const parsed = new URL(rawUrl);
+        const currentSourceLooksDirectHls =
+          this.providerId === "siiir" &&
+          isHttpUrl(this.lastCurrentSource) &&
+          /\.m3u8(?:$|[?#])/i.test(String(new URL(this.lastCurrentSource).pathname || "").toLowerCase());
         if (
+          !currentSourceLooksDirectHls &&
           !fetchOptions.skipWaitForMediaSequence &&
           Number.isFinite(this.lastRuntimeMediaSequence) &&
           this.lastRuntimeMediaSequence !== null
